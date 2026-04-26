@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 194.
-**Remaining:** 274.
+**Implemented:** 204.
+**Remaining:** 264.
 
 ## Convention
 
@@ -279,7 +279,7 @@ _§[restart_semantics] Restart Semantics_
 - [x] **08** — on success, CPU accesses to the VAR's range use effective permissions = `VAR.cur_rwx`.
 - [x] **09** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## unmap — 10/12
+## unmap — 12/12
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
 - [x] **02** — returns E_INVAL if [1].field1 `map` is 0 (nothing to unmap).
@@ -289,21 +289,21 @@ _§[restart_semantics] Restart Semantics_
 - [x] **06** — returns E_INVAL if [1].field1 `map` is 3 and any offset selector is not aligned to [1]'s `sz`.
 - [x] **07** — returns E_NOENT if [1].field1 `map` is 3 and no demand-allocated page exists at any offset selector.
 - [x] **08** — on success, when N is 0, all installations or demand-allocated pages are removed and `map` is set to 0.
-- [ ] **09** — on success, when N is 0 and `map` was 2, the device_region installation is removed and `device` is cleared to 0.
+- [x] **09** — on success, when N is 0 and `map` was 2, the device_region installation is removed and `device` is cleared to 0.
 - [x] **10** — on success, when N > 0 and `map` is 1, only the specified page_frames are removed; `map` stays 1 unless every installed page_frame has been removed, in which case it becomes 0.
-- [ ] **11** — on success, when N > 0 and `map` is 3, only the pages at the specified offsets are freed; `map` stays 3 unless every demand-allocated page has been freed, in which case it becomes 0.
+- [x] **11** — on success, when N > 0 and `map` is 3, only the pages at the specified offsets are freed; `map` stays 3 unless every demand-allocated page has been freed, in which case it becomes 0.
 - [x] **12** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## remap — 0/9
+## remap — 8/9
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
-- [ ] **02** — returns E_INVAL if [1].field1 `map` is 0 or 2 (no pf or demand mapping to remap).
-- [ ] **03** — returns E_INVAL if [2] new_cur_rwx is not a subset of [1]'s caps r/w/x.
-- [ ] **04** — returns E_INVAL if [1].field1 `map` is 1 and [2] new_cur_rwx is not a subset of the intersection of all installed page_frames' r/w/x caps.
-- [ ] **05** — returns E_INVAL if [1].caps.dma = 1 and [2] new_cur_rwx has bit 2 (x) set.
-- [ ] **06** — returns E_INVAL if any reserved bits are set in [2].
-- [ ] **07** — on success, [1].field1 `cur_rwx` is set to [2] new_cur_rwx.
-- [ ] **08** — on success, subsequent accesses to mapped pages use effective permissions = `cur_rwx` ∩ `page_frame.r/w/x` (for map=1) or `cur_rwx` (for map=3).
+- [x] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
+- [x] **02** — returns E_INVAL if [1].field1 `map` is 0 or 2 (no pf or demand mapping to remap).
+- [x] **03** — returns E_INVAL if [2] new_cur_rwx is not a subset of [1]'s caps r/w/x.
+- [x] **04** — returns E_INVAL if [1].field1 `map` is 1 and [2] new_cur_rwx is not a subset of the intersection of all installed page_frames' r/w/x caps.
+- [x] **05** — returns E_INVAL if [1].caps.dma = 1 and [2] new_cur_rwx has bit 2 (x) set.
+- [x] **06** — returns E_INVAL if any reserved bits are set in [2].
+- [x] **07** — on success, [1].field1 `cur_rwx` is set to [2] new_cur_rwx.
+- [x] **08** — on success, subsequent accesses to mapped pages use effective permissions = `cur_rwx` ∩ `page_frame.r/w/x` (for map=1) or `cur_rwx` (for map=3).
 - [ ] **09** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 ## snapshot — 0/11
