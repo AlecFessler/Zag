@@ -6,7 +6,7 @@ const vtd = zag.arch.x64.intel.vtd;
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const PAddr = zag.memory.address.PAddr;
-const SharedMemory = zag.memory.shared.SharedMemory;
+const PageFrame = zag.memory.page_frame.PageFrame;
 
 const IommuType = enum {
     none,
@@ -55,7 +55,7 @@ pub fn enableTranslation() void {
     }
 }
 
-pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
+pub fn mapDmaPages(device: *DeviceRegion, frame: *PageFrame) !u64 {
     if (active_type == .none) return error.NoIommu;
 
     // Serialize concurrent mapDmaPages/unmapDmaPages on this device via
@@ -63,27 +63,27 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
     // leaf-PTE walk+install, and the IOTLB invalidation must all be
     // atomic with respect to other threads holding the same device cap
     // — otherwise two mappers read the same cursor, install overlapping
-    // PTEs, and hand two SHMs the same `dma_base`, then an unmap of
+    // PTEs, and hand two frames the same `dma_base`, then an unmap of
     // either mapping tears down shared leaf PTEs and pmm-frees frames
     // the device is still DMAing into. See
     // exploits/dma_map_race_iova_alias.
     device._gen_lock.lock();
     defer device._gen_lock.unlock();
-    shm._gen_lock.lock();
-    defer shm._gen_lock.unlock();
+    frame._gen_lock.lock();
+    defer frame._gen_lock.unlock();
 
     const base_dma = device.detail.pci.dma_cursor;
     var i: usize = 0;
-    while (i < shm.num_pages) : (i += 1) {
+    while (i < frame.num_pages) : (i += 1) {
         const dma_addr = base_dma + @as(u64, i) * 0x1000;
-        const phys = shm.pageAddr(i);
+        const phys = frame.pageAddr(i);
         switch (active_type) {
             .intel_vtd => try vtd.mapDmaPage(device, dma_addr, phys),
             .amd_vi => try vi.mapDmaPage(device, dma_addr, phys),
             .none => unreachable,
         }
     }
-    device.detail.pci.dma_cursor = base_dma + @as(u64, shm.num_pages) * 0x1000;
+    device.detail.pci.dma_cursor = base_dma + @as(u64, frame.num_pages) * 0x1000;
     switch (active_type) {
         .amd_vi => vi.flushDevice(device),
         .intel_vtd => vtd.invalidateIotlb(),

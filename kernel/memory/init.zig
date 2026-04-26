@@ -9,12 +9,11 @@ const KA = address.KernelVA.KernelAllocators;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const pmu_mod = zag.syscall.pmu;
-const shared = zag.memory.shared;
 const vmm_mod = zag.memory.vmm;
 
 const BuddyAllocator = zag.memory.allocators.buddy.BuddyAllocator;
 const BumpAllocator = zag.memory.allocators.bump.BumpAllocator;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const MMap = zag.boot.protocol.MMap;
 const MMapEntry = zag.boot.protocol.MMapEntry;
 const PAddr = zag.memory.address.PAddr;
@@ -189,12 +188,6 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.device_region_slab,
         KA.device_region_slab_ptrs,
         KA.device_region_slab_links,
-    );
-
-    shared.slab_allocator_instance = shared.SharedMemoryAllocator.init(
-        KA.shm_slab,
-        KA.shm_slab_ptrs,
-        KA.shm_slab_links,
     );
 
     pmu_mod.initSlab(

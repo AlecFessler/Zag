@@ -21,7 +21,7 @@
 //!
 //! Dispatch interface mapping:
 //!   isAvailable()          → true if IORT contains an SMMU node
-//!   mapDmaPages(dev, shm)  → create stage-2 mapping for device's stream ID
+//!   mapDmaPages(dev, frame) → create stage-2 mapping for device's stream ID
 //!   unmapDmaPages(...)     → remove stage-2 mapping, invalidate IOTLB
 //!   enableTranslation()    → set SMMU_CR0.SMMUEN (SMMUv3) or SMMU_sCR0 (SMMUv2)
 //!
@@ -33,7 +33,7 @@
 const zag = @import("zag");
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const SharedMemory = zag.memory.shared.SharedMemory;
+const PageFrame = zag.memory.page_frame.PageFrame;
 
 // SMMU driver is not yet implemented. QEMU `virt` does not expose an IORT
 // SMMU node by default, and the kernel test rig does not need real stage-2
@@ -50,14 +50,14 @@ pub fn isAvailable() bool {
     return true;
 }
 
-pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
+pub fn mapDmaPages(device: *DeviceRegion, frame: *PageFrame) !u64 {
     device._gen_lock.lock();
     defer device._gen_lock.unlock();
-    shm._gen_lock.lock();
-    defer shm._gen_lock.unlock();
+    frame._gen_lock.lock();
+    defer frame._gen_lock.unlock();
 
     const base_dma = device.detail.pci.dma_cursor;
-    device.detail.pci.dma_cursor = base_dma + @as(u64, shm.num_pages) * 0x1000;
+    device.detail.pci.dma_cursor = base_dma + @as(u64, frame.num_pages) * 0x1000;
     return base_dma;
 }
 

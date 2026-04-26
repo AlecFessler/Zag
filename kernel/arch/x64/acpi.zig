@@ -11,7 +11,7 @@ const paging = zag.memory.paging;
 const timers = zag.arch.x64.timers;
 
 const DeviceClass = zag.memory.device_region.DeviceClass;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
