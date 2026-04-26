@@ -1128,6 +1128,20 @@
       font-size: 10px;
       font-style: italic;
     }
+    /* Side chip — tiny tag distinguishing LIVE-side line numbers from
+       OLDER-side. Mirrors the trace-pane tag colors so the user can
+       associate the chip with the pane it points to without thinking. */
+    .review_unit_row .unit_side_chip {
+      flex: 0 0 auto;
+      font-size: 9px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 0 4px;
+      border-radius: 2px;
+      font-weight: 600;
+    }
+    .review_unit_row .unit_side_chip.side_live  { background: rgba(80, 180, 80, 0.18); color: #6fd17a; }
+    .review_unit_row .unit_side_chip.side_older { background: rgba(220, 80, 80, 0.18); color: #f06060; }
     /* Legacy classes kept for any in-flight transitional rendering. */
     .diff_changes_subrow {
       display: flex;

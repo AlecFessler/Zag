@@ -1166,7 +1166,10 @@
       // the review tracker so dep-unit clicks display the same hunk on
       // both sides instead of jumping to the contributing fn's def.
       if (opts.secondaryByFile) {
-        renderSecondarySourceByFile(opts.secondaryByFile, highlightLine);
+        renderSecondarySourceByFile(
+          opts.secondaryByFile,
+          opts.secondaryHighlight || highlightLine,
+        );
       } else {
         maybeRenderSecondarySource(payload && payload.fn_name, highlightLine);
       }
@@ -3029,27 +3032,24 @@
       const fnStart = fn.def_loc ? (fn.def_loc.line || 0) : 0;
       const fnEnd = fnEndLineByFnId.get(fn.id) || fnStart;
 
-      // Own-body units.
+      // Own-body units. Match by repo-relative path; fnStart/fnEnd are
+      // LIVE-side line numbers, so we test against the unit's new_start
+      // (the position in the new file). For removed-only hunks
+      // new_start is the position where the deletion sits in the new
+      // file — close enough to belong to the same fn for grouping
+      // purposes.
       if (fnFileRel) {
         for (const u of (compareState.units || [])) {
           if (u.file !== fnFileRel) continue;
-          const line = u.new_start || u.old_start || 0;
-          if (line < fnStart || line > fnEnd) continue;
-          contribs.push({
-            unit: u,
-            kind: u.kind, // "added" | "removed"
-            file: u.file,
-            line: line,
-            fn: fn,
-            dep: null,
-          });
+          const matchLine = u.new_start || u.old_start || 0;
+          if (matchLine < fnStart || matchLine > fnEnd) continue;
+          contribs.push(makeContrib(u, "own", fn, null));
         }
       }
 
-      // Dep-def units. Iterate fn.def_deps ∩ changedDefIds.
-      // Definition records store absolute paths (`/home/alec/Zag/...`),
-      // but units come from `git diff` output and are repo-relative
-      // (`kernel/...`). Normalize the def's path before matching.
+      // Dep-def units. Iterate fn.def_deps ∩ changedDefIds. Definition
+      // records store absolute paths (`/home/alec/Zag/...`); units use
+      // repo-relative (`kernel/...`). Normalize before matching.
       for (const did of (fn.def_deps || [])) {
         if (!compareState.changedDefIds.has(did)) continue;
         const def = defById.get(did);
@@ -3060,31 +3060,54 @@
         let matched = 0;
         for (const u of (compareState.units || [])) {
           if (u.file !== defFileRel) continue;
-          const line = u.new_start || u.old_start || 0;
-          if (line < defStart || line > defEnd) continue;
-          contribs.push({
-            unit: u,
-            kind: "dep",
-            file: defFileRel,
-            line: line,
-            fn: fn,
-            dep: def,
-          });
+          const matchLine = u.new_start || u.old_start || 0;
+          if (matchLine < defStart || matchLine > defEnd) continue;
+          contribs.push(makeContrib(u, "dep", fn, def));
           matched += 1;
         }
         if (matched === 0) {
-          // Fallback row when no unit cleanly overlaps the def — still
-          // gives the user a jump target.
+          // Fallback row when no unit cleanly overlaps the def — give
+          // the user a jump target on the def's first line in both
+          // sides.
           contribs.push({
             unit: null,
-            kind: "dep",
+            relation: "dep",
             file: defFileRel,
-            line: defStart,
+            unitKind: "dep",
+            displayLine: defStart,
+            displaySide: "live",
+            liveLine: defStart,
+            olderLine: defStart,
             fn: fn,
             dep: def,
           });
         }
       }
+    }
+
+    /** Build a contribution record from a real unit. The unit's kind
+     *  ("added" | "removed") drives which side's line number we
+     *  surface — for a removed hunk the "removed text" actually sits
+     *  on the OLDER side at old_start; new_start is just the position
+     *  in the post-edit file where the deletion happened, which is
+     *  confusing as a label. Click handlers also pass both lines so
+     *  each pane scrolls to where the change is on its own side. */
+    function makeContrib(u, relation, fn, def) {
+      const liveLine = u.new_start || 0;
+      const olderLine = u.old_start || 0;
+      const isAdd = u.kind === "added";
+      return {
+        unit: u,
+        relation: relation, // "own" | "dep"
+        unitKind: u.kind,   // "added" | "removed"
+        file: u.file,
+        liveLine: liveLine,
+        olderLine: olderLine,
+        displayLine: isAdd ? liveLine : olderLine,
+        displaySide: isAdd ? "live" : "older",
+        fn: fn,
+        dep: def,
+      };
     }
 
     if (contribs.length === 0) {
@@ -3214,10 +3237,11 @@
         const fn = fnEntry.fn;
         const cs = fnEntry.contribs.slice();
         cs.sort(function (a, b) {
-          // Own units first, then dep, then by line.
-          if (a.kind === "dep" && b.kind !== "dep") return 1;
-          if (a.kind !== "dep" && b.kind === "dep") return -1;
-          return a.line - b.line;
+          // Own units first, then dep, then by display line so the
+          // visual order tracks where the user will see the hunk.
+          if (a.relation === "dep" && b.relation !== "dep") return 1;
+          if (a.relation !== "dep" && b.relation === "dep") return -1;
+          return a.displayLine - b.displayLine;
         });
 
         // Per-fn rollup: unique unit count + reviewed.
@@ -3319,37 +3343,60 @@
             row.appendChild(placeholder);
           }
 
+          // Glyph: "+" for added, "−" for removed. The relation
+          // ("own" vs "dep") drives the *color* — dep-via-def hunks
+          // use the purple "dep" tint regardless of whether the
+          // underlying unit is an addition or deletion. The synthetic
+          // dep-fallback rows have no real unit and use Δ.
           const glyph = document.createElement("span");
-          glyph.className = "unit_glyph " +
-            (c.kind === "added" ? "added" :
-             c.kind === "removed" ? "removed" : "dep");
-          glyph.textContent = c.kind === "added" ? "+"
-            : c.kind === "removed" ? "−"
+          const colorClass = c.relation === "dep" ? "dep"
+            : (c.unitKind === "added" ? "added" : "removed");
+          glyph.className = "unit_glyph " + colorClass;
+          glyph.textContent = c.unit
+            ? (c.unitKind === "added" ? "+" : "−")
             : "Δ";
           row.appendChild(glyph);
 
+          // Label: show the line on the side where the change actually
+          // exists. For "removed" units, that's old_start in the OLDER
+          // commit; for "added", new_start in LIVE. Without this, a
+          // removed hunk at OLDER:1055 would label as "1053" (its
+          // post-deletion position in the new file), which is the
+          // surprising number the user pointed out.
           const label = document.createElement("span");
           label.className = "unit_label";
-          if (c.kind === "dep") {
+          const sideTag = c.displaySide === "older" ? "older" : "live";
+          if (c.relation === "dep") {
             label.textContent = (c.dep && c.dep.name ? c.dep.name : "<def>") +
-              "  " + shortenFile(c.file) + ":" + c.line;
+              "  " + shortenFile(c.file) + ":" + c.displayLine;
           } else {
-            label.textContent = "line " + c.line;
+            label.textContent = "line " + c.displayLine;
           }
           row.appendChild(label);
 
-          if (c.kind === "dep") {
+          // Side tag — small chip telling the user whether the
+          // displayed line lives in the LIVE or OLDER side. Avoids
+          // ambiguity when a fn has both added and removed units (the
+          // line numbers are otherwise indistinguishable).
+          if (c.unit) {
+            const sideChip = document.createElement("span");
+            sideChip.className = "unit_side_chip side_" + sideTag;
+            sideChip.textContent = sideTag;
+            row.appendChild(sideChip);
+          }
+          if (c.relation === "dep") {
             const via = document.createElement("span");
             via.className = "unit_dep_via";
             via.textContent = "[dep]";
             row.appendChild(via);
           }
 
+          const kindStr = c.relation === "dep"
+            ? "dep-def hunk via " + (c.dep && c.dep.name ? c.dep.name : "?")
+            : (c.unitKind === "added" ? "added hunk" : "removed hunk");
           const tooltipParts = [
-            c.kind === "added" ? "added hunk" :
-              c.kind === "removed" ? "removed hunk" :
-              "dep-def hunk via " + (c.dep && c.dep.name ? c.dep.name : "?"),
-            shortenFile(c.file) + ":" + c.line,
+            kindStr,
+            shortenFile(c.file) + ":" + c.displayLine + " (" + sideTag + ")",
           ];
           if (rec && rec.at) {
             tooltipParts.push("reviewed at " + rec.at);
@@ -3357,15 +3404,19 @@
           row.title = tooltipParts.join(" · ");
 
           row.addEventListener("click", function () {
-            // Click anywhere outside the checkbox jumps source pane.
-            // Show the SAME repo-relative file on both sides — the
-            // user reviewing a hunk wants to compare the file's old
-            // and new state, not jump to the contributing fn's def
-            // (which for dep units lives in a different file).
+            // Show the SAME repo-relative file on both sides; each pane
+            // scrolls to where the change exists on its own side
+            // (LIVE → liveLine, OLDER → olderLine). For an "added"
+            // hunk those are the same line in two timelines; for
+            // "removed" they differ — old_start sits in the OLDER pane
+            // where the deleted text actually appears, and liveLine
+            // (= new_start) is the corresponding position in the
+            // post-edit file (so the user lands at the deletion site).
             els.info.classList.add("visible");
             setLastClickedFn(c.fn.name || c.fn.mangled || null);
-            fetchSource(c.file, 1, 10000000, c.line, {
+            fetchSource(c.file, 1, 10000000, c.liveLine || 1, {
               secondaryByFile: c.file,
+              secondaryHighlight: c.olderLine || 1,
             });
           });
 
