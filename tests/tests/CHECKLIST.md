@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 275.
-**Remaining:** 193.
+**Implemented:** 285.
+**Remaining:** 183.
 
 ## Convention
 
@@ -391,7 +391,7 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **07** — on success, after a subsequent IRQ from the device, every domain-local copy's `field1.irq_count` reaches the new value within a bounded delay and an EC blocked in `futex_wait_val` on each copy's `field1` paddr is woken.
 - [x] **08** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## create_virtual_machine — 6/9
+## create_virtual_machine — 9/9
 
 - [x] **01** — returns E_PERM if the caller's self-handle lacks `crvm`.
 - [x] **02** — returns E_PERM if caps is not a subset of the caller's `vm_ceiling`.
@@ -399,19 +399,19 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **04** — returns E_BADCAP if [2] is not a valid page frame handle.
 - [x] **05** — returns E_INVAL if `policy_page_frame` is smaller than `sizeof(VmPolicy)`.
 - [x] **06** — returns E_INVAL if `VmPolicy.num_cpuid_responses` exceeds `MAX_CPUID_POLICIES`.
-- [ ] **07** — returns E_INVAL if `VmPolicy.num_cr_policies` exceeds `MAX_CR_POLICIES`.
-- [ ] **08** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **09** — on success, the caller receives a VM handle with caps = `[1].caps`.
+- [x] **07** — returns E_INVAL if `VmPolicy.num_cr_policies` exceeds `MAX_CR_POLICIES`.
+- [x] **08** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **09** — on success, the caller receives a VM handle with caps = `[1].caps`.
 
-## create_vcpu — 0/12
+## create_vcpu — 7/12
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `crec`.
-- [ ] **02** — returns E_PERM if caps is not a subset of the VM's owning domain's `ec_inner_ceiling`.
-- [ ] **03** — returns E_PERM if priority exceeds the caller's priority ceiling.
-- [ ] **04** — returns E_BADCAP if [2] is not a valid VM handle.
-- [ ] **05** — returns E_BADCAP if [4] is not a valid port handle.
-- [ ] **06** — returns E_INVAL if [3] affinity has bits set outside the system's core count.
-- [ ] **07** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `crec`.
+- [x] **02** — returns E_PERM if caps is not a subset of the VM's owning domain's `ec_inner_ceiling`.
+- [x] **03** — returns E_PERM if priority exceeds the caller's priority ceiling.
+- [x] **04** — returns E_BADCAP if [2] is not a valid VM handle.
+- [x] **05** — returns E_BADCAP if [4] is not a valid port handle.
+- [x] **06** — returns E_INVAL if [3] affinity has bits set outside the system's core count.
+- [x] **07** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **08** — on success, the caller receives an EC handle with caps = `[1].caps`.
 - [ ] **09** — on success, `suspend` on the returned EC handle returns E_INVAL, and after `recv` on [4] consumes the initial vm_exit and `reply` on its reply handle, a subsequent `recv` on [4] returns a vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s architecture.
 - [ ] **10** — on success, the EC's priority is set to `[1].priority`.
