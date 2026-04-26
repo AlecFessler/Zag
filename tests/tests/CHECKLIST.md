@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 410.
-**Remaining:** 58.
+**Implemented:** 415.
+**Remaining:** 53.
 
 ## Convention
 
@@ -543,13 +543,13 @@ _§[handle_attachments] Handle Attachments_
 - [x] **06** — on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
 - [x] **07** — on success, the suspended EC is resumed.
 
-## reply_transfer — 4/15
+## reply_transfer — 5/15
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid reply handle.
 - [x] **02** — returns E_PERM if [1] does not have the `xfer` cap.
 - [x] **03** — returns E_INVAL if N is 0 or N > 63.
 - [x] **04** — returns E_INVAL if any reserved bits are set in [1] or any pair entry.
-- [ ] **05** — returns E_BADCAP if any pair entry's source handle id is not valid in the caller's domain.
+- [x] **05** — returns E_BADCAP if any pair entry's source handle id is not valid in the caller's domain.
 - [ ] **06** — returns E_PERM if any pair entry's caps are not a subset of the source handle's current caps.
 - [ ] **07** — returns E_PERM if any pair entry with `move = 1` references a source handle that lacks the `move` cap.
 - [ ] **08** — returns E_PERM if any pair entry with `move = 0` references a source handle that lacks the `copy` cap.
@@ -574,14 +574,14 @@ _§[handle_attachments] Handle Attachments_
 - [x] **09** — on each fire, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
 - [x] **10** — calling `timer_arm` again yields a fresh, independent timer handle; the prior handle's field0 and field1 are unaffected.
 
-## timer_rearm — 5/10
+## timer_rearm — 6/10
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid timer handle.
 - [x] **02** — returns E_PERM if [1] does not have the `arm` cap.
 - [x] **03** — returns E_INVAL if [2] deadline_ns is 0.
 - [x] **04** — returns E_INVAL if any reserved bits are set in [1] or [3].
 - [x] **05** — on success, the calling domain's copy of [1] has `field0 = 0` immediately on return; every other domain-local copy returns 0 from a fresh `sync` within a bounded delay.
-- [ ] **06** — on success, [1].field1.arm = 1 and [1].field1.pd = [3].periodic.
+- [x] **06** — on success, [1].field1.arm = 1 and [1].field1.pd = [3].periodic.
 - [ ] **07** — on success with [3].periodic = 0, [1].field0 is incremented by 1 once after [2] deadline_ns and `[1].field1.arm` becomes 0; with [3].periodic = 1, [1].field0 is incremented by 1 every [2] deadline_ns until `timer_cancel` or another `timer_rearm`.
 - [ ] **08** — on success, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
 - [ ] **09** — `timer_rearm` called on a currently-armed timer replaces the prior configuration; the prior pending fire does not occur and field0 reflects the reset to 0 rather than any partial fire.
@@ -599,7 +599,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **08** — on success, after one full prior `deadline_ns` has elapsed, every domain-local copy of [1] still returns `field0 = u64::MAX` from a fresh `sync`.
 - [x] **09** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## futex_wait_val — 7/8
+## futex_wait_val — 8/8
 
 - [x] **01** — returns E_PERM if the caller's self-handle has `fut_wait_max = 0`.
 - [x] **02** — returns E_INVAL if N is 0 or N > 63.
@@ -608,7 +608,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **05** — returns E_BADADDR if any addr is not a valid user address in the caller's domain.
 - [x] **06** — returns E_TIMEOUT if the timeout expires before any pair's `addr != expected` condition is met and before any watched address is woken.
 - [x] **07** — on entry, when any pair's current `*addr != expected`, returns immediately with `[1]` set to that addr.
-- [ ] **08** — when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
+- [x] **08** — when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
 
 ## futex_wait_change — 8/8
 
@@ -628,21 +628,21 @@ _§[handle_attachments] Handle Attachments_
 - [x] **03** — returns E_BADADDR if [1] addr is not a valid user address in the caller's domain.
 - [x] **04** — on success, [1] is the number of ECs actually woken (0..count).
 
-## time — 0/5
+## time — 1/5
 
 _§[time] Time_
 
-- [ ] **01** — on success, [1] is a u64 nanosecond count strictly greater than the value returned by any prior call to `time_monotonic`.
+- [x] **01** — on success, [1] is a u64 nanosecond count strictly greater than the value returned by any prior call to `time_monotonic`.
 - [ ] **02** — after `time_setwall(X)` succeeds, a subsequent `time_getwall` returns a value within a small bounded delta of X.
 - [ ] **03** — returns E_PERM if the caller's self-handle lacks `setwall`.
 - [ ] **04** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **05** — on success, a subsequent `time_getwall` returns a value within a small bounded delta of [1].
 
-## rng — 0/2
+## rng — 1/2
 
 _§[rng] RNG_
 
-- [ ] **01** — returns E_INVAL if count is 0 or count > 127.
+- [x] **01** — returns E_INVAL if count is 0 or count > 127.
 - [ ] **02** — on success, vregs `[1..count]` contain qwords (the CSPRNG-source guarantee in the prose above is a kernel implementation contract, not a black-box-testable assertion).
 
 ## system_info — 0/6
