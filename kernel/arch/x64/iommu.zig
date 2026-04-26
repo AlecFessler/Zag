@@ -6,7 +6,7 @@ const vi = zag.arch.x64.amd.vi;
 const vtd = zag.arch.x64.intel.vtd;
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const MemoryPerms = dispatch_iommu.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
 const SpecDeviceRegion = zag.devices.device_region.DeviceRegion;

@@ -8,7 +8,6 @@ const device_region_mod = zag.memory.device_region;
 const KA = address.KernelVA.KernelAllocators;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-const pmu_mod = zag.syscall.pmu;
 const vmm_mod = zag.memory.vmm;
 
 const BuddyAllocator = zag.memory.allocators.buddy.BuddyAllocator;
@@ -185,9 +184,10 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.device_region_slab_links,
     );
 
-    pmu_mod.initSlab(
-        KA.pmu_state_slab,
-        KA.pmu_state_slab_ptrs,
-        KA.pmu_state_slab_links,
-    );
+    // TODO: perfmon slab init — kernel/sched/perfmon.zig.slab_instance is
+    // still `undefined`; needs an initSlab equivalent wired here once the
+    // perfmon migration lands.
+    _ = KA.pmu_state_slab;
+    _ = KA.pmu_state_slab_ptrs;
+    _ = KA.pmu_state_slab_links;
 }

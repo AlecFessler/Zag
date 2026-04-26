@@ -143,7 +143,7 @@ pub fn createPort(caller: *ExecutionContext, caps: u64) i64 {
         0,
         0,
     ) catch {
-        onHandleRelease(port, @bitCast(port_caps));
+        _ = onHandleRelease(port, @bitCast(port_caps));
         return errors.E_FULL;
     };
     return @intCast(slot);
