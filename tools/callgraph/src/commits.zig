@@ -276,6 +276,7 @@ fn runLoad(reg: *Registry, entry: *Entry) !void {
 
     // 3. AST walk — once per worktree, shared across arches.
     const arena_alloc = entry.arena.allocator();
+    const t_ast_start = std.time.milliTimestamp();
     const walk = ast.walkKernelFull(arena_alloc, kernel_root_in_worktree) catch |err| {
         const msg = try std.fmt.allocPrint(
             reg.gpa,
@@ -288,6 +289,24 @@ fn runLoad(reg: *Registry, entry: *Entry) !void {
         reg.mutex.unlock();
         return;
     };
+    std.debug.print(
+        "[commit {s}] phase ast_walk: {d}ms ({d} fns, {d} files)\n",
+        .{ entry.short_sha, std.time.milliTimestamp() - t_ast_start, walk.fns.len, walk.asts.len },
+    );
+
+    // Shared across both arches: def_deps' setup state (qname index,
+    // alias map, per-file line→node maps) is identical between arches.
+    // The Cache is built ONCE here from the AST walk + a representative
+    // Definition catalog, then both per-arch compute() calls reuse it.
+    // The catalog is per-arch in principle, but `buildDefinitionList`
+    // produces the same DefIds in the same order regardless of the
+    // arch's ir_graph (it iterates `walk.definitions`), so a shared
+    // catalog is fine. We build it now from the walk.
+    const shared_definitions = try ast.buildDefinitionList(arena_alloc, walk.definitions);
+    var def_deps_cache = try def_deps.Cache.init(
+        arena_alloc, shared_definitions, walk.asts, walk.aliases,
+    );
+    defer def_deps_cache.deinit();
 
     // 4. Per-arch parse + join + reach.
     for (reg.arch_specs) |spec| {
@@ -314,6 +333,7 @@ fn runLoad(reg: *Registry, entry: *Entry) !void {
         // ir.parse, so a separate arena would leave dangling slices once
         // it deinits. Memory grows with the IR size but caps at one
         // commit's worth — acceptable.
+        const t_ir_start = std.time.milliTimestamp();
         const ir_graph = ir.parse(entry.arena, ir_path) catch |err| {
             std.debug.print(
                 "[commit {s}] IR parse {s} failed: {s}\n",
@@ -321,7 +341,12 @@ fn runLoad(reg: *Registry, entry: *Entry) !void {
             );
             continue;
         };
+        std.debug.print(
+            "[commit {s}] phase ir_parse({s}): {d}ms\n",
+            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_ir_start },
+        );
 
+        const t_disc_start = std.time.milliTimestamp();
         const discovered = entry_mod.discover(
             arena_alloc,
             kernel_root_in_worktree,
@@ -335,7 +360,12 @@ fn runLoad(reg: *Registry, entry: *Entry) !void {
             );
             continue;
         };
+        std.debug.print(
+            "[commit {s}] phase discover({s}): {d}ms\n",
+            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_disc_start },
+        );
 
+        const t_join_start = std.time.milliTimestamp();
         var stats: join.JoinStats = undefined;
         var graph = join.buildGraphWithStats(
             arena_alloc,
@@ -354,19 +384,36 @@ fn runLoad(reg: *Registry, entry: *Entry) !void {
             );
             continue;
         };
+        std.debug.print(
+            "[commit {s}] phase join({s}): {d}ms ({d} graph fns)\n",
+            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_join_start, graph.functions.len },
+        );
 
-        // Mirror main.zig: install the Definition catalog and dep edges
-        // for this commit's snapshot.
-        graph.definitions = ast.buildDefinitionList(arena_alloc, walk.definitions) catch &.{};
-        def_deps.compute(arena_alloc, &graph, walk.asts, walk.aliases) catch |err| {
+        // Install the Definition catalog. We share the catalog built
+        // up-front for the def_deps cache — fast and keeps DefIds
+        // consistent across arches.
+        graph.definitions = shared_definitions;
+
+        const t_deps_start = std.time.milliTimestamp();
+        def_deps.compute(arena_alloc, &graph, &def_deps_cache) catch |err| {
             std.debug.print(
                 "[commit {s}] def_deps {s} failed: {s}\n",
                 .{ entry.short_sha, spec.api_tag, @errorName(err) },
             );
         };
+        std.debug.print(
+            "[commit {s}] phase def_deps({s}): {d}ms\n",
+            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_deps_start },
+        );
 
+        const t_reach_start = std.time.milliTimestamp();
         _ = reachability.compute(reg.gpa, &graph) catch {};
+        std.debug.print(
+            "[commit {s}] phase reach({s}): {d}ms\n",
+            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_reach_start },
+        );
 
+        const t_serial_start = std.time.milliTimestamp();
         const blob = std.json.Stringify.valueAlloc(reg.gpa, graph, .{}) catch |err| {
             std.debug.print(
                 "[commit {s}] serialize {s} failed: {s}\n",
@@ -374,6 +421,10 @@ fn runLoad(reg: *Registry, entry: *Entry) !void {
             );
             continue;
         };
+        std.debug.print(
+            "[commit {s}] phase serialize({s}): {d}ms ({d} KB)\n",
+            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_serial_start, blob.len / 1024 },
+        );
 
         // Install under mutex.
         reg.mutex.lock();

@@ -24,51 +24,105 @@ const ImportTable = ast_mod.walker.ImportTable;
 
 const DepSet = std.AutoArrayHashMap(types.DefId, void);
 
-/// Compute and install def_deps for every function in `graph`. Idempotent —
-/// each call overwrites the previous def_deps slice. `file_asts` is the
-/// walker's per-file (tree, source, imports) bundle; `aliases` is its
-/// re-export alias table.
+/// Per-file bundle: parsed AST, its module path, and a pre-built
+/// `start_line → fn_node` map. Building the line map up-front trades a
+/// per-file AST scan for what was previously a per-fn linear scan in
+/// `findFnNode` (O(n_fns × n_nodes_per_file)).
+const FileBundle = struct {
+    fa: *const FileAst,
+    module_path: []const u8,
+    fn_node_by_line: std.AutoHashMap(u32, std.zig.Ast.Node.Index),
+};
+
+/// Cache of all the work that doesn't depend on which arch's graph
+/// we're processing — the qname-to-def index, the alias map, and the
+/// per-file (line→node) maps. Building these eats ~5.3s per call on
+/// the kernel (1018 files × 5k AST nodes scan). Building ONCE and
+/// reusing across arches is the biggest single def_deps win.
+///
+/// The cross-arch result cache (`by_qname`) sits in the same struct
+/// so a single Cache parameter covers both reuse points: setup-state
+/// + per-fn results.
+pub const Cache = struct {
+    qname_to_def: std.StringHashMap(types.DefId),
+    alias_map: std.StringHashMap([]const u8),
+    file_index: std.StringHashMap(FileBundle),
+    by_qname: std.StringHashMap([]const types.DefId),
+
+    /// Build all shared lookups from the walk results. `definitions`
+    /// must be the same catalog the per-arch graphs share (i.e. built
+    /// from `walk.definitions`); the DefIds keyed here are then portable
+    /// across arches.
+    pub fn init(
+        arena: std.mem.Allocator,
+        definitions: []const types.Definition,
+        file_asts: []const FileAst,
+        aliases_in: []const types.ReexportAlias,
+    ) !Cache {
+        var qname_to_def = std.StringHashMap(types.DefId).init(arena);
+        for (definitions) |d| {
+            _ = try qname_to_def.getOrPutValue(d.qualified_name, d.id);
+        }
+
+        var alias_map = std.StringHashMap([]const u8).init(arena);
+        for (aliases_in) |a| {
+            _ = try alias_map.getOrPutValue(a.key, a.target);
+        }
+
+        var file_index = std.StringHashMap(FileBundle).init(arena);
+        for (file_asts) |*fa| {
+            const mod = ast_mod.walker.filePathToModulePath(arena, fa.file) catch continue;
+            var line_map = std.AutoHashMap(u32, std.zig.Ast.Node.Index).init(arena);
+            try buildFnLineMap(fa.tree, &line_map);
+            try file_index.put(fa.file, .{
+                .fa = fa,
+                .module_path = mod,
+                .fn_node_by_line = line_map,
+            });
+        }
+
+        return .{
+            .qname_to_def = qname_to_def,
+            .alias_map = alias_map,
+            .file_index = file_index,
+            .by_qname = std.StringHashMap([]const types.DefId).init(arena),
+        };
+    }
+
+    pub fn deinit(self: *Cache) void {
+        // file_index entries' inner line_map maps live in the same
+        // arena and don't need explicit deinit (arena owns them).
+        self.qname_to_def.deinit();
+        self.alias_map.deinit();
+        self.file_index.deinit();
+        self.by_qname.deinit();
+    }
+};
+
+/// Install def_deps on every fn in `graph` using the pre-built `cache`
+/// (qname index, alias map, file/line lookup, and any previously
+/// computed per-fn results from a prior arch). Idempotent.
 pub fn compute(
     arena: std.mem.Allocator,
     graph: *types.Graph,
-    file_asts: []const FileAst,
-    aliases: []const types.ReexportAlias,
+    cache: *Cache,
 ) !void {
     if (graph.definitions.len == 0 or graph.functions.len == 0) return;
 
-    var qname_to_def = std.StringHashMap(types.DefId).init(arena);
-    defer qname_to_def.deinit();
-    for (graph.definitions) |d| {
-        _ = try qname_to_def.getOrPutValue(d.qualified_name, d.id);
-    }
-
-    var alias_map = std.StringHashMap([]const u8).init(arena);
-    defer alias_map.deinit();
-    for (aliases) |a| {
-        _ = try alias_map.getOrPutValue(a.key, a.target);
-    }
-
-    // Per-file lookup: (file_path) → (FileAst, module_path). The module
-    // path is computed once per file and reused across every fn in that
-    // file. Computing it per-fn would be the obvious shape but it's
-    // measurable overhead at ~25k fns.
-    const FileBundle = struct {
-        fa: *const FileAst,
-        module_path: []const u8,
-    };
-    var file_index = std.StringHashMap(FileBundle).init(arena);
-    defer file_index.deinit();
-    for (file_asts) |*fa| {
-        const mod = ast_mod.walker.filePathToModulePath(arena, fa.file) catch continue;
-        try file_index.put(fa.file, .{ .fa = fa, .module_path = mod });
-    }
-
     for (graph.functions) |*fn_rec| {
+        // Cache hit: skip the AST walk entirely, reuse the prior result.
+        if (fn_rec.name.len > 0) {
+            if (cache.by_qname.get(fn_rec.name)) |cached| {
+                fn_rec.def_deps = cached;
+                continue;
+            }
+        }
+
         const file = fn_rec.def_loc.file;
-        const bundle = file_index.get(file) orelse continue;
+        const bundle = cache.file_index.get(file) orelse continue;
         const tree = bundle.fa.tree;
 
-        const fn_node = findFnNode(tree, fn_rec) orelse continue;
+        const fn_node = bundle.fn_node_by_line.get(fn_rec.def_loc.line) orelse continue;
 
         var deps = DepSet.init(arena);
         defer deps.deinit();
@@ -80,11 +134,18 @@ pub fn compute(
             bundle.module_path,
             fn_node,
             &deps,
-            &qname_to_def,
-            &alias_map,
+            &cache.qname_to_def,
+            &cache.alias_map,
         );
 
-        if (deps.count() == 0) continue;
+        if (deps.count() == 0) {
+            // Still record an empty result so the second arch's lookup
+            // hits the cache.
+            if (fn_rec.name.len > 0) {
+                _ = cache.by_qname.getOrPutValue(fn_rec.name, &.{}) catch {};
+            }
+            continue;
+        }
 
         const out = try arena.alloc(types.DefId, deps.count());
         var i: usize = 0;
@@ -94,6 +155,39 @@ pub fn compute(
             i += 1;
         }
         fn_rec.def_deps = out;
+
+        if (fn_rec.name.len > 0) {
+            _ = cache.by_qname.getOrPutValue(fn_rec.name, out) catch {};
+        }
+    }
+}
+
+/// Pre-scan a tree and record every fn's start line → node index. Lets
+/// the per-fn loop in `compute()` look up its node in O(1) instead of
+/// rescanning the whole tree per fn.
+fn buildFnLineMap(
+    tree: *std.zig.Ast,
+    out: *std.AutoHashMap(u32, std.zig.Ast.Node.Index),
+) !void {
+    const node_count = tree.nodes.len;
+    var i: u32 = 0;
+    while (i < node_count) : (i += 1) {
+        const idx: std.zig.Ast.Node.Index = @enumFromInt(i);
+        const tag = tree.nodeTag(idx);
+        const matches = switch (tag) {
+            .fn_decl, .fn_proto, .fn_proto_simple, .fn_proto_multi, .fn_proto_one => true,
+            else => false,
+        };
+        if (!matches) continue;
+        var proto_buf: [1]std.zig.Ast.Node.Index = undefined;
+        const fn_proto = tree.fullFnProto(&proto_buf, idx) orelse continue;
+        const start_loc = tree.tokenLocation(0, fn_proto.ast.fn_token);
+        const start_line: u32 = @intCast(start_loc.line + 1);
+        // First-write-wins: if two fns somehow share a start line (rare
+        // single-line decl pairings), the first one wins, matching the
+        // old findFnNode tie-break-on-first-match behavior.
+        const gop = try out.getOrPut(start_line);
+        if (!gop.found_existing) gop.value_ptr.* = idx;
     }
 }
 

@@ -217,7 +217,11 @@ pub fn main() !void {
         // Phase 2: walk each fn's tokens, resolve references against the
         // def-qname index, and install Function.def_deps. Best-effort —
         // unresolved refs are dropped silently.
-        def_deps.compute(arena_allocator, &graph, walk.asts, walk.aliases) catch |err| {
+        var dep_cache = try def_deps.Cache.init(
+            arena_allocator, graph.definitions, walk.asts, walk.aliases,
+        );
+        defer dep_cache.deinit();
+        def_deps.compute(arena_allocator, &graph, &dep_cache) catch |err| {
             std.debug.print("[arch {s}] def_deps failed: {s}\n", .{ spec.api_tag, @errorName(err) });
         };
 

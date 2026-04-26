@@ -189,6 +189,28 @@
     window.__cgRenderCount += 1;
     window.__cgReady = true;
   }
+
+  /** Emit a `performance.mark` so the perf harness can read per-phase
+   *  boundaries (commit-switch wants `activateCompare:start`,
+   *  `ensureSecGraph:bodyDone`, `recomputeDiffSets:start/done`, etc.).
+   *  Also kept on `window.__cgPerfMarks` as a flat array of {name,t} for
+   *  harnesses that don't want to use the PerformanceObserver API. The
+   *  array is bounded — older marks roll off after 1024 entries. */
+  if (!window.__cgPerfMarks) window.__cgPerfMarks = [];
+  function cgPerfMark(name) {
+    try { performance.mark(name); } catch (_) { /* ignore */ }
+    window.__cgPerfMarks.push({ name: name, t: performance.now() });
+    if (window.__cgPerfMarks.length > 1024) {
+      window.__cgPerfMarks.splice(0, window.__cgPerfMarks.length - 1024);
+    }
+  }
+  /** Reset the marks buffer so the next harness measurement starts clean.
+   *  Called via `window.__cgPerfReset()` from playwright. */
+  window.__cgPerfReset = function () {
+    window.__cgPerfMarks = [];
+    try { performance.clearMarks(); } catch (_) { /* ignore */ }
+  };
+
   function cgClearReady() {
     window.__cgReady = false;
   }
@@ -2371,18 +2393,25 @@
   /** Fetch + cache the secondary graph blob for a sha. Reuses live arch
    *  picker so the comparison is apples-to-apples (x86_64 vs x86_64). */
   async function ensureSecGraph(sha) {
-    if (compareState.secGraphs.has(sha)) return compareState.secGraphs.get(sha);
+    if (compareState.secGraphs.has(sha)) {
+      cgPerfMark("ensureSecGraph:cacheHit");
+      return compareState.secGraphs.get(sha);
+    }
+    cgPerfMark("ensureSecGraph:fetchStart");
     try {
       const url = "/api/graph?sha=" + encodeURIComponent(sha) +
                   "&arch=" + encodeURIComponent(currentArch);
       const r = await fetch(url);
       if (!r.ok) throw new Error("HTTP " + r.status);
+      cgPerfMark("ensureSecGraph:bodyStart");
       const g = await r.json();
+      cgPerfMark("ensureSecGraph:bodyDone");
       const ix = new Map();
       for (const fn of g.functions || []) ix.set(fn.id, fn);
       const byName = window.traceMode ? window.traceMode.buildFnByName(ix) : new Map();
       const entry = { graph: g, fnById: ix, fnByName: byName };
       compareState.secGraphs.set(sha, entry);
+      cgPerfMark("ensureSecGraph:done");
       return entry;
     } catch (err) {
       console.error("secondary graph fetch failed", err);
@@ -2436,6 +2465,7 @@
   }
 
   async function recomputeDiffSets() {
+    cgPerfMark("recomputeDiffSets:start");
     const clear = function () {
       compareState.changedFnIds = new Set();
       compareState.changedFnNames = new Set();
@@ -2664,6 +2694,7 @@
 
     repopulateEntriesPreservingSelection();
     refreshTraceForDiff();
+    cgPerfMark("recomputeDiffSets:done");
   }
 
   /** Build the diffOpts argument for renderSourceSnippet on the primary
@@ -3502,9 +3533,13 @@
   }
 
   async function activateCompare() {
+    // Perf instrumentation — emits marks the harness can read via
+    // performance.getEntriesByName(). Inert when no harness watches.
+    cgPerfMark("activateCompare:start");
     const need = shasNeedingLoad();
     if (need.length === 0) {
       recomputeCompareStatus();
+      cgPerfMark("activateCompare:done");
       return;
     }
     setCompareStatus("starting builds…", "building");
@@ -3514,8 +3549,10 @@
       if (cur && cur.status === "ready") continue;
       await triggerLoad(sha);
     }
+    cgPerfMark("activateCompare:loadsKicked");
     recomputeCompareStatus();
     startStatusPoll();
+    cgPerfMark("activateCompare:done");
   }
 
   function onCompareModeChange() {
