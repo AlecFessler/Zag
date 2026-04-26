@@ -401,20 +401,8 @@ fn fireRouted(
 pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void {
     if (fireRouted(ec, .memory_fault, subcode, fault_addr)) return;
 
-    // No-route fallback: restart the EC's domain if its self-handle has
-    // the `restart` cap, otherwise destroy. Both paths terminate the
-    // currently-faulting EC so it doesn't get re-dispatched.
-    const dom_ref = ec.domain;
-    const dom = dom_ref.lock(@src()) catch return;
-    const self_caps_word = Word0.caps(dom.user_table[0].word0);
-    const self_caps: capability_domain.CapabilityDomainCaps = @bitCast(self_caps_word);
-    dom_ref.unlock();
-
-    if (self_caps.restart) {
-        _ = capability_domain.restartDomain(dom);
-    } else {
-        capability_domain.releaseSelf(dom);
-    }
+    arch.boot.printRaw("[fault] memory_fault no-route fallback (panic)\n");
+    @panic("memory_fault with no event_route — restartDomain/releaseSelf are stubbed; cannot recover");
 }
 
 /// Fire a thread_fault event. Fallback on no route: terminate EC.

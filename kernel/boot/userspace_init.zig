@@ -124,6 +124,8 @@ pub fn init(root_service_elf: []const u8) !void {
     // local to root_cd as desired.
     arch_paging.copyKernelMappings(root_virt);
 
+    arch.boot.print("[boot] root EC ready: entry=0x{x} stack_top=0x{x} ut=0x{x}\n", .{ parsed.entry.addr, ROOT_USER_STACK_TOP, ROOT_USER_TABLE_BASE });
+
     sched.enqueueOnCore(@intCast(arch.smp.coreID()), root_ec);
 }
 
