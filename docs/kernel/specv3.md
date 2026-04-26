@@ -73,26 +73,31 @@ word 2 (field1):
 
 Syscall arguments that take a handle carry only the 12-bit handle id — the caller's handle-table index. Such arguments may be named `handle` directly or after the role they play (e.g. `target`, `exit_port`). The kernel resolves the id against the caller's table and reads the full capability for cap checks and dispatch.
 
+A capability domain's handle table contains at most one handle referencing any given kernel object. Operations that would mint a duplicate handle into a table already containing one referencing the same object instead coalesce: the existing handle's caps are upgraded to the union of its prior caps and the incoming caps (bounded by any receive-time filters such as `idc_rx`), and its slot id is unchanged.
+
+Some handles carry kernel-mutable snapshots in their field0/field1 (e.g., an EC handle's priority and affinity, a VAR handle's `cur_rwx`/`map`/`device`). The kernel cannot keep these snapshots atomically synchronized across all handle copies at once. Any syscall that takes such a handle implicitly refreshes that handle's snapshot from the authoritative kernel state as a side effect; an explicit `sync` syscall is also provided when the caller wants a fresh snapshot without performing any other operation.
+
 Handle types a capability domain can hold:
 
 | Type | How obtained |
 |---|---|
 | capability_domain_self | inherent (slot 0 at capability domain creation) |
-| capability_domain (IDC handle) | `create_capability_domain`; received via call/reply transfer |
-| execution_context | `create_execution_context`; received via call/reply transfer |
-| page_frame | `create_page_frame`; received via call/reply transfer |
-| virtual_address_range | `create_var`; received via call/reply transfer |
-| device_region | kernel-issued at boot to root service; received via call/reply transfer |
-| port | `create_port`; received via call/reply transfer |
+| capability_domain (IDC handle) | `create_capability_domain`; received via suspend/reply transfer |
+| execution_context | `create_execution_context`; received via suspend/reply transfer |
+| page_frame | `create_page_frame`; received via suspend/reply transfer |
+| virtual_address_range | `create_var`; received via suspend/reply transfer |
+| device_region | kernel-issued at boot to root service; received via suspend/reply transfer |
+| port | `create_port`; received via suspend/reply transfer |
 | reply | created by recv |
 | virtual_machine | `create_virtual_machine` |
+| timer | `timer_arm`; received via suspend/reply transfer |
 
 ### Lifetimes
 
 Kernel objects are grouped by the **ceiling** of their lifetime — the longest they could possibly persist. An object may die sooner (via delete, revoke, kill, etc.) but cannot outlive its ceiling.
 
 - **System lifetime** — Device Region, Capability Domain. Could persist as long as the kernel runs.
-- **Refcount lifetime** — Port, Page Frame. Bounded by the distributed set of handles referencing them.
+- **Refcount lifetime** — Port, Page Frame, Timer. Bounded by the distributed set of handles referencing them.
 - **Capability domain lifetime** — Execution Context, Virtual Address Range, Virtual Machine. Cannot outlive the capability domain they are bound to.
 - **Execution context lifetime** — Event Route, Reply. Event routes are kernel-held bindings (not handles) that are swept when the execution context they route from is destroyed. Replies cannot outlive the execution context they are bound to.
 
@@ -110,8 +115,12 @@ restrict([1] handle, [2] caps) -> void
     bits 16-63: _reserved
 ```
 
+Most cap fields use bitwise subset semantics: a bit set in `[2].caps` must also be set in the handle's current caps. The `restart_policy` field on EC handles (bits 8-9) and VAR handles (bits 9-10) is a 2-bit enum ordered by privilege (lowest privilege = numeric 0); for these fields "reducing" means the new numeric value is less than or equal to the current value, not bitwise subset.
+
 [test] returns E_BADCAP if [1] is not a valid handle.
-[test] returns E_PERM if [2].caps is not a subset of the handle's current caps.
+[test] returns E_PERM if any cap field in [2].caps using bitwise semantics has a bit set that is not set in the handle's current caps.
+[test] returns E_PERM if the handle is an EC handle and [2].caps' `restart_policy` (bits 8-9) numeric value exceeds the handle's current `restart_policy`.
+[test] returns E_PERM if the handle is a VAR handle and [2].caps' `restart_policy` (bits 9-10) numeric value exceeds the handle's current `restart_policy`.
 [test] returns E_INVAL if any reserved bits are set in [1] or [2].
 [test] on success, the handle's caps field equals [2].caps.
 [test] on success, syscalls gated by caps cleared by restrict return E_PERM when invoked via this handle.
@@ -137,9 +146,10 @@ No self-handle cap required.
 | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
 | `virtual_address_range` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
 | `device_region` | Release handle. When the last handle to a device region is released, the region returns to the root service |
-| `port` | Decrement the send refcount if this handle has `xfer` or `call`; decrement the recv refcount if this handle has `recv`. When the recv refcount hits zero, callers suspended on the port resume with `E_CLOSED`. When the send refcount hits zero and no event routes target the port, receivers suspended on the port resume with `E_CLOSED`. Release handle |
+| `port` | Decrement the send refcount if this handle has `bind`; decrement the recv refcount if this handle has `recv`. When the recv refcount hits zero, suspended senders resume with `E_CLOSED`. When the send refcount hits zero and no event routes target the port, receivers suspended on the port resume with `E_CLOSED`. Release handle |
 | `reply` | If the suspended sender is still waiting, resume them with `E_ABANDONED`. Release handle |
 | `virtual_machine` | Non-transferable; exactly one handle exists. Destroy the VM: all vCPU ECs terminate, guest memory is freed, kernel-emulated LAPIC/IOAPIC/timer state is torn down. Release handle |
+| `timer` | Release handle. When the last handle to the timer is released, the kernel cancels the timer if armed and reclaims its kernel state |
 
 [test] returns E_BADCAP if [1] is not a valid handle.
 [test] returns E_INVAL if any reserved bits are set in [1].
@@ -169,6 +179,21 @@ Each released descendant is processed with the type-specific behavior defined fo
 [test] revoke([1]) does not release [1] itself.
 [test] revoke([1]) does not release any handle on the copy ancestor side of [1].
 
+### sync
+
+Refreshes a handle's kernel-mutable field0/field1 snapshot. No-op for handles whose state does not drift.
+
+```
+sync([1] handle) -> void
+  syscall_num = [sync]
+
+  [1] handle: handle in the caller's table
+```
+
+[test] returns E_BADCAP if [1] is not a valid handle.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] on success, [1]'s field0 and field1 reflect the authoritative kernel state at the moment of the call.
+
 ## §[capability_domain] Capability Domain
 
 A capability domain is a set of capabilities usable by execution contexts bound to the domain.
@@ -185,27 +210,28 @@ word 0:
 └────────────────┴──────────────────────────────┴───────┴────────────┘
 
 word 1 (field0):
- 63      56 55    48 47     40 39     32 31     24 23         16 15           0
-┌─────────┬────────┬─────────┬─────────┬─────────┬────────────┬──────────────┐
-│port_clg │  vm_   │   pf_   │ idc_rx  │cridc_clg│var_ceiling │ ec_ceiling   │
-│  (8)    │ceiling │ ceiling │   (8)   │   (8)   │    (8)     │    (16)      │
-│         │  (8)   │   (8)   │         │         │            │              │
-└─────────┴────────┴─────────┴─────────┴─────────┴────────────┴──────────────┘
+ 63    56 55     48 47     40 39     32 31     24 23                  8 7         0
+┌────────┬─────────┬─────────┬─────────┬─────────┬──────────────────────┬───────────┐
+│port_clg│vm_clg   │ pf_clg  │ idc_rx  │cridc_clg│   var_inner_clg      │ec_inner_clg│
+│  (8)   │  (8)    │   (8)   │   (8)   │   (8)   │       (16)           │    (8)    │
+└────────┴─────────┴─────────┴─────────┴─────────┴──────────────────────┴───────────┘
 
 word 2 (field1):
- 63                                                                  0
-┌─────────────────────────────────────────────────────────────────────┐
-│                         _reserved (64)                              │
-└─────────────────────────────────────────────────────────────────────┘
+ 63              38 37        32 31              16 15        8 7         0
+┌──────────────────┬────────────┬──────────────────┬─────────────┬───────────┐
+│ _reserved (26)   │fut_wait_max│restart_policy_clg│var_outer_clg│ec_outer_clg│
+│                  │    (6)     │      (16)        │    (8)      │    (8)    │
+└──────────────────┴────────────┴──────────────────┴─────────────┴───────────┘
 ```
 
 cap (word 0, bits 48-63):
 
 ```
- 15    13 12                        6   5    4    3     2      1      0
-┌────────┬───────────────────────────┬──────┬──────┬──────┬──────┬──────┬────┐
-│ pri(3) │       _reserved (7)       │ crpt │ crvm │ crpf │ crvr │ crec │crcd│
-└────────┴───────────────────────────┴──────┴──────┴──────┴──────┴──────┴────┘
+ 15  14 13 12   11      10     9      8      7      6     5     4     3     2     1     0
+┌──────┬────┬─────┬──────┬──────┬──────┬──────┬──────┬───────┬──────┬──────┬──────┬──────┬──────┬──────┐
+│pri(2)│_rsv│timer│fut_wk│reply │restrt│power │setwal│  pmu  │ crpt │ crvm │ crpf │ crvr │ crec │ crcd │
+│      │    │     │      │_plcy │      │      │      │       │      │      │      │      │      │      │
+└──────┴────┴─────┴──────┴──────┴──────┴──────┴──────┴───────┴──────┴──────┴──────┴──────┴──────┴──────┘
 ```
 
 | Bit(s) | Name | Gates |
@@ -216,19 +242,35 @@ cap (word 0, bits 48-63):
 | 3 | `crpf` — create page frame | `create_page_frame` syscall |
 | 4 | `crvm` — create virtual machine | `create_virtual_machine` syscall |
 | 5 | `crpt` — create port | `create_port` syscall |
-| 13-15 | `pri` — priority ceiling (0-7) | max priority any EC in this domain may be created with or raised to |
+| 6 | `pmu` — performance monitoring | `perfmon_*` syscalls |
+| 7 | `setwall` — set wall-clock time | `time_setwall` syscall |
+| 8 | `power` — power management | `power_*` syscalls |
+| 9 | `restart` — domain restart on EC exit/fault | the kernel restarts the domain rather than tearing it down (see §[restart_semantics]) |
+| 10 | `reply_policy` — reply caps survive restart | on restart, reply handles in the domain are kept (1) rather than dropped (0) |
+| 11 | `fut_wake` — futex wake | `futex_wake` syscall |
+| 12 | `timer` — mint timer | `timer_arm` syscall |
+| 14-15 | `pri` — priority ceiling (0-3) | max priority any EC in this domain may be created with or raised to |
 
 field0:
 
 | field | bits | meaning |
 |---|---|---|
-| ec_ceiling | 0-15 | max caps any EC handle referencing an EC in this domain may hold |
-| var_ceiling | 16-23 | max caps any VAR handle referencing a VAR in this domain may hold |
+| ec_inner_ceiling | 0-7 | max caps on EC handles held by this domain itself referencing its own ECs |
+| var_inner_ceiling | 8-23 | max caps on VAR handles held by this domain itself referencing its own VARs (16 bits to fit all VAR caps) |
 | cridc_ceiling | 24-31 | see §[cridc_ceiling] |
 | idc_rx | 32-39 | mask intersected with sent caps when this domain receives an IDC handle |
 | pf_ceiling | 40-47 | max caps `create_page_frame` may mint when called from this domain (`max_rwx` bits 40-42, `max_sz` bits 43-44) |
 | vm_ceiling | 48-55 | max caps `create_virtual_machine` may mint when called from this domain (`policy` bit 48) |
-| port_ceiling | 56-63 | max caps `create_port` may mint when called from this domain (`xfer` bit 58, `call` bit 59, `recv` bit 60, `bind` bit 61) |
+| port_ceiling | 56-63 | max caps `create_port` may mint when called from this domain (`xfer` bit 58, `recv` bit 59, `bind` bit 60) |
+
+field1:
+
+| field | bits | meaning |
+|---|---|---|
+| ec_outer_ceiling | 0-7 | max caps on EC handles held by other domains referencing ECs in this domain |
+| var_outer_ceiling | 8-15 | max caps on VAR handles held by other domains referencing VARs in this domain |
+| restart_policy_ceiling | 16-31 | max `restart_policy` value per handle type allowed at create time in this domain (see §[restart_semantics]); semantically inner, lives in field1 because field0 is full |
+| fut_wait_max | 32-37 | max number of addresses the domain may pass to `futex_wait_val` or `futex_wait_change` per call (0..63); 0 disables futex wait entirely |
 
 #### §[cridc_ceiling] cridc_ceiling
 
@@ -259,10 +301,11 @@ word 0:
 └────────────────┴──────────────────────────────┴───────┴────────────┘
 
 word 1 (field0):
- 63                                                                  0
-┌─────────────────────────────────────────────────────────────────────┐
-│                         _reserved (64)                              │
-└─────────────────────────────────────────────────────────────────────┘
+ 63                                          24 23        16 15           0
+┌─────────────────────────────────────────────┬─────────────┬───────────────┐
+│              _reserved (40)                 │var_cap_clg  │ec_cap_ceiling │
+│                                             │    (8)      │     (16)      │
+└─────────────────────────────────────────────┴─────────────┴───────────────┘
 
 word 2 (field1):
  63                                                                  0
@@ -271,13 +314,21 @@ word 2 (field1):
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+Field layout:
+
+| field | location | meaning |
+|---|---|---|
+| ec_cap_ceiling | field0 bits 0-15 | per-IDC ceiling on caps of EC handles minted via `acquire_ecs` through this IDC |
+| var_cap_ceiling | field0 bits 16-23 | per-IDC ceiling on caps of VAR handles minted via `acquire_vars` through this IDC |
+
 cap (word 0, bits 48-63):
 
 ```
- 15                                          3   2    1    0
-┌─────────────────────────────────────────────┬──────┬────┬────┐
-│              _reserved (13)                 │ crec │copy│move│
-└─────────────────────────────────────────────┴──────┴────┴────┘
+ 15                          6    5    4    3    2    1    0
+┌─────────────────────────────┬──────┬──────┬──────┬──────┬────┬────┐
+│      _reserved (10)         │rstrt │ aqvr │ aqec │ crec │copy│move│
+│                             │_plcy │      │      │      │    │    │
+└─────────────────────────────┴──────┴──────┴──────┴──────┴────┴────┘
 ```
 
 | Bit | Name | Gates |
@@ -285,13 +336,16 @@ cap (word 0, bits 48-63):
 | 0 | `move` | transferring this handle via move to another capability domain |
 | 1 | `copy` | transferring this handle via copy to another capability domain |
 | 2 | `crec` — create execution context in referenced domain | `create_execution_context` with this handle as `target` |
+| 3 | `aqec` — acquire ECs | `acquire_ecs` syscall on this IDC |
+| 4 | `aqvr` — acquire VARs | `acquire_vars` syscall on this IDC |
+| 5 | `restart_policy` | IDC handle behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
 ### create_capability_domain
 
 Creates a new capability domain from an ELF image carried in a page frame. The caller receives back an IDC handle to the new domain.
 
 ```
-create_capability_domain([1] caps, [2] ceilings, [3] elf_page_frame, [4+] passed_handles)
+create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5+] passed_handles)
   -> [1] idc_handle
   syscall_num = [create_capability_domain]
 
@@ -300,13 +354,16 @@ create_capability_domain([1] caps, [2] ceilings, [3] elf_page_frame, [4+] passed
     bits 16-23: idc_rx             — new domain's idc_rx (see §[capability_domain] Self handle)
     bits 24-63: _reserved
 
-  [2] ceilings: u64 packed as
-    bits  0-15: ec_ceiling         — max caps any EC handle in the new domain may hold
-    bits 16-23: var_ceiling:
-                   bit 16:     mmio_allowed
-                   bits 17-18: max_sz (enum)
-                   bits 19-21: max_rwx (r/w/x)
-                   bits 22-23: _reserved
+  [2] ceilings_inner: u64 packed as (matches self-handle field0)
+    bits  0-7:  ec_inner_ceiling
+    bits  8-23: var_inner_ceiling:
+                   bit  8:     move
+                   bit  9:     copy
+                   bits 10-12: r/w/x
+                   bit 13:     mmio
+                   bits 14-15: max_sz (enum)
+                   bit 16:     dma
+                   bits 17-23: _reserved
     bits 24-31: cridc_ceiling      — new domain's cridc_ceiling (see §[capability_domain] Self handle)
     bits 32-39: pf_ceiling:
                    bits 32-34: max_rwx (r/w/x)
@@ -317,15 +374,30 @@ create_capability_domain([1] caps, [2] ceilings, [3] elf_page_frame, [4+] passed
                    bits 41-47: _reserved
     bits 48-55: port_ceiling:
                    bit 50:     xfer
-                   bit 51:     call
-                   bit 52:     recv
-                   bit 53:     bind
-                   bits 48-49, 54-55: _reserved
+                   bit 51:     recv
+                   bit 52:     bind
+                   bits 48-49, 53-55: _reserved
     bits 56-63: _reserved
 
-  [3] elf_page_frame: page frame handle containing the ELF image from offset 0
+  [3] ceilings_outer: u64 packed as (matches self-handle field1)
+    bits  0-7: ec_outer_ceiling
+    bits  8-15: var_outer_ceiling
+    bits 16-31: restart_policy_ceiling:
+                   bits 16-17: ec_restart_max     (kill / restart_at_entry / persist / _reserved)
+                   bits 18-19: var_restart_max    (free / decommit / preserve / snapshot)
+                   bit 20:     pf_restart_max     (drop / keep)
+                   bit 21:     dr_restart_max     (drop / keep)
+                   bit 22:     port_restart_max   (drop / keep)
+                   bit 23:     vm_restart_max     (drop / keep)
+                   bit 24:     idc_restart_max    (drop / keep)
+                   bit 25:     tm_restart_max     (drop / keep)
+                   bits 26-31: _reserved
+    bits 32-37: fut_wait_max         — max addresses per `futex_wait_*` call (0..63); 0 disables futex wait
+    bits 38-63: _reserved
 
-  [4+] passed_handles: each entry is a u64 packed as
+  [4] elf_page_frame: page frame handle containing the ELF image from offset 0
+
+  [5+] passed_handles: each entry is a u64 packed as
     bits  0-11: handle id (12-bit handle in the caller's table)
     bits 12-15: _reserved
     bits 16-31: caps to install on the handle inserted into the new domain
@@ -343,8 +415,12 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 
 [test] returns E_PERM if the caller's self-handle lacks `crcd`.
 [test] returns E_PERM if `self_caps` is not a subset of the caller's self-handle caps.
-[test] returns E_PERM if `ec_ceiling` is not a subset of the caller's `ec_ceiling`.
-[test] returns E_PERM if `var_ceiling` is not a subset of the caller's `var_ceiling`.
+[test] returns E_PERM if `ec_inner_ceiling` is not a subset of the caller's `ec_inner_ceiling`.
+[test] returns E_PERM if `ec_outer_ceiling` is not a subset of the caller's `ec_outer_ceiling`.
+[test] returns E_PERM if `var_inner_ceiling` is not a subset of the caller's `var_inner_ceiling`.
+[test] returns E_PERM if `var_outer_ceiling` is not a subset of the caller's `var_outer_ceiling`.
+[test] returns E_PERM if any field in `restart_policy_ceiling` exceeds the caller's corresponding field.
+[test] returns E_PERM if `fut_wait_max` exceeds the caller's `fut_wait_max`.
 [test] returns E_PERM if `cridc_ceiling` is not a subset of the caller's `cridc_ceiling`.
 [test] returns E_PERM if `pf_ceiling` is not a subset of the caller's `pf_ceiling`.
 [test] returns E_PERM if `vm_ceiling` is not a subset of the caller's `vm_ceiling`.
@@ -354,6 +430,7 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 [test] returns E_INVAL if the ELF header is malformed.
 [test] returns E_INVAL if `elf_page_frame` is smaller than the declared ELF image size.
 [test] returns E_INVAL if any reserved bits are set in [1], [2], or a passed handle entry.
+[test] returns E_INVAL if any two entries in [4+] reference the same source handle.
 [test] on success, the caller receives an IDC handle to the new domain with caps = the caller's `cridc_ceiling`.
 [test] on success, the new domain's handle table contains the self-handle at slot 0 with caps = `self_caps`.
 [test] on success, the new domain's handle table contains the initial EC at slot 1.
@@ -361,9 +438,92 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 [test] on success, passed handles occupy slots 3+ of the new domain's handle table in the order supplied, each with the caps specified in its entry.
 [test] a passed handle entry with `move = 1` is removed from the caller's handle table after the call.
 [test] a passed handle entry with `move = 0` remains in the caller's handle table after the call.
-[test] on success, the new domain's `ec_ceiling`, `var_ceiling`, `cridc_ceiling`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2].
+[test] on success, the new domain's `ec_inner_ceiling`, `var_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
+[test] on success, the new domain's `ec_outer_ceiling` and `var_outer_ceiling` in field1 are set to the values supplied in [3].
 [test] on success, the new domain's `idc_rx` in field0 is set to the value supplied in [1].
 [test] the initial EC begins executing at the entry point declared in the ELF header.
+
+### acquire_ecs
+
+Returns handles to all non-vCPU execution contexts bound to the target domain referenced by an IDC handle.
+
+```
+acquire_ecs([1] target) -> [1..N] handles
+  syscall_num = [acquire_ecs]
+
+  syscall word bits 12-19: count (set by the kernel on return; 0 on entry)
+
+  [1] target: IDC handle
+```
+
+IDC cap required on [1]: `aqec`.
+
+Each returned handle has caps = `target.ec_outer_ceiling` ∩ `target.ec_cap_ceiling` of the IDC handle in [1]. The kernel sets the syscall word's count field to N, the number of handles returned, and writes them to vregs `[1..N]`.
+
+Returns E_FULL if the caller's handle table cannot accommodate all returned handles.
+
+[test] returns E_BADCAP if [1] is not a valid IDC handle.
+[test] returns E_PERM if [1] does not have the `aqec` cap.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] returns E_FULL if the caller's handle table cannot accommodate all returned handles.
+[test] on success, the syscall word's count field equals the number of non-vCPU ECs bound to the target domain.
+[test] on success, vregs `[1..N]` contain handles in the caller's table referencing those ECs, each with caps = target's `ec_outer_ceiling` intersected with the IDC's `ec_cap_ceiling`.
+[test] vCPUs in the target domain are not included in the returned handles.
+
+### acquire_vars
+
+Returns handles to all `map=1` (pf) and `map=3` (demand) VARs bound to the target domain referenced by an IDC handle. MMIO and DMA VARs are excluded.
+
+```
+acquire_vars([1] target) -> [1..N] handles
+  syscall_num = [acquire_vars]
+
+  syscall word bits 12-19: count (set by the kernel on return; 0 on entry)
+
+  [1] target: IDC handle
+```
+
+IDC cap required on [1]: `aqvr`.
+
+Each returned handle has caps = `target.var_outer_ceiling` ∩ the IDC's `var_cap_ceiling`. While in flight, all ECs in the target domain are paused — `acquire_vars` and the resulting `idc_read`/`idc_write` traffic is intended as a debugger primitive, not a performance path.
+
+[test] returns E_BADCAP if [1] is not a valid IDC handle.
+[test] returns E_PERM if [1] does not have the `aqvr` cap.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] returns E_FULL if the caller's handle table cannot accommodate all returned handles.
+[test] on success, the syscall word's count field equals the number of `map=1` and `map=3` VARs bound to the target domain.
+[test] on success, vregs `[1..N]` contain handles in the caller's table referencing those VARs, each with caps = target's `var_outer_ceiling` intersected with the IDC's `var_cap_ceiling`.
+[test] MMIO and DMA VARs in the target domain are not included in the returned handles.
+
+### §[restart_semantics] Restart Semantics
+
+When a capability domain holding the `restart` cap on its self-handle exits — voluntary, fault, or kill — the kernel restarts the domain rather than tearing it down. ECs re-enter at their original entry points (or `persist` through the restart, see below); the handle table survives; each handle is processed per its `restart_policy` bits. Reply handles held by the restarting domain are governed by the domain-wide `reply_policy` bit on the self-handle.
+
+Per-handle policies are ordered least-to-most privileged. The `restart_policy` cap field is monotonic-reducing along this ordering: a holder may reduce its handle's policy to any value at or below the current setting. (For 2-bit policies, "reducing" is numeric reduction along the privilege ordering, not bitwise subset.)
+
+| Handle type | Policies (low → high privilege) | Notes |
+|---|---|---|
+| `capability_domain_self` | always preserved | the restart target itself |
+| `execution_context` | 0=kill / 1=restart_at_entry / 2=persist | `persist` keeps the EC running through the restart, including its stack pages; otherwise the EC re-enters at its original entry point (1) or is killed (0) |
+| `virtual_address_range` | 0=free / 1=decommit / 2=preserve / 3=snapshot | `snapshot` requires a bound source VAR via the `snapshot` syscall; `preserve` keeps contents; `decommit` keeps the reservation but releases pages; `free` releases everything. A VAR lives in exactly one domain's address space; the owning domain's handle's `restart_policy` determines what happens to the VAR. Cross-domain handles to the same VAR carry their own `restart_policy` for whether the foreign handle survives the foreign domain's restart |
+| `page_frame` | 0=drop / 1=keep | refcount semantics apply on `drop` |
+| `device_region` | 0=drop / 1=keep | |
+| `port` | 0=drop / 1=keep | refcount semantics apply on `drop` |
+| `virtual_machine` | 0=drop / 1=keep | |
+| `capability_domain` (IDC) | 0=drop / 1=keep | |
+| `timer` | 0=drop / 1=keep | refcount semantics apply on `drop` |
+| `reply` | governed by domain `reply_policy` | drop: pending callers resume with `E_REFUSED`; keep: reply remains valid, caller stays suspended |
+
+Each handle's `restart_policy` value is bounded at create time (and at copy time) by the domain's `restart_policy_ceiling` corresponding field on its self-handle.
+
+[test] returns E_PERM if `create_execution_context` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.ec_restart_max`.
+[test] returns E_PERM if `create_var` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.var_restart_max`.
+[test] returns E_PERM if `create_page_frame` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.pf_restart_max = 0`.
+[test] returns E_PERM if `create_virtual_machine` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.vm_restart_max = 0`.
+[test] returns E_PERM if `create_port` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.port_restart_max = 0`.
+[test] returns E_PERM if any IDC handle minted by `create_capability_domain` (the caller's own returned handle, the new domain's slot-2 self-IDC, or any `passed_handles` IDC entry) has `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.idc_restart_max = 0`.
+[test] returns E_PERM if any device_region handle minted by transfer (e.g., copy/move via xfer) has `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.dr_restart_max = 0`.
+[test] returns E_PERM if `timer_arm` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.tm_restart_max = 0`.
 
 ## §[execution_context] Execution Context
 
@@ -379,33 +539,52 @@ word 0:
 └────────────────┴──────────────────────────────┴───────┴────────────┘
 
 word 1 (field0):
- 63                                                                  0
-┌─────────────────────────────────────────────────────────────────────┐
-│                         _reserved (64)                              │
-└─────────────────────────────────────────────────────────────────────┘
+ 63                                              2 1   0
+┌─────────────────────────────────────────────────┬─────┐
+│              _reserved (62)                     │pri  │
+│                                                 │ (2) │
+└─────────────────────────────────────────────────┴─────┘
 
 word 2 (field1):
  63                                                                  0
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         _reserved (64)                              │
+│                       affinity (64)                                 │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+Field layout:
+
+| field | location | meaning |
+|---|---|---|
+| pri | field0 bits 0-1 | current scheduling priority (0-3); reflects the EC's runtime state |
+| affinity | field1 bits 0-63 | current 64-bit core affinity mask; bit N = 1 means the EC may run on core N |
+
+Both fields are kernel-mutable: `priority` and `affinity` syscalls update them, and the snapshot in any caller's handle is refreshed by the implicit-sync side effect of any syscall that takes the handle (or by an explicit `sync` call).
 
 cap (word 0, bits 48-63):
 
 ```
- 15                                    4    3    2    1    0
-┌───────────────────────────────────────┬──────┬──────┬────┬────┐
-│           _reserved (12)              │ spri │ saff │copy│move│
-└───────────────────────────────────────┴──────┴──────┴────┴────┘
+ 15      13 12    11    10   9     8 7      6    5    4    3    2    1    0
+┌──────────┬──────┬──────┬──────┬───────┬───────┬──────┬──────┬──────┬──────┬──────┬────┬────┐
+│_rsvd (3) │unbind│rebind│ bind │ rstrt │ write │ read │ susp │ term │ spri │ saff │copy│move│
+│          │      │      │      │ _plcy │       │      │      │      │      │      │    │    │
+└──────────┴──────┴──────┴──────┴───────┴───────┴──────┴──────┴──────┴──────┴──────┴────┴────┘
 ```
 
 | Bit | Name | Gates |
 |---|---|---|
 | 0 | `move` | transferring this handle via move to another capability domain |
 | 1 | `copy` | transferring this handle via copy to another capability domain |
-| 2 | `saff` — set affinity | future `set_affinity` syscall on this EC |
-| 3 | `spri` — set priority | future `set_priority` syscall on this EC |
+| 2 | `saff` — set affinity | `affinity` syscall on this EC |
+| 3 | `spri` — set priority | `priority` syscall on this EC |
+| 4 | `term` — terminate | `terminate` syscall on this EC |
+| 5 | `susp` — suspend | `suspend` syscall on this EC |
+| 6 | `read` | exposing this EC's state in event payloads during event delivery (§[event_state]); when absent, state in the payload is zeroed |
+| 7 | `write` | applying modifications written to the event payload back to this EC's state on reply; when absent, modifications are discarded |
+| 8-9 | `restart_policy` | EC behavior on domain restart: 0=kill, 1=restart_at_entry, 2=persist, 3=_reserved (see §[restart_semantics]) |
+| 10 | `bind` | `bind_event_route` on this EC when no prior route exists for the given event type |
+| 11 | `rebind` | `bind_event_route` on this EC when a prior route exists for the given event type (atomic overwrite) |
+| 12 | `unbind` | `clear_event_route` on this EC |
 
 ### create_execution_context
 
@@ -420,8 +599,8 @@ create_execution_context([1] caps, [2] entry, [3] stack_pages, [4] target, [5] v
     bits  0-15: caps          — caps on the EC handle returned to the caller
     bits 16-31: target_caps   — caps on the EC handle inserted into target's table
                                 (ignored when target = self)
-    bits 32-34: priority      — scheduling priority, 0-7, bounded by caller's priority ceiling
-    bits 35-63: _reserved
+    bits 32-33: priority      — scheduling priority, 0-3, bounded by caller's priority ceiling
+    bits 34-63: _reserved
 
   [2] entry:        instruction pointer where the EC begins execution
   [3] stack_pages:  number of stack pages the kernel allocates in the target's address space;
@@ -441,8 +620,9 @@ Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the target's a
 
 [test] returns E_PERM if the caller's self-handle lacks `crec`.
 [test] returns E_PERM if [4] is nonzero and [4] lacks `crec`.
-[test] returns E_PERM if caps is not a subset of the target domain's `ec_ceiling`.
-[test] returns E_PERM if target_caps is not a subset of the target domain's `ec_ceiling`.
+[test] returns E_PERM if [4] is 0 (target = self) and caps is not a subset of self's `ec_inner_ceiling`.
+[test] returns E_PERM if [4] is nonzero and caps is not a subset of the target domain's `ec_outer_ceiling`.
+[test] returns E_PERM if [4] is nonzero and target_caps is not a subset of the target domain's `ec_inner_ceiling`.
 [test] returns E_PERM if priority exceeds the caller's priority ceiling.
 [test] returns E_BADCAP if [4] is nonzero and not a valid IDC handle.
 [test] returns E_INVAL if [3] stack_pages is 0.
@@ -453,9 +633,223 @@ Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the target's a
 [test] on success, the EC's priority is set to `[1].priority`.
 [test] on success, the EC's affinity is set to `[5]`.
 
+### self
+
+Returns the handle in the caller's table that references the calling execution context. Pure lookup — no handle is inserted, minted, or modified, and no authority is granted. By the at-most-one invariant, there is at most one such handle.
+
+```
+self() -> [1] handle
+  syscall_num = [self]
+```
+
+[test] returns E_NOENT if no handle in the caller's table references the calling execution context.
+[test] on success, [1] is a handle in the caller's table whose resolved capability references the calling execution context.
+
+### terminate
+
+Terminates the target execution context.
+
+```
+terminate([1] target) -> void
+  syscall_num = [terminate]
+
+  [1] target: EC handle
+```
+
+EC cap required: `term`.
+
+Termination atomically destroys the EC. Handles referencing it in any capability domain become stale; a syscall invoked with a stale handle returns `E_TERM` and the stale handle is removed from the caller's table on the same call.
+
+Termination also clears the kernel-held event routes bound to the EC (§[event_route]) and marks any reply handles whose suspended sender was the terminated EC such that subsequent operations on those reply handles return `E_ABANDONED`.
+
+[test] returns E_BADCAP if [1] is not a valid EC handle.
+[test] returns E_PERM if [1] does not have the `term` cap.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] on success, the target EC stops executing.
+[test] on success, syscalls invoked with any handle to the terminated EC return E_TERM and remove that handle from the caller's table on the same call.
+[test] on success, event routes bound to the terminated EC are cleared.
+[test] on success, reply handles whose suspended sender was the terminated EC return E_ABANDONED on subsequent operations.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### yield
+
+Yields the calling EC's timeslice. With `[1] = 0`, the scheduler selects the next EC to run. With `[1]` a valid handle to a runnable EC, that EC is scheduled next; if it is not runnable, the scheduler selects.
+
+```
+yield([1] target) -> void
+  syscall_num = [yield]
+
+  [1] target: 0 = yield to scheduler; else an EC handle to yield to
+```
+
+No cap required.
+
+[test] returns E_BADCAP if [1] is nonzero and not a valid EC handle.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] on success, when [1] is a valid handle to a runnable EC, the target EC runs at least once before the calling EC's next quantum begins.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### priority
+
+Sets the target execution context's priority. The new priority applies to subsequent scheduling, port event delivery, and futex wake ordering. If the target is currently suspended on a port or waiting on a futex, the new priority takes effect immediately and reorders the target into the appropriate priority bucket (this is the mechanism priority inheritance is built on).
+
+```
+priority([1] target, [2] new_priority) -> void
+  syscall_num = [priority]
+
+  [1] target: EC handle
+  [2] new_priority: 0..3
+```
+
+EC cap required on [1]: `spri`. `[2]` must not exceed the caller's self-handle `pri`.
+
+[test] returns E_BADCAP if [1] is not a valid EC handle.
+[test] returns E_PERM if [1] does not have the `spri` cap.
+[test] returns E_PERM if [2] exceeds the caller's self-handle `pri`.
+[test] returns E_INVAL if [2] is greater than 3.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] on success, subsequent scheduling, port event delivery, and futex wake ordering for the target EC use priority [2].
+[test] on success, when the target is suspended on a port or waiting on a futex, [2] takes effect on the target's next port event delivery and futex wake.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### affinity
+
+Sets the target execution context's CPU affinity mask.
+
+```
+affinity([1] target, [2] new_affinity) -> void
+  syscall_num = [affinity]
+
+  [1] target: EC handle
+  [2] new_affinity: 64-bit core mask. 0 = kernel picks any core.
+                    Otherwise, bit N = 1 allows the target EC to run on core N;
+                    bit N must only be set for cores the system actually has.
+```
+
+EC cap required on [1]: `saff`.
+
+[test] returns E_BADCAP if [1] is not a valid EC handle.
+[test] returns E_PERM if [1] does not have the `saff` cap.
+[test] returns E_INVAL if any bit set in [2] corresponds to a core the system does not have.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] on success, the target EC's affinity is set to [2].
+[test] on success, when the target is currently running on a core not allowed by [2], it is migrated to a core allowed by [2].
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### perfmon_info
+
+Queries system PMU capabilities.
+
+```
+perfmon_info() -> [1] caps_word, [2] supported_events
+  syscall_num = [perfmon_info]
+
+  [1] caps_word: u64 packed as
+    bits 0-7: num_counters
+    bit 8:    overflow_support
+    bits 9-63: _reserved
+
+  [2] supported_events: u64 bitmask
+```
+
+Self-handle cap required: `pmu`.
+
+Supported event bits:
+
+| Bit | Event |
+|---|---|
+| 0 | cycles |
+| 1 | instructions |
+| 2 | cache_references |
+| 3 | cache_misses |
+| 4 | branch_instructions |
+| 5 | branch_misses |
+| 6 | bus_cycles |
+| 7 | stalled_cycles_frontend |
+| 8 | stalled_cycles_backend |
+
+[test] returns E_PERM if the caller's self-handle lacks `pmu`.
+[test] [1] bits 0-7 contain the number of available PMU counters.
+[test] [1] bit 8 is set when the hardware supports counter overflow events.
+[test] [2] is a bitmask of supported events indexed by the table above.
+
+### perfmon_start
+
+Starts hardware performance counters on the target EC.
+
+```
+perfmon_start([1] target, [2] num_configs, [3 + 2i] config_event, [3 + 2i + 1] config_threshold) -> void
+  syscall_num = [perfmon_start]
+
+  [1] target:        EC handle
+  [2] num_configs:   N, the number of counter configs supplied
+  [3 + 2i] config_event: u64 packed as
+    bits 0-7: event index (per perfmon_info supported_events bitmask)
+    bit 8:    has_threshold
+    bits 9-63: _reserved
+  [3 + 2i + 1] config_threshold: u64 overflow threshold (used only when has_threshold = 1)
+
+  for i in 0..N-1.
+```
+
+Self-handle cap required: `pmu`.
+
+[test] returns E_PERM if the caller's self-handle lacks `pmu`.
+[test] returns E_BADCAP if [1] is not a valid EC handle.
+[test] returns E_INVAL if [2] is 0 or exceeds num_counters.
+[test] returns E_INVAL if any config's event is not in supported_events.
+[test] returns E_INVAL if any config has has_threshold = 1 but the hardware does not support overflow.
+[test] returns E_INVAL if any reserved bits are set in any config_event.
+[test] returns E_BUSY if [1] is not the calling EC and not currently suspended.
+[test] on success, the first [2] PMU counters on the target EC begin counting the configured events.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### perfmon_read
+
+Reads the current counter values from the target EC.
+
+```
+perfmon_read([1] target) -> [1..num_counters] counter_values, [num_counters + 1] timestamp
+  syscall_num = [perfmon_read]
+
+  [1] target: EC handle
+```
+
+Self-handle cap required: `pmu`.
+
+[test] returns E_PERM if the caller's self-handle lacks `pmu`.
+[test] returns E_BADCAP if [1] is not a valid EC handle.
+[test] returns E_INVAL if perfmon was not started on the target EC.
+[test] returns E_BUSY if [1] is not the calling EC and not currently suspended.
+[test] on success, [1..num_counters] contain the current counter values for the active counters.
+[test] on success, [num_counters + 1] contains a monotonic timestamp (ns) atomically captured with the counter values.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### perfmon_stop
+
+Stops counting on the target EC and releases PMU state.
+
+```
+perfmon_stop([1] target) -> void
+  syscall_num = [perfmon_stop]
+
+  [1] target: EC handle
+```
+
+Self-handle cap required: `pmu`.
+
+[test] returns E_PERM if the caller's self-handle lacks `pmu`.
+[test] returns E_BADCAP if [1] is not a valid EC handle.
+[test] returns E_INVAL if perfmon was not started on the target EC.
+[test] returns E_BUSY if [1] is not the calling EC and not currently suspended.
+[test] on success, counters on the target EC stop counting and PMU state is released.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
 ## §[var] Virtual Address Range
 
 A virtual address range is a contiguous span of the virtual address space bound to a capability domain. It is available for demand-paged memory, or for installing page frames or device regions.
+
+A regular VAR (`caps.mmio = 0, caps.dma = 0`) created without explicit mapping starts at `map = 0`. The first faulted access transitions it to `map = 3` (demand): the kernel allocates a fresh zero-filled page_frame and installs it at the faulting offset, with effective permissions = `VAR.cur_rwx`. Once `map = 3`, the VAR cannot be `map_pf`'d until it is `unmap`'d back to `map = 0`.
 
 Handle ABI:
 
@@ -473,48 +867,55 @@ word 1 (field0):
 └─────────────────────────────────────────────────────────────────────┘
 
 word 2 (field1):
- 63                         39 38    36 35 34 33 32 31             0
-┌─────────────────────────────┬────────┬─────┬──────┬────────────────┐
-│     _reserved (25)          │cur_rwx │ cch │  sz  │ page_count (32)│
-└─────────────────────────────┴────────┴─────┴──────┴────────────────┘
+ 63          53 52        41 40 39 38    36 35 34 33 32 31             0
+┌──────────────┬────────────┬─────┬────────┬─────┬──────┬────────────────┐
+│_reserved (11)│ device(12) │ map │cur_rwx │ cch │  sz  │ page_count (32)│
+└──────────────┴────────────┴─────┴────────┴─────┴──────┴────────────────┘
 ```
 
 Field layout:
 
 | field | location | meaning |
 |---|---|---|
-| base vaddr | field0 bits 0-63 | base virtual address of the VAR |
+| base vaddr | field0 bits 0-63 | base virtual address of the VAR (or base IOVA, for DMA VARs) |
 | page_count | field1 bits 0-31 | number of pages (in `sz` units) |
 | sz | field1 bits 32-33 | page size (immutable): 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
 | cch | field1 bits 34-35 | cache type (immutable): 0=wb, 1=uc, 2=wc, 3=wt |
 | cur_rwx | field1 bits 36-38 | current mapping permissions (bit 36=r, 37=w, 38=x) |
+| map | field1 bits 39-40 | mapping type: 0=unmapped, 1=pf, 2=mmio, 3=demand |
+| device | field1 bits 41-52 | bound device_region handle id (DMA VARs immutably from `create_var`; MMIO VARs set by `map_mmio` and cleared by `unmap_mmio`; 0 otherwise) |
 
 cap (word 0, bits 48-63):
 
 ```
- 15            6 5    4 3      2   1   0
-┌───────────────┬──────┬──────┬───┬───┬───┐
-│ _reserved(10) │max_sz│ mmio │ x │ w │ r │
-└───────────────┴──────┴──────┴───┴───┴───┘
+ 15    11 10        9 8  7   6 5    4 3    2   1    0
+┌────────┬─────────────┬───┬──────┬──────┬───┬───┬───┬────┬────┐
+│_rsvd(5)│restart_plcy │dma│max_sz│ mmio │ x │ w │ r │copy│move│
+│        │    (2)      │   │      │      │   │   │   │    │    │
+└────────┴─────────────┴───┴──────┴──────┴───┴───┴───┴────┴────┘
 ```
 
 | Bit(s) | Name | Meaning |
 |---|---|---|
-| 0 | `r` | max read |
-| 1 | `w` | max write |
-| 2 | `x` | max execute |
-| 3 | `mmio` | mmio mode |
-| 4-5 | `max_sz` | max page size: 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
-| 6-15 | `_reserved` | |
+| 0 | `move` | transferring this handle via move to another capability domain |
+| 1 | `copy` | transferring this handle via copy to another capability domain |
+| 2 | `r` | max read |
+| 3 | `w` | max write |
+| 4 | `x` | max execute |
+| 5 | `mmio` | mmio mode |
+| 6-7 | `max_sz` | max page size: 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
+| 8 | `dma` | dma mode (VAR represents a device-IOVA range) |
+| 9-10 | `restart_policy` | VAR behavior on domain restart: 0=free, 1=decommit, 2=preserve, 3=snapshot (see §[restart_semantics]) |
+| 11-15 | `_reserved` | |
 
-`r`/`w`/`x` and `max_sz` are ceiling-checked against the domain's `var_ceiling`. `mmio` and `max_sz` describe the VAR object and are immutable after creation. `sz`, `cch`, and `cur_rwx` in field1 are observable state on the VAR.
+`r`/`w`/`x` and `max_sz` are ceiling-checked against the domain's `var_inner_ceiling`. `mmio`, `dma`, and `max_sz` describe the VAR object and are immutable after creation. `mmio` and `dma` are mutually exclusive. `dma` VARs cannot have `x` set. `sz`, `cch`, and `cur_rwx` in field1 are observable state on the VAR. Move/copy semantics on VARs are bounded by `var_outer_ceiling` for the receiving handle.
 
 ### create_var
 
 Reserves a range of virtual address space bound to the caller's domain.
 
 ```
-create_var([1] caps, [2] props, [3] pages, [4] preferred_base) -> [1] handle
+create_var([1] caps, [2] props, [3] pages, [4] preferred_base, [5] device_region) -> [1] handle
   syscall_num = [create_var]
 
   [1] caps: u64 packed as
@@ -529,6 +930,8 @@ create_var([1] caps, [2] props, [3] pages, [4] preferred_base) -> [1] handle
 
   [3] pages:          number of `sz` pages to reserve
   [4] preferred_base: 0 = kernel chooses
+  [5] device_region:  device_region handle to bind for the IOMMU mapping
+                      (required when caps.dma = 1; ignored otherwise)
 ```
 
 Self-handle cap required: `crvr`.
@@ -536,9 +939,9 @@ Self-handle cap required: `crvr`.
 Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the address space has no room for the requested range; returns E_FULL if the caller's handle table has no free slot.
 
 [test] returns E_PERM if the caller's self-handle lacks `crvr`.
-[test] returns E_PERM if caps' r/w/x bits are not a subset of the caller's `var_ceiling.max_rwx`.
-[test] returns E_PERM if caps.max_sz exceeds the caller's `var_ceiling.max_sz`.
-[test] returns E_PERM if caps.mmio = 1 and the caller's `var_ceiling` does not permit mmio.
+[test] returns E_PERM if caps' r/w/x bits are not a subset of the caller's `var_inner_ceiling`'s r/w/x bits.
+[test] returns E_PERM if caps.max_sz exceeds the caller's `var_inner_ceiling`'s max_sz.
+[test] returns E_PERM if caps.mmio = 1 and the caller's `var_inner_ceiling` does not permit mmio.
 [test] returns E_INVAL if [3] pages is 0.
 [test] returns E_INVAL if [4] preferred_base is nonzero and not aligned to the page size encoded in props.sz.
 [test] returns E_INVAL if caps.max_sz is 3 (reserved).
@@ -546,12 +949,212 @@ Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the address sp
 [test] returns E_INVAL if props.sz is 3 (reserved).
 [test] returns E_INVAL if props.sz exceeds caps.max_sz.
 [test] returns E_INVAL if caps.mmio = 1 and caps.x is set.
+[test] returns E_INVAL if caps.dma = 1 and caps.x is set.
+[test] returns E_INVAL if caps.mmio = 1 and caps.dma = 1.
+[test] returns E_BADCAP if caps.dma = 1 and [5] is not a valid device_region handle.
+[test] returns E_PERM if caps.dma = 1 and [5] does not have the `dma` cap.
 [test] returns E_INVAL if props.cur_rwx is not a subset of caps.r/w/x.
 [test] returns E_INVAL if any reserved bits are set in [1] or [2].
 [test] on success, the caller receives a VAR handle with caps = `[1].caps`.
 [test] on success, field0 contains the assigned base address.
 [test] on success, field1 contains `[2].props` together with `[3]` pages.
 [test] on success, when [4] preferred_base is nonzero and the range is available, the assigned base address equals `[4]`.
+[test] on success, when caps.dma = 1, field1's `device` field equals [5]'s handle id; the assigned base address (field0) is an IOVA in [5]'s IOMMU domain.
+
+### map_pf
+
+Installs page_frames into a regular or DMA-flagged VAR. The kernel dispatches based on `caps.dma`:
+- Regular VAR (`caps.dma = 0`): pages are mapped into the CPU's virtual address space at `VAR.base + offset`.
+- DMA VAR (`caps.dma = 1`): pages are mapped into the bound device's IOMMU page tables at `VAR.base + offset` (an IOVA).
+
+```
+map_pf([1] var, [2 + 2i] offset, [2 + 2i + 1] page_frame) -> void
+  syscall_num = [map_pf]
+
+  syscall word bits 12-19: N (number of (offset, page_frame) pairs)
+
+  [1] var: VAR handle
+  [2 + 2i] offset: byte offset within the VAR
+  [2 + 2i + 1] page_frame: page_frame handle to install at that offset
+
+  for i in 0..N-1.
+```
+
+[test] returns E_BADCAP if [1] is not a valid VAR handle.
+[test] returns E_BADCAP if any [2 + 2i + 1] is not a valid page_frame handle.
+[test] returns E_PERM if [1].caps has `mmio` set (mmio VARs accept only `map_mmio`).
+[test] returns E_INVAL if N is 0.
+[test] returns E_INVAL if any offset is not aligned to the VAR's `sz` page size.
+[test] returns E_INVAL if any page_frame's `sz` is smaller than the VAR's `sz`.
+[test] returns E_INVAL if any pair's range exceeds the VAR's size.
+[test] returns E_INVAL if any two pairs' ranges overlap.
+[test] returns E_INVAL if any pair's range overlaps an existing mapping in the VAR.
+[test] returns E_INVAL if [1].field1 `map` is 2 (mmio) or 3 (demand) — pf installation requires `map = 0` or `map = 1`.
+[test] on success, [1].field1 `map` becomes 1 if it was 0; otherwise stays 1.
+[test] on success, when [1].caps.dma = 0, CPU accesses to `VAR.base + offset` use effective permissions = `VAR.cur_rwx` ∩ `page_frame.r/w/x` per page.
+[test] on success, when [1].caps.dma = 1, device accesses by the bound device to `VAR.base + offset` (IOVA) translate via the IOMMU to the page_frame, with permissions = `VAR.cur_rwx` ∩ `page_frame.r/w/x` per page.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### map_mmio
+
+Installs a device_region as an MMIO mapping into an MMIO-flagged VAR.
+
+```
+map_mmio([1] var, [2] device_region) -> void
+  syscall_num = [map_mmio]
+
+  [1] var: VAR handle (must have `mmio` cap)
+  [2] device_region: device_region handle
+```
+
+VAR cap required on [1]: `mmio`.
+
+[test] returns E_BADCAP if [1] is not a valid VAR handle.
+[test] returns E_BADCAP if [2] is not a valid device_region handle.
+[test] returns E_PERM if [1] does not have the `mmio` cap.
+[test] returns E_INVAL if [1].field1 `map` is not 0 (mmio mappings are atomic; the VAR must be unmapped).
+[test] returns E_INVAL if [2]'s size does not equal [1]'s size.
+[test] on success, [1].field1 `map` becomes 2.
+[test] on success, [1].field1 `device` is set to [2]'s handle id.
+[test] on success, CPU accesses to the VAR's range use effective permissions = `VAR.cur_rwx`.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### unmap
+
+Removes mappings from a VAR. Dispatches on the VAR's `map` field. With `N = 0`, unmaps everything; with `N > 0`, the selectors specify which mappings to remove and depend on `map`.
+
+```
+unmap([1] var, [2..N+1] selectors) -> void
+  syscall_num = [unmap]
+
+  syscall word bits 12-19: N (number of selectors; 0 = unmap everything)
+
+  [1] var: VAR handle
+  [2..N+1] selectors:
+    - map = 1 (pf):     page_frame handles to unmap
+    - map = 3 (demand): byte offsets into the VAR
+    - map = 2 (mmio):   N must be 0
+```
+
+[test] returns E_BADCAP if [1] is not a valid VAR handle.
+[test] returns E_INVAL if [1].field1 `map` is 0 (nothing to unmap).
+[test] returns E_INVAL if [1].field1 `map` is 2 (mmio) and N > 0.
+[test] returns E_BADCAP if [1].field1 `map` is 1 and any selector is not a valid page_frame handle.
+[test] returns E_NOENT if [1].field1 `map` is 1 and any page_frame selector is not currently installed in [1].
+[test] returns E_INVAL if [1].field1 `map` is 3 and any offset selector is not aligned to [1]'s `sz`.
+[test] returns E_NOENT if [1].field1 `map` is 3 and no demand-allocated page exists at any offset selector.
+[test] on success, when N is 0, all installations or demand-allocated pages are removed and `map` is set to 0.
+[test] on success, when N is 0 and `map` was 2, the device_region installation is removed and `device` is cleared to 0.
+[test] on success, when N > 0 and `map` is 1, only the specified page_frames are removed; `map` stays 1 unless every installed page_frame has been removed, in which case it becomes 0.
+[test] on success, when N > 0 and `map` is 3, only the pages at the specified offsets are freed; `map` stays 3 unless every demand-allocated page has been freed, in which case it becomes 0.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### remap
+
+Updates a VAR's `cur_rwx`, changing the effective permissions on its currently-mapped pages. Applies to pf and demand mappings only.
+
+```
+remap([1] var, [2] new_cur_rwx) -> void
+  syscall_num = [remap]
+
+  [1] var: VAR handle
+  [2] new_cur_rwx: u64 packed as
+    bits 0-2: new r/w/x
+    bits 3-63: _reserved
+```
+
+[test] returns E_BADCAP if [1] is not a valid VAR handle.
+[test] returns E_INVAL if [1].field1 `map` is 0 or 2 (no pf or demand mapping to remap).
+[test] returns E_INVAL if [2] new_cur_rwx is not a subset of [1]'s caps r/w/x.
+[test] returns E_INVAL if [1].field1 `map` is 1 and [2] new_cur_rwx is not a subset of the intersection of all installed page_frames' r/w/x caps.
+[test] returns E_INVAL if [1].caps.dma = 1 and [2] new_cur_rwx has bit 2 (x) set.
+[test] returns E_INVAL if any reserved bits are set in [2].
+[test] on success, [1].field1 `cur_rwx` is set to [2] new_cur_rwx.
+[test] on success, subsequent accesses to mapped pages use effective permissions = `cur_rwx` ∩ `page_frame.r/w/x` (for map=1) or `cur_rwx` (for map=3).
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### snapshot
+
+Binds a source VAR to a target VAR. On the owning domain's restart, the kernel copies the source's contents into the target before the domain resumes. Used together with `restart_policy = snapshot` on the target VAR — see §[restart_semantics].
+
+```
+snapshot([1] target_var, [2] source_var) -> void
+  syscall_num = [snapshot]
+
+  [1] target_var: VAR handle (must have `caps.restart_policy = snapshot` (3))
+  [2] source_var: VAR handle (must have `caps.restart_policy = preserve` (2))
+```
+
+Calling `snapshot` again replaces any prior binding for `[1]`.
+
+At restart time, the source-to-target copy succeeds only if the source is stable:
+- For `[2].field1.map = 1` (page_frame-backed): every backing page_frame has `field1.mapcnt = 1` AND the source's effective write permission is 0 (`[2].field1.cur_rwx` write bit ∩ each page_frame's `caps.w` is 0).
+- For `[2].field1.map = 3` (demand-paged): the source's `cur_rwx.w = 0`. Demand-paged pages are kernel-allocated and not exposed elsewhere, so `mapcnt = 1` is implicit.
+
+If the source's stability cannot be verified at restart, the restart fails and the domain is terminated.
+
+[test] returns E_BADCAP if [1] is not a valid VAR handle.
+[test] returns E_BADCAP if [2] is not a valid VAR handle.
+[test] returns E_INVAL if [1].caps.restart_policy is not 3 (snapshot).
+[test] returns E_INVAL if [2].caps.restart_policy is not 2 (preserve).
+[test] returns E_INVAL if [1] and [2] have different sizes (`page_count` × `sz`).
+[test] returns E_INVAL if any reserved bits are set in [1] or [2].
+[test] calling `snapshot` a second time on the same target replaces the prior source binding.
+[test] if the source [2] is deleted before restart, the binding is cleared; on restart with no source bound, the domain is terminated rather than restarted.
+[test] on domain restart, when the source's stability constraints hold, [1]'s contents are replaced by a copy of [2]'s contents before the domain resumes.
+[test] on domain restart, when [2].map = 1 and any backing page_frame has `mapcnt > 1` or the source's effective write permission is nonzero, the restart fails and the domain is terminated.
+[test] on domain restart, when [2].map = 3 and `[2].cur_rwx.w = 1`, the restart fails and the domain is terminated.
+
+### idc_read
+
+Reads qwords from a VAR into the caller's vregs. Used for cross-domain memory inspection (e.g., debugger reads of an acquired VAR's contents). The kernel pauses every EC in the VAR's owning domain for the duration of the call so the read returns a consistent snapshot; this is intended as a debugger primitive, not a performance path.
+
+```
+idc_read([1] var, [2] offset) -> [3..2+count] qwords
+  syscall_num = [idc_read]
+
+  syscall word bits 12-19: count (number of qwords; max 125)
+
+  [1] var:    VAR handle
+  [2] offset: byte offset within the VAR (must be 8-byte aligned)
+```
+
+VAR cap required on [1]: `r`.
+
+[test] returns E_BADCAP if [1] is not a valid VAR handle.
+[test] returns E_PERM if [1] does not have the `r` cap.
+[test] returns E_INVAL if [2] offset is not 8-byte aligned.
+[test] returns E_INVAL if count is 0 or count > 125.
+[test] returns E_INVAL if [2] + count*8 exceeds the VAR's size.
+[test] returns E_INVAL if any reserved bits are set in [1] or [2].
+[test] on success, vregs `[3..2+count]` contain the qwords from the VAR starting at [2] offset.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### idc_write
+
+Writes qwords from the caller's vregs into a VAR. Used for cross-domain memory writes (e.g., debugger writes of an acquired VAR's contents). The kernel pauses every EC in the VAR's owning domain for the duration of the call so the write commits without observable interleaving; this is intended as a debugger primitive, not a performance path.
+
+```
+idc_write([1] var, [2] offset, [3..2+count] qwords) -> void
+  syscall_num = [idc_write]
+
+  syscall word bits 12-19: count (number of qwords; max 125)
+
+  [1] var:    VAR handle
+  [2] offset: byte offset within the VAR (must be 8-byte aligned)
+  [3..2+count] qwords: bytes to write into the VAR
+```
+
+VAR cap required on [1]: `w`.
+
+[test] returns E_BADCAP if [1] is not a valid VAR handle.
+[test] returns E_PERM if [1] does not have the `w` cap.
+[test] returns E_INVAL if [2] offset is not 8-byte aligned.
+[test] returns E_INVAL if count is 0 or count > 125.
+[test] returns E_INVAL if [2] + count*8 exceeds the VAR's size.
+[test] returns E_INVAL if any reserved bits are set in [1] or [2].
+[test] on success, the qwords from vregs `[3..2+count]` are written into the VAR starting at [2] offset.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 ## §[page_frame] Page Frame
 
@@ -573,10 +1176,10 @@ word 1 (field0):
 └─────────────────────────────┴──────┴────────────────────────────────┘
 
 word 2 (field1):
- 63                                                                  0
-┌─────────────────────────────────────────────────────────────────────┐
-│                         _reserved (64)                              │
-└─────────────────────────────────────────────────────────────────────┘
+ 63                            32 31                               0
+┌────────────────────────────────┬──────────────────────────────────┐
+│         _reserved (32)         │           mapcnt (32)            │
+└────────────────────────────────┴──────────────────────────────────┘
 ```
 
 Field layout:
@@ -585,14 +1188,16 @@ Field layout:
 |---|---|---|
 | page_count | field0 bits 0-31 | number of pages (in `sz` units) |
 | sz | field0 bits 32-33 | page size (immutable): 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
+| mapcnt | field1 bits 0-31 | total number of active installations of this physical page across all VARs and IOMMU domains; sync-refreshed on any syscall touching the handle |
 
 cap (word 0, bits 48-63):
 
 ```
- 15             7 6   5  4   3   2    1    0
-┌────────────────┬──────┬───┬───┬───┬────┬────┐
-│ _reserved (9)  │max_sz│ x │ w │ r │copy│move│
-└────────────────┴──────┴───┴───┴───┴────┴────┘
+ 15           8 7      6   5  4   3   2    1    0
+┌──────────────┬──────┬──────┬───┬───┬───┬────┬────┐
+│_reserved (8) │rstrt │max_sz│ x │ w │ r │copy│move│
+│              │_plcy │      │   │   │   │    │    │
+└──────────────┴──────┴──────┴───┴───┴───┴────┴────┘
 ```
 
 | Bit(s) | Name | Meaning |
@@ -603,7 +1208,8 @@ cap (word 0, bits 48-63):
 | 3 | `w` | write; applied only if the installing VAR's `cur_rwx.w` is set |
 | 4 | `x` | execute; applied only if the installing VAR's `cur_rwx.x` is set |
 | 5-6 | `max_sz` | max page size: 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
-| 7-15 | `_reserved` | |
+| 7 | `restart_policy` | page_frame behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
+| 8-15 | `_reserved` | |
 
 ### create_page_frame
 
@@ -641,7 +1247,7 @@ Returns E_NOMEM if insufficient physical memory; returns E_FULL if the caller's 
 
 ## §[device_region] Device Region
 
-A device region is a reference to a physical device's MMIO region. Installing it into a virtual address range makes the device directly accessible to execution contexts in that capability domain.
+A device region is a reference to a physical device's MMIO region or x86-64 I/O port range. Installing it into a virtual address range makes the device directly accessible to execution contexts in that capability domain.
 
 Handle ABI:
 
@@ -653,31 +1259,106 @@ word 0:
 └────────────────┴──────────────────────────────┴───────┴────────────┘
 
 word 1 (field0):
- 63                                                                  0
-┌─────────────────────────────────────────────────────────────────────┐
-│                         _reserved (64)                              │
-└─────────────────────────────────────────────────────────────────────┘
+ 63                            36 35              20 19              4 3       0
+┌────────────────────────────────┬──────────────────┬──────────────────┬─────────┐
+│        _reserved (28)          │  port_count (16) │  base_port (16)  │dev_type │
+│                                │                  │                  │  (4)    │
+└────────────────────────────────┴──────────────────┴──────────────────┴─────────┘
 
 word 2 (field1):
  63                                                                  0
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         _reserved (64)                              │
+│                       irq_count (64)                                │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+Field layout:
+
+| field | location | meaning |
+|---|---|---|
+| dev_type | field0 bits 0-3 | device region kind (immutable): 0=mmio, 1=port_io (x86-64 only); other values _reserved |
+| base_port | field0 bits 4-19 | x86-64 I/O port base (u16) for `dev_type = port_io`; _reserved otherwise |
+| port_count | field0 bits 20-35 | number of consecutive x86-64 I/O ports (u16) for `dev_type = port_io`; _reserved otherwise |
+| irq_count | field1 bits 0-63 | u64 IRQ counter, kernel-incremented (saturating at u64::MAX) on each device IRQ; cleared by `ack`. The kernel propagates each increment to every domain-local copy of the handle, but propagation is not atomic across copies — different copies may transiently observe different counts (see §[device_irq]). 0 stays 0 for device regions that do not deliver IRQs |
 
 cap (word 0, bits 48-63):
 
 ```
- 15                                                  2  1    0
-┌────────────────────────────────────────────────────┬────┬────┐
-│                 _reserved (14)                     │copy│move│
-└────────────────────────────────────────────────────┴────┴────┘
+ 15                              5    4    3    2    1    0
+┌─────────────────────────────────┬──────┬────┬────┬────┬────┐
+│         _reserved (11)          │rstrt │ irq│dma │copy│move│
+│                                 │_plcy │    │    │    │    │
+└─────────────────────────────────┴──────┴────┴────┴────┴────┘
 ```
 
 | Bit | Name | Gates |
 |---|---|---|
 | 0 | `move` | transferring this handle via move to another capability domain |
 | 1 | `copy` | transferring this handle via copy to another capability domain |
+| 2 | `dma` | binding this device_region to a DMA-flagged VAR via `create_var`, authorizing IOMMU mappings for the device |
+| 3 | `irq` | acknowledging IRQs from this device via `ack` |
+| 4 | `restart_policy` | device_region behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
+
+### §[port_io_virtualization] x86-64 Port I/O Virtualization
+
+A device_region with `dev_type = port_io` carries a 16-bit `base_port` and `port_count`. Installing it into an MMIO VAR via `map_mmio` reserves the VAR's virtual range without populating CPU page tables: every CPU access to the range page-faults into the kernel.
+
+The kernel handles such faults by decoding the faulting MOV instruction, computing the target port as `base_port + (fault_vaddr - VAR.base)`, executing the corresponding x86-64 `in`/`out` of the operand width, writing the result into the destination GPR (loads) or committing the source value (stores), and advancing RIP past the instruction.
+
+Supported decoder forms: `MOV r/m ↔ reg` and `MOV r/m ← imm` with operand widths of 1, 2, or 4 bytes. Other instruction forms targeting the range — `IN`/`OUT` named mnemonics, `INS`/`OUTS`, 8-byte operand widths, and `LOCK`-prefixed variants — deliver a `thread_fault` event with the protection_fault sub-code.
+
+Effective permissions follow `VAR.cur_rwx`: a read MOV when `cur_rwx.r = 0`, or a write MOV when `cur_rwx.w = 0`, delivers a `memory_fault` event. Accesses with computed offset `>= port_count` deliver a `memory_fault` event.
+
+[test] `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and the running architecture is not x86-64.
+[test] `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and [1].field1.cch != 1 (uc).
+[test] `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and [1].caps.x is set.
+[test] on success of `map_mmio` with [2].field0.dev_type = port_io, no PTEs are populated for the VAR's range; every access to the range triggers a page fault.
+[test] a 1-, 2-, or 4-byte MOV load from `VAR.base + offset` (offset < port_count, `cur_rwx.r = 1`) executes an `in` of the matching operand width at port `base_port + offset`, writes the result into the load's destination GPR, and advances RIP past the instruction.
+[test] a 1-, 2-, or 4-byte MOV store to `VAR.base + offset` (offset < port_count, `cur_rwx.w = 1`) executes an `out` of the matching operand width at port `base_port + offset` with the source value, and advances RIP past the instruction.
+[test] a MOV access to `VAR.base + offset` with `offset >= port_count` delivers a `memory_fault` event.
+[test] a MOV load when `VAR.cur_rwx.r = 0` delivers a `memory_fault` event.
+[test] a MOV store when `VAR.cur_rwx.w = 0` delivers a `memory_fault` event.
+[test] an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
+[test] a `LOCK`-prefixed MOV targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
+[test] an 8-byte MOV access targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
+
+### §[device_irq] Device IRQ Delivery
+
+A device_region configured for IRQ delivery exposes its IRQ counter directly as `field1.irq_count` of every handle to it. The handle table is mapped read-only into the holding domain, so the field's vaddr (computable as `cap_table_base + handle_id * sizeof(handle) + offsetof(field1)`) is a valid futex address.
+
+On each IRQ from the bound device, the kernel:
+1. Atomically increments `field1.irq_count` by 1 (saturating at `u64::MAX`) in every domain-local copy of the handle. Increments are propagated to all copies but not atomically across copies — different copies may transiently observe different counts.
+2. Masks the IRQ line at the interrupt controller.
+3. Issues a futex wake on the physical address of `field1` for each copy.
+
+Userspace pairs the counter with `futex_wait_val(addr=&handle.field1, expected=last_seen)` to sleep until the next IRQ. After observing one or more IRQs, userspace calls `ack` to clear the counter and unmask the line.
+
+[test] when the device fires an IRQ, [1].field1.irq_count is incremented by 1 (eventually visible in every domain-local copy of the handle).
+[test] when the device fires a second IRQ before `ack` is called, [1].field1.irq_count is not incremented a second time; only after `ack` does a subsequent IRQ from the device increment it again.
+[test] when the device fires an IRQ, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field1 returns from the call with [1] = the corresponding domain-local vaddr of field1.
+[test] when the device has no IRQ delivery configured, [1].field1.irq_count remains 0.
+
+### ack
+
+Acknowledges accumulated IRQs from a device_region. Atomically reads the current IRQ counter, resets it to 0, and unmasks the IRQ line at the interrupt controller.
+
+```
+ack([1] device_region) -> [1] prior_count
+  syscall_num = [ack]
+
+  [1] device_region: device_region handle
+```
+
+device_region cap required on [1]: `irq`.
+
+[test] returns E_BADCAP if [1] is not a valid device_region handle.
+[test] returns E_PERM if [1] does not have the `irq` cap.
+[test] returns E_INVAL if the device_region has no IRQ delivery configured.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] on success, the returned `prior_count` equals [1].field1.irq_count immediately before the call.
+[test] on success, [1].field1.irq_count is 0 in every domain-local copy of the handle after the call.
+[test] on success, a subsequent IRQ from the device increments [1].field1.irq_count and issues a futex wake on its paddr in every domain-local copy of the handle.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 ## §[virtual_machine] Virtual Machine
 
@@ -708,15 +1389,17 @@ word 2 (field1):
 cap (word 0, bits 48-63):
 
 ```
- 15                                                       1    0
-┌──────────────────────────────────────────────────────────┬──────┐
-│                   _reserved (15)                         │policy│
-└──────────────────────────────────────────────────────────┴──────┘
+ 15                                                  2    1     0
+┌────────────────────────────────────────────────────┬──────┬──────┐
+│              _reserved (14)                        │rstrt │policy│
+│                                                    │_plcy │      │
+└────────────────────────────────────────────────────┴──────┴──────┘
 ```
 
 | Bit | Name | Gates |
 |---|---|---|
 | 0 | `policy` | mutating this VM's policy tables (§[vm_policy]) via runtime syscalls |
+| 1 | `restart_policy` | VM behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
 ### create_virtual_machine
 
@@ -826,7 +1509,7 @@ SysregPolicy {
   write_mask: u64,
 }
 
-MAX_ID_REG_RESPONSES = 64
+MAX_ID_REG_RESPONSES = 62
 MAX_SYSREG_POLICIES = 32
 ```
 
@@ -846,8 +1529,8 @@ create_vcpu([1] caps, [2] vm_handle, [3] affinity, [4] exit_port) -> [1] handle
 
   [1] caps: u64 packed as
     bits  0-15: caps       — caps on the EC handle returned to the caller
-    bits 32-34: priority   — scheduling priority, 0-7, bounded by caller's priority ceiling
-    bits 35-63: _reserved
+    bits 32-33: priority   — scheduling priority, 0-3, bounded by caller's priority ceiling
+    bits 34-63: _reserved
 
   [2] vm_handle:  VM handle the vCPU binds to
   [3] affinity:   64-bit core mask; bit N = 1 allows the vCPU to run on core N.
@@ -862,7 +1545,7 @@ The vCPU EC is bound to the capability domain that holds the VM handle. `create_
 Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's handle table has no free slot.
 
 [test] returns E_PERM if the caller's self-handle lacks `crec`.
-[test] returns E_PERM if caps is not a subset of the VM's owning domain's `ec_ceiling`.
+[test] returns E_PERM if caps is not a subset of the VM's owning domain's `ec_inner_ceiling`.
 [test] returns E_PERM if priority exceeds the caller's priority ceiling.
 [test] returns E_BADCAP if [2] is not a valid VM handle.
 [test] returns E_BADCAP if [4] is not a valid port handle.
@@ -873,6 +1556,115 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 [test] on success, the EC's priority is set to `[1].priority`.
 [test] on success, the EC's affinity is set to `[3]`.
 [test] immediately after creation, an initial vm_exit event is delivered on `[4] exit_port` with zeroed guest state in the vregs and the initial-state sub-code.
+
+### map_guest
+
+Installs page_frames into the VM's guest physical address space. Subsequent guest accesses to `guest_addr` translate via the second-stage page tables to the corresponding page_frame.
+
+```
+map_guest([1] vm, [2 + 2i] guest_addr, [2 + 2i + 1] page_frame) -> void
+  syscall_num = [map_guest]
+
+  syscall word bits 12-19: N (number of (guest_addr, page_frame) pairs)
+
+  [1] vm: VM handle
+  [2 + 2i] guest_addr: guest physical address
+  [2 + 2i + 1] page_frame: page_frame handle to install at that guest_addr
+
+  for i in 0..N-1.
+```
+
+[test] returns E_BADCAP if [1] is not a valid VM handle.
+[test] returns E_BADCAP if any [2 + 2i + 1] is not a valid page_frame handle.
+[test] returns E_INVAL if N is 0.
+[test] returns E_INVAL if any guest_addr is not aligned to its paired page_frame's `sz`.
+[test] returns E_INVAL if any two pairs' ranges overlap.
+[test] returns E_INVAL if any pair's range overlaps an existing mapping in the VM's guest physical address space.
+[test] on success, guest accesses to `guest_addr` translate via the second-stage tables to the paired page_frame, with effective per-page permissions = `page_frame.r/w/x`.
+[test] on success, guest accesses outside the page_frame's permissions deliver a `vm_exit` event with the guest-page-fault sub-code via the vCPU's bound exit_port.
+
+### unmap_guest
+
+Removes page_frame mappings from a VM's guest physical address space.
+
+```
+unmap_guest([1] vm, [2 + i] page_frame for i in 0..N-1) -> void
+  syscall_num = [unmap_guest]
+
+  syscall word bits 12-19: N (number of page_frames to unmap)
+
+  [1] vm: VM handle
+  [2 + i] page_frame: page_frame handle to unmap from the VM
+```
+
+[test] returns E_BADCAP if [1] is not a valid VM handle.
+[test] returns E_BADCAP if any [2 + i] is not a valid page_frame handle.
+[test] returns E_INVAL if N is 0.
+[test] returns E_NOENT if any page_frame is not currently mapped in [1].
+[test] on success, each page_frame's installation in [1]'s guest physical address space is removed; subsequent guest accesses to those guest_addr ranges deliver a `vm_exit` event with the guest-page-fault sub-code.
+
+### vm_set_policy
+
+Replaces a single VmPolicy table on the VM, atomically. Tables for other kinds are unchanged. The kind selector is overloaded across architectures; see the per-arch tables below.
+
+```
+vm_set_policy([1] vm, [2..] entries) -> void
+  syscall_num = [vm_set_policy]
+
+  syscall word bit 12:     kind
+  syscall word bits 13-20: count (number of entries supplied)
+
+  [1] vm: VM handle
+```
+
+VM cap required on [1]: `policy`.
+
+**x86-64**
+
+| kind | meaning | vregs/entry | layout (entry 0 starts at vreg 2) |
+|---|---|---|---|
+| 0 | replaces `cpuid_responses` | 3 | `[2+3i+0]` = `{leaf u32, subleaf u32}`; `[2+3i+1]` = `{eax u32, ebx u32}`; `[2+3i+2]` = `{ecx u32, edx u32}` |
+| 1 | replaces `cr_policies` | 3 | `[2+3i+0]` = `{cr_num u8, _pad u8[7]}`; `[2+3i+1]` = `read_value u64`; `[2+3i+2]` = `write_mask u64` |
+
+**aarch64**
+
+| kind | meaning | vregs/entry | layout (entry 0 starts at vreg 2) |
+|---|---|---|---|
+| 0 | replaces `id_reg_responses` | 2 | `[2+2i+0]` = `{op0 u8, op1 u8, crn u8, crm u8, op2 u8, _pad u8[3]}`; `[2+2i+1]` = `value u64` |
+| 1 | replaces `sysreg_policies` | 3 | `[2+3i+0]` = `{op0 u8, op1 u8, crn u8, crm u8, op2 u8, _pad u8[3]}`; `[2+3i+1]` = `read_value u64`; `[2+3i+2]` = `write_mask u64` |
+
+[test] returns E_BADCAP if [1] is not a valid VM handle.
+[test] returns E_PERM if [1] does not have the `policy` cap.
+[test] returns E_INVAL if count exceeds the active (kind, arch)'s MAX_* constant from §[vm_policy].
+[test] returns E_INVAL if any reserved bits are set in [1] or any entry.
+[test] on x86-64 with kind=0, the VM's `cpuid_responses` table is replaced by the count entries; subsequent guest CPUIDs match against this table per §[vm_policy], and the prior contents are no longer matched.
+[test] on x86-64 with kind=1, the VM's `cr_policies` table is replaced by the count entries; subsequent guest CR accesses match against this table per §[vm_policy].
+[test] on aarch64 with kind=0, the VM's `id_reg_responses` table is replaced by the count entries; subsequent guest reads of matching ID_AA64* registers return the configured values per §[vm_policy].
+[test] on aarch64 with kind=1, the VM's `sysreg_policies` table is replaced by the count entries; subsequent guest sysreg accesses match against this table per §[vm_policy].
+[test] on success, the table for the other kind is unchanged.
+
+### vm_inject_irq
+
+Asserts or deasserts a virtual IRQ line on the VM's emulated interrupt controller. Routing to vCPUs follows the guest's configured redirection (IOAPIC RTE on x86-64, GIC distributor on aarch64).
+
+```
+vm_inject_irq([1] vm, [2] irq_num, [3] assert) -> void
+  syscall_num = [vm_inject_irq]
+
+  [1] vm:      VM handle
+  [2] irq_num: u64 virtual IRQ line number
+  [3] assert:  u64 packed as
+    bit 0: 1 = assert, 0 = deassert
+    bits 1-63: _reserved
+```
+
+No cap required beyond holding [1].
+
+[test] returns E_BADCAP if [1] is not a valid VM handle.
+[test] returns E_INVAL if [2] exceeds the maximum IRQ line supported by the VM's emulated interrupt controller.
+[test] returns E_INVAL if any reserved bits are set in [1] or [3].
+[test] on success with [3].assert = 1, IRQ line [2] is asserted on the VM's emulated interrupt controller; if a vCPU is unmasked for the line, an interrupt event is delivered to the vCPU on its next runnable opportunity (observable as an exception/interrupt vm_exit or as a guest interrupt handler invocation per the guest's IDT/GIC configuration).
+[test] on success with [3].assert = 0, IRQ line [2] is deasserted on the VM's emulated interrupt controller.
 
 ## §[port] Port
 
@@ -903,20 +1695,21 @@ word 2 (field1):
 cap (word 0, bits 48-63):
 
 ```
- 15                  6     5    4    3    2    1  0
-┌────────────────────┬────┬────┬────┬────┬────┬────┐
-│   _reserved (10)   │bind│recv│call│xfer│copy│move│
-└────────────────────┴────┴────┴────┴────┴────┴────┘
+ 15                  6    5    4    3    2    1    0
+┌─────────────────────┬──────┬────┬────┬────┬────┬────┐
+│  _reserved (10)     │rstrt │bind│recv│xfer│copy│move│
+│                     │_plcy │    │    │    │    │    │
+└─────────────────────┴──────┴────┴────┴────┴────┴────┘
 ```
 
 | Bit | Name | Meaning |
 |---|---|---|
 | 0 | `move` | transferring this handle via move to another capability domain |
 | 1 | `copy` | transferring this handle via copy to another capability domain |
-| 2 | `xfer` | transferring capabilities on this port, either as part of a call or as part of a reply |
-| 3 | `call` | suspending on this port and passing register state |
-| 4 | `recv` | reading events off this port and receiving the associated reply capability |
-| 5 | `bind` | binding this port as an event delivery target (e.g., vCPU exit port, event route destination) |
+| 2 | `xfer` | transferring capabilities on this port (attaching handles to a suspension event payload, or to a reply payload) |
+| 3 | `recv` | reading events off this port and receiving the associated reply capability |
+| 4 | `bind` | using this port as the destination of a `suspend` syscall, the `exit_port` of a `create_vcpu`, or an `event_route` registration |
+| 5 | `restart_policy` | port behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
 ### create_port
 
@@ -940,17 +1733,91 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 [test] returns E_INVAL if any reserved bits are set in [1].
 [test] on success, the caller receives a port handle with caps = `[1].caps`.
 
+### suspend
+
+Suspends the target execution context and delivers a suspension event to a port. The event exposes the EC's state per §[event_state]; the receiver may modify state and reply through the included reply capability to resume the EC.
+
+```
+suspend([1] target, [2] port) -> void
+  syscall_num = [suspend]
+
+  [1] target: EC handle
+  [2] port: port handle (suspension event delivery target)
+```
+
+EC cap required on [1]: `susp`. Visibility and writability of the target's state in the suspension event are gated by [1]'s `read` and `write` caps.
+Port cap required on [2]: `bind`. Additionally `xfer` if any handles are attached in the syscall word's `pair_count`.
+
+`[1]` may reference the calling EC; the syscall returns after the calling EC is resumed.
+
+Handle attachments in the suspension event payload follow §[handle_attachments].
+
+[test] returns E_BADCAP if [1] is not a valid EC handle.
+[test] returns E_BADCAP if [2] is not a valid port handle.
+[test] returns E_PERM if [1] does not have the `susp` cap.
+[test] returns E_PERM if [2] does not have the `bind` cap.
+[test] returns E_INVAL if any reserved bits are set.
+[test] returns E_INVAL if [1] references a vCPU.
+[test] returns E_INVAL if [1] is already suspended.
+[test] on success, the target EC stops executing.
+[test] on success, a suspension event is delivered on [2].
+[test] on success, when [1] has the `read` cap, the suspension event payload exposes the target's EC state per §[event_state]; otherwise the state in the payload is zeroed.
+[test] on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's EC state on reply; otherwise modifications are discarded.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### recv
+
+Blocks waiting for an event on a port. On return, the kernel has dequeued one suspended sender, allocated a reply handle for it in the caller's table, allocated slots for any handles the sender attached, written the suspended EC's state to the caller's vregs per §[event_state] (and §[vm_exit_state] for vm_exits), and populated the syscall word with the reply handle id, event_type, pair_count, and tstart.
+
+```
+recv([1] port) -> void
+  syscall_num = [recv]
+
+  syscall word return layout (per §[event_state]):
+    bits  0-11: _reserved
+    bits 12-19: pair_count           — handles attached by sender (0..63)
+    bits 20-31: tstart               — slot id of first attached handle
+    bits 32-43: reply_handle_id      — slot id of the reply handle
+    bits 44-48: event_type
+    bits 49-63: _reserved
+
+  [1] port: port handle
+```
+
+Port cap required on [1]: `recv`.
+
+When multiple senders are queued on the port, the kernel selects the highest-priority sender; ties resolve FIFO. The chosen sender remains suspended until the reply handle is consumed: `reply` resumes them, `delete` on the reply handle resolves them with `E_ABANDONED`.
+
+Returns E_CLOSED if the port has no bind-cap holders, no event_routes targeting it, and no events queued — the call returns immediately rather than blocking. If the port becomes terminally closed while a recv is blocked, the call returns E_CLOSED.
+
+Returns E_FULL if the caller's handle table cannot accommodate the reply handle plus pair_count attached handles.
+
+[test] returns E_BADCAP if [1] is not a valid port handle.
+[test] returns E_PERM if [1] does not have the `recv` cap.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] returns E_CLOSED if the port has no bind-cap holders, no event_routes targeting it, and no queued events.
+[test] returns E_CLOSED when a recv is blocked on a port and the last bind-cap holder releases its handle while no event_routes target the port and no events are queued.
+[test] returns E_FULL if the caller's handle table cannot accommodate the reply handle and pair_count attached handles.
+[test] on success, the syscall word's reply_handle_id is the slot id of a reply handle inserted into the caller's table referencing the dequeued sender.
+[test] on success, the syscall word's event_type equals the event_type that triggered delivery.
+[test] on success when the sender attached N handles, the syscall word's pair_count = N and the next N table slots [tstart, tstart+N) contain the inserted handles per §[handle_attachments].
+[test] on success when the sender attached no handles, pair_count = 0.
+[test] on success when the suspending EC handle had the `read` cap, the receiver's vregs reflect the suspended EC's state per §[event_state] (or §[vm_exit_state] when event_type = vm_exit).
+[test] on success when the suspending EC handle did not have the `read` cap, all event-state vregs are zeroed.
+[test] when multiple senders are queued, the kernel selects the highest-priority sender; ties resolve FIFO.
+[test] on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
+
 ### §[event_type] Event Type
 
 Event type identifies the kind of event an event route binds or that a reply originated from.
 
 | Value | Name | Description |
 |---|---|---|
-| 0 | call | IDC call delivered via recv on a port |
+| 0 | _reserved | |
 | 1 | memory_fault | invalid read/write/execute, unmapped access, protection violation |
 | 2 | thread_fault | arithmetic fault, illegal instruction, alignment check, stack overflow |
 | 3 | breakpoint | software or hardware breakpoint trap |
-| 4 | suspension | explicit suspension |
+| 4 | suspension | EC suspended via the `suspend` syscall (subsumes IDC call delivery; the receiver inspects/mutates the suspended EC's state per §[event_state] gated by the `read`/`write` caps on the EC handle the suspender used) |
 | 5 | vm_exit | vCPU exited guest mode |
 | 6 | pmu_overflow | performance counter overflowed |
 | 7..31 | _reserved | |
@@ -959,7 +1826,18 @@ Sub-codes within an event type (e.g., read vs write vs execute within memory_fau
 
 ### §[event_state] Event State
 
-For suspended events other than IDC, when the event handler holds a capability with read and/or write access to the suspended execution context's state, the kernel exposes that state through the vreg layout at recv time and consumes modifications on reply. GPRs are 1:1 with hardware registers during handler execution — the handler reads or modifies EC state by directly reading or writing the hardware register. Non-GPR state lives on the stack at fixed offsets. VM exit events expose additional state — see §[vm_exit_state].
+When the EC handle that triggered the event held the `read` and/or `write` cap, the kernel exposes the suspended EC's state through the vreg layout at recv time and consumes modifications on reply. GPRs are 1:1 with hardware registers during handler execution — the handler reads or modifies EC state by directly reading or writing the hardware register. Non-GPR state lives on the stack at fixed offsets. The reply handle id is returned in the receiver's syscall word, not a vreg, so receivers handling small events do not need to allocate stack to reach a high vreg slot. VM exit events expose additional state — see §[vm_exit_state]. Handle attachments ride in pair vregs at the top of the vreg range — see §[handle_attachments].
+
+The receiver's syscall word on recv return carries:
+
+```
+bits  0-11: _reserved
+bits 12-19: pair_count           — count of handles attached by sender (0..63)
+bits 20-31: tstart               — slot id of first attached handle (valid when pair_count > 0)
+bits 32-43: reply_handle_id      — slot id of the inserted reply handle in the receiver's table
+bits 44-48: event_type           — per §[event_type]
+bits 49-63: _reserved
+```
 
 **x86-64**
 
@@ -971,8 +1849,7 @@ For suspended events other than IDC, when the event handler holds a capability w
 | 16 | `[rsp + 24]` | RSP |
 | 17 | `[rsp + 32]` | FS.base |
 | 18 | `[rsp + 40]` | GS.base |
-| 19..126 | `[rsp + ...]` | event-specific payload |
-| 127 | `[rsp + 912]` | reply capability |
+| 19..127 | `[rsp + ...]` | event-specific payload |
 
 **aarch64**
 
@@ -983,13 +1860,41 @@ For suspended events other than IDC, when the event handler holds a capability w
 | 33 | `[sp + 16]` | PSTATE |
 | 34 | `[sp + 24]` | SP_EL0 |
 | 35 | `[sp + 32]` | TPIDR_EL0 |
-| 36..126 | `[sp + ...]` | event-specific payload |
-| 127 | `[sp + 768]` | reply capability |
+| 36..127 | `[sp + ...]` | event-specific payload |
 
 FPU, SIMD, and other extended state (XSAVE area on x86-64, SVE/NEON state on aarch64) is not exposed through vregs and is accessed through a separate mechanism. When copied to a buffer, the state is laid out per-architecture:
 
 - **x86-64**: XSAVE(C) format, as defined in Intel® 64 and IA-32 Architectures Software Developer's Manual Vol. 1, Chapter 13 ("Managing State Using the XSAVE Feature Set"). Layout and offsets of individual state components are enumerated at runtime via `CPUID.0xD`.
 - **aarch64**: V0..V31 packed from offset 0 (16 bytes each, 512 bytes total), FPSR at offset 512, FPCR at offset 516. If SVE is enabled, SVE state (Z0..Z31, P0..P15, FFR) follows in the architecturally canonical layout as defined in Arm Architecture Reference Manual (DDI0487), §B1.
+
+### §[handle_attachments] Handle Attachments
+
+A suspending EC may attach handles to the event by encoding them as pair entries in the high vregs and writing the count into the syscall word.
+
+The syscall word at suspend time carries `pair_count` `N` in bits 12-19 (0..255). When `N > 0`, the entries occupy vregs `[128-N..127]`. Each entry is a u64 packed as:
+
+```
+bits  0-11: source handle id (in the suspending EC's domain)
+bits 12-15: _reserved
+bits 16-31: caps to install on the handle in the receiver's domain
+bit     32: move (1 = remove from sender's table; 0 = copy)
+bits 33-63: _reserved
+```
+
+The kernel validates the entries at suspend time. The actual move/copy is performed at recv time — if the suspend resumes with `E_CLOSED` before any recv, no attachment is moved or copied and the sender's table is unchanged.
+
+At recv time the kernel inserts the `N` handles into the receiving EC's table at contiguous slots `[S, S+N)` with `S` chosen by the kernel, and sets the receiver's syscall word with `pair_count = N`, `tstart = S`, `reply_handle_id` (slot id of the inserted reply handle), and `event_type` per the layout in §[event_state]. Each installed handle's caps are the entry's `caps` intersected with the receiver's `idc_rx` for IDC handles, or the entry's `caps` verbatim for other handle types.
+
+[test] returns E_PERM if `N > 0` and the port handle does not have the `xfer` cap.
+[test] returns E_BADCAP if any entry's source handle id is not valid in the suspending EC's domain.
+[test] returns E_PERM if any entry's caps are not a subset of the source handle's current caps.
+[test] returns E_PERM if any entry with `move = 1` references a source handle that lacks the `move` cap.
+[test] returns E_PERM if any entry with `move = 0` references a source handle that lacks the `copy` cap.
+[test] returns E_INVAL if any reserved bits are set in an entry.
+[test] returns E_INVAL if two entries reference the same source handle.
+[test] on recv, the receiver's syscall word `pair_count` equals `N` and the next `N` table slots `[tstart, tstart+N)` contain the inserted handles, each with caps = entry.caps intersected with `idc_rx` for IDC handles, or entry.caps verbatim for other handle types.
+[test] on recv, source entries with `move = 1` are removed from the sender's table; entries with `move = 0` are not removed.
+[test] when the suspend resumes with `E_CLOSED` before any recv, no entry is moved or copied.
 
 ### §[vm_exit_state] VM Exit State
 
@@ -1041,8 +1946,7 @@ vreg layout:
 | 66..69 | `[rsp + 424..455]` | interrupt_bitmap (256 bits = 4 u64s) |
 | 70 | `[rsp + 456]` | exit sub-code |
 | 71..73 | `[rsp + 464..487]` | exit payload (per sub-code below) |
-| 74..126 | `[rsp + 488..911]` | _reserved |
-| 127 | `[rsp + 912]` | reply capability |
+| 74..127 | `[rsp + 488..919]` | _reserved |
 
 Exit payload per sub-code (up to 3 vregs = 24 bytes; unused vregs in the payload band are `_reserved` for that sub-code):
 
@@ -1093,8 +1997,7 @@ vreg layout:
 | 116 | `[sp + 680]` | packed pending state `{virq u8, vfiq u8, vserror u8}` |
 | 117 | `[sp + 688]` | exit sub-code |
 | 118..120 | `[sp + 696..719]` | exit payload (per sub-code below) |
-| 121..126 | `[sp + 720..767]` | _reserved |
-| 127 | `[sp + 768]` | reply capability |
+| 121..127 | `[sp + 720..775]` | _reserved |
 
 Exit payload per sub-code (up to 3 vregs = 24 bytes; unused vregs in the payload band are `_reserved` for that sub-code):
 
@@ -1114,9 +2017,73 @@ Exit payload per sub-code (up to 3 vregs = 24 bytes; unused vregs in the payload
 
 An event route is a kernel-held binding of events generated by an execution context to a given port, such that the execution context is suspended on the port when the event occurs. Event routes are not handles — they are identified by the `(execution_context, event_type)` tuple and cleared either by explicit syscall or by destruction of the execution context they are bound to.
 
+The registerable event types (per §[event_type]) are `memory_fault` (1), `thread_fault` (2), `breakpoint` (3), and `pmu_overflow` (6). `suspension` (4) and `vm_exit` (5) are not registered through these syscalls — `suspension` is delivered to the port specified in the `suspend` syscall directly, and `vm_exit` is bound at `create_vcpu` to the vCPU's exit_port.
+
+When an event of a registered type fires for an EC, the kernel suspends the EC and delivers an event of the corresponding type on the bound port per §[event_state]; the receiver may modify the EC's state and reply through the included reply capability to resume it.
+
+When an event of a registerable type fires for an EC and no route is bound for `(EC, event_type)` — never bound, cleared, or the bound port lost its last `bind` holder — the kernel resolves the event per the no-route fallback:
+
+| event_type | Fallback |
+|---|---|
+| memory_fault | the EC's capability domain is restarted if its self-handle has the `restart` cap (per §[restart_semantics]); otherwise the capability domain is destroyed |
+| thread_fault | the EC is terminated |
+| breakpoint | the event is dropped; the kernel advances past the trapping instruction and resumes the EC |
+| pmu_overflow | the event is dropped; the EC continues running |
+
+`suspension` and `vm_exit` always have a bound port by construction (the `suspend` syscall's `port` argument and the `create_vcpu` `exit_port` respectively), so the no-route fallback does not apply to them.
+
+### bind_event_route
+
+Installs the kernel-held binding `(target, event_type) → port`. If a binding already exists for `(target, event_type)`, it is replaced atomically — there is no window during which the route falls back to the no-route handling.
+
+```
+bind_event_route([1] target, [2] event_type, [3] port) -> void
+  syscall_num = [bind_event_route]
+
+  [1] target:     EC handle
+  [2] event_type: u64; must be a registerable event type (1, 2, 3, or 6)
+  [3] port:       port handle
+```
+
+EC cap required on [1]: `bind` if no prior route exists for `(target, event_type)`; `rebind` if one does.
+Port cap required on [3]: `bind`.
+
+[test] returns E_BADCAP if [1] is not a valid EC handle.
+[test] returns E_BADCAP if [3] is not a valid port handle.
+[test] returns E_INVAL if [2] is not a registerable event type (i.e., not in {1, 2, 3, 6}).
+[test] returns E_INVAL if any reserved bits are set in [1], [2], or [3].
+[test] returns E_PERM if [3] does not have the `bind` cap.
+[test] returns E_PERM if no prior route exists for ([1], [2]) and [1] does not have the `bind` cap.
+[test] returns E_PERM if a prior route exists for ([1], [2]) and [1] does not have the `rebind` cap.
+[test] on success, when [2] subsequently fires for [1], the EC is suspended and an event of type [2] is delivered on [3] per §[event_state] with the reply handle id placed in the receiver's syscall word `reply_handle_id` field.
+[test] on success when a prior route existed, the replacement is observable atomically: every subsequent firing of [2] for [1] is delivered to [3], and no firing in the interval is delivered to the prior port or to the no-route fallback.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### clear_event_route
+
+Removes the binding for `(target, event_type)`. Subsequent firings of that event type for the EC fall back to the no-route handling defined above.
+
+```
+clear_event_route([1] target, [2] event_type) -> void
+  syscall_num = [clear_event_route]
+
+  [1] target:     EC handle
+  [2] event_type: u64; must be a registerable event type
+```
+
+EC cap required on [1]: `unbind`.
+
+[test] returns E_BADCAP if [1] is not a valid EC handle.
+[test] returns E_PERM if [1] does not have the `unbind` cap.
+[test] returns E_INVAL if [2] is not a registerable event type.
+[test] returns E_INVAL if any reserved bits are set in [1] or [2].
+[test] returns E_NOENT if no binding exists for ([1], [2]).
+[test] on success, the binding for ([1], [2]) is removed; subsequent firings of [2] for [1] follow the no-route fallback above.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
 ## §[reply] Reply
 
-A reply is a one-shot capability referencing a suspended execution context that has been dequeued from a port by a receive but has not yet been resumed.
+A reply is a one-shot capability referencing a suspended execution context that has been dequeued from a port by a receive but has not yet been resumed. Holding a reply handle authorizes resuming or abandoning the suspended sender; consuming the handle (via `reply`, `reply_transfer`, or `delete`) is the only way to free the suspended sender.
 
 Handle ABI:
 
@@ -1143,18 +2110,508 @@ word 2 (field1):
 cap (word 0, bits 48-63):
 
 ```
- 15                                                              0
-┌─────────────────────────────────────────────────────────────────┐
-│                        _reserved (16)                           │
-└─────────────────────────────────────────────────────────────────┘
+ 15                                          2    1    0
+┌─────────────────────────────────────────────┬────┬────┬────┐
+│              _reserved (13)                 │xfer│copy│move│
+└─────────────────────────────────────────────┴────┴────┴────┘
 ```
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | `move` | transferring this reply handle via move to another capability domain |
+| 1 | `copy` | always 0 — reply handles are one-shot and cannot be duplicated |
+| 2 | `xfer` | attaching handles to the resumption via `reply_transfer` |
+| 3-15 | `_reserved` | |
+
+The kernel mints the reply handle at recv time with `move = 1`, `copy = 0`, and `xfer = 1` if and only if the recv'ing port had the `xfer` cap; otherwise `xfer = 0`. A holder may `restrict` away `move` or `xfer` to hand a more limited reply handle to another domain. `copy` cannot be set, so `restrict` cannot grant it.
+
+### reply
+
+Consumes a reply handle and resumes the suspended EC. State modifications written to the receiver's event-state vregs (per §[event_state] / §[vm_exit_state]) between recv and reply are applied to the suspended EC's state on resume, gated by the `write` cap on the EC handle that originated the binding (the suspending EC handle for explicit suspend, the EC handle used at `bind_event_route` for fault events, the vCPU EC handle for vm_exit).
+
+```
+reply([1] reply) -> void
+  syscall_num = [reply]
+
+  [1] reply: reply handle
+```
+
+No self-handle cap required — the reply handle itself authorizes the operation.
+
+[test] returns E_BADCAP if [1] is not a valid reply handle.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] returns E_TERM if the suspended EC was terminated before reply could deliver; [1] is consumed.
+[test] on success, [1] is consumed (removed from the caller's table).
+[test] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply.
+[test] on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
+[test] on success, the suspended EC is resumed.
+
+### reply_transfer
+
+Consumes a reply handle, resumes the suspended EC, and attaches N handles to the resumption. The resumed EC's syscall word carries `pair_count = N` and `tstart = S` (slot id of the first attached handle in the resumed EC's domain). State writes are applied per `reply` semantics.
+
+```
+reply_transfer([1] reply, [128-N..127] pair_entries) -> void
+  syscall_num = [reply_transfer]
+
+  syscall word bits 12-19: N (1..63)
+
+  [1] reply: reply handle
+  [128-N..127]: pair entries packed per §[handle_attachments]
+```
+
+Reply cap required on [1]: `xfer`.
+
+[test] returns E_BADCAP if [1] is not a valid reply handle.
+[test] returns E_PERM if [1] does not have the `xfer` cap.
+[test] returns E_INVAL if N is 0 or N > 63.
+[test] returns E_INVAL if any reserved bits are set in [1] or any pair entry.
+[test] returns E_BADCAP if any pair entry's source handle id is not valid in the caller's domain.
+[test] returns E_PERM if any pair entry's caps are not a subset of the source handle's current caps.
+[test] returns E_PERM if any pair entry with `move = 1` references a source handle that lacks the `move` cap.
+[test] returns E_PERM if any pair entry with `move = 0` references a source handle that lacks the `copy` cap.
+[test] returns E_INVAL if two pair entries reference the same source handle.
+[test] returns E_TERM if the suspended EC was terminated before reply could deliver; [1] is consumed and no handle transfer occurs.
+[test] returns E_FULL if the resumed EC's domain handle table cannot accommodate N contiguous slots; [1] is NOT consumed and the caller's table is unchanged.
+[test] on success, [1] is consumed; the resumed EC's syscall word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in the resumed EC's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
+[test] on success, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
+[test] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
+[test] on success, the suspended EC is resumed.
+
+## §[timer] Timer
+
+A timer is a kernel object that fires either once or periodically and exposes a u64 counter directly in its handle's `field0`. Userspace observes fires by polling the counter or waiting on it via `futex_wait_val`. Timers are independent of any specific EC: a timer handle can be copied, moved, or transferred over IDC, and any holder may wait on the counter (only holders with the `arm`/`cancel` caps may reconfigure or stop it).
+
+The handle table is mapped read-only into the holding domain, so `field0`'s vaddr (computable from the handle id and table base) is a valid futex address. The kernel propagates each fire to every domain-local copy of the handle, but propagation is not atomic across copies — different copies may transiently observe different counter values.
+
+The kernel reserves `u64::MAX` as the cancellation sentinel; fire-driven increments saturate at `u64::MAX − 1`, so a real counter value is never confused with cancellation.
+
+Handle ABI:
+
+```
+word 0:
+ 63            48 47                          16 15   12 11         0
+┌────────────────┬──────────────────────────────┬───────┬────────────┐
+│   cap (16)     │       _reserved (32)         │type(4)│   id(12)   │
+└────────────────┴──────────────────────────────┴───────┴────────────┘
+
+word 1 (field0):
+ 63                                                                  0
+┌─────────────────────────────────────────────────────────────────────┐
+│                       counter (64)                                  │
+└─────────────────────────────────────────────────────────────────────┘
+
+word 2 (field1):
+ 63                                              2 1   0
+┌─────────────────────────────────────────────────┬─────┬───┐
+│              _reserved (62)                     │ pd  │arm│
+└─────────────────────────────────────────────────┴─────┴───┘
+```
+
+Field layout:
+
+| field | location | meaning |
+|---|---|---|
+| counter | field0 bits 0-63 | u64 incremented on each fire (saturating at u64::MAX − 1); set to u64::MAX by `timer_cancel`; reset to 0 by `timer_rearm`. Kernel-mutable; eagerly propagated to every domain-local copy of the handle, but not atomically across copies |
+| arm | field1 bit 0 | armed (1) / not armed (0); kernel-mutable, sync-refreshed |
+| pd | field1 bit 1 | periodic (1) / one-shot (0); kernel-mutable, sync-refreshed |
+
+cap (word 0, bits 48-63):
+
+```
+ 15                       5    4    3    2    1    0
+┌─────────────────────────┬──────┬────┬────┬────┬────┬────┐
+│    _reserved (11)       │rstrt │canc│ arm│copy│move│
+│                         │_plcy │    │    │    │    │
+└─────────────────────────┴──────┴────┴────┴────┴────┴────┘
+```
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | `move` | transferring this handle via move to another capability domain |
+| 1 | `copy` | transferring this handle via copy to another capability domain |
+| 2 | `arm` | reconfiguring the timer via `timer_rearm` |
+| 3 | `cancel` | cancelling the timer via `timer_cancel` |
+| 4 | `restart_policy` | timer behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
+
+### timer_arm
+
+Mints a new timer handle with its own counter and arms it. Each call yields an independent timer; previously-minted timers are unaffected.
+
+```
+timer_arm([1] caps, [2] deadline_ns, [3] flags) -> [1] handle
+  syscall_num = [timer_arm]
+
+  [1] caps: u64 packed as
+    bits  0-15: caps     — caps on the returned timer handle
+    bits 16-63: _reserved
+
+  [2] deadline_ns: nanoseconds until first fire (and period if periodic)
+
+  [3] flags: u64 packed as
+    bit 0:     periodic
+    bits 1-63: _reserved
+```
+
+Self-handle cap required: `timer`.
+
+On each fire, the kernel atomically increments `field0` of every domain-local copy of the handle (saturating at `u64::MAX − 1`) and issues a futex wake on each copy's `field0` paddr. One-shot timers transition `field1.arm` to 0 after the single fire; periodic timers stay armed until `timer_cancel`.
+
+Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's handle table has no free slot.
+
+[test] returns E_PERM if the caller's self-handle lacks `timer`.
+[test] returns E_PERM if [1].caps.restart_policy = 1 and the caller's `restart_policy_ceiling.tm_restart_max = 0`.
+[test] returns E_INVAL if [2] deadline_ns is 0.
+[test] returns E_INVAL if any reserved bits are set in [1] or [3].
+[test] on success, the caller receives a timer handle with caps = [1].caps.
+[test] on success, [1].field0 = 0, [1].field1.arm = 1, and [1].field1.pd = [3].periodic.
+[test] on success with [3].periodic = 0, [1].field0 is incremented by 1 once after [2] deadline_ns; [1].field1.arm becomes 0 after the fire.
+[test] on success with [3].periodic = 1, [1].field0 is incremented by 1 every [2] deadline_ns until `timer_cancel` or `timer_rearm`; [1].field1.arm remains 1.
+[test] on each fire, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
+[test] calling `timer_arm` again yields a fresh, independent timer handle; the prior handle's field0 and field1 are unaffected.
+
+### timer_rearm
+
+Reconfigures an existing timer. Resets `field0` to 0, sets `field1.arm = 1`, sets `field1.pd = [3].periodic`, and applies the new `deadline_ns`. Works regardless of whether the timer was armed or disarmed at call time.
+
+```
+timer_rearm([1] timer, [2] deadline_ns, [3] flags) -> void
+  syscall_num = [timer_rearm]
+
+  [1] timer: timer handle
+  [2] deadline_ns: nanoseconds until first fire (and period if periodic)
+  [3] flags: u64 packed as
+    bit 0:     periodic
+    bits 1-63: _reserved
+```
+
+Timer cap required on [1]: `arm`.
+
+[test] returns E_BADCAP if [1] is not a valid timer handle.
+[test] returns E_PERM if [1] does not have the `arm` cap.
+[test] returns E_INVAL if [2] deadline_ns is 0.
+[test] returns E_INVAL if any reserved bits are set in [1] or [3].
+[test] on success, [1].field0 is set to 0 in every domain-local copy of the handle.
+[test] on success, [1].field1.arm = 1 and [1].field1.pd = [3].periodic.
+[test] on success, the timer fires per [2] deadline_ns and [3].periodic semantics.
+[test] on success, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
+[test] `timer_rearm` called on a currently-armed timer replaces the prior configuration; the prior pending fire does not occur and field0 reflects the reset to 0 rather than any partial fire.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+### timer_cancel
+
+Disarms a timer. Returns an error if the timer is not currently armed (e.g., a one-shot that already fired, or one already cancelled). Sets `field0` to `u64::MAX` (the cancellation sentinel), sets `field1.arm = 0`, and wakes futex waiters.
+
+```
+timer_cancel([1] timer) -> void
+  syscall_num = [timer_cancel]
+
+  [1] timer: timer handle
+```
+
+Timer cap required on [1]: `cancel`.
+
+[test] returns E_BADCAP if [1] is not a valid timer handle.
+[test] returns E_PERM if [1] does not have the `cancel` cap.
+[test] returns E_INVAL if [1].field1.arm = 0.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] on success, [1].field0 is set to u64::MAX in every domain-local copy of the handle.
+[test] on success, [1].field1.arm becomes 0.
+[test] on success, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0; subsequent reads observe field0 = u64::MAX.
+[test] on success, no further fires from this timer modify field0 in any holder.
+[test] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+## §[futex] Futex
+
+A futex is a user-side synchronization primitive: a thread atomically checks one or more user memory locations against a comparison and sleeps until the condition is met or another thread wakes it. The kernel keys waits by physical address, so two capability domains sharing a page_frame can synchronize through their respective virtual addresses to the same word.
+
+Two wait primitives with opposite comparison directions:
+- `futex_wait_val` — "I think these addresses currently hold these expected values; wake me when any of them differs."
+- `futex_wait_change` — "I want to be woken when any of these addresses becomes its target value."
+
+Both block until any of the per-pair conditions is met, until any thread calls `futex_wake` on one of the watched addresses, or until the timeout expires. Wake order is priority-ordered (highest first; FIFO within a priority).
+
+### futex_wait_val
+
+Blocks while every `(addr, expected)` pair satisfies `*addr == expected`. Returns when any pair has `*addr != expected` (either at call entry or after a wake), when any watched address is woken via `futex_wake`, or on timeout.
+
+```
+futex_wait_val([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] expected) -> [1] addr
+  syscall_num = [futex_wait_val]
+
+  syscall word bits 12-19: N (1..63)
+
+  [1] timeout_ns: 0 = non-blocking, u64::MAX = indefinite, otherwise nanoseconds
+  [2 + 2i] addr: 8-byte-aligned user address in the caller's domain
+  [2 + 2i + 1] expected: u64 expected value at addr
+
+  for i in 0..N-1.
+```
+
+Self-handle requirement: `fut_wait_max >= 1`. The call's `N` must not exceed `fut_wait_max`.
+
+[test] returns E_PERM if the caller's self-handle has `fut_wait_max = 0`.
+[test] returns E_INVAL if N is 0 or N > 63.
+[test] returns E_INVAL if N exceeds the caller's self-handle `fut_wait_max`.
+[test] returns E_INVAL if any addr is not 8-byte aligned.
+[test] returns E_BADADDR if any addr is not a valid user address in the caller's domain.
+[test] returns E_TIMEOUT if the timeout expires before any pair's `addr != expected` condition is met and before any watched address is woken.
+[test] on entry, when any pair's current `*addr != expected`, returns immediately with `[1]` set to that addr.
+[test] when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
+
+### futex_wait_change
+
+Blocks while every `(addr, target)` pair satisfies `*addr != target`. Returns when any pair has `*addr == target` (at call entry or after a wake), when any watched address is woken via `futex_wake`, or on timeout.
+
+```
+futex_wait_change([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] target) -> [1] addr
+  syscall_num = [futex_wait_change]
+
+  syscall word bits 12-19: N (1..63)
+
+  [1] timeout_ns: 0 = non-blocking, u64::MAX = indefinite, otherwise nanoseconds
+  [2 + 2i] addr: 8-byte-aligned user address in the caller's domain
+  [2 + 2i + 1] target: u64 target value at addr
+
+  for i in 0..N-1.
+```
+
+Self-handle requirement: `fut_wait_max >= 1`. The call's `N` must not exceed `fut_wait_max`.
+
+[test] returns E_PERM if the caller's self-handle has `fut_wait_max = 0`.
+[test] returns E_INVAL if N is 0 or N > 63.
+[test] returns E_INVAL if N exceeds the caller's self-handle `fut_wait_max`.
+[test] returns E_INVAL if any addr is not 8-byte aligned.
+[test] returns E_BADADDR if any addr is not a valid user address in the caller's domain.
+[test] returns E_TIMEOUT if the timeout expires before any pair's `addr == target` condition is met and before any watched address is woken.
+[test] on entry, when any pair's current `*addr == target`, returns immediately with `[1]` set to that addr.
+[test] when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
+
+### futex_wake
+
+Wakes up to `count` ECs blocked in `futex_wait_val` or `futex_wait_change` on the given address. Wake order is priority-ordered.
+
+```
+futex_wake([1] addr, [2] count) -> [1] woken
+  syscall_num = [futex_wake]
+
+  [1] addr: 8-byte-aligned user address in the caller's domain
+  [2] count: maximum number of ECs to wake
+```
+
+Self-handle cap required: `fut_wake`.
+
+[test] returns E_PERM if the caller's self-handle lacks `fut_wake`.
+[test] returns E_INVAL if [1] addr is not 8-byte aligned.
+[test] returns E_BADADDR if [1] addr is not a valid user address in the caller's domain.
+[test] on success, [1] is the number of ECs actually woken (0..count).
 
 ## §[system_services] System Services
 
 ### §[time] Time
 
+#### time_monotonic
+
+Returns nanoseconds since boot.
+
+```
+time_monotonic() -> [1] ns
+  syscall_num = [time_monotonic]
+```
+
+No cap required.
+
+[test] on success, [1] is a u64 nanosecond count strictly greater than the value returned by any prior call to `time_monotonic`.
+
+#### time_getwall
+
+Returns wall-clock time as nanoseconds since the Unix epoch.
+
+```
+time_getwall() -> [1] ns_since_epoch
+  syscall_num = [time_getwall]
+```
+
+No cap required.
+
+[test] on success, [1] is a u64 nanosecond count since the Unix epoch.
+
+#### time_setwall
+
+Sets the wall-clock time to the given nanoseconds-since-epoch.
+
+```
+time_setwall([1] ns_since_epoch) -> void
+  syscall_num = [time_setwall]
+
+  [1] ns_since_epoch: new wall-clock value (nanoseconds since Unix epoch)
+```
+
+Self-handle cap required: `setwall`.
+
+[test] returns E_PERM if the caller's self-handle lacks `setwall`.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] on success, a subsequent `time_getwall` returns a value within a small bounded delta of [1].
+
 ### §[rng] RNG
+
+#### random
+
+Fills the requested number of vregs with cryptographically random qwords.
+
+```
+random() -> [1..count] qwords
+  syscall_num = [random]
+
+  syscall word bits 12-19: count (1..127)
+```
+
+No cap required.
+
+[test] returns E_INVAL if count is 0 or count > 127.
+[test] on success, vregs `[1..count]` contain qwords drawn from the kernel's CSPRNG.
 
 ### §[system_info] System Info
 
+#### info_system
+
+Returns system-wide capacity and capability information.
+
+```
+info_system() -> [1] cores, [2] features, [3] total_phys_pages, [4] page_size_mask
+  syscall_num = [info_system]
+```
+
+No cap required.
+
+Output:
+- `[1]` cores: total online CPU core count
+- `[2]` features: bitmask
+  - bit 0: hardware virtualization (Intel VMX or AMD SVM)
+  - bit 1: IOMMU
+  - bit 2: PMU
+  - bit 3: wide vector ISA (AVX-512 on x86-64, SVE on aarch64)
+  - bits 4-63: _reserved
+- `[3]` total_phys_pages: total physical memory expressed in 4 KiB pages
+- `[4]` page_size_mask: which physical page sizes the kernel can allocate
+  - bit 0: 4 KiB
+  - bit 1: 2 MiB
+  - bit 2: 1 GiB
+  - bits 3-63: _reserved
+
+[test] on success, [1] equals the number of online CPU cores reported by the platform.
+[test] on success, [3] equals the platform's total RAM divided by 4 KiB.
+[test] on success, [4] bit 0 is set on every supported architecture.
+
+#### info_cores
+
+Returns information about a specific core.
+
+```
+info_cores([1] core_id) -> [1] flags, [2] freq_hz, [3] vendor_model
+  syscall_num = [info_cores]
+
+  [1] on input: core id
+```
+
+No cap required.
+
+Output:
+- `[1]` flags: bitmask
+  - bit 0: online
+  - bit 1: idle states supported
+  - bit 2: frequency scaling supported
+  - bits 3-63: _reserved
+- `[2]` freq_hz: current frequency in Hz, 0 if unreadable
+- `[3]` vendor_model: platform-defined packed identifier; layout follows the architecture vendor's encoding (e.g., x86 family/model/stepping, ARM IDR fields)
+
+[test] returns E_INVAL if [1] core_id is greater than or equal to `info_system`'s `cores`.
+[test] returns E_INVAL if any reserved bits are set in [1].
+[test] on success, [1] flag bit 0 reflects whether the queried core is currently online.
+
 ### §[power] Power Management
+
+All `power_*` syscalls require `power` on the caller's self-handle.
+
+#### power_shutdown
+
+Performs an immediate orderly system poweroff. Does not return on success.
+
+```
+power_shutdown() -> void
+  syscall_num = [power_shutdown]
+```
+
+[test] returns E_PERM if the caller's self-handle lacks `power`.
+
+#### power_reboot
+
+Performs a warm system reboot. Does not return on success.
+
+```
+power_reboot() -> void
+  syscall_num = [power_reboot]
+```
+
+[test] returns E_PERM if the caller's self-handle lacks `power`.
+
+#### power_sleep
+
+Enters a system-wide low-power state at the requested depth. Returns when the system wakes.
+
+```
+power_sleep([1] depth) -> void
+  syscall_num = [power_sleep]
+
+  [1] depth: 1 = sleep (S1/S3-equivalent), 3 = deep sleep (S4-equivalent), 4 = hibernate (S5-equivalent)
+```
+
+[test] returns E_PERM if the caller's self-handle lacks `power`.
+[test] returns E_INVAL if [1] is not 1, 3, or 4.
+[test] returns E_NODEV if the platform does not support the requested sleep depth.
+
+#### power_screen_off
+
+Turns the primary display off. Subsequent input wakes it.
+
+```
+power_screen_off() -> void
+  syscall_num = [power_screen_off]
+```
+
+[test] returns E_PERM if the caller's self-handle lacks `power`.
+
+#### power_set_freq
+
+Sets the target frequency for a specific core in Hz.
+
+```
+power_set_freq([1] core_id, [2] hz) -> void
+  syscall_num = [power_set_freq]
+
+  [1] core_id: target core
+  [2] hz: target frequency in Hz; 0 = let the kernel pick
+```
+
+[test] returns E_PERM if the caller's self-handle lacks `power`.
+[test] returns E_INVAL if [1] is greater than or equal to `info_system`'s `cores`.
+[test] returns E_NODEV if the queried core does not support frequency scaling (per `info_cores` flag bit 2).
+[test] returns E_INVAL if [2] is nonzero and outside the platform's supported frequency range.
+[test] on success, a subsequent `info_cores([1])` reports a `freq_hz` consistent with the requested target (within hardware tolerance).
+
+#### power_set_idle
+
+Sets the idle policy for a specific core.
+
+```
+power_set_idle([1] core_id, [2] policy) -> void
+  syscall_num = [power_set_idle]
+
+  [1] core_id: target core
+  [2] policy: 0 = busy-poll (no idle entry), 1 = halt only (shallow), 2 = deepest available c-state
+```
+
+[test] returns E_PERM if the caller's self-handle lacks `power`.
+[test] returns E_INVAL if [1] is greater than or equal to `info_system`'s `cores`.
+[test] returns E_NODEV if the queried core does not support idle states (per `info_cores` flag bit 1).
+[test] returns E_INVAL if [2] is greater than 2.
