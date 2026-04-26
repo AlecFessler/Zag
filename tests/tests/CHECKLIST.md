@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 265.
-**Remaining:** 203.
+**Implemented:** 275.
+**Remaining:** 193.
 
 ## Convention
 
@@ -380,25 +380,25 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **03** — when the device fires an IRQ, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field1 returns from the call with [1] = the corresponding domain-local vaddr of field1.
 - [x] **04** — when the device has no IRQ delivery configured, [1].field1.irq_count remains 0.
 
-## ack — 4/8
+## ack — 8/8
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid device_region handle.
 - [x] **02** — returns E_PERM if [1] does not have the `irq` cap.
 - [x] **03** — returns E_INVAL if the device_region has no IRQ delivery configured.
 - [x] **04** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **05** — on success, the returned `prior_count` equals [1].field1.irq_count immediately before the call.
-- [ ] **06** — on success, the calling domain's copy of [1] has `field1.irq_count = 0` immediately on return; every other domain-local copy returns 0 from a fresh `sync` within a bounded delay.
-- [ ] **07** — on success, after a subsequent IRQ from the device, every domain-local copy's `field1.irq_count` reaches the new value within a bounded delay and an EC blocked in `futex_wait_val` on each copy's `field1` paddr is woken.
-- [ ] **08** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+- [x] **05** — on success, the returned `prior_count` equals [1].field1.irq_count immediately before the call.
+- [x] **06** — on success, the calling domain's copy of [1] has `field1.irq_count = 0` immediately on return; every other domain-local copy returns 0 from a fresh `sync` within a bounded delay.
+- [x] **07** — on success, after a subsequent IRQ from the device, every domain-local copy's `field1.irq_count` reaches the new value within a bounded delay and an EC blocked in `futex_wait_val` on each copy's `field1` paddr is woken.
+- [x] **08** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## create_virtual_machine — 0/9
+## create_virtual_machine — 6/9
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `crvm`.
-- [ ] **02** — returns E_PERM if caps is not a subset of the caller's `vm_ceiling`.
-- [ ] **03** — returns E_NODEV if the platform does not support hardware virtualization.
-- [ ] **04** — returns E_BADCAP if [2] is not a valid page frame handle.
-- [ ] **05** — returns E_INVAL if `policy_page_frame` is smaller than `sizeof(VmPolicy)`.
-- [ ] **06** — returns E_INVAL if `VmPolicy.num_cpuid_responses` exceeds `MAX_CPUID_POLICIES`.
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `crvm`.
+- [x] **02** — returns E_PERM if caps is not a subset of the caller's `vm_ceiling`.
+- [x] **03** — returns E_NODEV if the platform does not support hardware virtualization.
+- [x] **04** — returns E_BADCAP if [2] is not a valid page frame handle.
+- [x] **05** — returns E_INVAL if `policy_page_frame` is smaller than `sizeof(VmPolicy)`.
+- [x] **06** — returns E_INVAL if `VmPolicy.num_cpuid_responses` exceeds `MAX_CPUID_POLICIES`.
 - [ ] **07** — returns E_INVAL if `VmPolicy.num_cr_policies` exceeds `MAX_CR_POLICIES`.
 - [ ] **08** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **09** — on success, the caller receives a VM handle with caps = `[1].caps`.
