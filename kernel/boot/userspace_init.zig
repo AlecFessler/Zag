@@ -69,6 +69,23 @@ pub fn init(root_service_elf: []const u8) !void {
     const root_ec = try resolveOrSpawnRootEc(root_cd, parsed.entry);
 
     grantDevices(root_cd);
+
+    // Re-mirror kernel-half PML4 entries from the kernel root into the
+    // new domain's PML4. Fresh L3/L2/L1 paging structures created
+    // between allocCapabilityDomain (which copies entries 256..511 once
+    // up front) and now — most notably the EC's kernel stack PTEs
+    // installed in allocExecutionContext — only landed in the kernel
+    // address space root. Without this re-copy, swapAddrSpace into the
+    // new domain leaves the kernel-stack VAs unmapped and the iret
+    // epilogue's stack pop / writethrough faults.
+    //
+    // This is a v0 expedient until per-domain PML4s share their kernel
+    // L3 pointers from boot; longer term, memory.init eagerly
+    // pre-allocates the L3 layer so copyKernelMappings hands out the
+    // same physical L3 to every domain.
+    const root_virt = VAddr.fromPAddr(root_cd.addr_space_root, null);
+    zag.arch.x64.paging.copyKernelMappings(root_virt);
+
     sched.enqueueOnCore(@intCast(arch.smp.coreID()), root_ec);
 }
 

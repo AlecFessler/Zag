@@ -860,6 +860,27 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     unreachable;
 }
 
+/// Build a first-dispatch iret frame at the top of `kstack_top` so that
+/// `interrupts.switchTo`'s jmp interruptStubEpilogue → iretq lands at
+/// `entry` in user mode (or kernel mode when `ustack_top` is null).
+/// Spec §[execution_context] first-dispatch.
+pub fn prepareEcContext(
+    kstack_top: VAddr,
+    ustack_top: ?VAddr,
+    entry: VAddr,
+    arg: u64,
+) *interrupts.ArchCpuContext {
+    @setRuntimeSafety(false);
+    const aligned = alignStack(kstack_top);
+    const entry_fn: *const fn () void = @ptrFromInt(entry.addr);
+    return interrupts.prepareThreadContext(
+        aligned,
+        ustack_top,
+        entry_fn,
+        arg,
+    );
+}
+
 /// Write IA32_FS_BASE (MSR C000_0100h). Spec §[execution_context].
 pub fn writeFsBase(value: u64) void {
     _ = value;

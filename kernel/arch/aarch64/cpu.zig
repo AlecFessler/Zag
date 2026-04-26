@@ -420,6 +420,21 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     @panic("not implemented");
 }
 
+/// Build a first-dispatch ERET frame. aarch64 EC bringup is not in the
+/// spec-v3 critical path right now (test runner is x86-only).
+pub fn prepareEcContext(
+    kstack_top: zag.memory.address.VAddr,
+    ustack_top: ?zag.memory.address.VAddr,
+    entry: zag.memory.address.VAddr,
+    arg: u64,
+) *zag.arch.aarch64.interrupts.ArchCpuContext {
+    _ = kstack_top;
+    _ = ustack_top;
+    _ = entry;
+    _ = arg;
+    @panic("aarch64 prepareEcContext not implemented");
+}
+
 /// Write TPIDR_EL0 (the ARMv8 user-mode TLS base). Spec §[execution_context].
 pub fn writeTpidrEl0(value: u64) void {
     _ = value;
