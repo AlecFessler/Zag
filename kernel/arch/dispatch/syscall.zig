@@ -42,6 +42,27 @@ pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
+/// Write event-state vreg 2 — the per-event-type sub-code (Spec
+/// §[event_state]). x86-64: rbx; aarch64: x1.
+pub fn setEventSubcode(ctx: *ArchCpuContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.setEventSubcode(ctx, value),
+        .aarch64 => aarch64.interrupts.setEventSubcode(ctx, value),
+        else => unreachable,
+    }
+}
+
+/// Write event-state vreg 3 — the event-type-specific u64 payload
+/// value (faulting address for memory_fault, etc.; Spec §[event_state]).
+/// x86-64: rdx; aarch64: x2.
+pub fn setEventAddr(ctx: *ArchCpuContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.setEventAddr(ctx, value),
+        .aarch64 => aarch64.interrupts.setEventAddr(ctx, value),
+        else => unreachable,
+    }
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.interrupts.getIpcHandle(ctx),

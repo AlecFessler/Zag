@@ -202,7 +202,11 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
     const p = port_ref.lock(@src()) catch return errors.E_BADCAP;
     defer port_ref.unlock();
 
-    return execution_context.suspendOnPort(target_ec, p, .suspension, 0, 0);
+    // Snapshot the originating EC handle's `write` cap so reply-time
+    // can decide whether receiver mutations apply (Spec §[reply] tests
+    // 05/06). The caps were captured into `ec_caps` above under the
+    // domain lock.
+    return execution_context.suspendOnPort(target_ec, p, .suspension, 0, 0, ec_caps.write);
 }
 
 /// `recv` syscall handler. Spec §[port].recv.
@@ -325,11 +329,13 @@ pub fn installEventRoute(ec: *ExecutionContext, port: *Port, slot_idx: u8) i64 {
     if (ec.event_routes[slot_idx]) |prior_ref| {
         // Caller already holds `port._gen_lock` and `ec._gen_lock`. The
         // prior port is a different slab slot; reach in to dec its route
-        // count without re-acquiring `port`'s lock.
+        // count without re-acquiring `port`'s lock. If the dec drove the
+        // prior port to teardown, `destroyLocked` already released its
+        // lock — skip the SlabRef-side unlock.
         const prior = prior_ref.lock(@src()) catch null;
         if (prior) |pr| {
-            decEventRouteCount(pr);
-            prior_ref.unlock();
+            const destroyed = decEventRouteCount(pr);
+            if (!destroyed) prior_ref.unlock();
         }
     }
     incEventRouteCount(port);
@@ -348,8 +354,8 @@ pub fn removeEventRoute(ec: *ExecutionContext, slot_idx: u8) i64 {
         ec.event_routes[slot_idx] = null;
         return 0;
     };
-    decEventRouteCount(prior);
-    prior_ref.unlock();
+    const destroyed = decEventRouteCount(prior);
+    if (!destroyed) prior_ref.unlock();
     ec.event_routes[slot_idx] = null;
     return 0;
 }
@@ -375,7 +381,13 @@ fn fireRouted(
     // Receivers are still allowed to dequeue from such a port, so honor
     // the route here — the EC will sit suspended until either a recv
     // arrives or the route itself is cleared.
-    _ = execution_context.suspendOnPort(ec, port_ptr, event, subcode, addr);
+    // The originating EC handle here is the one that called
+    // `bind_event_route` (Spec §[reply] originating-handle table). Its
+    // write-cap snapshot is not yet plumbed through to this path; until
+    // event_route bookkeeping records that snapshot at bind time the
+    // safe default is to discard receiver mutations on reply (§[reply]
+    // test 06's no-write-cap branch).
+    _ = execution_context.suspendOnPort(ec, port_ptr, event, subcode, addr, false);
     return true;
 }
 
@@ -433,7 +445,13 @@ pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
     const exit_port_ref = ec.exit_port orelse return;
     const port_ptr = exit_port_ref.lock(@src()) catch return;
     defer exit_port_ref.unlock();
-    _ = execution_context.suspendOnPort(ec, port_ptr, .vm_exit, subcode, payload[0]);
+    // The originating EC handle for vm_exit is the vCPU EC handle held
+    // by the VMM. Its write-cap snapshot drives whether reply applies
+    // receiver mutations. The lookup that captures that bit per-vCPU
+    // is part of the VMM-owned exit pipeline; until it lands, default
+    // to allowing applies (the common case for VMM resume) so the
+    // exit→reply→resume cycle remains observable end-to-end.
+    _ = execution_context.suspendOnPort(ec, port_ptr, .vm_exit, subcode, payload[0], true);
 }
 
 // ── Internal API ─────────────────────────────────────────────────────
@@ -465,37 +483,52 @@ fn shouldDestroy(p: *const Port) bool {
 }
 
 /// Refcount adjusters — each `dec*` checks for teardown / E_CLOSED
-/// propagation on transition to 0. All under `_gen_lock`.
+/// propagation on transition to 0. All under `_gen_lock`. Each `dec*`
+/// returns true iff it drove the port to teardown — the caller uses the
+/// flag to skip a redundant unlock (`destroyPort` releases the lock as
+/// part of the gen bump in `destroyLocked`).
 fn incSendRefcount(p: *Port) void {
     p.send_refcount += 1;
 }
-fn decSendRefcount(p: *Port) void {
+fn decSendRefcount(p: *Port) bool {
     std.debug.assert(p.send_refcount > 0);
     p.send_refcount -= 1;
     if (p.send_refcount == 0 and p.event_route_count == 0) {
         propagateClosedToReceivers(p);
     }
-    if (shouldDestroy(p)) destroyPort(p);
+    if (shouldDestroy(p)) {
+        destroyPort(p);
+        return true;
+    }
+    return false;
 }
 fn incRecvRefcount(p: *Port) void {
     p.recv_refcount += 1;
 }
-fn decRecvRefcount(p: *Port) void {
+fn decRecvRefcount(p: *Port) bool {
     std.debug.assert(p.recv_refcount > 0);
     p.recv_refcount -= 1;
     if (p.recv_refcount == 0) propagateClosedToSenders(p);
-    if (shouldDestroy(p)) destroyPort(p);
+    if (shouldDestroy(p)) {
+        destroyPort(p);
+        return true;
+    }
+    return false;
 }
 fn incEventRouteCount(p: *Port) void {
     p.event_route_count += 1;
 }
-fn decEventRouteCount(p: *Port) void {
+fn decEventRouteCount(p: *Port) bool {
     std.debug.assert(p.event_route_count > 0);
     p.event_route_count -= 1;
     if (p.send_refcount == 0 and p.event_route_count == 0) {
         propagateClosedToReceivers(p);
     }
-    if (shouldDestroy(p)) destroyPort(p);
+    if (shouldDestroy(p)) {
+        destroyPort(p);
+        return true;
+    }
+    return false;
 }
 
 /// Aggregate handle-cap bookkeeping. Called from caps copy/delete/
@@ -505,29 +538,38 @@ fn onHandleAcquire(p: *Port, caps: u16) void {
     if (c.bind or c.xfer) incSendRefcount(p);
     if (c.recv) incRecvRefcount(p);
 }
-fn onHandleRelease(p: *Port, caps: u16) void {
+
+/// Returns true iff the release drove the port to teardown — caller
+/// must skip the standard unlock since `destroyPort` released the lock
+/// via `destroyLocked`.
+fn onHandleRelease(p: *Port, caps: u16) bool {
     const c: PortCaps = @bitCast(caps);
-    if (c.bind or c.xfer) decSendRefcount(p);
-    if (c.recv) decRecvRefcount(p);
+    var destroyed = false;
+    if (c.bind or c.xfer) destroyed = decSendRefcount(p) or destroyed;
+    if (c.recv) destroyed = decRecvRefcount(p) or destroyed;
+    return destroyed;
 }
 
 /// Public release-handle entry point invoked from the cross-cutting
 /// `caps.capability.delete` path. Wraps `onHandleRelease`.
 pub fn releaseHandle(p: *Port, caps: u16) void {
     p._gen_lock.lock(@src());
-    onHandleRelease(p, caps);
-    // `onHandleRelease` may have driven the port to teardown, in which
-    // case `destroyPort` already released the lock via `destroyLocked`.
-    if (p._gen_lock.currentGen() % 2 == 1) p._gen_lock.unlock();
+    const destroyed = onHandleRelease(p, caps);
+    // `decSendRefcount`/`decRecvRefcount` already released the lock via
+    // `destroyLocked` on the teardown transition; only unlock when no
+    // decrement drove the port through teardown.
+    if (!destroyed) p._gen_lock.unlock();
 }
 
-fn onHandleRestrict(p: *Port, old_caps: u16, new_caps: u16) void {
+fn onHandleRestrict(p: *Port, old_caps: u16, new_caps: u16) bool {
     const old_c: PortCaps = @bitCast(old_caps);
     const new_c: PortCaps = @bitCast(new_caps);
     const old_send = old_c.bind or old_c.xfer;
     const new_send = new_c.bind or new_c.xfer;
-    if (old_send and !new_send) decSendRefcount(p);
-    if (old_c.recv and !new_c.recv) decRecvRefcount(p);
+    var destroyed = false;
+    if (old_send and !new_send) destroyed = decSendRefcount(p) or destroyed;
+    if (old_c.recv and !new_c.recv) destroyed = decRecvRefcount(p) or destroyed;
+    return destroyed;
 }
 
 /// Wait queue ops — assert empty or matching kind, transition kind
@@ -571,9 +613,6 @@ fn deliverEvent(
     event_addr: u64,
     pair_count: u8,
 ) i64 {
-    _ = subcode;
-    _ = event_addr;
-
     const dom_ref = receiver.domain;
     const dom = dom_ref.lock(@src()) catch return errors.E_BADCAP;
     defer dom_ref.unlock();
@@ -590,11 +629,13 @@ fn deliverEvent(
         (@as(u64, reply_slot) << REPLY_HANDLE_SHIFT) |
         (@as(u64, @intFromEnum(event_type)) << EVENT_TYPE_SHIFT);
 
-    if (receiver.iret_frame) |frame| {
-        arch.syscall.setSyscallReturn(frame, ret_word);
-    } else {
-        arch.syscall.setSyscallReturn(receiver.ctx, ret_word);
-    }
+    // §[event_state] vreg 2 = sub-code, vreg 3 = event-type-specific
+    // u64 payload (faulting address for memory_fault, etc.). Both ride
+    // alongside the syscall-word return.
+    const target_ctx = receiver.iret_frame orelse receiver.ctx;
+    arch.syscall.setSyscallReturn(target_ctx, ret_word);
+    arch.syscall.setEventSubcode(target_ctx, subcode);
+    arch.syscall.setEventAddr(target_ctx, event_addr);
 
     _ = p;
     return 0;
@@ -628,15 +669,14 @@ fn mintReply(receiver_domain: *CapabilityDomain, sender: *ExecutionContext, xfer
 
 /// Resume the sender via the reply path, applying receiver's GPR
 /// modifications (gated by originating EC handle's `write` cap).
+/// Spec §[reply] tests 05/06.
 fn consumeReply(holder: *KernelHandle, sender: *ExecutionContext) void {
     _ = holder;
-    // Slow-path mirror of arch/x64/interrupts.zig fast reply: receiver's
-    // mutations to event-state vregs (already in receiver's CPU regs by
-    // the time the syscall traps in) get applied to the sender's saved
-    // iret frame iff the originating EC handle had `write` cap. Until
-    // the per-handle write-cap snapshot is plumbed end-to-end, default
-    // to the apply-writes path; the resume path is otherwise identical.
-    execution_context.resumeFromReply(sender, true);
+    // The write-cap snapshot was stamped onto `sender` at suspend time
+    // (see `suspendOnPort`); any receiver-side modifications to the
+    // event-state vregs commit to the sender's saved iret frame iff
+    // that bit was set.
+    execution_context.resumeFromReply(sender, sender.originating_write_cap);
 }
 
 /// Resume the suspended sender with `E_ABANDONED` — the path invoked
@@ -681,6 +721,7 @@ fn propagateClosedToSenders(p: *Port) void {
         sender.event_type = .none;
         sender.event_subcode = 0;
         sender.event_addr = 0;
+        sender.originating_write_cap = false;
         sender.state = .ready;
         scheduler.markReady(sender);
     }

@@ -1145,6 +1145,16 @@ pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rax = value;
 }
 
+/// Spec §[event_state] vreg 2 — rbx on x86-64.
+pub fn setEventSubcode(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.rbx = value;
+}
+
+/// Spec §[event_state] vreg 3 — rdx on x86-64.
+pub fn setEventAddr(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.rdx = value;
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.r13;
 }

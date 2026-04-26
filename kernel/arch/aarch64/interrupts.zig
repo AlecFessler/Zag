@@ -398,6 +398,16 @@ pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x0 = value;
 }
 
+/// Spec §[event_state] vreg 2 — x1 on aarch64.
+pub fn setEventSubcode(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.x1 = value;
+}
+
+/// Spec §[event_state] vreg 3 — x2 on aarch64.
+pub fn setEventAddr(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.x2 = value;
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.x5;
 }

@@ -279,6 +279,30 @@ pub fn unmapGuest(caller: *ExecutionContext, vm_handle: u64, page_frames: []cons
     return 0;
 }
 
+/// `vm_inject_irq` syscall handler. Spec §[virtual_machine].vm_inject_irq.
+/// Thin wrapper around `dispatch.vm.vmInjectIrq` — the syscall trampoline
+/// has already validated the VM handle and stripped the `assert` flag's
+/// reserved bits.
+pub fn vmInjectIrq(
+    caller: *ExecutionContext,
+    vm_handle: u64,
+    irq_num: u64,
+    assert: u64,
+) i64 {
+    if (vm_handle >> 12 != 0) return errors.E_INVAL;
+
+    const domain = caller.domain.lock(@src()) catch return errors.E_BADCAP;
+    defer caller.domain.unlock();
+
+    const slot: u12 = @truncate(vm_handle);
+    const vm = lookupVirtualMachine(domain, slot) orelse return errors.E_BADCAP;
+
+    const irq32: u32 = @truncate(irq_num);
+    const assert_bit: bool = (assert & 0x1) != 0;
+    vm_dispatch.vmInjectIrq(vm, irq32, assert_bit);
+    return 0;
+}
+
 /// `vm_set_policy` syscall handler. Spec §[virtual_machine].vm_set_policy.
 /// Proxies to `dispatch.vm.applyVmPolicyTable` for the per-arch encoding.
 pub fn applyVmPolicyTable(
@@ -514,7 +538,11 @@ fn pageFramePerms(caps_bits: PageFrameCaps) MemoryPerms {
 /// Holder-side refcount + mapcnt accessors. The PageFrame module's
 /// own equivalents are file-private; the `_gen_lock` guard semantics
 /// are mirrored here so cross-object install paths cannot race a
-/// concurrent PageFrame teardown.
+/// concurrent PageFrame teardown. Mirrors the canonical pattern in
+/// `memory/page_frame.zig`: when both counters reach 0 the decrementer
+/// owns teardown and `destroyPageFrame` is invoked while still holding
+/// the lock so the gen-bump on slot release cannot race with a
+/// concurrent acquire.
 fn incPageFrameRef(pf: *PageFrame) void {
     pf._gen_lock.lock(@src());
     defer pf._gen_lock.unlock();
@@ -523,8 +551,12 @@ fn incPageFrameRef(pf: *PageFrame) void {
 
 fn decPageFrameRef(pf: *PageFrame) void {
     pf._gen_lock.lock(@src());
-    defer pf._gen_lock.unlock();
     if (pf.refcount > 0) pf.refcount -= 1;
+    if (pf.refcount == 0 and pf.mapcnt == 0) {
+        destroyPageFrame(pf);
+        return;
+    }
+    pf._gen_lock.unlock();
 }
 
 fn incPageFrameMap(pf: *PageFrame) void {
@@ -535,6 +567,18 @@ fn incPageFrameMap(pf: *PageFrame) void {
 
 fn decPageFrameMap(pf: *PageFrame) void {
     pf._gen_lock.lock(@src());
-    defer pf._gen_lock.unlock();
     if (pf.mapcnt > 0) pf.mapcnt -= 1;
+    if (pf.refcount == 0 and pf.mapcnt == 0) {
+        destroyPageFrame(pf);
+        return;
+    }
+    pf._gen_lock.unlock();
+}
+
+/// Final teardown — caller has observed both `refcount` and `mapcnt`
+/// at zero under `_gen_lock`. Returns the slab slot via `destroyLocked`
+/// which performs the gen bump as part of releasing the lock.
+fn destroyPageFrame(pf: *PageFrame) void {
+    const expected_gen: u63 = @intCast(pf._gen_lock.currentGen());
+    zag.memory.page_frame.slab_instance.destroyLocked(pf, expected_gen);
 }
