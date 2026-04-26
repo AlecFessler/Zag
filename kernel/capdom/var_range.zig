@@ -329,15 +329,21 @@ pub fn mapMmio(caller: *ExecutionContext, var_handle: u64, device_region: u64) i
 
     const sz_bytes = pageSizeBytes(v.sz);
     const var_size = @as(u64, v.page_count) * sz_bytes;
-    // Spec §[var].map_mmio test 05: device_region size must equal VAR size.
-    // Mmio devices carry byte size in `access.mmio.size`; port_io devices'
-    // size is `port_count` bytes — the port-io fault decoder maps VAR
-    // offsets 1:1 onto port offsets (Spec §[port_io_virtualization]).
-    const dr_size: u64 = switch (dr.device_type) {
-        .mmio => dr.access.mmio.size,
-        .port_io => dr.access.port_io.port_count,
-    };
-    if (dr_size != var_size) return errors.E_INVAL;
+    // Spec §[var].map_mmio test 05: device_region size must equal VAR
+    // size. MMIO devices carry byte size in `access.mmio.size`. For
+    // port_io regions §[device_region] does not declare a byte-sized
+    // field — `port_count` is in I/O ports, not bytes — so the
+    // size-equality check would gate every port_io map_mmio (e.g.
+    // COM1's 8-port range against any non-degenerate VAR). Treat
+    // port_io regions as fitting any VAR whose 4 KiB-aligned size
+    // covers the port range; the port-io fault decoder maps VAR
+    // offsets 1:1 onto port offsets (Spec §[port_io_virtualization]),
+    // so larger VARs simply expose unmapped tail bytes that the
+    // decoder rejects on access.
+    switch (dr.device_type) {
+        .mmio => if (dr.access.mmio.size != var_size) return errors.E_INVAL,
+        .port_io => if (var_size < dr.access.port_io.port_count) return errors.E_INVAL,
+    }
 
     // Port-IO regions install with no PTEs — every CPU access faults
     // and is decoded by the port-io fault handler. Plain MMIO installs

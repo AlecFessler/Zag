@@ -470,9 +470,30 @@ pub fn suspendOnPort(
     ec.originating_write_cap = originating_write_cap;
     ec.on_cpu.store(false, .release);
 
-    // Enqueue into the port's sender wait queue. WaiterKind tracks
-    // which side owns the queue; transition .none → .senders here so
-    // a recv() observing waiters knows what to dequeue.
+    // Rendezvous with a waiting receiver if one is parked. Spec
+    // §[recv]/§[suspend]: a send-side rendezvous must wake the
+    // highest-priority receiver immediately rather than parking the
+    // sender — otherwise a recv() that arrived first sleeps forever
+    // because the matching suspend() only enqueues into the wait
+    // queue without consulting `waiter_kind == .receivers`.
+    //
+    // We delegate the dequeue + delivery to `port.rendezvousWithReceiver`
+    // (defined alongside its mirror `port.recv`) so both sides share
+    // identical event-state framing (reply mint, vreg layout, state
+    // transitions).
+    if (port.waiter_kind == .receivers) {
+        if (zag.sched.port.rendezvousWithReceiver(ec, port, event, subcode, addr)) {
+            const core_id = arch.smp.coreID();
+            if (scheduler.core_states[core_id].current_ec == ec) {
+                scheduler.core_states[core_id].current_ec = null;
+            }
+            return 0;
+        }
+    }
+
+    // No waiting receiver — park as a sender. WaiterKind tracks which
+    // side owns the queue; transition .none → .senders here so a
+    // subsequent recv() observing waiters knows what to dequeue.
     port.waiters.enqueue(ec);
     if (port.waiter_kind == .none) port.waiter_kind = .senders;
 

@@ -667,7 +667,14 @@ pub fn restartDomain(cd: *CapabilityDomain) i64 {
 
 /// Public release-handle entry point invoked when `delete` is called
 /// on the domain's self-handle. Wraps `destroyCapabilityDomain`.
+///
+/// STUB step 7h: full domain teardown (handle-table walk, kernel-thread
+/// kill, PMM frees) is not wired yet. Children leak after they call
+/// `delete(SLOT_SELF)`, but the kernel does not panic — the suspended
+/// initial EC is still suspended on the parent's port and gets recv'd
+/// + reply'd; control returns to the test, which falls through to this
+/// path. Without this, the very first child to complete kills the
+/// kernel and the runner produces zero `[runner] result` lines.
 pub fn releaseSelf(cd: *CapabilityDomain) void {
     _ = cd;
-    @panic("not implemented");
 }

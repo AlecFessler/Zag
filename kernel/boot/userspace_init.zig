@@ -156,11 +156,6 @@ pub fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed
         if (phdr.p_type != std.elf.PT_LOAD) continue;
         const writable = (phdr.p_flags & std.elf.PF_W) != 0;
         const executable = (phdr.p_flags & std.elf.PF_X) != 0;
-        const perms = zag.memory.address.MemoryPerms{
-            .read = true,
-            .write = writable,
-            .exec = executable,
-        };
 
         const seg_start = std.mem.alignBackward(u64, phdr.p_vaddr, paging_consts.PAGE4K);
         const seg_end = std.mem.alignForward(u64, phdr.p_vaddr + phdr.p_memsz, paging_consts.PAGE4K);
@@ -171,6 +166,21 @@ pub fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed
         while (seg_start + off < seg_end) {
             const target_vaddr = VAddr.fromInt(seg_start + off);
             const existing_phys = arch_paging.resolveVaddr(root_cd.addr_space_root, target_vaddr);
+
+            // Compute the union of perms across every PT_LOAD that
+            // touches this 4 KiB page. Test ELFs commonly split a
+            // single page into a R-only header PT_LOAD (bytes 0..0x10)
+            // followed by a R+E PT_LOAD (entry at 0x10); if the first
+            // segment maps the page R-only and the second skips the
+            // remap on `existing_phys`, instruction fetch at the
+            // entry point faults. Walk every segment's per-page span
+            // and OR the perms here so the eventual mapPage call
+            // installs the merged perms.
+            const page_perms = unionPagePerms(elf_bytes, target_vaddr.addr) catch zag.memory.address.MemoryPerms{
+                .read = true,
+                .write = writable,
+                .exec = executable,
+            };
 
             const page_phys: PAddr = if (existing_phys) |p| p else blk: {
                 const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
@@ -184,7 +194,7 @@ pub fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed
                     root_cd.addr_space_root,
                     phys,
                     target_vaddr,
-                    perms,
+                    page_perms,
                     .user_data,
                 );
                 break :blk phys;
@@ -207,6 +217,104 @@ pub fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed
             }
 
             off += paging_consts.PAGE4K;
+        }
+    }
+
+    // Apply R_X86_64_RELATIVE dynamic relocations. The runner is built
+    // PIE; any pointer in initialized .data (notably the embedded test
+    // ELF manifest's `bytes.ptr` slots) is encoded as a RELATIVE
+    // relocation in `.rela.dyn` whose addend is the unslided VA. The
+    // bootloader's KASLR pass only relocates the kernel ELF and skips
+    // when slide==0; the userspace ELF (loaded at p_vaddr without
+    // slide) is loaded verbatim with the relocation slots holding
+    // file-time zeros. Without applying these, the runner reads
+    // `bytes.ptr == 0` and dereferences user-VA 0, which maps to the
+    // .text page — the kernel-side reads of pf.phys_base then see the
+    // runner's `_start` prologue (`48 83 ec 68 ...`) instead of the
+    // staged test ELF's magic (`7f 45 4c 46 ...`), and parseElf bails
+    // E_INVAL on every spawn.
+    try applyRelativeRelocations(root_cd, elf_bytes);
+}
+
+/// Walk PT_LOADs and return the union of perms across every segment
+/// that overlaps the given page-aligned VA. Page-granularity perms
+/// must be OR'd because two PT_LOADs can share a 4 KiB page (e.g. a
+/// 16-byte R-only header followed by a R+E entry segment) and the
+/// stricter perms would otherwise win and break instruction fetch.
+fn unionPagePerms(
+    elf_bytes: []const u8,
+    page_va: u64,
+) !zag.memory.address.MemoryPerms {
+    const hdr_sz = @sizeOf(std.elf.Elf64_Ehdr);
+    var rd = std.Io.Reader.fixed(elf_bytes[0..hdr_sz]);
+    const hdr = try std.elf.Header.read(&rd);
+
+    var perms = zag.memory.address.MemoryPerms{ .read = true };
+    var phdr_itr = hdr.iterateProgramHeadersBuffer(@constCast(elf_bytes));
+    while (try phdr_itr.next()) |phdr| {
+        if (phdr.p_type != std.elf.PT_LOAD) continue;
+        const seg_start = std.mem.alignBackward(u64, phdr.p_vaddr, paging_consts.PAGE4K);
+        const seg_end = std.mem.alignForward(u64, phdr.p_vaddr + phdr.p_memsz, paging_consts.PAGE4K);
+        if (page_va < seg_start or page_va >= seg_end) continue;
+        if ((phdr.p_flags & std.elf.PF_W) != 0) perms.write = true;
+        if ((phdr.p_flags & std.elf.PF_X) != 0) perms.exec = true;
+    }
+    return perms;
+}
+
+/// Walk SHT_RELA sections and apply R_X86_64_RELATIVE entries against
+/// the user address space. Slide is 0 (segments loaded at p_vaddr), so
+/// the patched value is just the addend. We translate the relocation's
+/// runtime VA (`r_offset`) to a PA via `resolveVaddr` and write through
+/// the kernel physmap rather than touching the file bytes — the file
+/// bytes live in either the bootloader's `loader_data` blob (root
+/// service path) or a page frame's physmap (createCapabilityDomain
+/// path), and patching them in place would corrupt the original ELF
+/// the caller still holds a reference to.
+fn applyRelativeRelocations(
+    root_cd: *CapabilityDomain,
+    elf_bytes: []const u8,
+) !void {
+    const hdr_sz = @sizeOf(std.elf.Elf64_Ehdr);
+    if (elf_bytes.len < hdr_sz) return;
+    const ehdr: *const std.elf.Elf64_Ehdr = @ptrCast(@alignCast(elf_bytes.ptr));
+    if (ehdr.e_shoff == 0 or ehdr.e_shnum == 0) return;
+
+    const shdrs = std.mem.bytesAsSlice(
+        std.elf.Elf64_Shdr,
+        elf_bytes[ehdr.e_shoff .. ehdr.e_shoff + ehdr.e_shnum * ehdr.e_shentsize],
+    );
+
+    for (shdrs) |shdr| {
+        if (shdr.sh_type != std.elf.SHT_RELA) continue;
+
+        const entry_size: u64 = @sizeOf(std.elf.Elf64_Rela);
+        const num_entries = shdr.sh_size / entry_size;
+        const relas = std.mem.bytesAsSlice(
+            std.elf.Elf64_Rela,
+            elf_bytes[shdr.sh_offset .. shdr.sh_offset + num_entries * entry_size],
+        );
+
+        for (relas) |rela| {
+            const rtype: u32 = @truncate(rela.r_info);
+            // R_X86_64.RELATIVE (= 8) only. Other types (e.g. ABS64)
+            // require a symbol table walk, which the runner does not
+            // emit — its dynamic linker is the kernel and the runner
+            // is statically linked, so all live relocations are RELATIVE.
+            if (rtype != @intFromEnum(std.elf.R_X86_64.RELATIVE)) continue;
+
+            const target_va = VAddr.fromInt(rela.r_offset);
+            const target_pa = arch_paging.resolveVaddr(
+                root_cd.addr_space_root,
+                target_va,
+            ) orelse return error.RelocationTargetUnmapped;
+
+            const page_off: u64 = rela.r_offset & (paging_consts.PAGE4K - 1);
+            const km_va = VAddr.fromPAddr(target_pa, null).addr + page_off;
+
+            const new_val: u64 = @as(u64, @bitCast(rela.r_addend));
+            const slot: *align(1) u64 = @ptrFromInt(km_va);
+            slot.* = new_val;
         }
     }
 }
@@ -299,9 +407,45 @@ fn resolveOrSpawnRootEc(root_cd: *CapabilityDomain, entry: VAddr) !*ExecutionCon
 }
 
 fn grantDevices(root_cd: *CapabilityDomain) void {
-    _ = root_cd;
-    // TODO(spec-v3): zag.devices.registry was removed; the discovery →
-    // root-handout pipeline now needs to either (a) iterate over
-    // device_region's owning store directly, or (b) be relocated into a
-    // post-ACPI hook that mints handles inline. Pending spec decision.
+    // Surface a port_io device_region for COM1 (0x3F8/8) so the runner's
+    // serial sink can find it via slot scan + `caps.deviceRegionFields`.
+    // Without this the runner's `[runner] *` print stream is silent —
+    // `findCom1` returns null, the `Serial` defaults to `DISABLED`, and
+    // every subsequent `[runner] result: code=X aid=Y` line that the
+    // primary tries to emit is dropped on the floor. Spec §[device_region]
+    // does not pin where boot mints the early platform device handles;
+    // we put COM1 here so it's available before sched.run() picks up
+    // the root EC.
+    //
+    // Spec §[device_region] field0 layout (port_io):
+    //   bits  0-3  dev_type (1 = port_io)
+    //   bits  4-19 base_port (16-bit)
+    //   bits 20-35 port_count (16-bit)
+    const COM1_BASE: u16 = 0x3F8;
+    const COM1_COUNT: u16 = 8;
+    const dr = zag.devices.device_region.registerPortIo(COM1_BASE, COM1_COUNT) catch {
+        arch.boot.print("[boot] WARNING: COM1 registerPortIo failed; serial disabled\n", .{});
+        return;
+    };
+
+    const field0: u64 = 1 |
+        (@as(u64, COM1_BASE) << 4) |
+        (@as(u64, COM1_COUNT) << 20);
+    const dr_caps: u16 = 0; // No move/copy/dma/irq required; runner only
+                             //   needs the slot to exist for map_mmio.
+
+    const erased: zag.caps.capability.ErasedSlabRef = .{
+        .ptr = @ptrCast(dr),
+        .gen = @intCast(dr._gen_lock.currentGen()),
+    };
+    _ = capdom.mintHandle(
+        root_cd,
+        erased,
+        zag.caps.capability.CapabilityType.device_region,
+        dr_caps,
+        field0,
+        0,
+    ) catch {
+        arch.boot.print("[boot] WARNING: COM1 device_region handle mint failed\n", .{});
+    };
 }
