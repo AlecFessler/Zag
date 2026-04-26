@@ -3,6 +3,7 @@ pub const allocators = @import("allocators/allocators.zig");
 pub const device_region = @import("device_region.zig");
 pub const fault = @import("fault.zig");
 pub const init = @import("init.zig");
+pub const page_frame = @import("page_frame.zig");
 pub const paging = @import("paging.zig");
 pub const pmm = @import("pmm.zig");
 pub const shared = @import("shared.zig");

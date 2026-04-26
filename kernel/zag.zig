@@ -1,12 +1,12 @@
 pub const arch = @import("arch/arch.zig");
 pub const boot = @import("boot/boot.zig");
 pub const build_options = @import("build_options");
+pub const capdom = @import("capdom/capdom.zig");
+pub const caps = @import("caps/caps.zig");
 pub const devices = @import("devices/devices.zig");
 pub const kprof = @import("kprof");
 pub const memory = @import("memory/memory.zig");
 pub const panic = @import("panic.zig");
-pub const perms = @import("perms/perms.zig");
-pub const proc = @import("proc/proc.zig");
 pub const sched = @import("sched/sched.zig");
 pub const syscall = @import("syscall/syscall.zig");
 pub const utils = @import("utils/utils.zig");

@@ -19,19 +19,18 @@ const errors = zag.syscall.errors;
 const port_mod = zag.sched.port;
 const vm_dispatch = zag.arch.dispatch.vm;
 
-const Capability = zag.caps.capability.Capability;
 const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
 const CapabilityType = zag.caps.capability.CapabilityType;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const KernelHandle = zag.caps.capability.KernelHandle;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
+const PageFrameCaps = zag.memory.page_frame.PageFrameCaps;
 const Port = zag.sched.port.Port;
 const Priority = zag.sched.execution_context.Priority;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
 const VarPageSize = zag.capdom.var_range.PageSize;
 const Word0 = zag.caps.capability.Word0;
@@ -247,9 +246,10 @@ pub fn mapGuest(caller: *ExecutionContext, vm_handle: u64, pairs: []const u64) i
 
     i = 0;
     while (i < pair_count) {
-        const pf = lookupPageFrame(domain, @truncate(pairs[2 * i + 1])) orelse
-            return errors.E_BADCAP;
-        const rc = installPageFrame(vm, pairs[2 * i], pf);
+        const pf_slot: u12 = @truncate(pairs[2 * i + 1]);
+        const pf = lookupPageFrame(domain, pf_slot) orelse return errors.E_BADCAP;
+        const pf_caps: PageFrameCaps = @bitCast(Word0.caps(domain.user_table[pf_slot].word0));
+        const rc = installPageFrame(vm, pairs[2 * i], pf, pageFramePerms(pf_caps));
         if (rc < 0) return rc;
         i += 1;
     }
@@ -357,10 +357,11 @@ fn destroyVm(vm: *VirtualMachine) void {
 
 /// Install `pf` at `guest_addr` in stage-2 tables; increments mapcnt.
 /// Per-page loop: each page in the page_frame is mapped contiguously
-/// at `guest_addr + i * pf.sz`.
-fn installPageFrame(vm: *VirtualMachine, guest_addr: u64, pf: *PageFrame) i64 {
+/// at `guest_addr + i * pf.sz`. `perms` carries the cap-derived stage-2
+/// rwx envelope — guest accesses outside this envelope take a stage-2
+/// fault per spec §[virtual_machine].map_guest test 07.
+fn installPageFrame(vm: *VirtualMachine, guest_addr: u64, pf: *PageFrame, perms: MemoryPerms) i64 {
     const stride = pageStride(pf.sz);
-    const perms = pageFramePerms(pf);
 
     var i: u32 = 0;
     while (i < pf.page_count) {
@@ -428,20 +429,23 @@ fn allocVcpu(
 }
 
 /// Scheduler-dispatch entry point — load guest state from `vcpu_ec.ctx`
-/// into VMCS/VMCB/sysregs, run the guest until exit, save guest state
-/// back into `vcpu_ec.ctx`. Caller invokes `handleGuestExit` next to
-/// deliver the resulting event.
+/// into VMCS/VMCB/sysregs, then world-switch into the guest. Returns
+/// when the guest exits; the caller invokes `handleGuestExit` next to
+/// snapshot exit state and deliver the event on the vCPU's exit_port.
 pub fn enterGuest(vcpu_ec: *ExecutionContext) void {
     vm_dispatch.loadGuestState(vcpu_ec);
     vm_dispatch.enterGuest(vcpu_ec);
-    vm_dispatch.saveGuestState(vcpu_ec);
 }
 
-/// Arch-dispatch VM-exit handler — fires a vm_exit event on the
-/// vCPU's bound exit_port. Suspension and reply-cap minting flow
-/// through the standard event-delivery path. Spec §[vm_exit_state].
-pub fn handleGuestExit(vcpu_ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
-    port_mod.fireVmExit(vcpu_ec, subcode, payload);
+/// Arch-dispatch VM-exit handler — saves live guest registers into
+/// `vcpu_ec.ctx`, reads the per-arch exit info, and fires a vm_exit
+/// event on the vCPU's bound `exit_port`. Suspension and reply-cap
+/// minting flow through the standard event-delivery path.
+/// Spec §[vm_exit_state].
+pub fn handleGuestExit(vcpu_ec: *ExecutionContext) void {
+    vm_dispatch.saveGuestState(vcpu_ec);
+    const info = vm_dispatch.lastVmExitInfo(vcpu_ec);
+    port_mod.fireVmExit(vcpu_ec, info.subcode, info.payload);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -495,22 +499,15 @@ fn rangesOverlap(addr_a: u64, pf_a: *PageFrame, addr_b: u64, pf_b: *PageFrame) b
     return addr_a < end_b and addr_b < end_a;
 }
 
-/// Translate a PageFrame's r/w/x cap bits into stage-2 permissions.
-/// Stage-2 perms are the VMM-visible cap envelope; the resulting
-/// vm_exit on a guest access whose required rwx is not a subset of
-/// these bits is what spec §[virtual_machine].map_guest test 07
-/// requires. The full cap-bit lookup walks the holder's parallel
-/// `Capability` row — for now defer to the most permissive guest-
-/// usable permission set since per-handle perm propagation needs a
-/// holder-handle parameter that this signature does not carry.
-fn pageFramePerms(pf: *PageFrame) MemoryPerms {
-    _ = pf;
+/// Translate a holder's PageFrame `r/w/x` cap bits into stage-2
+/// permissions. Spec §[virtual_machine].map_guest test 07: a guest
+/// access whose required rwx is not a subset of these bits delivers a
+/// vm_exit (`ept` on x86-64, `stage2_fault` on aarch64).
+fn pageFramePerms(caps_bits: PageFrameCaps) MemoryPerms {
     return .{
-        .write_perm = .write,
-        .execute_perm = .executable,
-        .cache_perm = .cacheable,
-        .global_perm = .not_global,
-        .privilege_perm = .user,
+        .read = caps_bits.r,
+        .write = caps_bits.w,
+        .exec = caps_bits.x,
     };
 }
 

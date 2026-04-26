@@ -89,13 +89,32 @@ pub fn broadcastKprofIpi() void {
 
 // ── Spec v3 SMP primitives ───────────────────────────────────────────
 
+/// Cross-core wake reuses the scheduler-rearm vector on x86: an idle
+/// core parked in HLT exits on any IDT-dispatched interrupt and re-runs
+/// the scheduler regardless of which vector poked it. On aarch64 SGIs
+/// 0 and 1 are already taken by the scheduler and kprof-dump paths, so
+/// the wake path claims SGI 2.
+const wake_ipi_vector: u8 = switch (builtin.cpu.arch) {
+    .x86_64 => @intFromEnum(x64.interrupts.IntVecs.sched),
+    .aarch64 => 2,
+    else => unreachable,
+};
+
+/// TLB-shootdown IPI vector. x86 has a dedicated entry in the reserved
+/// high-vector band; aarch64 uses SGI 3 (SGIs 0/1/2 are scheduler /
+/// kprof-dump / wake).
+const tlb_shootdown_ipi_vector: u8 = switch (builtin.cpu.arch) {
+    .x86_64 => @intFromEnum(x64.interrupts.IntVecs.tlb_shootdown),
+    .aarch64 => 3,
+    else => unreachable,
+};
+
 /// Wake an idle remote core so it picks up freshly enqueued work.
 /// Spec §[execution_context] cross-core enqueue.
 pub fn sendWakeIpi(core_id: u64) void {
-    _ = core_id;
     switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => {},
+        .x86_64 => x64.apic.sendIpiToCore(core_id, wake_ipi_vector),
+        .aarch64 => aarch64.gic.sendIpiToCore(core_id, wake_ipi_vector),
         else => unreachable,
     }
 }
@@ -105,10 +124,14 @@ pub fn sendWakeIpi(core_id: u64) void {
 /// pending range queue. Used by `paging.shootdownTlbRange` /
 /// `shootdownTlbAll`.
 pub fn sendTlbShootdownIpi(core_mask: u64) void {
-    _ = core_mask;
-    switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => {},
-        else => unreachable,
+    var mask = core_mask;
+    while (mask != 0) {
+        const core_id: u64 = @ctz(mask);
+        mask &= mask - 1;
+        switch (builtin.cpu.arch) {
+            .x86_64 => x64.apic.sendIpiToCore(core_id, tlb_shootdown_ipi_vector),
+            .aarch64 => aarch64.gic.sendIpiToCore(core_id, tlb_shootdown_ipi_vector),
+            else => unreachable,
+        }
     }
 }

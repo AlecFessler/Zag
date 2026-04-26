@@ -531,3 +531,51 @@ fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
         page_addr += paging.PAGE4K;
     }
 }
+
+// ── Spec-v3 dispatch backings (STUB) ─────────────────────────────────
+
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
+const VmExitInfo = zag.arch.dispatch.vm.VmExitInfo;
+
+pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void {
+    _ = vm;
+    _ = vcpu_ec;
+    @panic("not implemented");
+}
+
+pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
+    _ = vcpu_ec;
+    @panic("not implemented");
+}
+
+pub fn loadGuestState(vcpu_ec: *ExecutionContext) void {
+    _ = vcpu_ec;
+    @panic("not implemented");
+}
+
+pub fn saveGuestState(vcpu_ec: *ExecutionContext) void {
+    _ = vcpu_ec;
+    @panic("not implemented");
+}
+
+pub fn enterGuest(vcpu_ec: *ExecutionContext) void {
+    _ = vcpu_ec;
+    @panic("not implemented");
+}
+
+pub fn lastVmExitInfo(vcpu_ec: *ExecutionContext) VmExitInfo {
+    _ = vcpu_ec;
+    @panic("not implemented");
+}
+
+pub fn vmEmulatedTimerArm(vcpu_ec: *ExecutionContext, deadline_ns: u64) void {
+    _ = vcpu_ec;
+    _ = deadline_ns;
+    @panic("not implemented");
+}
+
+pub fn vmEmulatedTimerCancel(vcpu_ec: *ExecutionContext) void {
+    _ = vcpu_ec;
+    @panic("not implemented");
+}

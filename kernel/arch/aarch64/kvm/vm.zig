@@ -550,3 +550,80 @@ fn writeGuestGpr(gs: *vm_hw.GuestState, n: u8, value: u64) void {
     base[n] = value;
 }
 
+// ── Spec-v3 dispatch backings (STUB) ─────────────────────────────────
+
+const MemoryPerms = zag.memory.address.MemoryPerms;
+const PageFrame = zag.memory.page_frame.PageFrame;
+const VarPageSize = zag.capdom.var_range.PageSize;
+const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
+
+pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
+    _ = vm;
+    _ = policy_pf;
+    @panic("not implemented");
+}
+
+pub fn freeVmArchState(vm: *VirtualMachine) void {
+    _ = vm;
+    @panic("not implemented");
+}
+
+pub fn allocStage2Root(vm: *VirtualMachine) !PAddr {
+    _ = vm;
+    @panic("not implemented");
+}
+
+pub fn freeStage2Root(vm: *VirtualMachine) void {
+    _ = vm;
+    @panic("not implemented");
+}
+
+pub fn stage2MapPage(
+    vm: *VirtualMachine,
+    guest_phys: u64,
+    host_phys: PAddr,
+    sz: VarPageSize,
+    perms: MemoryPerms,
+) !void {
+    _ = vm;
+    _ = guest_phys;
+    _ = host_phys;
+    _ = sz;
+    _ = perms;
+    @panic("not implemented");
+}
+
+pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) ?PAddr {
+    _ = vm;
+    _ = guest_phys;
+    _ = sz;
+    @panic("not implemented");
+}
+
+pub fn invalidateStage2Range(
+    vm: *VirtualMachine,
+    guest_phys: u64,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = vm;
+    _ = guest_phys;
+    _ = sz;
+    _ = page_count;
+    @panic("not implemented");
+}
+
+pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, entries: []const u64) i64 {
+    _ = vm;
+    _ = kind;
+    _ = entries;
+    @panic("not implemented");
+}
+
+pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) void {
+    _ = vm;
+    _ = irq_num;
+    _ = assert;
+    @panic("not implemented");
+}
+

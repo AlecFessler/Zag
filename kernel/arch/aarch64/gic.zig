@@ -47,6 +47,7 @@
 //! - ARM ARM DDI 0487: D13.2.83 (MPIDR_EL1)
 
 const std = @import("std");
+const zag = @import("zag");
 
 // ── GICD register offsets (IHI 0069H, Section 8.9 / IHI 0048B, Section 4.3) ──
 
@@ -1155,4 +1156,34 @@ pub fn unmaskIrq(intid: u32) void {
 
     // SPI — use distributor (same for v2 and v3).
     gicdWriteOffset(.isenabler0, reg_offset, bit);
+}
+
+/// Mask an interrupt at the GIC distributor — GICD_ICENABLER for SPIs,
+/// GICR_ICENABLER0 (v3) / banked GICD_ICENABLER0 (v2) for SGIs/PPIs.
+/// IHI 0069H, Section 8.9.6: GICD_ICENABLER<n>.
+pub fn maskIrq(intid: u32) void {
+    _ = intid;
+    @panic("not implemented");
+}
+
+/// Bind a hardware IRQ source (GIC INTID) to a DeviceRegion so device IRQs
+/// route into its `irq_count` and futex-wake every domain-local copy.
+/// Spec §[device_irq].
+pub fn registerDeviceIrq(device: *zag.devices.device_region.DeviceRegion, irq_source: u32) !void {
+    _ = device;
+    _ = irq_source;
+    @panic("not implemented");
+}
+
+/// Tear down the binding installed by `registerDeviceIrq`. Spec §[device_irq].
+pub fn unregisterDeviceIrq(device: *zag.devices.device_region.DeviceRegion) void {
+    _ = device;
+    @panic("not implemented");
+}
+
+/// Generic IRQ dispatch entry point — called from the per-arch ISR with
+/// the source identifier. Spec §[device_irq].
+pub fn deviceIrqDispatch(irq_source: u32) void {
+    _ = irq_source;
+    @panic("not implemented");
 }

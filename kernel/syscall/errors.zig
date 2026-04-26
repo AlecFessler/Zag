@@ -1,0 +1,16 @@
+pub const E_ABANDONED: i64 = -1;
+pub const E_BADADDR: i64 = -2;
+pub const E_BADCAP: i64 = -3;
+pub const E_BUSY: i64 = -4;
+pub const E_CLOSED: i64 = -5;
+pub const E_FULL: i64 = -6;
+pub const E_INVAL: i64 = -7;
+pub const E_NODEV: i64 = -8;
+pub const E_NOENT: i64 = -9;
+pub const E_NOMEM: i64 = -10;
+pub const E_NOSPC: i64 = -11;
+pub const E_PERM: i64 = -12;
+pub const E_REFUSED: i64 = -13;
+pub const E_TERM: i64 = -14;
+pub const E_TIMEOUT: i64 = -15;
+pub const E_AGAIN: i64 = -16;
