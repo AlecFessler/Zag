@@ -1,11 +1,14 @@
 const zag = @import("zag");
 
 const capability = zag.caps.capability;
+const device_region = zag.devices.device_region;
 const errors = zag.syscall.errors;
 const port = zag.sched.port;
 
+const DeviceRegion = device_region.DeviceRegion;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const HANDLE_ARG_MASK = capability.HANDLE_ARG_MASK;
+const PAddr = zag.memory.address.PAddr;
 const ReplyCaps = port.ReplyCaps;
 const Word0 = capability.Word0;
 
@@ -146,4 +149,61 @@ fn hasDuplicateSources(entries: []const u64) bool {
         i += 1;
     }
     return false;
+}
+
+/// Acknowledges a device IRQ counter. Per Spec §[device_region].ack:
+/// the kernel atomically reads the caller's `field1.irq_count` back to
+/// zero, signals EOI to the interrupt controller, unmasks the line,
+/// and returns the prior counter value.
+///
+/// Spec gap: `ack` lives in §[device_region] only. Other handle types
+/// (port, timer, reply, etc.) carry no per-handle ack semantics; ack on
+/// them returns E_BADCAP.
+///
+/// ```
+/// ack([1] handle) -> [1] prior_count
+///   syscall_num = 26
+///
+///   [1] handle: device_region handle
+/// ```
+///
+/// [test 01] returns E_BADCAP if [1] is not a valid device_region handle.
+/// [test 02] returns E_INVAL if any reserved bits are set in [1].
+/// [test 03] on success, [1].field1.irq_count is reset to zero, the
+///           interrupt line's EOI is signaled, the line is unmasked, and
+///           the return value is the counter value observed before the
+///           reset.
+pub fn ack(caller: *anyopaque, handle: u64) i64 {
+    if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
+
+    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+    const slot: u12 = @truncate(handle);
+
+    const cd_ref = ec.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+
+    const entry = capability.resolveHandleOnDomain(cd, slot, .device_region) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    const dr_ref = capability.typedRef(DeviceRegion, entry.*) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+
+    // Resolve the physical address of the caller's `field1` slot in its
+    // domain's user_table — the futex-watch address Spec §[device_irq]
+    // wakes on. The user_table page is identity-mapped via the kernel's
+    // direct map, so taking `&` yields a valid kernel-VA the userio
+    // helpers can translate.
+    const field1_kva: u64 = @intFromPtr(&cd.user_table[slot].field1);
+    const field1_paddr = PAddr.fromInt(field1_kva);
+
+    cd_ref.unlock();
+
+    const dr = dr_ref.lock(@src()) catch return errors.E_BADCAP;
+    defer dr_ref.unlock();
+
+    const prior = device_region.ack(dr, field1_paddr);
+    return @bitCast(prior);
 }

@@ -291,8 +291,14 @@ pub fn unmapGuest(caller: *anyopaque, vm: u64, page_frames: []const u64) i64 {
 /// [test 02] returns E_PERM if [1] does not have the `policy` cap.
 /// [test 03] returns E_INVAL if count exceeds the active (kind, arch)'s MAX_* constant from §[vm_policy].
 /// [test 04] returns E_INVAL if any reserved bits are set in [1] or any entry.
-pub fn vmSetPolicy(caller: *anyopaque, vm: u64, entries: []const u64) i64 {
+pub fn vmSetPolicy(caller: *anyopaque, syscall_word: u64, vm: u64, entries: []const u64) i64 {
     if (vm & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
+
+    // Spec §[virtual_machine].vm_set_policy: syscall word bit 12 = kind.
+    // The 8-bit `kind` argument to the inner layer carries that single
+    // bit; the per-arch table encoding determines how the inner layer
+    // interprets it.
+    const kind: u8 = @truncate((syscall_word >> 12) & 0x1);
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
@@ -311,7 +317,7 @@ pub fn vmSetPolicy(caller: *anyopaque, vm: u64, entries: []const u64) i64 {
     if (vm_entry == null) return errors.E_BADCAP;
     if (!vm_caps.policy) return errors.E_PERM;
 
-    return vm_obj.vmSetPolicy(ec, vm, entries);
+    return vm_obj.applyVmPolicyTable(ec, vm, kind, entries);
 }
 
 /// Asserts or deasserts a virtual IRQ line on the VM's emulated interrupt
