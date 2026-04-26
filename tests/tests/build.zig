@@ -11,6 +11,10 @@ const TestEntry = struct {
 // resources should be ordered serially here. New tests: add a file
 // under tests/ then add an entry below.
 const test_entries = [_]TestEntry{
+    .{ .name = "ack_01", .path = "tests/ack_01.zig" },
+    .{ .name = "ack_02", .path = "tests/ack_02.zig" },
+    .{ .name = "ack_03", .path = "tests/ack_03.zig" },
+    .{ .name = "ack_04", .path = "tests/ack_04.zig" },
     .{ .name = "acquire_ecs_01", .path = "tests/acquire_ecs_01.zig" },
     .{ .name = "acquire_ecs_02", .path = "tests/acquire_ecs_02.zig" },
     .{ .name = "acquire_ecs_03", .path = "tests/acquire_ecs_03.zig" },
@@ -87,6 +91,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "create_port_01", .path = "tests/create_port_01.zig" },
     .{ .name = "create_port_02", .path = "tests/create_port_02.zig" },
     .{ .name = "create_port_03", .path = "tests/create_port_03.zig" },
+    .{ .name = "create_port_04", .path = "tests/create_port_04.zig" },
     .{ .name = "create_var_01", .path = "tests/create_var_01.zig" },
     .{ .name = "create_var_02", .path = "tests/create_var_02.zig" },
     .{ .name = "create_var_03", .path = "tests/create_var_03.zig" },
@@ -112,6 +117,10 @@ const test_entries = [_]TestEntry{
     .{ .name = "delete_01", .path = "tests/delete_01.zig" },
     .{ .name = "delete_02", .path = "tests/delete_02.zig" },
     .{ .name = "delete_03", .path = "tests/delete_03.zig" },
+    .{ .name = "device_irq_01", .path = "tests/device_irq_01.zig" },
+    .{ .name = "device_irq_02", .path = "tests/device_irq_02.zig" },
+    .{ .name = "device_irq_03", .path = "tests/device_irq_03.zig" },
+    .{ .name = "device_irq_04", .path = "tests/device_irq_04.zig" },
     .{ .name = "idc_read_01", .path = "tests/idc_read_01.zig" },
     .{ .name = "idc_read_02", .path = "tests/idc_read_02.zig" },
     .{ .name = "idc_read_03", .path = "tests/idc_read_03.zig" },
@@ -186,6 +195,8 @@ const test_entries = [_]TestEntry{
     .{ .name = "port_io_virtualization_07", .path = "tests/port_io_virtualization_07.zig" },
     .{ .name = "port_io_virtualization_08", .path = "tests/port_io_virtualization_08.zig" },
     .{ .name = "port_io_virtualization_09", .path = "tests/port_io_virtualization_09.zig" },
+    .{ .name = "port_io_virtualization_10", .path = "tests/port_io_virtualization_10.zig" },
+    .{ .name = "port_io_virtualization_11", .path = "tests/port_io_virtualization_11.zig" },
     .{ .name = "priority_01", .path = "tests/priority_01.zig" },
     .{ .name = "priority_02", .path = "tests/priority_02.zig" },
     .{ .name = "priority_03", .path = "tests/priority_03.zig" },

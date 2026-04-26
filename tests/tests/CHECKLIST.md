@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 254.
-**Remaining:** 214.
+**Implemented:** 265.
+**Remaining:** 203.
 
 ## Convention
 
@@ -355,7 +355,7 @@ _§[restart_semantics] Restart Semantics_
 - [x] **09** — on success, the caller receives a page frame handle with caps = `[1].caps`.
 - [x] **10** — on success, field0 contains `[3]` pages and `[2].props.sz`.
 
-## port_io_virtualization — 9/11
+## port_io_virtualization — 11/11
 
 _§[port_io_virtualization] x86-64 Port I/O Virtualization_
 
@@ -368,24 +368,24 @@ _§[port_io_virtualization] x86-64 Port I/O Virtualization_
 - [x] **07** — a MOV load when `VAR.cur_rwx.r = 0` delivers a `memory_fault` event.
 - [x] **08** — a MOV store when `VAR.cur_rwx.w = 0` delivers a `memory_fault` event.
 - [x] **09** — an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
-- [ ] **10** — a `LOCK`-prefixed MOV targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
-- [ ] **11** — an 8-byte MOV access targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
+- [x] **10** — a `LOCK`-prefixed MOV targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
+- [x] **11** — an 8-byte MOV access targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
 
-## device_irq — 0/4
+## device_irq — 4/4
 
 _§[device_irq] Device IRQ Delivery_
 
-- [ ] **01** — when the device fires an IRQ, within a bounded delay every domain-local copy of [1] returns `field1.irq_count = (prior + 1)` from a fresh `sync`.
-- [ ] **02** — when the device fires a second IRQ before `ack` is called, [1].field1.irq_count is not incremented a second time; only after `ack` does a subsequent IRQ from the device increment it again.
-- [ ] **03** — when the device fires an IRQ, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field1 returns from the call with [1] = the corresponding domain-local vaddr of field1.
-- [ ] **04** — when the device has no IRQ delivery configured, [1].field1.irq_count remains 0.
+- [x] **01** — when the device fires an IRQ, within a bounded delay every domain-local copy of [1] returns `field1.irq_count = (prior + 1)` from a fresh `sync`.
+- [x] **02** — when the device fires a second IRQ before `ack` is called, [1].field1.irq_count is not incremented a second time; only after `ack` does a subsequent IRQ from the device increment it again.
+- [x] **03** — when the device fires an IRQ, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field1 returns from the call with [1] = the corresponding domain-local vaddr of field1.
+- [x] **04** — when the device has no IRQ delivery configured, [1].field1.irq_count remains 0.
 
-## ack — 0/8
+## ack — 4/8
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid device_region handle.
-- [ ] **02** — returns E_PERM if [1] does not have the `irq` cap.
-- [ ] **03** — returns E_INVAL if the device_region has no IRQ delivery configured.
-- [ ] **04** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **01** — returns E_BADCAP if [1] is not a valid device_region handle.
+- [x] **02** — returns E_PERM if [1] does not have the `irq` cap.
+- [x] **03** — returns E_INVAL if the device_region has no IRQ delivery configured.
+- [x] **04** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **05** — on success, the returned `prior_count` equals [1].field1.irq_count immediately before the call.
 - [ ] **06** — on success, the calling domain's copy of [1] has `field1.irq_count = 0` immediately on return; every other domain-local copy returns 0 from a fresh `sync` within a bounded delay.
 - [ ] **07** — on success, after a subsequent IRQ from the device, every domain-local copy's `field1.irq_count` reaches the new value within a bounded delay and an EC blocked in `futex_wait_val` on each copy's `field1` paddr is woken.
@@ -456,12 +456,12 @@ _§[device_irq] Device IRQ Delivery_
 - [ ] **04** — on success with [3].assert = 1, IRQ line [2] is asserted on the VM's emulated interrupt controller; if a vCPU is unmasked for the line, an interrupt event is delivered to the vCPU on its next runnable opportunity (observable as an exception/interrupt vm_exit or as a guest interrupt handler invocation per the guest's IDT/GIC configuration).
 - [ ] **05** — on success with [3].assert = 0 immediately after a prior `vm_inject_irq([1], [2], assert = 1)`, no interrupt vm_exit corresponding to line [2] is delivered to any vCPU even when the vCPU's interrupt window opens or it becomes runnable with the line unmasked.
 
-## create_port — 3/4
+## create_port — 4/4
 
 - [x] **01** — returns E_PERM if the caller's self-handle lacks `crpt`.
 - [x] **02** — returns E_PERM if caps is not a subset of the caller's `port_ceiling`.
 - [x] **03** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **04** — on success, the caller receives a port handle with caps = `[1].caps`.
+- [x] **04** — on success, the caller receives a port handle with caps = `[1].caps`.
 
 ## suspend — 0/12
 
