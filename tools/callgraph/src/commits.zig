@@ -206,6 +206,169 @@ fn workerMain(ctx: *WorkerCtx) void {
     };
 }
 
+/// Context passed from runLoad's per-arch dispatch into the worker
+/// thread that handles ir_parse + discover + join + def_deps + reach +
+/// serialize for one arch. All fields are read-only inside the thread
+/// except `cache_ptr` (mutex-guarded) and `reg_ptr` / `entry_ptr` for
+/// the final blob install (also mutex-guarded).
+const ArchWorkerCtx = struct {
+    reg_ptr: *Registry,
+    entry_ptr: *Entry,
+    spec: ArchSpec,
+    ir_dir: []const u8,
+    kernel_root: []const u8,
+    walk_ptr: *const ast.WalkResult,
+    shared_definitions: []const types.Definition,
+    cache_ptr: *def_deps.Cache,
+};
+
+/// Run the IR-side pipeline for one arch in its own arena. Called both
+/// inline (when thread-spawn fails) and from a worker thread.
+fn runOneArch(ctx: ArchWorkerCtx) !void {
+    const reg = ctx.reg_ptr;
+    const entry = ctx.entry_ptr;
+    const spec = ctx.spec;
+
+    const ir_filename = try std.fmt.allocPrint(reg.gpa, "kernel.{s}.ll", .{spec.file_tag});
+    defer reg.gpa.free(ir_filename);
+
+    const ir_path = try std.fs.path.join(reg.gpa, &.{ ctx.ir_dir, ir_filename });
+    defer reg.gpa.free(ir_path);
+
+    std.fs.cwd().access(ir_path, .{}) catch {
+        std.debug.print(
+            "[commit {s}] no IR at {s}; skipping arch\n",
+            .{ entry.short_sha, ir_path },
+        );
+        return;
+    };
+
+    // Per-arch arena, parented to reg.gpa (thread-safe). Holds the IR
+    // graph, the joined Graph, intermediate strings — everything that
+    // doesn't need to outlive serialization. The serialized JSON blob
+    // is allocated separately from reg.gpa so it can be installed in
+    // the registry after we tear this down.
+    var arch_arena = std.heap.ArenaAllocator.init(reg.gpa);
+    defer arch_arena.deinit();
+    const arch_alloc = arch_arena.allocator();
+
+    const t_ir_start = std.time.milliTimestamp();
+    const ir_graph = ir.parse(&arch_arena, ir_path) catch |err| {
+        std.debug.print(
+            "[commit {s}] IR parse {s} failed: {s}\n",
+            .{ entry.short_sha, spec.api_tag, @errorName(err) },
+        );
+        return;
+    };
+    std.debug.print(
+        "[commit {s}] phase ir_parse({s}): {d}ms\n",
+        .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_ir_start },
+    );
+
+    const t_disc_start = std.time.milliTimestamp();
+    const discovered = entry_mod.discover(
+        arch_alloc,
+        ctx.kernel_root,
+        spec.build_tag,
+        ctx.walk_ptr.fns,
+        ctx.walk_ptr.asts,
+    ) catch |err| {
+        std.debug.print(
+            "[commit {s}] entry.discover {s} failed: {s}\n",
+            .{ entry.short_sha, spec.api_tag, @errorName(err) },
+        );
+        return;
+    };
+    std.debug.print(
+        "[commit {s}] phase discover({s}): {d}ms\n",
+        .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_disc_start },
+    );
+
+    const t_join_start = std.time.milliTimestamp();
+    var stats: join.JoinStats = undefined;
+    var graph = join.buildGraphWithStats(
+        arch_alloc,
+        ir_graph,
+        ctx.walk_ptr.fns,
+        ctx.walk_ptr.asts,
+        ctx.walk_ptr.struct_types,
+        ctx.walk_ptr.aliases,
+        discovered,
+        spec.target_arch,
+        &stats,
+    ) catch |err| {
+        std.debug.print(
+            "[commit {s}] join {s} failed: {s}\n",
+            .{ entry.short_sha, spec.api_tag, @errorName(err) },
+        );
+        return;
+    };
+    std.debug.print(
+        "[commit {s}] phase join({s}): {d}ms ({d} graph fns)\n",
+        .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_join_start, graph.functions.len },
+    );
+
+    // Cast away const because Graph.definitions is `[]Definition`. The
+    // shared_definitions slice is treated read-only by all consumers
+    // — both arches just read it for serialization and downstream
+    // index lookups; nobody mutates Definition records after init.
+    graph.definitions = @constCast(ctx.shared_definitions);
+
+    const t_deps_start = std.time.milliTimestamp();
+    def_deps.compute(arch_alloc, &graph, ctx.cache_ptr) catch |err| {
+        std.debug.print(
+            "[commit {s}] def_deps {s} failed: {s}\n",
+            .{ entry.short_sha, spec.api_tag, @errorName(err) },
+        );
+    };
+    std.debug.print(
+        "[commit {s}] phase def_deps({s}): {d}ms\n",
+        .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_deps_start },
+    );
+
+    const t_reach_start = std.time.milliTimestamp();
+    _ = reachability.compute(reg.gpa, &graph) catch {};
+    std.debug.print(
+        "[commit {s}] phase reach({s}): {d}ms\n",
+        .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_reach_start },
+    );
+
+    const t_serial_start = std.time.milliTimestamp();
+    const blob = std.json.Stringify.valueAlloc(reg.gpa, graph, .{}) catch |err| {
+        std.debug.print(
+            "[commit {s}] serialize {s} failed: {s}\n",
+            .{ entry.short_sha, spec.api_tag, @errorName(err) },
+        );
+        return;
+    };
+    std.debug.print(
+        "[commit {s}] phase serialize({s}): {d}ms ({d} KB)\n",
+        .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_serial_start, blob.len / 1024 },
+    );
+
+    // Install under registry mutex. Per-arch arena gets torn down via
+    // `defer` once we return — at that point graph + ir_graph + walk
+    // references inside the JSON blob are already consumed, so it's
+    // safe to free.
+    reg.mutex.lock();
+    defer reg.mutex.unlock();
+    const dup_key = reg.gpa.dupe(u8, spec.api_tag) catch {
+        reg.gpa.free(blob);
+        return;
+    };
+    entry.arch_blobs.put(dup_key, blob) catch {
+        reg.gpa.free(dup_key);
+        reg.gpa.free(blob);
+        return;
+    };
+    entry.arches.append(reg.gpa, dup_key) catch {};
+
+    std.debug.print(
+        "[commit {s}] arch {s} ready ({d} fns)\n",
+        .{ entry.short_sha, spec.api_tag, graph.functions.len },
+    );
+}
+
 fn runLoad(reg: *Registry, entry: *Entry) !void {
     // 1. Ensure worktree exists.
     try ensureWorktree(reg.gpa, reg.git_root, entry);
@@ -308,143 +471,43 @@ fn runLoad(reg: *Registry, entry: *Entry) !void {
     );
     defer def_deps_cache.deinit();
 
-    // 4. Per-arch parse + join + reach.
+    // 4. Per-arch parse + join + reach. Runs the two arches in
+    //    parallel — independent IR files, independent ArenaAllocators,
+    //    only the def_deps Cache and the registry's blob map are
+    //    shared (both mutex-protected). Roughly halves the per-arch
+    //    wall time on multi-core hosts.
+    const Worker = struct {
+        fn run(ctx: ArchWorkerCtx) void {
+            runOneArch(ctx) catch |err| {
+                std.debug.print(
+                    "[commit {s}] arch {s} unexpected error: {s}\n",
+                    .{ ctx.entry_ptr.short_sha, ctx.spec.api_tag, @errorName(err) },
+                );
+            };
+        }
+    };
+
+    var arch_threads: [16]std.Thread = undefined;
+    var n_arch_threads: usize = 0;
     for (reg.arch_specs) |spec| {
-        const ir_filename = try std.fmt.allocPrint(
-            reg.gpa,
-            "kernel.{s}.ll",
-            .{spec.file_tag},
-        );
-        defer reg.gpa.free(ir_filename);
-
-        const ir_path = try std.fs.path.join(reg.gpa, &.{ ir_dir_in_worktree, ir_filename });
-        defer reg.gpa.free(ir_path);
-
-        std.fs.cwd().access(ir_path, .{}) catch {
-            std.debug.print(
-                "[commit {s}] no IR at {s}; skipping arch\n",
-                .{ entry.short_sha, ir_path },
-            );
+        const ctx = ArchWorkerCtx{
+            .reg_ptr = reg,
+            .entry_ptr = entry,
+            .spec = spec,
+            .ir_dir = ir_dir_in_worktree,
+            .kernel_root = kernel_root_in_worktree,
+            .walk_ptr = &walk,
+            .shared_definitions = shared_definitions,
+            .cache_ptr = &def_deps_cache,
+        };
+        arch_threads[n_arch_threads] = std.Thread.spawn(.{}, Worker.run, .{ctx}) catch {
+            // If spawn fails, run inline as a fallback.
+            Worker.run(ctx);
             continue;
         };
-
-        // The IR parse must share the commit's arena: buildGraphWithStats
-        // keeps references to mangled names and SourceLocs allocated by
-        // ir.parse, so a separate arena would leave dangling slices once
-        // it deinits. Memory grows with the IR size but caps at one
-        // commit's worth — acceptable.
-        const t_ir_start = std.time.milliTimestamp();
-        const ir_graph = ir.parse(entry.arena, ir_path) catch |err| {
-            std.debug.print(
-                "[commit {s}] IR parse {s} failed: {s}\n",
-                .{ entry.short_sha, spec.api_tag, @errorName(err) },
-            );
-            continue;
-        };
-        std.debug.print(
-            "[commit {s}] phase ir_parse({s}): {d}ms\n",
-            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_ir_start },
-        );
-
-        const t_disc_start = std.time.milliTimestamp();
-        const discovered = entry_mod.discover(
-            arena_alloc,
-            kernel_root_in_worktree,
-            spec.build_tag,
-            walk.fns,
-            walk.asts,
-        ) catch |err| {
-            std.debug.print(
-                "[commit {s}] entry.discover {s} failed: {s}\n",
-                .{ entry.short_sha, spec.api_tag, @errorName(err) },
-            );
-            continue;
-        };
-        std.debug.print(
-            "[commit {s}] phase discover({s}): {d}ms\n",
-            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_disc_start },
-        );
-
-        const t_join_start = std.time.milliTimestamp();
-        var stats: join.JoinStats = undefined;
-        var graph = join.buildGraphWithStats(
-            arena_alloc,
-            ir_graph,
-            walk.fns,
-            walk.asts,
-            walk.struct_types,
-            walk.aliases,
-            discovered,
-            spec.target_arch,
-            &stats,
-        ) catch |err| {
-            std.debug.print(
-                "[commit {s}] join {s} failed: {s}\n",
-                .{ entry.short_sha, spec.api_tag, @errorName(err) },
-            );
-            continue;
-        };
-        std.debug.print(
-            "[commit {s}] phase join({s}): {d}ms ({d} graph fns)\n",
-            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_join_start, graph.functions.len },
-        );
-
-        // Install the Definition catalog. We share the catalog built
-        // up-front for the def_deps cache — fast and keeps DefIds
-        // consistent across arches.
-        graph.definitions = shared_definitions;
-
-        const t_deps_start = std.time.milliTimestamp();
-        def_deps.compute(arena_alloc, &graph, &def_deps_cache) catch |err| {
-            std.debug.print(
-                "[commit {s}] def_deps {s} failed: {s}\n",
-                .{ entry.short_sha, spec.api_tag, @errorName(err) },
-            );
-        };
-        std.debug.print(
-            "[commit {s}] phase def_deps({s}): {d}ms\n",
-            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_deps_start },
-        );
-
-        const t_reach_start = std.time.milliTimestamp();
-        _ = reachability.compute(reg.gpa, &graph) catch {};
-        std.debug.print(
-            "[commit {s}] phase reach({s}): {d}ms\n",
-            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_reach_start },
-        );
-
-        const t_serial_start = std.time.milliTimestamp();
-        const blob = std.json.Stringify.valueAlloc(reg.gpa, graph, .{}) catch |err| {
-            std.debug.print(
-                "[commit {s}] serialize {s} failed: {s}\n",
-                .{ entry.short_sha, spec.api_tag, @errorName(err) },
-            );
-            continue;
-        };
-        std.debug.print(
-            "[commit {s}] phase serialize({s}): {d}ms ({d} KB)\n",
-            .{ entry.short_sha, spec.api_tag, std.time.milliTimestamp() - t_serial_start, blob.len / 1024 },
-        );
-
-        // Install under mutex.
-        reg.mutex.lock();
-        const dup_key = reg.gpa.dupe(u8, spec.api_tag) catch {
-            reg.gpa.free(blob);
-            reg.mutex.unlock();
-            continue;
-        };
-        entry.arch_blobs.put(dup_key, blob) catch {
-            reg.gpa.free(dup_key);
-            reg.gpa.free(blob);
-        };
-        entry.arches.append(reg.gpa, dup_key) catch {};
-        reg.mutex.unlock();
-
-        std.debug.print(
-            "[commit {s}] arch {s} ready ({d} fns)\n",
-            .{ entry.short_sha, spec.api_tag, graph.functions.len },
-        );
+        n_arch_threads += 1;
     }
+    for (arch_threads[0..n_arch_threads]) |t| t.join();
 
     // 5. Finalize: build arches_blob + status.
     reg.mutex.lock();

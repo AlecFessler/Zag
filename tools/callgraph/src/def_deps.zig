@@ -48,6 +48,10 @@ pub const Cache = struct {
     alias_map: std.StringHashMap([]const u8),
     file_index: std.StringHashMap(FileBundle),
     by_qname: std.StringHashMap([]const types.DefId),
+    /// Guards `by_qname` so multiple per-arch compute() calls can run
+    /// concurrently. The other fields are populated in `init` and then
+    /// read-only — safe to share without locking.
+    by_qname_mutex: std.Thread.Mutex = .{},
 
     /// Build all shared lookups from the walk results. `definitions`
     /// must be the same catalog the per-arch graphs share (i.e. built
@@ -112,7 +116,10 @@ pub fn compute(
     for (graph.functions) |*fn_rec| {
         // Cache hit: skip the AST walk entirely, reuse the prior result.
         if (fn_rec.name.len > 0) {
-            if (cache.by_qname.get(fn_rec.name)) |cached| {
+            cache.by_qname_mutex.lock();
+            const cached_opt = cache.by_qname.get(fn_rec.name);
+            cache.by_qname_mutex.unlock();
+            if (cached_opt) |cached| {
                 fn_rec.def_deps = cached;
                 continue;
             }
@@ -142,7 +149,9 @@ pub fn compute(
             // Still record an empty result so the second arch's lookup
             // hits the cache.
             if (fn_rec.name.len > 0) {
+                cache.by_qname_mutex.lock();
                 _ = cache.by_qname.getOrPutValue(fn_rec.name, &.{}) catch {};
+                cache.by_qname_mutex.unlock();
             }
             continue;
         }
@@ -157,7 +166,9 @@ pub fn compute(
         fn_rec.def_deps = out;
 
         if (fn_rec.name.len > 0) {
+            cache.by_qname_mutex.lock();
             _ = cache.by_qname.getOrPutValue(fn_rec.name, out) catch {};
+            cache.by_qname_mutex.unlock();
         }
     }
 }
