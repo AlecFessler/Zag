@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 154.
-**Remaining:** 314.
+**Implemented:** 164.
+**Remaining:** 304.
 
 ## Convention
 
@@ -225,36 +225,36 @@ _§[restart_semantics] Restart Semantics_
 - [x] **05** — on success, a subsequent `perfmon_read` on the target EC returns E_INVAL (perfmon was not started).
 - [x] **06** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## create_var — 15/22
+## create_var — 22/22
 
 - [x] **01** — returns E_PERM if the caller's self-handle lacks `crvr`.
 - [x] **02** — returns E_PERM if caps' r/w/x bits are not a subset of the caller's `var_inner_ceiling`'s r/w/x bits.
-- [ ] **03** — returns E_PERM if caps.max_sz exceeds the caller's `var_inner_ceiling`'s max_sz.
-- [ ] **04** — returns E_PERM if caps.mmio = 1 and the caller's `var_inner_ceiling` does not permit mmio.
+- [x] **03** — returns E_PERM if caps.max_sz exceeds the caller's `var_inner_ceiling`'s max_sz.
+- [x] **04** — returns E_PERM if caps.mmio = 1 and the caller's `var_inner_ceiling` does not permit mmio.
 - [x] **05** — returns E_INVAL if [3] pages is 0.
-- [ ] **06** — returns E_INVAL if [4] preferred_base is nonzero and not aligned to the page size encoded in props.sz.
+- [x] **06** — returns E_INVAL if [4] preferred_base is nonzero and not aligned to the page size encoded in props.sz.
 - [x] **07** — returns E_INVAL if caps.max_sz is 3 (reserved).
-- [ ] **08** — returns E_INVAL if caps.mmio = 1 and props.sz != 0.
+- [x] **08** — returns E_INVAL if caps.mmio = 1 and props.sz != 0.
 - [x] **09** — returns E_INVAL if props.sz is 3 (reserved).
 - [x] **10** — returns E_INVAL if props.sz exceeds caps.max_sz.
 - [x] **11** — returns E_INVAL if caps.mmio = 1 and caps.x is set.
 - [x] **12** — returns E_INVAL if caps.dma = 1 and caps.x is set.
 - [x] **13** — returns E_INVAL if caps.mmio = 1 and caps.dma = 1.
 - [x] **14** — returns E_BADCAP if caps.dma = 1 and [5] is not a valid device_region handle.
-- [ ] **15** — returns E_PERM if caps.dma = 1 and [5] does not have the `dma` cap.
+- [x] **15** — returns E_PERM if caps.dma = 1 and [5] does not have the `dma` cap.
 - [x] **16** — returns E_INVAL if props.cur_rwx is not a subset of caps.r/w/x.
 - [x] **17** — returns E_INVAL if any reserved bits are set in [1] or [2].
 - [x] **18** — on success, the caller receives a VAR handle with caps = `[1].caps`.
 - [x] **19** — on success, field0 contains the assigned base address.
 - [x] **20** — on success, field1 contains `[2].props` together with `[3]` pages.
-- [ ] **21** — on success, when [4] preferred_base is nonzero and the range is available, the assigned base address equals `[4]`.
-- [ ] **22** — on success, when caps.dma = 1, field1's `device` field equals [5]'s handle id, and a subsequent `map_pf` into this VAR routes the bound device's accesses at field0 + offset to the installed page_frame.
+- [x] **21** — on success, when [4] preferred_base is nonzero and the range is available, the assigned base address equals `[4]`.
+- [x] **22** — on success, when caps.dma = 1, field1's `device` field equals [5]'s handle id, and a subsequent `map_pf` into this VAR routes the bound device's accesses at field0 + offset to the installed page_frame.
 
-## map_pf — 0/14
+## map_pf — 3/14
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
-- [ ] **02** — returns E_BADCAP if any [2 + 2i + 1] is not a valid page_frame handle.
-- [ ] **03** — returns E_PERM if [1].caps has `mmio` set (mmio VARs accept only `map_mmio`).
+- [x] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
+- [x] **02** — returns E_BADCAP if any [2 + 2i + 1] is not a valid page_frame handle.
+- [x] **03** — returns E_PERM if [1].caps has `mmio` set (mmio VARs accept only `map_mmio`).
 - [ ] **04** — returns E_INVAL if N is 0.
 - [ ] **05** — returns E_INVAL if any offset is not aligned to the VAR's `sz` page size.
 - [ ] **06** — returns E_INVAL if any page_frame's `sz` is smaller than the VAR's `sz`.
