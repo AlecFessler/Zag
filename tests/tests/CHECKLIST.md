@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 354.
-**Remaining:** 114.
+**Implemented:** 363.
+**Remaining:** 105.
 
 ## Convention
 
@@ -463,14 +463,14 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **03** — returns E_INVAL if any reserved bits are set in [1].
 - [x] **04** — on success, the caller receives a port handle with caps = `[1].caps`.
 
-## suspend — 3/12
+## suspend — 6/12
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid EC handle.
 - [x] **02** — returns E_BADCAP if [2] is not a valid port handle.
 - [x] **03** — returns E_PERM if [1] does not have the `susp` cap.
-- [ ] **04** — returns E_PERM if [2] does not have the `bind` cap.
-- [ ] **05** — returns E_INVAL if any reserved bits are set.
-- [ ] **06** — returns E_INVAL if [1] references a vCPU.
+- [x] **04** — returns E_PERM if [2] does not have the `bind` cap.
+- [x] **05** — returns E_INVAL if any reserved bits are set.
+- [x] **06** — returns E_INVAL if [1] references a vCPU.
 - [ ] **07** — returns E_INVAL if [1] is already suspended.
 - [ ] **08** — on success, the target EC stops executing.
 - [ ] **09** — on success, a suspension event is delivered on [2].
@@ -478,13 +478,13 @@ _§[device_irq] Device IRQ Delivery_
 - [ ] **11** — on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's EC state on reply; otherwise modifications are discarded.
 - [ ] **12** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## recv — 4/14
+## recv — 5/14
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid port handle.
 - [x] **02** — returns E_PERM if [1] does not have the `recv` cap.
 - [x] **03** — returns E_INVAL if any reserved bits are set in [1].
 - [x] **04** — returns E_CLOSED if the port has no bind-cap holders, no event_routes targeting it, and no queued events.
-- [ ] **05** — returns E_CLOSED when a recv is blocked on a port and the last bind-cap holder releases its handle while no event_routes target the port and no events are queued.
+- [x] **05** — returns E_CLOSED when a recv is blocked on a port and the last bind-cap holder releases its handle while no event_routes target the port and no events are queued.
 - [ ] **06** — returns E_FULL if the caller's handle table cannot accommodate the reply handle and pair_count attached handles.
 - [ ] **07** — on success, the syscall word's reply_handle_id is the slot id of a reply handle inserted into the caller's table referencing the dequeued sender.
 - [ ] **08** — on success, the syscall word's event_type equals the event_type that triggered delivery.
@@ -533,19 +533,19 @@ _§[handle_attachments] Handle Attachments_
 - [x] **06** — on success, the binding for ([1], [2]) is removed; subsequent firings of [2] for [1] follow the no-route fallback above.
 - [x] **07** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## reply — 3/7
+## reply — 5/7
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid reply handle.
 - [x] **02** — returns E_INVAL if any reserved bits are set in [1].
 - [x] **03** — returns E_TERM if the suspended EC was terminated before reply could deliver; [1] is consumed.
-- [ ] **04** — on success, [1] is consumed (removed from the caller's table).
-- [ ] **05** — on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply.
+- [x] **04** — on success, [1] is consumed (removed from the caller's table).
+- [x] **05** — on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply.
 - [ ] **06** — on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
 - [ ] **07** — on success, the suspended EC is resumed.
 
-## reply_transfer — 0/15
+## reply_transfer — 1/15
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid reply handle.
+- [x] **01** — returns E_BADCAP if [1] is not a valid reply handle.
 - [ ] **02** — returns E_PERM if [1] does not have the `xfer` cap.
 - [ ] **03** — returns E_INVAL if N is 0 or N > 63.
 - [ ] **04** — returns E_INVAL if any reserved bits are set in [1] or any pair entry.
@@ -574,10 +574,10 @@ _§[handle_attachments] Handle Attachments_
 - [x] **09** — on each fire, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
 - [x] **10** — calling `timer_arm` again yields a fresh, independent timer handle; the prior handle's field0 and field1 are unaffected.
 
-## timer_rearm — 0/10
+## timer_rearm — 2/10
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid timer handle.
-- [ ] **02** — returns E_PERM if [1] does not have the `arm` cap.
+- [x] **01** — returns E_BADCAP if [1] is not a valid timer handle.
+- [x] **02** — returns E_PERM if [1] does not have the `arm` cap.
 - [ ] **03** — returns E_INVAL if [2] deadline_ns is 0.
 - [ ] **04** — returns E_INVAL if any reserved bits are set in [1] or [3].
 - [ ] **05** — on success, the calling domain's copy of [1] has `field0 = 0` immediately on return; every other domain-local copy returns 0 from a fresh `sync` within a bounded delay.
