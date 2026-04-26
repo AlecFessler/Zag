@@ -15,7 +15,7 @@ const uefi = std.os.uefi;
 
 const BootInfo = boot_protocol.BootInfo;
 const ElfSection = elf.ElfSection;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageAllocator = page_allocator.PageAllocator;
 const ParsedElf = zag.utils.elf.ParsedElf;

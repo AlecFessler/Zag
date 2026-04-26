@@ -16,7 +16,7 @@ const sched = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
 const timers = zag.arch.x64.timers;
 
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 

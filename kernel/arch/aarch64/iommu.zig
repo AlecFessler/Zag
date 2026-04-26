@@ -21,7 +21,7 @@
 //!
 //! Dispatch interface mapping:
 //!   isAvailable()          → true if IORT contains an SMMU node
-//!   mapDmaPages(dev, shm)  → create stage-2 mapping for device's stream ID
+//!   mapDmaPages(dev, frame) → create stage-2 mapping for device's stream ID
 //!   unmapDmaPages(...)     → remove stage-2 mapping, invalidate IOTLB
 //!   enableTranslation()    → set SMMU_CR0.SMMUEN (SMMUv3) or SMMU_sCR0 (SMMUv2)
 //!
@@ -35,9 +35,9 @@ const zag = @import("zag");
 const dispatch_iommu = zag.arch.dispatch.iommu;
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const MemoryPerms = dispatch_iommu.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
-const SharedMemory = zag.memory.shared.SharedMemory;
+const PageFrame = zag.memory.page_frame.PageFrame;
 const SpecDeviceRegion = zag.devices.device_region.DeviceRegion;
 const VarPageSize = zag.capdom.var_range.PageSize;
 
@@ -56,14 +56,14 @@ pub fn isAvailable() bool {
     return true;
 }
 
-pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
+pub fn mapDmaPages(device: *DeviceRegion, frame: *PageFrame) !u64 {
     device._gen_lock.lock(@src());
     defer device._gen_lock.unlock();
-    shm._gen_lock.lock(@src());
-    defer shm._gen_lock.unlock();
+    frame._gen_lock.lock(@src());
+    defer frame._gen_lock.unlock();
 
     const base_dma = device.detail.pci.dma_cursor;
-    device.detail.pci.dma_cursor = base_dma + @as(u64, shm.num_pages) * 0x1000;
+    device.detail.pci.dma_cursor = base_dma + @as(u64, frame.num_pages) * 0x1000;
     return base_dma;
 }
 

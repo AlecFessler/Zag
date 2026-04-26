@@ -20,7 +20,7 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 

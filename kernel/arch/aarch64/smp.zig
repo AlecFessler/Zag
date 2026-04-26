@@ -52,7 +52,7 @@ const sched = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
 
 // Type aliases — alphabetical
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageEntry = aarch64_paging.PageEntry;
 const VAddr = zag.memory.address.VAddr;
