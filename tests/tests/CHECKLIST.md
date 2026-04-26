@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 117.
-**Remaining:** 351.
+**Implemented:** 141.
+**Remaining:** 327.
 
 ## Convention
 
@@ -194,44 +194,44 @@ _§[restart_semantics] Restart Semantics_
 - [x] **03** — [1] bit 8 is set when the hardware supports counter overflow events.
 - [x] **04** — [2] is a bitmask of supported events indexed by the table above.
 
-## perfmon_start — 0/9
+## perfmon_start — 9/9
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `pmu`.
-- [ ] **02** — returns E_BADCAP if [1] is not a valid EC handle.
-- [ ] **03** — returns E_INVAL if [2] is 0 or exceeds num_counters.
-- [ ] **04** — returns E_INVAL if any config's event is not in supported_events.
-- [ ] **05** — returns E_INVAL if any config has has_threshold = 1 but the hardware does not support overflow.
-- [ ] **06** — returns E_INVAL if any reserved bits are set in any config_event.
-- [ ] **07** — returns E_BUSY if [1] is not the calling EC and not currently suspended.
-- [ ] **08** — on success, a subsequent `perfmon_read` on the target EC returns nonzero values in vregs `[1..2]` after the target EC has executed enough work to register the configured events.
-- [ ] **09** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `pmu`.
+- [x] **02** — returns E_BADCAP if [1] is not a valid EC handle.
+- [x] **03** — returns E_INVAL if [2] is 0 or exceeds num_counters.
+- [x] **04** — returns E_INVAL if any config's event is not in supported_events.
+- [x] **05** — returns E_INVAL if any config has has_threshold = 1 but the hardware does not support overflow.
+- [x] **06** — returns E_INVAL if any reserved bits are set in any config_event.
+- [x] **07** — returns E_BUSY if [1] is not the calling EC and not currently suspended.
+- [x] **08** — on success, a subsequent `perfmon_read` on the target EC returns nonzero values in vregs `[1..2]` after the target EC has executed enough work to register the configured events.
+- [x] **09** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## perfmon_read — 0/7
+## perfmon_read — 7/7
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `pmu`.
-- [ ] **02** — returns E_BADCAP if [1] is not a valid EC handle.
-- [ ] **03** — returns E_INVAL if perfmon was not started on the target EC.
-- [ ] **04** — returns E_BUSY if [1] is not the calling EC and not currently suspended.
-- [ ] **05** — on success, [1..num_counters] contain the current counter values for the active counters.
-- [ ] **06** — on success, [num_counters + 1] is a u64 nanosecond timestamp strictly greater than the timestamp from any prior `perfmon_read` on the same target EC, and each counter value is greater than or equal to the value returned by the prior `perfmon_read` on that target.
-- [ ] **07** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `pmu`.
+- [x] **02** — returns E_BADCAP if [1] is not a valid EC handle.
+- [x] **03** — returns E_INVAL if perfmon was not started on the target EC.
+- [x] **04** — returns E_BUSY if [1] is not the calling EC and not currently suspended.
+- [x] **05** — on success, [1..num_counters] contain the current counter values for the active counters.
+- [x] **06** — on success, [num_counters + 1] is a u64 nanosecond timestamp strictly greater than the timestamp from any prior `perfmon_read` on the same target EC, and each counter value is greater than or equal to the value returned by the prior `perfmon_read` on that target.
+- [x] **07** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## perfmon_stop — 0/6
+## perfmon_stop — 6/6
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `pmu`.
-- [ ] **02** — returns E_BADCAP if [1] is not a valid EC handle.
-- [ ] **03** — returns E_INVAL if perfmon was not started on the target EC.
-- [ ] **04** — returns E_BUSY if [1] is not the calling EC and not currently suspended.
-- [ ] **05** — on success, a subsequent `perfmon_read` on the target EC returns E_INVAL (perfmon was not started).
-- [ ] **06** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `pmu`.
+- [x] **02** — returns E_BADCAP if [1] is not a valid EC handle.
+- [x] **03** — returns E_INVAL if perfmon was not started on the target EC.
+- [x] **04** — returns E_BUSY if [1] is not the calling EC and not currently suspended.
+- [x] **05** — on success, a subsequent `perfmon_read` on the target EC returns E_INVAL (perfmon was not started).
+- [x] **06** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## create_var — 0/22
+## create_var — 2/22
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `crvr`.
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `crvr`.
 - [ ] **02** — returns E_PERM if caps' r/w/x bits are not a subset of the caller's `var_inner_ceiling`'s r/w/x bits.
 - [ ] **03** — returns E_PERM if caps.max_sz exceeds the caller's `var_inner_ceiling`'s max_sz.
 - [ ] **04** — returns E_PERM if caps.mmio = 1 and the caller's `var_inner_ceiling` does not permit mmio.
-- [ ] **05** — returns E_INVAL if [3] pages is 0.
+- [x] **05** — returns E_INVAL if [3] pages is 0.
 - [ ] **06** — returns E_INVAL if [4] preferred_base is nonzero and not aligned to the page size encoded in props.sz.
 - [ ] **07** — returns E_INVAL if caps.max_sz is 3 (reserved).
 - [ ] **08** — returns E_INVAL if caps.mmio = 1 and props.sz != 0.
