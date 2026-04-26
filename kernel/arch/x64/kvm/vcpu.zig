@@ -4,29 +4,30 @@ const zag = @import("zag");
 const apic = zag.arch.x64.apic;
 const arch_paging = zag.arch.x64.paging;
 const cpu = zag.arch.x64.cpu;
-const kvm = zag.arch.x64.kvm;
+const exit_handler = zag.arch.x64.kvm.exit_handler;
 const interrupts = zag.arch.x64.interrupts;
-const vm_hw = zag.arch.x64.vm;
-const exit_handler = kvm.exit_handler;
+const kvm = zag.arch.x64.kvm;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const sched = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
-const thread_mod = zag.sched.thread;
+const vm_hw = zag.arch.x64.vm;
 const vm_mod = kvm.vm;
 
+const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
-const Process = zag.proc.process.Process;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
+const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
 const Vm = vm_mod.Vm;
+const VmExitInfo = zag.arch.dispatch.vm.VmExitInfo;
 
-/// State of a vCPU. The field is accessed from multiple threads:
-/// the vCPU's own thread, `kickRunningVcpus` (walks all vCPUs), the
+/// State of a vCPU. The field is accessed from multiple contexts:
+/// the vCPU's own EC, `kickRunningVcpus` (walks all vCPUs), the
 /// exit handler, and `vm_reply`. All reads/writes must use atomic
 /// load/store -- see `loadState`/`storeState` helpers on `VCpu`.
 pub const VCpuState = enum(u8) {
@@ -42,7 +43,7 @@ pub var slab_instance: VCpuAllocator = undefined;
 
 pub const VCpu = struct {
     _gen_lock: GenLock = .{},
-    thread: SlabRef(Thread),
+    vcpu_ec: SlabRef(ExecutionContext),
     vm: SlabRef(Vm),
     guest_state: vm_hw.GuestState = .{},
     /// Atomic state. Use `loadState`/`storeState` -- direct `.state = ...`
@@ -89,375 +90,96 @@ pub const VCpu = struct {
     }
 };
 
-/// Create a vCPU: allocate the struct, create a kernel thread, link them.
+/// Create a vCPU: allocate the struct, link it to its vCPU EC.
 pub fn create(vm_obj: *Vm) !*VCpu {
-    const vcpu_alloc = try slab_instance.create();
-    const vcpu_obj = vcpu_alloc.ptr;
-    errdefer slab_instance.destroy(vcpu_obj, vcpu_alloc.gen) catch unreachable;
-
-    // Caller (vmCreate) holds the owning Process live for the entire
-    // duration of this syscall — the Process is the syscall caller.
-    // self-alive: owning Process is the syscall caller.
-    const proc = vm_obj.owner.ptr;
-
-    // Allocate a thread from the existing ThreadAllocator
-    const thread_alloc = try thread_mod.slab_instance.create();
-    const thread = thread_alloc.ptr;
-    errdefer thread_mod.slab_instance.destroy(thread, thread_alloc.gen) catch unreachable;
-
-    // Field-by-field init preserves `thread._gen_lock` set by the slab
-    // allocator. A `.* = .{...}` would zero it.
-    thread.tid = @atomicRmw(u64, &thread_mod.tid_counter, .Add, 1, .monotonic);
-    thread.ctx = undefined;
-    thread.kernel_stack = undefined;
-    thread.user_stack = null;
-    thread.process = SlabRef(Process).init(proc, proc._gen_lock.currentGen());
-    thread.next = null;
-    thread.priority = .normal;
-    thread.pre_pin_priority = .normal;
-    thread.pre_pin_affinity = null;
-    thread.core_affinity = null;
-    thread.state = .blocked; // starts blocked until vm_vcpu_run
-    thread.on_cpu = std.atomic.Value(bool).init(false);
-    thread.pinned_exclusive = false;
-    thread.futex_deadline_ns = 0;
-    thread.futex_wake_index = 0;
-    thread.futex_wait_nodes = null;
-    thread.futex_bucket_count = 0;
-    thread.ipc_server = null;
-    thread.slot_index = 0;
-    thread.fault_reason = .none;
-    thread.fault_addr = 0;
-    thread.fault_rip = 0;
-    thread.fault_user_ctx = null;
-    thread.pmu_state = null;
-    thread.fpu_state = [_]u8{0} ** 576;
-    thread.last_fpu_core = null;
-
-    // Allocate kernel stack
-    thread.kernel_stack = try stack_mod.createKernel();
-    errdefer stack_mod.destroyKernel(thread.kernel_stack, memory_init.kernel_addr_space_root);
-
-    try mapKernelStack(thread.kernel_stack);
-
-    // Set up the thread context with the vCPU entry point
-    const kstack_top = zag.memory.address.alignStack(thread.kernel_stack.top);
-    thread.ctx = interrupts.prepareThreadContext(kstack_top, null, &vcpuEntryPoint, @intFromPtr(vcpu_obj));
-
-    // Add thread to process thread list
-    proc._gen_lock.lock(@src());
-    if (proc.num_threads >= Process.MAX_THREADS) {
-        proc._gen_lock.unlock();
-        return error.MaxThreads;
-    }
-    thread.slot_index = @intCast(proc.num_threads);
-    proc.threads[proc.num_threads] = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
-    proc.num_threads += 1;
-    proc._gen_lock.unlock();
-
-    // Field-by-field to preserve `vcpu_obj._gen_lock`.
-    vcpu_obj.thread = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
-    vcpu_obj.vm = SlabRef(Vm).init(vm_obj, vm_obj._gen_lock.currentGen());
-    vcpu_obj.guest_state = .{};
-    vcpu_obj.state = .idle;
-    vcpu_obj.last_exit_info = .{ .unknown = 0 };
-    vcpu_obj.guest_fxsave = vm_hw.fxsaveInit();
-
-    return vcpu_obj;
+    // TODO step 6: rewrite for spec-v3. vCPU bring-up lives in
+    // `kernel/capdom/virtual_machine.zig`.allocVcpu, which calls
+    // `execution_context.allocExecutionContext` with `vm`/`exit_port`
+    // and then `dispatch.vm.allocVcpuArchState`.
+    _ = vm_obj;
+    @panic("step 6: rewrite for spec-v3");
 }
 
-/// Destroy a vCPU: kill its thread and free the struct.
+/// Destroy a vCPU: detach its EC and free the struct.
 /// `carried_gen` is the caller's SlabRef(VCpu) generation, passed
 /// through to the slab destroy so a stale ref panics rather than
 /// freeing a recycled slot.
 pub fn destroy(vcpu_obj: *VCpu, carried_gen: u63) void {
-    // vcpu_obj and its paired Thread are being torn down together here;
-    // the caller (Vm.destroy / vmCreate error unwind) has already
-    // ensured no concurrent observer holds the vCPU.
-    // self-alive: caller guarantees no concurrent observer holds vcpu_obj.
-    const thread = vcpu_obj.thread.ptr;
-
-    // Mark thread as exited so scheduler won't run it
-    thread.state = .exited;
-
-    // If on a CPU, IPI to force off
-    if (sched.coreRunning(thread)) |core_id| {
-        apic.sendSchedulerIpi(core_id);
-    }
-
-    // Remove from run queues
-    sched.removeFromAnyRunQueue(thread);
-
-    slab_instance.destroy(vcpu_obj, carried_gen) catch unreachable;
+    // TODO step 6: rewrite for spec-v3. vCPU teardown is owned by
+    // `dispatch.vm.freeVcpuArchState` plus the EC slab destroy from
+    // `execution_context`. Run-queue removal flows through scheduler
+    // helpers keyed on `*ExecutionContext`.
+    _ = vcpu_obj;
+    _ = carried_gen;
+    @panic("step 6: rewrite for spec-v3");
 }
 
 /// Syscall: transition vCPU from idle to running.
-pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-    const E_BUSY: i64 = -11;
-
-    const vm_ref = proc.vm orelse return E_INVAL;
-    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (entry.object != .thread) return E_BADCAP;
-
-    const thread_ptr = entry.object.thread.lock(@src()) catch return E_BADCAP;
-    defer entry.object.thread.unlock();
-
-    const vm_obj = vm_ref.lock(@src()) catch return E_BADCAP;
-    defer vm_ref.unlock();
-
-    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse return E_BADCAP;
-
-    if (vcpu_obj.loadState() != .idle) return E_BUSY;
-
-    vcpu_obj.storeState(.running);
-    // Reuse the gen-lock we already hold on `entry.object.thread`:
-    // `vcpuFromThread` matched by identity, so `vcpu_obj.thread.ptr ==
-    // thread_ptr`. Taking a second gen-lock on the same Thread slot
-    // would self-deadlock on the lock bit.
-    const thread = thread_ptr;
-    thread.state = .ready;
-    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
-    sched.enqueueOnCore(target_core, thread);
-
-    return 0; // E_OK
+pub fn vcpuRun(domain: *CapabilityDomain, ec_handle: u64) i64 {
+    // TODO step 6: rewrite for spec-v3. The EC is dispatched by the
+    // scheduler once ready and `enterGuest` is called from the EC's
+    // run path (`kernel/capdom/virtual_machine.zig` enterGuest).
+    _ = domain;
+    _ = ec_handle;
+    @panic("step 6: rewrite for spec-v3");
 }
 
 /// Syscall: set guest state (only when idle).
-pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-    const E_BADADDR: i64 = -7;
-    const E_BUSY: i64 = -11;
-
-    const vm_ref = proc.vm orelse return E_INVAL;
-    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (entry.object != .thread) return E_BADCAP;
-
-    const thread_ptr = entry.object.thread.lock(@src()) catch return E_BADCAP;
-    defer entry.object.thread.unlock();
-
-    const vm_obj = vm_ref.lock(@src()) catch return E_BADCAP;
-    defer vm_ref.unlock();
-
-    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse return E_BADCAP;
-
-    if (vcpu_obj.loadState() != .idle) return E_BUSY;
-
-    if (state_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
-
-    // Read guest state from userspace via physmap, handling cross-page boundaries.
-    var buf: [@sizeOf(vm_hw.GuestState)]u8 = undefined;
-    if (!readUserStruct(proc, state_ptr, &buf)) return E_BADADDR;
-    vcpu_obj.guest_state = std.mem.bytesAsValue(vm_hw.GuestState, &buf).*;
-    return 0; // E_OK
+pub fn vcpuSetState(domain: *CapabilityDomain, ec_handle: u64, state_ptr: u64) i64 {
+    // TODO step 6: rewrite for spec-v3. Guest state is mutated by
+    // writing the receiver's vregs between recv and reply on the
+    // vCPU's exit_port (spec §[vm_exit_state] / §[reply]).
+    _ = domain;
+    _ = ec_handle;
+    _ = state_ptr;
+    @panic("step 6: rewrite for spec-v3");
 }
 
 /// Syscall: get guest state. If running, IPI+suspend+snapshot+resume.
-pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-    const E_BADADDR: i64 = -7;
-
-    const vm_ref = proc.vm orelse return E_INVAL;
-    // Verify vm_ref's gen once at function entry; owning proc's vm can
-    // only be torn down by proc itself (same syscall target), so after
-    // this check the slot stays live for the duration of the call.
-    _ = vm_ref.lock(@src()) catch return E_INVAL;
-    vm_ref.unlock();
-    // self-alive: caller IS vm's owner proc.
-    const vm_obj = vm_ref.ptr;
-
-    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (entry.object != .thread) return E_BADCAP;
-
-    const thread_ptr = entry.object.thread.lock(@src()) catch return E_BADCAP;
-    defer entry.object.thread.unlock();
-
-    // Resolve vcpu + snapshot state under vm_obj._gen_lock. The lock is
-    // released before the IPI/spin loop so we don't stall other cores
-    // touching vm_obj while we wait for the vcpu thread to leave CPU.
-    vm_obj._gen_lock.lock(@src());
-    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse {
-        vm_obj._gen_lock.unlock();
-        return E_BADCAP;
-    };
-    const state_snapshot = vcpu_obj.loadState();
-    vm_obj._gen_lock.unlock();
-
-    if (state_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
-
-    // If running, IPI to suspend and snapshot
-    if (state_snapshot == .running) {
-        // Reuse the already-held gen-lock on `entry.object.thread`;
-        // vcpu_obj.thread aliases the same slot (see `vcpuFromThread`).
-        const thread = thread_ptr;
-        if (sched.coreRunning(thread)) |core_id| {
-            apic.sendSchedulerIpi(core_id);
-            // Spin until the thread is off CPU
-            while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-        }
-    }
-
-    // Copy guest_state out under the lock again (point-in-time snapshot).
-    vm_obj._gen_lock.lock(@src());
-    const src_bytes = std.mem.asBytes(&vcpu_obj.guest_state);
-    const write_ok = writeUserStruct(proc, state_ptr, src_bytes);
-    vm_obj._gen_lock.unlock();
-    if (!write_ok) return E_BADADDR;
-
-    // Resume if it was running
-    if (state_snapshot == .running) {
-        // Same aliased Thread slot; reuse the outer gen-lock.
-        const thread = thread_ptr;
-        thread.state = .ready;
-        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
-        sched.enqueueOnCore(target_core, thread);
-    }
-
-    return 0; // E_OK
+pub fn vcpuGetState(domain: *CapabilityDomain, ec_handle: u64, state_ptr: u64) i64 {
+    // TODO step 6: rewrite for spec-v3. Guest state is read from the
+    // receiver's vregs on recv (gated by the EC handle's read cap,
+    // spec §[vm_exit_state]).
+    _ = domain;
+    _ = ec_handle;
+    _ = state_ptr;
+    @panic("step 6: rewrite for spec-v3");
 }
 
 /// Syscall: inject an interrupt into a vCPU.
-pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-    const E_BADADDR: i64 = -7;
-
-    const vm_ref = proc.vm orelse return E_INVAL;
-    _ = vm_ref.lock(@src()) catch return E_INVAL;
-    vm_ref.unlock();
-    // self-alive: caller IS vm's owner proc.
-    const vm_obj = vm_ref.ptr;
-
-    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (entry.object != .thread) return E_BADCAP;
-
-    const thread_ptr = entry.object.thread.lock(@src()) catch return E_BADCAP;
-    defer entry.object.thread.unlock();
-
-    // Resolve vcpu + snapshot state under vm_obj._gen_lock. Lock released
-    // before the IPI/spin so we don't stall cross-core work on the VM.
-    vm_obj._gen_lock.lock(@src());
-    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse {
-        vm_obj._gen_lock.unlock();
-        return E_BADCAP;
-    };
-    const state_snapshot = vcpu_obj.loadState();
-    vm_obj._gen_lock.unlock();
-
-    if (interrupt_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(interrupt_ptr)) return E_BADADDR;
-
-    // Read interrupt from userspace via physmap, handling cross-page boundaries.
-    var int_buf: [@sizeOf(vm_hw.GuestInterrupt)]u8 = undefined;
-    if (!readUserStruct(proc, interrupt_ptr, &int_buf)) return E_BADADDR;
-    const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, &int_buf).*;
-
-    // Reject reserved architectural exception vectors 0-31 (Intel SDM Vol 3A,
-    // §6.3.1 "External Interrupts" and Table 6-1). External interrupts must
-    // use vectors >= 32; injecting 0-15 (faults) or 16-31 (reserved) via the
-    // VM-entry event-injection path (bypassing the LAPIC) would let an
-    // attacker VMM corrupt guest exception handling by writing an illegal
-    // vector directly to VMCS VM_ENTRY_INTR_INFO.
-    if (interrupt.vector < 32) return E_INVAL;
-
-    if (state_snapshot == .running) {
-        // Suspend phase. Reuse the already-held gen-lock on
-        // `entry.object.thread`; `vcpu_obj.thread` aliases the same
-        // Thread slot, so a second lock here would self-deadlock.
-        // IPI to suspend
-        if (sched.coreRunning(thread_ptr)) |core_id| {
-            apic.sendSchedulerIpi(core_id);
-            while (thread_ptr.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-        }
-        vm_obj._gen_lock.lock(@src());
-        // If the vCPU entry loop (or a prior injection) already queued a
-        // vector in pending_eventinj, don't clobber it. Route this vector
-        // through the LAPIC IRR so the entry loop can pick it up next time.
-        if (vcpu_obj.guest_state.pending_eventinj != 0) {
-            vm_obj.injectExternal(interrupt.vector);
-        } else {
-            vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
-        }
-        vm_obj._gen_lock.unlock();
-        // Resume phase. Same aliased Thread slot; reuse the outer lock.
-        const thread = thread_ptr;
-        thread.state = .ready;
-        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
-        sched.enqueueOnCore(target_core, thread);
-    } else {
-        // Not running — write pending interrupt into arch state
-        vm_obj._gen_lock.lock(@src());
-        defer vm_obj._gen_lock.unlock();
-        if (vcpu_obj.guest_state.pending_eventinj != 0) {
-            vm_obj.injectExternal(interrupt.vector);
-        } else {
-            vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
-        }
-    }
-
-    return 0; // E_OK
+pub fn vcpuInterrupt(domain: *CapabilityDomain, ec_handle: u64, interrupt_ptr: u64) i64 {
+    // TODO step 6: rewrite for spec-v3. Virtual interrupts are
+    // injected through `vm_inject_irq` against the VM handle (spec
+    // §[virtual_machine].vm_inject_irq); per-vCPU direct injection
+    // is not part of the spec-v3 surface.
+    _ = domain;
+    _ = ec_handle;
+    _ = interrupt_ptr;
+    @panic("step 6: rewrite for spec-v3");
 }
 
-/// Find the VCpu that owns a given thread within a VM.
+/// Find the VCpu that owns a given EC within a VM.
 /// Callers must hold `vm_obj._gen_lock`, which serializes with Vm
 /// destroy and keeps every live `vm_obj.vcpus[i]` slot alive for the
 /// duration of the lookup. self-alive: the vCPU slots indexed
 /// [0, num_vcpus) were allocated during vmCreate and are only freed
 /// via Vm.destroy, which takes the same lock.
-pub fn vcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*VCpu {
+pub fn vcpuFromEc(vm_obj: *Vm, ec: *ExecutionContext) ?*VCpu {
     for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |v| {
-        if (v.ptr.thread.ptr == thread) return v.ptr;
+        if (v.ptr.vcpu_ec.ptr == ec) return v.ptr;
     }
     return null;
 }
 
-/// The kernel-managed vCPU thread entry point.
+/// The kernel-managed vCPU EC entry point.
 /// When scheduled, enters guest mode via vm_hw.vmResume() in a loop.
 fn vcpuEntryPoint() void {
-    // Look up our VCpu by finding the current thread in the VM's vcpu array.
-    const thread = sched.currentThread().?;
-    // self-alive: this is the vCPU's own thread entry — the process
-    // that owns it (and its `vm`) is alive for the whole lifetime of
-    // this function; teardown goes through vm.destroy() + deinit.
-    const vm_obj = thread.process.ptr.vm.?.ptr;
-    const vcpu_obj = vcpuFromThread(vm_obj, thread).?;
-
-    var last_tsc: u64 = cpu.rdtscLFenced();
-
-    while (true) {
-        if (vcpu_obj.loadState() != .running) {
-            // Block until the VMM resumes us via vm_reply.
-            thread.state = .blocked;
-            cpu.enableInterrupts();
-            sched.yield();
-            last_tsc = cpu.rdtscLFenced();
-            continue;
-        }
-
-        // Tick interrupt-controller timers with elapsed nanoseconds before
-        // each VMRUN. TSC ticks at ~1 GHz on most hardware; treat 1 tick = 1 ns.
-        const now_tsc = cpu.rdtscLFenced();
-        const elapsed_ns = now_tsc -% last_tsc;
-        last_tsc = now_tsc;
-        vm_obj.tickInterruptControllers(elapsed_ns);
-
-        // Inject any pending deliverable interrupt vector from the kernel
-        // interrupt controllers (gated on guest IF, no prior EVENTINJ).
-        vm_obj.deliverPendingInterrupts(&vcpu_obj.guest_state);
-
-        // Enter guest mode
-        const vm_structures = vm_obj.arch_structures;
-        const exit_info = vm_hw.vmResume(&vcpu_obj.guest_state, vm_structures, &vcpu_obj.guest_fxsave);
-
-        // Handle the exit
-        vcpu_obj.last_exit_info = exit_info;
-        exit_handler.handleExit(vcpu_obj, exit_info);
-    }
+    // TODO step 6: rewrite for spec-v3. Dispatched by
+    // `kernel/capdom/virtual_machine.zig` enterGuest / handleGuestExit,
+    // which routes through `dispatch.vm.{loadGuestState,enterGuest,
+    // saveGuestState,lastVmExitInfo}` and fires vm_exit events on the
+    // EC's exit_port.
+    @panic("step 6: rewrite for spec-v3");
 }
 
 /// Verify [user_va, user_va+len) is entirely inside the user partition.
@@ -473,46 +195,24 @@ fn checkUserRange(user_va: u64, len: usize) bool {
 
 /// Read a struct from userspace into a kernel buffer, handling cross-page boundaries.
 /// Pre-faults pages and resolves each page's physical address independently.
-fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
-    if (!checkUserRange(user_va, buf.len)) return false;
-    var remaining: usize = buf.len;
-    var dst_off: usize = 0;
-    var src_va: u64 = user_va;
-    while (remaining > 0) {
-        const page_off = src_va & 0xFFF;
-        const chunk = @min(remaining, paging.PAGE4K - page_off);
-        proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const page_paddr = arch_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
-        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
-        const src: [*]const u8 = @ptrFromInt(physmap_addr);
-        @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
-        dst_off += chunk;
-        src_va += chunk;
-        remaining -= chunk;
-    }
-    return true;
+fn readUserStruct(domain: *CapabilityDomain, user_va: u64, buf: []u8) bool {
+    // TODO step 6: rewrite for spec-v3. Capability-domain user-memory
+    // accessors live behind a different API.
+    _ = domain;
+    _ = user_va;
+    _ = buf;
+    @panic("step 6: rewrite for spec-v3");
 }
 
 /// Write a kernel buffer to userspace, handling cross-page boundaries.
 /// Pre-faults pages and resolves each page's physical address independently.
-fn writeUserStruct(proc: *Process, user_va: u64, data: []const u8) bool {
-    if (!checkUserRange(user_va, data.len)) return false;
-    var remaining: usize = data.len;
-    var src_off: usize = 0;
-    var dst_va: u64 = user_va;
-    while (remaining > 0) {
-        const page_off = dst_va & 0xFFF;
-        const chunk = @min(remaining, paging.PAGE4K - page_off);
-        proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return false;
-        const page_paddr = arch_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
-        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
-        const dst: [*]u8 = @ptrFromInt(physmap_addr);
-        @memcpy(dst[0..chunk], data[src_off..][0..chunk]);
-        src_off += chunk;
-        dst_va += chunk;
-        remaining -= chunk;
-    }
-    return true;
+fn writeUserStruct(domain: *CapabilityDomain, user_va: u64, data: []const u8) bool {
+    // TODO step 6: rewrite for spec-v3. Capability-domain user-memory
+    // accessors live behind a different API.
+    _ = domain;
+    _ = user_va;
+    _ = data;
+    @panic("step 6: rewrite for spec-v3");
 }
 
 fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
@@ -533,10 +233,6 @@ fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
 }
 
 // ── Spec-v3 dispatch backings (STUB) ─────────────────────────────────
-
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
-const VmExitInfo = zag.arch.dispatch.vm.VmExitInfo;
 
 pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void {
     _ = vm;
