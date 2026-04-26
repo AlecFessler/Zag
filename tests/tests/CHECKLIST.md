@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 388.
-**Remaining:** 80.
+**Implemented:** 395.
+**Remaining:** 73.
 
 ## Convention
 
@@ -478,7 +478,7 @@ _§[device_irq] Device IRQ Delivery_
 - [ ] **11** — on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's EC state on reply; otherwise modifications are discarded.
 - [ ] **12** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## recv — 9/14
+## recv — 10/14
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid port handle.
 - [x] **02** — returns E_PERM if [1] does not have the `recv` cap.
@@ -489,13 +489,13 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **07** — on success, the syscall word's reply_handle_id is the slot id of a reply handle inserted into the caller's table referencing the dequeued sender.
 - [x] **08** — on success, the syscall word's event_type equals the event_type that triggered delivery.
 - [x] **09** — on success when the sender attached N handles, the syscall word's pair_count = N and the next N table slots [tstart, tstart+N) contain the inserted handles per §[handle_attachments].
-- [ ] **10** — on success when the sender attached no handles, pair_count = 0.
+- [x] **10** — on success when the sender attached no handles, pair_count = 0.
 - [ ] **11** — on success when the suspending EC handle had the `read` cap, the receiver's vregs reflect the suspended EC's state per §[event_state] (or §[vm_exit_state] when event_type = vm_exit).
 - [ ] **12** — on success when the suspending EC handle did not have the `read` cap, all event-state vregs are zeroed.
 - [ ] **13** — when multiple senders are queued, the kernel selects the highest-priority sender; ties resolve FIFO.
 - [ ] **14** — on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
 
-## handle_attachments — 4/10
+## handle_attachments — 5/10
 
 _§[handle_attachments] Handle Attachments_
 
@@ -503,7 +503,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **02** — returns E_BADCAP if any entry's source handle id is not valid in the suspending EC's domain.
 - [x] **03** — returns E_PERM if any entry's caps are not a subset of the source handle's current caps.
 - [x] **04** — returns E_PERM if any entry with `move = 1` references a source handle that lacks the `move` cap.
-- [ ] **05** — returns E_PERM if any entry with `move = 0` references a source handle that lacks the `copy` cap.
+- [x] **05** — returns E_PERM if any entry with `move = 0` references a source handle that lacks the `copy` cap.
 - [ ] **06** — returns E_INVAL if any reserved bits are set in an entry.
 - [ ] **07** — returns E_INVAL if two entries reference the same source handle.
 - [ ] **08** — on recv, the receiver's syscall word `pair_count` equals `N` and the next `N` table slots `[tstart, tstart+N)` contain the inserted handles, each with caps = entry.caps intersected with `idc_rx` for IDC handles, or entry.caps verbatim for other handle types.
@@ -587,7 +587,7 @@ _§[handle_attachments] Handle Attachments_
 - [ ] **09** — `timer_rearm` called on a currently-armed timer replaces the prior configuration; the prior pending fire does not occur and field0 reflects the reset to 0 rather than any partial fire.
 - [ ] **10** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## timer_cancel — 6/9
+## timer_cancel — 8/9
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid timer handle.
 - [x] **02** — returns E_PERM if [1] does not have the `cancel` cap.
@@ -595,28 +595,28 @@ _§[handle_attachments] Handle Attachments_
 - [x] **04** — returns E_INVAL if any reserved bits are set in [1].
 - [x] **05** — on success, the calling domain's copy of [1] has `field0 = u64::MAX` immediately on return; every other domain-local copy returns u64::MAX from a fresh `sync` within a bounded delay.
 - [x] **06** — on success, [1].field1.arm becomes 0.
-- [ ] **07** — on success, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0; subsequent reads observe field0 = u64::MAX.
-- [ ] **08** — on success, after one full prior `deadline_ns` has elapsed, every domain-local copy of [1] still returns `field0 = u64::MAX` from a fresh `sync`.
+- [x] **07** — on success, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0; subsequent reads observe field0 = u64::MAX.
+- [x] **08** — on success, after one full prior `deadline_ns` has elapsed, every domain-local copy of [1] still returns `field0 = u64::MAX` from a fresh `sync`.
 - [ ] **09** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## futex_wait_val — 3/8
-
-- [x] **01** — returns E_PERM if the caller's self-handle has `fut_wait_max = 0`.
-- [x] **02** — returns E_INVAL if N is 0 or N > 63.
-- [x] **03** — returns E_INVAL if N exceeds the caller's self-handle `fut_wait_max`.
-- [ ] **04** — returns E_INVAL if any addr is not 8-byte aligned.
-- [ ] **05** — returns E_BADADDR if any addr is not a valid user address in the caller's domain.
-- [ ] **06** — returns E_TIMEOUT if the timeout expires before any pair's `addr != expected` condition is met and before any watched address is woken.
-- [ ] **07** — on entry, when any pair's current `*addr != expected`, returns immediately with `[1]` set to that addr.
-- [ ] **08** — when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
-
-## futex_wait_change — 4/8
+## futex_wait_val — 5/8
 
 - [x] **01** — returns E_PERM if the caller's self-handle has `fut_wait_max = 0`.
 - [x] **02** — returns E_INVAL if N is 0 or N > 63.
 - [x] **03** — returns E_INVAL if N exceeds the caller's self-handle `fut_wait_max`.
 - [x] **04** — returns E_INVAL if any addr is not 8-byte aligned.
-- [ ] **05** — returns E_BADADDR if any addr is not a valid user address in the caller's domain.
+- [x] **05** — returns E_BADADDR if any addr is not a valid user address in the caller's domain.
+- [ ] **06** — returns E_TIMEOUT if the timeout expires before any pair's `addr != expected` condition is met and before any watched address is woken.
+- [ ] **07** — on entry, when any pair's current `*addr != expected`, returns immediately with `[1]` set to that addr.
+- [ ] **08** — when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
+
+## futex_wait_change — 5/8
+
+- [x] **01** — returns E_PERM if the caller's self-handle has `fut_wait_max = 0`.
+- [x] **02** — returns E_INVAL if N is 0 or N > 63.
+- [x] **03** — returns E_INVAL if N exceeds the caller's self-handle `fut_wait_max`.
+- [x] **04** — returns E_INVAL if any addr is not 8-byte aligned.
+- [x] **05** — returns E_BADADDR if any addr is not a valid user address in the caller's domain.
 - [ ] **06** — returns E_TIMEOUT if the timeout expires before any pair's `addr == target` condition is met and before any watched address is woken.
 - [ ] **07** — on entry, when any pair's current `*addr == target`, returns immediately with `[1]` set to that addr.
 - [ ] **08** — when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
