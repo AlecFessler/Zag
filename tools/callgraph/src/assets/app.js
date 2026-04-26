@@ -2509,26 +2509,35 @@
       return;
     }
 
-    const changedFnIds = new Set();
-    const changedFnNames = new Set();
-    // Definitions whose source range overlaps a hunk. Computed alongside
-    // changedFnIds so we can extend the fn set with anything that
-    // depends on a changed def — the user's mental model is "a struct
-    // changed → every fn touching that struct should be flagged".
-    const changedDefIds = new Set();
+    // Pick the graph whose line numbers match the hunks' "+" side.
+    //   parent mode:  hunks = X^..X, .start refers to X's lines → use X's graph.
+    //   head mode:    hunks = worktree vs X, .start refers to worktree lines → use the worktree graph.
+    // Without this, fn def_loc.line is in the wrong coordinate space and the
+    // overlap check finds almost nothing — which is what was killing the
+    // tracker after the parent-mode diff endpoint was fixed to X^..X.
+    let overlapGraph = graph;
+    if (pair) {
+      const entry = await ensureSecGraph(pair.sha_b);
+      if (entry && entry.graph) overlapGraph = entry.graph;
+    }
+
+    // Step 1: overlap on overlapGraph → collect cross-graph keys (names for
+    // fns, qualified_names for defs). We don't keep IDs from overlapGraph
+    // because downstream code (subtree BFS, entryNeedsReview, the tracker's
+    // fn.def_deps lookup) all run against the worktree graph.
+    const hitFnNames = new Set();
+    const hitDefQNames = new Set();
 
     if (hunksByFile.size > 0) {
-      // Bucket fns AND defs by repo-relative file path; we only care
-      // about files that have at least one hunk.
       const fnsByFile = new Map();
-      for (const fn of (graph.functions || [])) {
+      for (const fn of (overlapGraph.functions || [])) {
         const rel = defLocToRepoRel(fn.def_loc && fn.def_loc.file);
         if (!rel || !hunksByFile.has(rel)) continue;
         if (!fnsByFile.has(rel)) fnsByFile.set(rel, []);
         fnsByFile.get(rel).push(fn);
       }
       const defsByFile = new Map();
-      for (const def of (graph.definitions || [])) {
+      for (const def of (overlapGraph.definitions || [])) {
         const rel = defLocToRepoRel(def.file);
         if (!rel || !hunksByFile.has(rel)) continue;
         if (!defsByFile.has(rel)) defsByFile.set(rel, []);
@@ -2536,10 +2545,9 @@
       }
 
       for (const [path, fns] of fnsByFile.entries()) {
-        // Sort by def_loc.line so we can use the next fn's start as
-        // an upper bound for the current fn's range. The last fn in
-        // the file gets +∞ — a conservative end that may over-flag
-        // trailing helpers but never under-flags a real change.
+        // Sort by def_loc.line so we can use the next fn's start as an
+        // upper bound for the current fn's range. The last fn in the file
+        // gets +∞ — over-flags trailing helpers but never under-flags.
         fns.sort(function (a, b) {
           return (a.def_loc.line || 0) - (b.def_loc.line || 0);
         });
@@ -2551,15 +2559,14 @@
             : Infinity;
           for (const h of hunks) {
             const hstart = h.start;
-            // count=0 represents pure deletions; treat as a single
-            // boundary line so insert/delete-only hunks still count.
+            // count=0 represents pure deletions; treat as one boundary
+            // line so insert/delete-only hunks still count.
             const span = h.count === 0 ? 1 : h.count;
             const hend = hstart + span - 1;
             if (hend < startLine) continue;
             if (hstart > endLine) continue;
-            changedFnIds.add(fns[i].id);
-            if (fns[i].name) changedFnNames.add(fns[i].name);
-            if (fns[i].mangled) changedFnNames.add(fns[i].mangled);
+            if (fns[i].name) hitFnNames.add(fns[i].name);
+            if (fns[i].mangled) hitFnNames.add(fns[i].mangled);
             break;
           }
         }
@@ -2579,27 +2586,46 @@
             const hend = hstart + span - 1;
             if (hend < startLine) continue;
             if (hstart > endLine) continue;
-            changedDefIds.add(def.id);
+            if (def.qualified_name) hitDefQNames.add(def.qualified_name);
             break;
           }
         }
       }
+    }
 
-      // Extend changedFnIds with any fn whose def_deps intersect
-      // changedDefIds. This is the "struct edit flags every fn that uses
-      // it" rule — the user's review-driven mental model.
-      if (changedDefIds.size > 0) {
-        for (const fn of (graph.functions || [])) {
-          const deps = fn.def_deps;
-          if (!deps || deps.length === 0) continue;
-          if (changedFnIds.has(fn.id)) continue;
-          for (const did of deps) {
-            if (changedDefIds.has(did)) {
-              changedFnIds.add(fn.id);
-              if (fn.name) changedFnNames.add(fn.name);
-              if (fn.mangled) changedFnNames.add(fn.mangled);
-              break;
-            }
+    // Step 2: translate hits into worktree id-space. Downstream code
+    // (subtree BFS, entryNeedsReview BFS, tracker fn.def_deps matching, the
+    // source-pane ident highlighter) all index into the worktree graph by
+    // id, so the result sets must use worktree ids.
+    const changedFnNames = new Set(hitFnNames);
+    const changedDefIds = new Set();
+    for (const def of (graph.definitions || [])) {
+      if (def.qualified_name && hitDefQNames.has(def.qualified_name)) {
+        changedDefIds.add(def.id);
+      }
+    }
+    const changedFnIds = new Set();
+    for (const fn of (graph.functions || [])) {
+      if ((fn.name && changedFnNames.has(fn.name)) ||
+          (fn.mangled && changedFnNames.has(fn.mangled))) {
+        changedFnIds.add(fn.id);
+      }
+    }
+
+    // Step 3: def_deps extension on the worktree graph. fn.def_deps
+    // reference worktree def ids; changedDefIds (post-translate) is also
+    // in worktree id-space — so this is a clean intersection.
+    if (changedDefIds.size > 0) {
+      for (const fn of (graph.functions || [])) {
+        if (changedFnIds.has(fn.id)) continue;
+        const deps = fn.def_deps;
+        if (!deps || deps.length === 0) continue;
+        for (const did of deps) {
+          if (changedDefIds.has(did)) {
+            changedFnIds.add(fn.id);
+            if (fn.name) changedFnNames.add(fn.name);
+            if (fn.mangled) changedFnNames.add(fn.mangled);
+            break;
           }
         }
       }
