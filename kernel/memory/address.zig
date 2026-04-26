@@ -135,9 +135,25 @@ pub const KernelVA = struct {
             .end = proc_slab_ptrs.end + SLAB_RESERVATION,
         };
 
+        // Spec-v3 §[device_region] slab (kernel/devices/device_region.zig).
+        // Distinct from the legacy `device_region_slab` above, which still
+        // backs the IOMMU PCI/DMA shape pending its spec-v3 rework.
+        pub const dev_region_slab: Range = .{
+            .start = proc_slab_links.end,
+            .end = proc_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const dev_region_slab_ptrs: Range = .{
+            .start = dev_region_slab.end,
+            .end = dev_region_slab.end + SLAB_RESERVATION,
+        };
+        pub const dev_region_slab_links: Range = .{
+            .start = dev_region_slab_ptrs.end,
+            .end = dev_region_slab_ptrs.end + SLAB_RESERVATION,
+        };
+
         pub const range: Range = .{
             .start = vm_node_slab.start,
-            .end = proc_slab_links.end,
+            .end = dev_region_slab_links.end,
         };
     };
 };

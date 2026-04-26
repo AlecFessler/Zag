@@ -4,6 +4,7 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const boot = zag.boot;
+const dev_region_mod = zag.devices.device_region;
 const device_region_mod = zag.memory.device_region;
 const KA = address.KernelVA.KernelAllocators;
 const paging = zag.memory.paging;
@@ -182,6 +183,15 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.device_region_slab,
         KA.device_region_slab_ptrs,
         KA.device_region_slab_links,
+    );
+    // Spec-v3 §[device_region] slab. Boot-time PCI / serial enumerators
+    // call into devices.device_region.registerMmio / registerPortIo
+    // before any userspace runs, so the slab must be live before
+    // arch.boot.parseFirmwareTables.
+    dev_region_mod.initSlab(
+        KA.dev_region_slab,
+        KA.dev_region_slab_ptrs,
+        KA.dev_region_slab_links,
     );
 
     // TODO: perfmon slab init — kernel/sched/perfmon.zig.slab_instance is
