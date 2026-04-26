@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 435.
-**Remaining:** 33.
+**Implemented:** 448.
+**Remaining:** 20.
 
 ## Convention
 
@@ -463,7 +463,7 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **03** — returns E_INVAL if any reserved bits are set in [1].
 - [x] **04** — on success, the caller receives a port handle with caps = `[1].caps`.
 
-## suspend — 7/12
+## suspend — 9/12
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid EC handle.
 - [x] **02** — returns E_BADCAP if [2] is not a valid port handle.
@@ -472,8 +472,8 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **05** — returns E_INVAL if any reserved bits are set.
 - [x] **06** — returns E_INVAL if [1] references a vCPU.
 - [x] **07** — returns E_INVAL if [1] is already suspended.
-- [ ] **08** — on success, the target EC stops executing.
-- [ ] **09** — on success, a suspension event is delivered on [2].
+- [x] **08** — on success, the target EC stops executing.
+- [x] **09** — on success, a suspension event is delivered on [2].
 - [ ] **10** — on success, when [1] has the `read` cap, the suspension event payload exposes the target's EC state per §[event_state]; otherwise the state in the payload is zeroed.
 - [ ] **11** — on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's EC state on reply; otherwise modifications are discarded.
 - [ ] **12** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
@@ -495,7 +495,7 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **13** — when multiple senders are queued, the kernel selects the highest-priority sender; ties resolve FIFO.
 - [x] **14** — on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
 
-## handle_attachments — 6/10
+## handle_attachments — 9/10
 
 _§[handle_attachments] Handle Attachments_
 
@@ -505,9 +505,9 @@ _§[handle_attachments] Handle Attachments_
 - [x] **04** — returns E_PERM if any entry with `move = 1` references a source handle that lacks the `move` cap.
 - [x] **05** — returns E_PERM if any entry with `move = 0` references a source handle that lacks the `copy` cap.
 - [x] **06** — returns E_INVAL if any reserved bits are set in an entry.
-- [ ] **07** — returns E_INVAL if two entries reference the same source handle.
-- [ ] **08** — on recv, the receiver's syscall word `pair_count` equals `N` and the next `N` table slots `[tstart, tstart+N)` contain the inserted handles, each with caps = entry.caps intersected with `idc_rx` for IDC handles, or entry.caps verbatim for other handle types.
-- [ ] **09** — on recv, source entries with `move = 1` are removed from the sender's table; entries with `move = 0` are not removed.
+- [x] **07** — returns E_INVAL if two entries reference the same source handle.
+- [x] **08** — on recv, the receiver's syscall word `pair_count` equals `N` and the next `N` table slots `[tstart, tstart+N)` contain the inserted handles, each with caps = entry.caps intersected with `idc_rx` for IDC handles, or entry.caps verbatim for other handle types.
+- [x] **09** — on recv, source entries with `move = 1` are removed from the sender's table; entries with `move = 0` are not removed.
 - [ ] **10** — when the suspend resumes with `E_CLOSED` before any recv, no entry is moved or copied.
 
 ## bind_event_route — 9/10
@@ -543,7 +543,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **06** — on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
 - [x] **07** — on success, the suspended EC is resumed.
 
-## reply_transfer — 7/15
+## reply_transfer — 8/15
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid reply handle.
 - [x] **02** — returns E_PERM if [1] does not have the `xfer` cap.
@@ -552,7 +552,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **05** — returns E_BADCAP if any pair entry's source handle id is not valid in the caller's domain.
 - [x] **06** — returns E_PERM if any pair entry's caps are not a subset of the source handle's current caps.
 - [x] **07** — returns E_PERM if any pair entry with `move = 1` references a source handle that lacks the `move` cap.
-- [ ] **08** — returns E_PERM if any pair entry with `move = 0` references a source handle that lacks the `copy` cap.
+- [x] **08** — returns E_PERM if any pair entry with `move = 0` references a source handle that lacks the `copy` cap.
 - [ ] **09** — returns E_INVAL if two pair entries reference the same source handle.
 - [ ] **10** — returns E_TERM if the suspended EC was terminated before reply could deliver; [1] is consumed and no handle transfer occurs.
 - [ ] **11** — returns E_FULL if the resumed EC's domain handle table cannot accommodate N contiguous slots; [1] is NOT consumed and the caller's table is unchanged.
@@ -645,7 +645,7 @@ _§[rng] RNG_
 - [x] **01** — returns E_INVAL if count is 0 or count > 127.
 - [x] **02** — on success, vregs `[1..count]` contain qwords (the CSPRNG-source guarantee in the prose above is a kernel implementation contract, not a black-box-testable assertion).
 
-## system_info — 4/6
+## system_info — 6/6
 
 _§[system_info] System Info_
 
@@ -653,10 +653,10 @@ _§[system_info] System Info_
 - [x] **02** — on success, [3] equals the platform's total RAM divided by 4 KiB.
 - [x] **03** — on success, [4] bit 0 is set on every supported architecture.
 - [x] **04** — returns E_INVAL if [1] core_id is greater than or equal to `info_system`'s `cores`.
-- [ ] **05** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **06** — on success, [1] flag bit 0 reflects whether the queried core is currently online.
+- [x] **05** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **06** — on success, [1] flag bit 0 reflects whether the queried core is currently online.
 
-## power — 4/15
+## power — 9/15
 
 _§[power] Power Management_
 
@@ -664,11 +664,11 @@ _§[power] Power Management_
 - [x] **02** — returns E_PERM if the caller's self-handle lacks `power`.
 - [x] **03** — returns E_PERM if the caller's self-handle lacks `power`.
 - [x] **04** — returns E_INVAL if [1] is not 1, 3, or 4.
-- [ ] **05** — returns E_NODEV if the platform does not support the requested sleep depth.
-- [ ] **06** — returns E_PERM if the caller's self-handle lacks `power`.
-- [ ] **07** — returns E_PERM if the caller's self-handle lacks `power`.
-- [ ] **08** — returns E_INVAL if [1] is greater than or equal to `info_system`'s `cores`.
-- [ ] **09** — returns E_NODEV if the queried core does not support frequency scaling (per `info_cores` flag bit 2).
+- [x] **05** — returns E_NODEV if the platform does not support the requested sleep depth.
+- [x] **06** — returns E_PERM if the caller's self-handle lacks `power`.
+- [x] **07** — returns E_PERM if the caller's self-handle lacks `power`.
+- [x] **08** — returns E_INVAL if [1] is greater than or equal to `info_system`'s `cores`.
+- [x] **09** — returns E_NODEV if the queried core does not support frequency scaling (per `info_cores` flag bit 2).
 - [ ] **10** — returns E_INVAL if [2] is nonzero and outside the platform's supported frequency range.
 - [ ] **11** — on success, a subsequent `info_cores([1])` reports a `freq_hz` consistent with the requested target (within hardware tolerance).
 - [ ] **12** — returns E_PERM if the caller's self-handle lacks `power`.
