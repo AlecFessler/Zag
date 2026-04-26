@@ -330,6 +330,15 @@ pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
     fpu_flush_mailbox[target_core].waitDone();
 }
 
+/// Spec-v3 EC variant of `fpuFlushIpi`. Identical wire protocol (SGI 2)
+/// but the mailbox payload names an `*ExecutionContext`. Spec
+/// §[execution_context] lazy FPU.
+pub fn fpuFlushIpiEc(target_core: u8, ec: *ExecutionContext) void {
+    _ = target_core;
+    _ = ec;
+    @panic("not implemented");
+}
+
 /// DC ZVA block size in bytes. Captured at boot from DCZID_EL0.BS. When
 /// `DCZID_EL0.DZP` is set the instruction is disabled at EL1 (or the
 /// implementation chose not to support it) and we must use the `@memset`
