@@ -64,6 +64,14 @@ pub const PerfmonState = struct {
 pub const Allocator = SecureSlab(PerfmonState, 256);
 pub var slab_instance: Allocator = undefined;
 
+pub fn initSlab(
+    data_range: zag.utils.range.Range,
+    ptrs_range: zag.utils.range.Range,
+    links_range: zag.utils.range.Range,
+) void {
+    slab_instance = Allocator.init(data_range, ptrs_range, links_range);
+}
+
 // ── Internal API (no syscalls — perfmon syscalls live on EC) ─────────
 
 /// Lazy-allocate a PerfmonState slot for an EC on first perfmon_start.

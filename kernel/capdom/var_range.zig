@@ -136,6 +136,14 @@ pub const VAR = struct {
 pub const Allocator = SecureSlab(VAR, 256);
 pub var slab_instance: Allocator = undefined;
 
+pub fn initSlab(
+    data_range: zag.utils.range.Range,
+    ptrs_range: zag.utils.range.Range,
+    links_range: zag.utils.range.Range,
+) void {
+    slab_instance = Allocator.init(data_range, ptrs_range, links_range);
+}
+
 inline fn pageSizeBytes(sz: PageSize) u64 {
     return switch (sz) {
         .sz_4k => 0x1000,
