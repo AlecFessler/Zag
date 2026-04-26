@@ -23,6 +23,7 @@ const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const VAddr = zag.memory.address.VAddr;
 
 /// Page size encoding (immutable per page frame). Same enum used by
 /// VAR — re-exported for convenience.
@@ -163,7 +164,12 @@ fn allocPageFrame(sz: PageSize, page_count: u32) !*PageFrame {
     const pf = ref.ptr;
     pf.refcount = 1;
     pf.mapcnt = 0;
-    pf.phys_base = PAddr.fromInt(@intFromPtr(block));
+    // PMM allocBlock returns a physmap virtual pointer (the buddy
+    // allocator is initialized over the physmap window — see
+    // memory/init.zig). Convert to PA here so PTE installs and
+    // IOMMU mappings see the real frame number rather than a
+    // canonical-form VA that overflows the 52-bit PA field.
+    pf.phys_base = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(block)), null);
     pf.page_count = page_count;
     pf.sz = sz;
 
@@ -174,7 +180,9 @@ fn allocPageFrame(sz: PageSize, page_count: u32) !*PageFrame {
 /// `_gen_lock`. Returns physical pages to PMM and frees the slab slot.
 fn destroyPageFrame(pf: *PageFrame) void {
     // Snapshot what we need before the slab destroy invalidates `pf`.
-    const phys = pf.phys_base.addr;
+    // PMM freeBlock expects a physmap virtual pointer (matches what
+    // allocBlock returned); convert from the stored physical address.
+    const phys_base = pf.phys_base;
     const total_bytes = pageSizeBytes(pf.sz) * @as(u64, pf.page_count);
     const expected_gen: u63 = @intCast(pf._gen_lock.currentGen());
 
@@ -186,7 +194,8 @@ fn destroyPageFrame(pf: *PageFrame) void {
     // PMM freeBlock zero-fills before returning pages to the buddy, so
     // the next allocator sees a clean region.
     if (pmm.global_pmm) |*pmm_mgr| {
-        const ptr: [*]u8 = @ptrFromInt(phys);
+        const virt = VAddr.fromPAddr(phys_base, null);
+        const ptr: [*]u8 = @ptrFromInt(virt.addr);
         pmm_mgr.freeBlock(ptr[0..total_bytes]);
     }
 }
