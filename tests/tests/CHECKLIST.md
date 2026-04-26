@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 164.
-**Remaining:** 304.
+**Implemented:** 174.
+**Remaining:** 294.
 
 ## Convention
 
@@ -250,28 +250,28 @@ _§[restart_semantics] Restart Semantics_
 - [x] **21** — on success, when [4] preferred_base is nonzero and the range is available, the assigned base address equals `[4]`.
 - [x] **22** — on success, when caps.dma = 1, field1's `device` field equals [5]'s handle id, and a subsequent `map_pf` into this VAR routes the bound device's accesses at field0 + offset to the installed page_frame.
 
-## map_pf — 3/14
+## map_pf — 10/14
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
 - [x] **02** — returns E_BADCAP if any [2 + 2i + 1] is not a valid page_frame handle.
 - [x] **03** — returns E_PERM if [1].caps has `mmio` set (mmio VARs accept only `map_mmio`).
-- [ ] **04** — returns E_INVAL if N is 0.
-- [ ] **05** — returns E_INVAL if any offset is not aligned to the VAR's `sz` page size.
-- [ ] **06** — returns E_INVAL if any page_frame's `sz` is smaller than the VAR's `sz`.
-- [ ] **07** — returns E_INVAL if any pair's range exceeds the VAR's size.
-- [ ] **08** — returns E_INVAL if any two pairs' ranges overlap.
-- [ ] **09** — returns E_INVAL if any pair's range overlaps an existing mapping in the VAR.
-- [ ] **10** — returns E_INVAL if [1].field1 `map` is 2 (mmio) or 3 (demand) — pf installation requires `map = 0` or `map = 1`.
+- [x] **04** — returns E_INVAL if N is 0.
+- [x] **05** — returns E_INVAL if any offset is not aligned to the VAR's `sz` page size.
+- [x] **06** — returns E_INVAL if any page_frame's `sz` is smaller than the VAR's `sz`.
+- [x] **07** — returns E_INVAL if any pair's range exceeds the VAR's size.
+- [x] **08** — returns E_INVAL if any two pairs' ranges overlap.
+- [x] **09** — returns E_INVAL if any pair's range overlaps an existing mapping in the VAR.
+- [x] **10** — returns E_INVAL if [1].field1 `map` is 2 (mmio) or 3 (demand) — pf installation requires `map = 0` or `map = 1`.
 - [ ] **11** — on success, [1].field1 `map` becomes 1 if it was 0; otherwise stays 1.
 - [ ] **12** — on success, when [1].caps.dma = 0, CPU accesses to `VAR.base + offset` use effective permissions = `VAR.cur_rwx` ∩ `page_frame.r/w/x` per page.
 - [ ] **13** — on success, when [1].caps.dma = 1, a DMA read by the bound device from `VAR.base + offset` returns the installed page_frame's contents, and a DMA access whose access type is not in `VAR.cur_rwx` ∩ `page_frame.r/w/x` is rejected by the IOMMU rather than reaching the page_frame.
 - [ ] **14** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## map_mmio — 0/9
+## map_mmio — 3/9
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
-- [ ] **02** — returns E_BADCAP if [2] is not a valid device_region handle.
-- [ ] **03** — returns E_PERM if [1] does not have the `mmio` cap.
+- [x] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
+- [x] **02** — returns E_BADCAP if [2] is not a valid device_region handle.
+- [x] **03** — returns E_PERM if [1] does not have the `mmio` cap.
 - [ ] **04** — returns E_INVAL if [1].field1 `map` is not 0 (mmio mappings are atomic; the VAR must be unmapped).
 - [ ] **05** — returns E_INVAL if [2]'s size does not equal [1]'s size.
 - [ ] **06** — on success, [1].field1 `map` becomes 2.
