@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 8.  
-**Remaining:** 460.
+**Implemented:** 18.  
+**Remaining:** 450.
 
 ## Convention
 
@@ -35,25 +35,25 @@ entry is in `test_entries`.
 - [x] **06** — on success, the handle's caps field equals [2].caps.
 - [x] **07** — on success, syscalls gated by caps cleared by restrict return E_PERM when invoked via this handle.
 
-## delete — 1/3
+## delete — 3/3
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid handle.
-- [ ] **02** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **03** — on success, the handle is released and subsequent operations on it return E_BADCAP.
+- [x] **02** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **03** — on success, the handle is released and subsequent operations on it return E_BADCAP.
 
-## revoke — 0/6
+## revoke — 6/6
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid handle.
-- [ ] **02** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **03** — on success, every handle transitively derived via copy from [1] is released from its holder with the type-specific delete behavior applied.
-- [ ] **04** — a handle that was copied from [1] and then subsequently moved is released by revoke([1]).
-- [ ] **05** — revoke([1]) does not release [1] itself.
-- [ ] **06** — revoke([1]) does not release any handle on the copy ancestor side of [1].
+- [x] **01** — returns E_BADCAP if [1] is not a valid handle.
+- [x] **02** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **03** — on success, every handle transitively derived via copy from [1] is released from its holder with the type-specific delete behavior applied.
+- [x] **04** — a handle that was copied from [1] and then subsequently moved is released by revoke([1]).
+- [x] **05** — revoke([1]) does not release [1] itself.
+- [x] **06** — revoke([1]) does not release any handle on the copy ancestor side of [1].
 
-## sync — 0/3
+## sync — 2/3
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid handle.
-- [ ] **02** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **01** — returns E_BADCAP if [1] is not a valid handle.
+- [x] **02** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **03** — on success, [1]'s field0 and field1 reflect the authoritative kernel state at the moment of the call.
 
 ## self_handle — 0/1

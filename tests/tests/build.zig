@@ -12,6 +12,8 @@ const TestEntry = struct {
 // under tests/ then add an entry below.
 const test_entries = [_]TestEntry{
     .{ .name = "delete_01", .path = "tests/delete_01.zig" },
+    .{ .name = "delete_02", .path = "tests/delete_02.zig" },
+    .{ .name = "delete_03", .path = "tests/delete_03.zig" },
     .{ .name = "restrict_01", .path = "tests/restrict_01.zig" },
     .{ .name = "restrict_02", .path = "tests/restrict_02.zig" },
     .{ .name = "restrict_03", .path = "tests/restrict_03.zig" },
@@ -19,6 +21,14 @@ const test_entries = [_]TestEntry{
     .{ .name = "restrict_05", .path = "tests/restrict_05.zig" },
     .{ .name = "restrict_06", .path = "tests/restrict_06.zig" },
     .{ .name = "restrict_07", .path = "tests/restrict_07.zig" },
+    .{ .name = "revoke_01", .path = "tests/revoke_01.zig" },
+    .{ .name = "revoke_02", .path = "tests/revoke_02.zig" },
+    .{ .name = "revoke_03", .path = "tests/revoke_03.zig" },
+    .{ .name = "revoke_04", .path = "tests/revoke_04.zig" },
+    .{ .name = "revoke_05", .path = "tests/revoke_05.zig" },
+    .{ .name = "revoke_06", .path = "tests/revoke_06.zig" },
+    .{ .name = "sync_01", .path = "tests/sync_01.zig" },
+    .{ .name = "sync_02", .path = "tests/sync_02.zig" },
 };
 
 fn buildTestElf(
