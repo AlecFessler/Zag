@@ -5,9 +5,13 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const arch_paging = zag.arch.x64.paging;
 const errors = zag.syscall.errors;
 const fpu = zag.sched.fpu;
+const memory_init = zag.memory.init;
+const paging_consts = zag.memory.paging;
 const perfmon_mod = zag.sched.perfmon;
+const pmm = zag.memory.pmm;
 const scheduler = zag.sched.scheduler;
 const stack = zag.memory.stack;
 
@@ -15,6 +19,7 @@ const ArchCpuContext = arch.cpu.ArchCpuContext;
 const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const KernelHandle = zag.caps.capability.KernelHandle;
+const PAddr = zag.memory.address.PAddr;
 const PerfmonState = zag.sched.perfmon.PerfmonState;
 const Port = zag.sched.port.Port;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
@@ -578,6 +583,26 @@ pub fn allocExecutionContext(
     const kstack = try stack.createKernel();
     errdefer stack.destroyKernel(kstack, domain.addr_space_root);
 
+    // Back the kernel stack VA range with physical pages mapped into
+    // the *kernel* address space root (the kernel half is shared
+    // across all domain PML4s via copyKernelMappings). Without this
+    // step the iret epilogue's stack pop and any subsequent kernel
+    // execution on this stack page-fault into the void.
+    var page_addr: u64 = kstack.base.addr;
+    while (page_addr < kstack.top.addr) {
+        const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
+        const page = try pmm_mgr.create(paging_consts.PageMem(.page4k));
+        const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
+        try arch_paging.mapPage(
+            memory_init.kernel_addr_space_root,
+            phys,
+            VAddr.fromInt(page_addr),
+            .{ .read = true, .write = true },
+            .kernel_data,
+        );
+        page_addr += paging_consts.PAGE4K;
+    }
+
     const ustack: ?Stack = if (vm != null) null else blk: {
         // VM vCPUs run guest code; no host user stack needed.
         // Otherwise reserve `stack_pages` pages in `domain`'s address
@@ -589,10 +614,16 @@ pub fn allocExecutionContext(
         break :blk null;
     };
 
-    const ctx_ptr: *ArchCpuContext = @ptrFromInt(kstack.top.addr - @sizeOf(ArchCpuContext));
-    // Arch-specific iret frame contents (RIP=entry, RSP=user_stack.top,
-    // CS/SS/RFLAGS for user mode) are filled in by the arch dispatch
-    // path on first dispatch; we only place the `ctx` pointer here.
+    // Build the first-dispatch iret frame at the top of the kernel
+    // stack. The arch helper writes RIP=entry, RFLAGS=0x202 (IF set),
+    // CS/SS=user-mode selectors, RSP=user stack top (or null when no
+    // user stack — currently the case for v0 ECs that have not had
+    // their domain VMM allocate a stack VAR yet). When ustack is null
+    // the resulting frame still iret's, but to user RSP=0 — fine for
+    // first-dispatch debugging since the panic shows up sooner than
+    // an infinite hang.
+    const ustack_top: ?VAddr = if (ustack) |us| us.top else null;
+    const ctx_ptr = arch.cpu.prepareEcContext(kstack.top, ustack_top, entry, 0);
 
     // Field-by-field init rather than `ec.* = .{ ... }` so the slab's
     // already-set `_gen_lock` (live, gen=odd, lock=clear) is not

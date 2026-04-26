@@ -507,6 +507,25 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     }
 }
 
+/// Build the first-dispatch iret frame at the top of an EC's kernel
+/// stack. Returns the *ArchCpuContext pointer that scheduler.switchTo
+/// will pass to loadEcContextAndReturn. `entry` is the user-mode RIP;
+/// `ustack_top` is the user RSP (or null for kernel-mode init ECs);
+/// `arg` is loaded into the first argument register (vreg 1 / rdi on
+/// x86-64) so create_capability_domain can pass `cap_table_base`.
+pub fn prepareEcContext(
+    kstack_top: VAddr,
+    ustack_top: ?VAddr,
+    entry: VAddr,
+    arg: u64,
+) *ArchCpuContext {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.prepareEcContext(kstack_top, ustack_top, entry, arg),
+        .aarch64 => aarch64.cpu.prepareEcContext(kstack_top, ustack_top, entry, arg),
+        else => unreachable,
+    };
+}
+
 /// Write the user FS base (x86-64). aarch64 has no equivalent — TLS
 /// uses TPIDR_EL0 (see `writeTpidrEl0`).
 pub fn writeFsBase(value: u64) void {

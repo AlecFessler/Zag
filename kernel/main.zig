@@ -101,5 +101,7 @@ fn kMain(boot_info: *BootInfo) !void {
     sched.perCoreInit();
     try kprof_log.init();
     kprof_log.start();
-    arch.cpu.halt();
+    // Spec v3: BSP enters the scheduler loop. Root EC was enqueued by
+    // userspace_init.init; sched.run picks it up and dispatches.
+    sched.run();
 }
