@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 345.
-**Remaining:** 123.
+**Implemented:** 354.
+**Remaining:** 114.
 
 ## Convention
 
@@ -463,11 +463,11 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **03** — returns E_INVAL if any reserved bits are set in [1].
 - [x] **04** — on success, the caller receives a port handle with caps = `[1].caps`.
 
-## suspend — 2/12
+## suspend — 3/12
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid EC handle.
 - [x] **02** — returns E_BADCAP if [2] is not a valid port handle.
-- [ ] **03** — returns E_PERM if [1] does not have the `susp` cap.
+- [x] **03** — returns E_PERM if [1] does not have the `susp` cap.
 - [ ] **04** — returns E_PERM if [2] does not have the `bind` cap.
 - [ ] **05** — returns E_INVAL if any reserved bits are set.
 - [ ] **06** — returns E_INVAL if [1] references a vCPU.
@@ -510,7 +510,7 @@ _§[handle_attachments] Handle Attachments_
 - [ ] **09** — on recv, source entries with `move = 1` are removed from the sender's table; entries with `move = 0` are not removed.
 - [ ] **10** — when the suspend resumes with `E_CLOSED` before any recv, no entry is moved or copied.
 
-## bind_event_route — 6/10
+## bind_event_route — 9/10
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid EC handle.
 - [x] **02** — returns E_BADCAP if [3] is not a valid port handle.
@@ -519,19 +519,19 @@ _§[handle_attachments] Handle Attachments_
 - [x] **05** — returns E_PERM if [3] does not have the `bind` cap.
 - [x] **06** — returns E_PERM if no prior route exists for ([1], [2]) and [1] does not have the `bind` cap.
 - [x] **07** — returns E_PERM if a prior route exists for ([1], [2]) and [1] does not have the `rebind` cap.
-- [ ] **08** — on success, when [2] subsequently fires for [1], the EC is suspended and an event of type [2] is delivered on [3] per §[event_state] with the reply handle id placed in the receiver's syscall word `reply_handle_id` field.
-- [ ] **09** — on success when a prior route existed, the replacement is observable atomically: every subsequent firing of [2] for [1] is delivered to [3], and no firing in the interval is delivered to the prior port or to the no-route fallback.
-- [ ] **10** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+- [x] **08** — on success, when [2] subsequently fires for [1], the EC is suspended and an event of type [2] is delivered on [3] per §[event_state] with the reply handle id placed in the receiver's syscall word `reply_handle_id` field.
+- [x] **09** — on success when a prior route existed, the replacement is observable atomically: every subsequent firing of [2] for [1] is delivered to [3], and no firing in the interval is delivered to the prior port or to the no-route fallback.
+- [x] **10** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## clear_event_route — 4/7
+## clear_event_route — 7/7
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid EC handle.
 - [x] **02** — returns E_PERM if [1] does not have the `unbind` cap.
 - [x] **03** — returns E_INVAL if [2] is not a registerable event type.
 - [x] **04** — returns E_INVAL if any reserved bits are set in [1] or [2].
-- [ ] **05** — returns E_NOENT if no binding exists for ([1], [2]).
-- [ ] **06** — on success, the binding for ([1], [2]) is removed; subsequent firings of [2] for [1] follow the no-route fallback above.
-- [ ] **07** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+- [x] **05** — returns E_NOENT if no binding exists for ([1], [2]).
+- [x] **06** — on success, the binding for ([1], [2]) is removed; subsequent firings of [2] for [1] follow the no-route fallback above.
+- [x] **07** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 ## reply — 3/7
 
@@ -561,7 +561,7 @@ _§[handle_attachments] Handle Attachments_
 - [ ] **14** — on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
 - [ ] **15** — on success, the suspended EC is resumed.
 
-## timer_arm — 8/10
+## timer_arm — 10/10
 
 - [x] **01** — returns E_PERM if the caller's self-handle lacks `timer`.
 - [x] **02** — returns E_PERM if [1].caps.restart_policy = 1 and the caller's `restart_policy_ceiling.tm_restart_max = 0`.
@@ -571,8 +571,8 @@ _§[handle_attachments] Handle Attachments_
 - [x] **06** — on success, [1].field0 = 0, [1].field1.arm = 1, and [1].field1.pd = [3].periodic.
 - [x] **07** — on success with [3].periodic = 0, [1].field0 is incremented by 1 once after [2] deadline_ns; [1].field1.arm becomes 0 after the fire.
 - [x] **08** — on success with [3].periodic = 1, [1].field0 is incremented by 1 every [2] deadline_ns until `timer_cancel` or `timer_rearm`; [1].field1.arm remains 1.
-- [ ] **09** — on each fire, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
-- [ ] **10** — calling `timer_arm` again yields a fresh, independent timer handle; the prior handle's field0 and field1 are unaffected.
+- [x] **09** — on each fire, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
+- [x] **10** — calling `timer_arm` again yields a fresh, independent timer handle; the prior handle's field0 and field1 are unaffected.
 
 ## timer_rearm — 0/10
 
