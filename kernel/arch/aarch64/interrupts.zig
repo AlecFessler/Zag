@@ -409,6 +409,23 @@ pub fn setEventAddr(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x2 = value;
 }
 
+/// Spec §[event_state] vreg 3 read — x2 on aarch64. Used to snapshot
+/// the suspending EC's GPR-backed vreg 3 for propagation to the
+/// receiver at recv time.
+pub fn getEventVreg3(ctx: *const ArchCpuContext) u64 {
+    return ctx.regs.x2;
+}
+
+/// Spec §[event_state] vreg 4 — x3 on aarch64.
+pub fn setEventVreg4(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.x3 = value;
+}
+
+/// Spec §[event_state] vreg 4 read — x3 on aarch64.
+pub fn getEventVreg4(ctx: *const ArchCpuContext) u64 {
+    return ctx.regs.x3;
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.x5;
 }

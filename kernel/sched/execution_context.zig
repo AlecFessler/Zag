@@ -201,6 +201,18 @@ pub const ExecutionContext = struct {
     /// payload value.
     event_addr: u64 = 0,
 
+    /// Spec §[event_state] vregs 1..13 = the suspending EC's GPRs at
+    /// suspend time. Snapshotted in `suspendOnPort` and rewritten into
+    /// the receiver's matching GPR slots in `port.deliverEvent` so the
+    /// sender's payload (e.g. test runner's result_code/assertion_id in
+    /// vreg 3/4) is observable on recv. Currently only vreg 3 (rdx /
+    /// x2) and vreg 4 (rbp / x3) are propagated — the two vregs the
+    /// userspace test ABI uses for `report(result_code, assertion_id)`.
+    /// Other GPR-backed vregs land in the receiver as zero until a
+    /// fuller snapshot is wired (no test asserts them today).
+    event_vreg3: u64 = 0,
+    event_vreg4: u64 = 0,
+
     /// Port we joined the wait queue on. Lets cleanup find us if the
     /// port closes while we are queued. `null` outside a suspension.
     suspend_port: ?SlabRef(Port) = null,
@@ -464,6 +476,18 @@ pub fn suspendOnPort(
     ec.event_type = event;
     ec.event_subcode = subcode;
     ec.event_addr = addr;
+    // §[event_state] vregs 1..13 carry the suspending EC's GPRs to the
+    // receiver. We snapshot vreg 3 / vreg 4 here from the EC's user
+    // iret frame (where the syscall-entry GPRs were saved) so they
+    // survive across the recv and ride into the receiver's matching
+    // GPR slots in `port.deliverEvent`. `iret_frame` is the canonical
+    // user-state pointer set on syscall/exception entry; fall back to
+    // `ctx` for ECs that suspend outside an in-flight syscall (e.g.
+    // event-route fault paths that suspend a not-currently-executing
+    // EC; ctx still references the most recent saved frame).
+    const sender_ctx = ec.iret_frame orelse ec.ctx;
+    ec.event_vreg3 = arch.syscall.getEventVreg3(sender_ctx);
+    ec.event_vreg4 = arch.syscall.getEventVreg4(sender_ctx);
     ec.suspend_port = SlabRef(Port).init(port, port._gen_lock.currentGen());
     ec.state = .suspended_on_port;
     ec.pending_reply_holder = null;

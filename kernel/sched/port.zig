@@ -621,13 +621,26 @@ fn deliverEvent(
         (@as(u64, reply_slot) << REPLY_HANDLE_SHIFT) |
         (@as(u64, @intFromEnum(event_type)) << EVENT_TYPE_SHIFT);
 
-    // §[event_state] vreg 2 = sub-code, vreg 3 = event-type-specific
-    // u64 payload (faulting address for memory_fault, etc.). Both ride
-    // alongside the syscall-word return.
+    // §[event_state] vreg 2 = sub-code (sender-suspend metadata),
+    // vregs 3 and 4 = sender's GPR-backed vregs snapshotted at suspend
+    // time (Spec §[event_state] vregs 1..13 are the suspending EC's
+    // GPRs). For suspension events triggered by `suspend(target, port)`
+    // both `subcode` and `event_addr` are 0; the sender's `event_vreg3`
+    // / `event_vreg4` carry the userspace payload. For fault / vm_exit
+    // events the firing site supplies `subcode` and `event_addr` for
+    // vreg 2 / vreg 3, and per-spec vreg 3 must reflect the suspended
+    // EC's rdx (x2) — the firing-site `event_addr` and the EC's vreg 3
+    // are different concepts that today share the same physical
+    // register because we have not yet relocated event_addr to a higher
+    // vreg slot. The sender snapshot wins per spec §[event_state] —
+    // event-specific u64 payloads must move to vreg 19+ (x86-64) /
+    // vreg 36+ (aarch64) when those tests come online.
     const target_ctx = receiver.iret_frame orelse receiver.ctx;
     arch.syscall.setSyscallReturn(target_ctx, ret_word);
     arch.syscall.setEventSubcode(target_ctx, subcode);
-    arch.syscall.setEventAddr(target_ctx, event_addr);
+    _ = event_addr;
+    arch.syscall.setEventAddr(target_ctx, sender.event_vreg3);
+    arch.syscall.setEventVreg4(target_ctx, sender.event_vreg4);
 
     _ = p;
     return 0;
