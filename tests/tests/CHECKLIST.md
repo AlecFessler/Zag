@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 18.  
-**Remaining:** 450.
+**Implemented:** 88.  
+**Remaining:** 380.
 
 ## Convention
 
@@ -50,110 +50,110 @@ entry is in `test_entries`.
 - [x] **05** — revoke([1]) does not release [1] itself.
 - [x] **06** — revoke([1]) does not release any handle on the copy ancestor side of [1].
 
-## sync — 2/3
+## sync — 3/3
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid handle.
 - [x] **02** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **03** — on success, [1]'s field0 and field1 reflect the authoritative kernel state at the moment of the call.
+- [x] **03** — on success, [1]'s field0 and field1 reflect the authoritative kernel state at the moment of the call.
 
-## self_handle — 0/1
+## self_handle — 1/1
 
 _§[self_handle] Self handle_
 
-- [ ] **01** — when a domain receives an IDC handle over IDC, the installed handle's caps = intersection of the granted caps and the receiver's `idc_rx`.
+- [x] **01** — when a domain receives an IDC handle over IDC, the installed handle's caps = intersection of the granted caps and the receiver's `idc_rx`.
 
-## create_capability_domain — 0/29
+## create_capability_domain — 29/29
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `crcd`.
-- [ ] **02** — returns E_PERM if `self_caps` is not a subset of the caller's self-handle caps.
-- [ ] **03** — returns E_PERM if `ec_inner_ceiling` is not a subset of the caller's `ec_inner_ceiling`.
-- [ ] **04** — returns E_PERM if `ec_outer_ceiling` is not a subset of the caller's `ec_outer_ceiling`.
-- [ ] **05** — returns E_PERM if `var_inner_ceiling` is not a subset of the caller's `var_inner_ceiling`.
-- [ ] **06** — returns E_PERM if `var_outer_ceiling` is not a subset of the caller's `var_outer_ceiling`.
-- [ ] **07** — returns E_PERM if any field in `restart_policy_ceiling` exceeds the caller's corresponding field.
-- [ ] **08** — returns E_PERM if `fut_wait_max` exceeds the caller's `fut_wait_max`.
-- [ ] **09** — returns E_PERM if `cridc_ceiling` is not a subset of the caller's `cridc_ceiling`.
-- [ ] **10** — returns E_PERM if `pf_ceiling` is not a subset of the caller's `pf_ceiling`.
-- [ ] **11** — returns E_PERM if `vm_ceiling` is not a subset of the caller's `vm_ceiling`.
-- [ ] **12** — returns E_PERM if `port_ceiling` is not a subset of the caller's `port_ceiling`.
-- [ ] **13** — returns E_BADCAP if `elf_page_frame` is not a valid page frame handle.
-- [ ] **14** — returns E_BADCAP if any passed handle id is not a valid handle in the caller's table.
-- [ ] **15** — returns E_INVAL if the ELF header is malformed.
-- [ ] **16** — returns E_INVAL if `elf_page_frame` is smaller than the declared ELF image size.
-- [ ] **17** — returns E_INVAL if any reserved bits are set in [1], [2], or a passed handle entry.
-- [ ] **18** — returns E_INVAL if any two entries in [4+] reference the same source handle.
-- [ ] **19** — on success, the caller receives an IDC handle to the new domain with caps = the caller's `cridc_ceiling`.
-- [ ] **20** — on success, the new domain's handle table contains the self-handle at slot 0 with caps = `self_caps`.
-- [ ] **21** — on success, the new domain's handle table contains the initial EC at slot 1 with caps = the `ec_inner_ceiling` supplied in [2].
-- [ ] **22** — on success, the new domain's handle table contains an IDC handle to itself at slot 2 with caps = the passed `cridc_ceiling`.
-- [ ] **23** — on success, passed handles occupy slots 3+ of the new domain's handle table in the order supplied, each with the caps specified in its entry.
-- [ ] **24** — a passed handle entry with `move = 1` is removed from the caller's handle table after the call.
-- [ ] **25** — a passed handle entry with `move = 0` remains in the caller's handle table after the call.
-- [ ] **26** — on success, the new domain's `ec_inner_ceiling`, `var_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
-- [ ] **27** — on success, the new domain's `ec_outer_ceiling` and `var_outer_ceiling` in field1 are set to the values supplied in [3].
-- [ ] **28** — on success, the new domain's `idc_rx` in field0 is set to the value supplied in [1].
-- [ ] **29** — the initial EC begins executing at the entry point declared in the ELF header.
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `crcd`.
+- [x] **02** — returns E_PERM if `self_caps` is not a subset of the caller's self-handle caps.
+- [x] **03** — returns E_PERM if `ec_inner_ceiling` is not a subset of the caller's `ec_inner_ceiling`.
+- [x] **04** — returns E_PERM if `ec_outer_ceiling` is not a subset of the caller's `ec_outer_ceiling`.
+- [x] **05** — returns E_PERM if `var_inner_ceiling` is not a subset of the caller's `var_inner_ceiling`.
+- [x] **06** — returns E_PERM if `var_outer_ceiling` is not a subset of the caller's `var_outer_ceiling`.
+- [x] **07** — returns E_PERM if any field in `restart_policy_ceiling` exceeds the caller's corresponding field.
+- [x] **08** — returns E_PERM if `fut_wait_max` exceeds the caller's `fut_wait_max`.
+- [x] **09** — returns E_PERM if `cridc_ceiling` is not a subset of the caller's `cridc_ceiling`.
+- [x] **10** — returns E_PERM if `pf_ceiling` is not a subset of the caller's `pf_ceiling`.
+- [x] **11** — returns E_PERM if `vm_ceiling` is not a subset of the caller's `vm_ceiling`.
+- [x] **12** — returns E_PERM if `port_ceiling` is not a subset of the caller's `port_ceiling`.
+- [x] **13** — returns E_BADCAP if `elf_page_frame` is not a valid page frame handle.
+- [x] **14** — returns E_BADCAP if any passed handle id is not a valid handle in the caller's table.
+- [x] **15** — returns E_INVAL if the ELF header is malformed.
+- [x] **16** — returns E_INVAL if `elf_page_frame` is smaller than the declared ELF image size.
+- [x] **17** — returns E_INVAL if any reserved bits are set in [1], [2], or a passed handle entry.
+- [x] **18** — returns E_INVAL if any two entries in [4+] reference the same source handle.
+- [x] **19** — on success, the caller receives an IDC handle to the new domain with caps = the caller's `cridc_ceiling`.
+- [x] **20** — on success, the new domain's handle table contains the self-handle at slot 0 with caps = `self_caps`.
+- [x] **21** — on success, the new domain's handle table contains the initial EC at slot 1 with caps = the `ec_inner_ceiling` supplied in [2].
+- [x] **22** — on success, the new domain's handle table contains an IDC handle to itself at slot 2 with caps = the passed `cridc_ceiling`.
+- [x] **23** — on success, passed handles occupy slots 3+ of the new domain's handle table in the order supplied, each with the caps specified in its entry.
+- [x] **24** — a passed handle entry with `move = 1` is removed from the caller's handle table after the call.
+- [x] **25** — a passed handle entry with `move = 0` remains in the caller's handle table after the call.
+- [x] **26** — on success, the new domain's `ec_inner_ceiling`, `var_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
+- [x] **27** — on success, the new domain's `ec_outer_ceiling` and `var_outer_ceiling` in field1 are set to the values supplied in [3].
+- [x] **28** — on success, the new domain's `idc_rx` in field0 is set to the value supplied in [1].
+- [x] **29** — the initial EC begins executing at the entry point declared in the ELF header.
 
-## acquire_ecs — 0/7
+## acquire_ecs — 7/7
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid IDC handle.
-- [ ] **02** — returns E_PERM if [1] does not have the `aqec` cap.
-- [ ] **03** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **04** — returns E_FULL if the caller's handle table cannot accommodate all returned handles.
-- [ ] **05** — on success, the syscall word's count field equals the number of non-vCPU ECs bound to the target domain.
-- [ ] **06** — on success, vregs `[1..N]` contain handles in the caller's table referencing those ECs, each with caps = target's `ec_outer_ceiling` intersected with the IDC's `ec_cap_ceiling`.
-- [ ] **07** — vCPUs in the target domain are not included in the returned handles.
+- [x] **01** — returns E_BADCAP if [1] is not a valid IDC handle.
+- [x] **02** — returns E_PERM if [1] does not have the `aqec` cap.
+- [x] **03** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **04** — returns E_FULL if the caller's handle table cannot accommodate all returned handles.
+- [x] **05** — on success, the syscall word's count field equals the number of non-vCPU ECs bound to the target domain.
+- [x] **06** — on success, vregs `[1..N]` contain handles in the caller's table referencing those ECs, each with caps = target's `ec_outer_ceiling` intersected with the IDC's `ec_cap_ceiling`.
+- [x] **07** — vCPUs in the target domain are not included in the returned handles.
 
-## acquire_vars — 0/7
+## acquire_vars — 7/7
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid IDC handle.
-- [ ] **02** — returns E_PERM if [1] does not have the `aqvr` cap.
-- [ ] **03** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **04** — returns E_FULL if the caller's handle table cannot accommodate all returned handles.
-- [ ] **05** — on success, the syscall word's count field equals the number of `map=1` and `map=3` VARs bound to the target domain.
-- [ ] **06** — on success, vregs `[1..N]` contain handles in the caller's table referencing those VARs, each with caps = target's `var_outer_ceiling` intersected with the IDC's `var_cap_ceiling`.
-- [ ] **07** — MMIO and DMA VARs in the target domain are not included in the returned handles.
+- [x] **01** — returns E_BADCAP if [1] is not a valid IDC handle.
+- [x] **02** — returns E_PERM if [1] does not have the `aqvr` cap.
+- [x] **03** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **04** — returns E_FULL if the caller's handle table cannot accommodate all returned handles.
+- [x] **05** — on success, the syscall word's count field equals the number of `map=1` and `map=3` VARs bound to the target domain.
+- [x] **06** — on success, vregs `[1..N]` contain handles in the caller's table referencing those VARs, each with caps = target's `var_outer_ceiling` intersected with the IDC's `var_cap_ceiling`.
+- [x] **07** — MMIO and DMA VARs in the target domain are not included in the returned handles.
 
-## restart_semantics — 0/8
+## restart_semantics — 8/8
 
 _§[restart_semantics] Restart Semantics_
 
-- [ ] **01** — returns E_PERM if `create_execution_context` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.ec_restart_max`.
-- [ ] **02** — returns E_PERM if `create_var` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.var_restart_max`.
-- [ ] **03** — returns E_PERM if `create_page_frame` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.pf_restart_max = 0`.
-- [ ] **04** — returns E_PERM if `create_virtual_machine` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.vm_restart_max = 0`.
-- [ ] **05** — returns E_PERM if `create_port` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.port_restart_max = 0`.
-- [ ] **06** — returns E_PERM if any IDC handle minted by `create_capability_domain` (the caller's own returned handle, the new domain's slot-2 self-IDC, or any `passed_handles` IDC entry) has `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.idc_restart_max = 0`.
-- [ ] **07** — returns E_PERM if any device_region handle minted by transfer (e.g., copy/move via xfer) has `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.dr_restart_max = 0`.
-- [ ] **08** — returns E_PERM if `timer_arm` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.tm_restart_max = 0`.
+- [x] **01** — returns E_PERM if `create_execution_context` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.ec_restart_max`.
+- [x] **02** — returns E_PERM if `create_var` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.var_restart_max`.
+- [x] **03** — returns E_PERM if `create_page_frame` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.pf_restart_max = 0`.
+- [x] **04** — returns E_PERM if `create_virtual_machine` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.vm_restart_max = 0`.
+- [x] **05** — returns E_PERM if `create_port` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.port_restart_max = 0`.
+- [x] **06** — returns E_PERM if any IDC handle minted by `create_capability_domain` (the caller's own returned handle, the new domain's slot-2 self-IDC, or any `passed_handles` IDC entry) has `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.idc_restart_max = 0`.
+- [x] **07** — returns E_PERM if any device_region handle minted by transfer (e.g., copy/move via xfer) has `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.dr_restart_max = 0`.
+- [x] **08** — returns E_PERM if `timer_arm` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.tm_restart_max = 0`.
 
-## create_execution_context — 0/14
+## create_execution_context — 14/14
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `crec`.
-- [ ] **02** — returns E_PERM if [4] is nonzero and [4] lacks `crec`.
-- [ ] **03** — returns E_PERM if [4] is 0 (target = self) and caps is not a subset of self's `ec_inner_ceiling`.
-- [ ] **04** — returns E_PERM if [4] is nonzero and caps is not a subset of the target domain's `ec_outer_ceiling`.
-- [ ] **05** — returns E_PERM if [4] is nonzero and target_caps is not a subset of the target domain's `ec_inner_ceiling`.
-- [ ] **06** — returns E_PERM if priority exceeds the caller's priority ceiling.
-- [ ] **07** — returns E_BADCAP if [4] is nonzero and not a valid IDC handle.
-- [ ] **08** — returns E_INVAL if [3] stack_pages is 0.
-- [ ] **09** — returns E_INVAL if [5] affinity has bits set outside the system's core count.
-- [ ] **10** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **11** — on success, the caller receives an EC handle with caps = `[1].caps`.
-- [ ] **12** — on success, when [4] is nonzero, the target domain also receives a handle with caps = `[1].target_caps`.
-- [ ] **13** — on success, the EC's priority is set to `[1].priority`.
-- [ ] **14** — on success, the EC's affinity is set to `[5]`.
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `crec`.
+- [x] **02** — returns E_PERM if [4] is nonzero and [4] lacks `crec`.
+- [x] **03** — returns E_PERM if [4] is 0 (target = self) and caps is not a subset of self's `ec_inner_ceiling`.
+- [x] **04** — returns E_PERM if [4] is nonzero and caps is not a subset of the target domain's `ec_outer_ceiling`.
+- [x] **05** — returns E_PERM if [4] is nonzero and target_caps is not a subset of the target domain's `ec_inner_ceiling`.
+- [x] **06** — returns E_PERM if priority exceeds the caller's priority ceiling.
+- [x] **07** — returns E_BADCAP if [4] is nonzero and not a valid IDC handle.
+- [x] **08** — returns E_INVAL if [3] stack_pages is 0.
+- [x] **09** — returns E_INVAL if [5] affinity has bits set outside the system's core count.
+- [x] **10** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **11** — on success, the caller receives an EC handle with caps = `[1].caps`.
+- [x] **12** — on success, when [4] is nonzero, the target domain also receives a handle with caps = `[1].target_caps`.
+- [x] **13** — on success, the EC's priority is set to `[1].priority`.
+- [x] **14** — on success, the EC's affinity is set to `[5]`.
 
 ## self — 0/2
 
 - [ ] **01** — returns E_NOENT if no handle in the caller's table references the calling execution context.
 - [ ] **02** — on success, [1] is a handle in the caller's table whose resolved capability references the calling execution context.
 
-## terminate — 0/8
+## terminate — 3/8
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid EC handle.
-- [ ] **02** — returns E_PERM if [1] does not have the `term` cap.
-- [ ] **03** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **01** — returns E_BADCAP if [1] is not a valid EC handle.
+- [x] **02** — returns E_PERM if [1] does not have the `term` cap.
+- [x] **03** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **04** — on success, the target EC stops executing.
 - [ ] **05** — on success, syscalls invoked with any handle to the terminated EC return E_TERM and remove that handle from the caller's table on the same call.
 - [ ] **06** — on success, no further events generated by the terminated EC are delivered to any port previously bound by an event_route from that EC.
@@ -675,4 +675,3 @@ _§[power] Power Management_
 - [ ] **13** — returns E_INVAL if [1] is greater than or equal to `info_system`'s `cores`.
 - [ ] **14** — returns E_NODEV if the queried core does not support idle states (per `info_cores` flag bit 1).
 - [ ] **15** — returns E_INVAL if [2] is greater than 2.
-
