@@ -73,7 +73,7 @@ pub fn init(cap_table_base: u64) Serial {
         (0 << 3) | // sz = 0 (4 KiB)
         0b011; // cur_rwx = r|w
     const cvar = syscall.createVar(
-        @as(u64, var_caps_word.toU16()) << 48,
+        @as(u64, var_caps_word.toU16()),
         props,
         1,
         0,

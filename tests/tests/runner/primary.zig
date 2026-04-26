@@ -54,7 +54,7 @@ pub fn main(cap_table_base: u64) void {
         .recv = true,
         .bind = true,
     };
-    const cp = syscall.createPort(@as(u64, port_caps.toU16()) << 48);
+    const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     const port_handle: caps.HandleId = @truncate(cp.v1 & 0xFFF);
 
     serial.print("[runner] starting ");
@@ -144,18 +144,48 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) void {
         }).toU64(),
     };
 
-    // ceilings_inner / ceilings_outer / self_caps: minimal bundle for
-    // a child that only needs to suspend itself on a port. Zero is
-    // not literally correct (the child needs `crec` implicitly for
-    // its initial EC, etc.) but the exact ceiling encoding is
-    // mechanical and orthogonal to the protocol; populate with the
-    // caller's own ceilings once we have a `sync` of the self-handle
-    // to read them. SPEC AMBIGUITY: how the *initial* EC's caps are
-    // determined — spec doesn't pin them; we assume the kernel mints
-    // slot-1 with full inner caps so the child can suspend itself.
-    const ceilings_inner: u64 = ~@as(u64, 0); // "all bits", caller is root.
-    const ceilings_outer: u64 = ~@as(u64, 0);
-    const self_caps: u64 = 0; // child needs no creation rights.
+    // §[capability_domain] field0 / field1 layouts have many reserved
+    // bit ranges. Setting `~0` would trigger E_INVAL on
+    // create_capability_domain test 17. Encode the all-valid-bits
+    // values with reserved bits zeroed.
+    //
+    // ceilings_inner (field0):
+    //   bits  0-7   ec_inner_ceiling          = 0xFF
+    //   bits  8-23  var_inner_ceiling         = 0x01FF (bits 0-8 valid)
+    //   bits 24-31  cridc_ceiling             = 0x3F  (IDC bits 0-5)
+    //   bits 32-39  pf_ceiling                = 0x1F  (rwx + max_sz)
+    //   bits 40-47  vm_ceiling                = 0x01  (policy)
+    //   bits 48-55  port_ceiling              = 0x1C  (xfer/recv/bind at field-bits 2-4)
+    //   bits 56-63  _reserved                 = 0
+    const ceilings_inner: u64 = 0x001C_011F_3F01_FFFF;
+
+    // ceilings_outer (field1):
+    //   bits  0-7   ec_outer_ceiling          = 0xFF
+    //   bits  8-15  var_outer_ceiling         = 0xFF
+    //   bits 16-31  restart_policy_ceiling    = 0x03FE
+    //                 ec_restart_max=2, var_restart_max=3, all type bools=1
+    //   bits 32-37  fut_wait_max              = 63
+    //   bits 38-63  _reserved                 = 0
+    const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
+
+    // Grant the child enough creation rights to set up the handles a
+    // typical spec test needs: ports (restrict_02 etc.), ECs
+    // (restrict_03 etc.), VARs, page frames. `power` and `restart` are
+    // intentionally withheld so a test can't shut the runner down or
+    // mask its own faults via domain-restart fallback.
+    const child_self = caps.SelfCap{
+        .crcd = true,
+        .crec = true,
+        .crvr = true,
+        .crpf = true,
+        .crvm = true,
+        .crpt = true,
+        .pmu = true,
+        .fut_wake = true,
+        .timer = true,
+        .pri = 3,
+    };
+    const self_caps: u64 = @as(u64, child_self.toU16());
 
     _ = syscall.createCapabilityDomain(
         self_caps,
@@ -172,7 +202,7 @@ fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
 
     const pf_caps = caps.PfCap{ .move = true, .r = true, .w = true };
     const cpf = syscall.createPageFrame(
-        @as(u64, pf_caps.toU16()) << 48,
+        @as(u64, pf_caps.toU16()),
         0, // props: sz = 0 (4 KiB)
         @intCast(pages),
     );
@@ -183,7 +213,7 @@ fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
         .w = true,
     };
     const cvar = syscall.createVar(
-        @as(u64, var_caps_word.toU16()) << 48,
+        @as(u64, var_caps_word.toU16()),
         0b011, // cur_rwx = r|w
         @intCast(pages),
         0, // preferred_base = kernel chooses
