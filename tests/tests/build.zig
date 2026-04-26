@@ -75,6 +75,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "create_execution_context_13", .path = "tests/create_execution_context_13.zig" },
     .{ .name = "create_execution_context_14", .path = "tests/create_execution_context_14.zig" },
     .{ .name = "create_page_frame_01", .path = "tests/create_page_frame_01.zig" },
+    .{ .name = "create_page_frame_02", .path = "tests/create_page_frame_02.zig" },
     .{ .name = "create_var_01", .path = "tests/create_var_01.zig" },
     .{ .name = "create_var_02", .path = "tests/create_var_02.zig" },
     .{ .name = "create_var_03", .path = "tests/create_var_03.zig" },
