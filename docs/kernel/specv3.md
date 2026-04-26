@@ -36,6 +36,28 @@ rsp, rcx, and r11 are not GPR-backed: rsp is the stack pointer anchor, and rcx/r
 | 1..31 | x0..x30 |
 | 32..127 | `[sp + (N - 31) * 8]` — stack |
 
+## §[error_codes] Error Codes
+
+Error codes are returned in vreg 1 by syscalls that fail. Zero indicates success.
+
+| Value | Name | Meaning |
+|---|---|---|
+| 1 | E_ABANDONED | the peer that would resolve a pending suspension was destroyed before it could do so |
+| 2 | E_BADADDR | a user address argument is not a valid mapped address in the caller's domain |
+| 3 | E_BADCAP | handle id is not a valid handle of the expected type in the caller's table |
+| 4 | E_BUSY | target object is in a state that disallows the operation (e.g., target EC is running and not suspended) |
+| 5 | E_CLOSED | port has no remaining endpoints to make progress against the call |
+| 6 | E_FULL | a fixed-capacity table cannot accommodate the requested allocation (caller's handle table or target's handle table) |
+| 7 | E_INVAL | argument violates a structural constraint (reserved bits set, value out of range, alignment, size, etc.) |
+| 8 | E_NODEV | required hardware feature is not present on this platform |
+| 9 | E_NOENT | named entry does not exist in the targeted structure |
+| 10 | E_NOMEM | insufficient kernel memory to complete the operation |
+| 11 | E_NOSPC | insufficient address space for the requested range |
+| 12 | E_PERM | required cap is missing on the handle (or self-handle), or argument exceeds a ceiling |
+| 13 | E_REFUSED | a pending IDC call was rejected by policy before a reply could be produced |
+| 14 | E_TERM | handle references an execution context that was terminated; the stale handle is removed from the caller's table on the same call |
+| 15 | E_TIMEOUT | a wait expired before its wakeup condition was met |
+
 ## §[capabilities] Capabilities
 
 An unforgeable reference to a kernel object, paired with bits that gate operations on that object.
@@ -1435,7 +1457,7 @@ Returns E_NOMEM if insufficient kernel memory; returns E_NODEV if the platform d
 
 ### §[vm_policy] VM Policy
 
-`VmPolicy` is a per-arch struct carrying fixed-size tables consulted by the kernel on guest exits to handle selected operations inline. Each table has an entry array and a count; only the first `num_*` entries are consulted. Tables seed with `create_virtual_machine` and are mutable at runtime by VMs holding the `policy` cap (runtime mutation syscall spec TBD).
+`VmPolicy` is a per-arch struct carrying fixed-size tables consulted by the kernel on guest exits to handle selected operations inline. Each table has an entry array and a count; only the first `num_*` entries are consulted. Tables seed with `create_virtual_machine` and are mutable at runtime by VMs holding the `policy` cap via `vm_set_policy`.
 
 **x86-64**
 
