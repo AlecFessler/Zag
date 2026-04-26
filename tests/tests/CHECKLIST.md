@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 429.
-**Remaining:** 39.
+**Implemented:** 435.
+**Remaining:** 33.
 
 ## Convention
 
@@ -463,7 +463,7 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **03** — returns E_INVAL if any reserved bits are set in [1].
 - [x] **04** — on success, the caller receives a port handle with caps = `[1].caps`.
 
-## suspend — 6/12
+## suspend — 7/12
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid EC handle.
 - [x] **02** — returns E_BADCAP if [2] is not a valid port handle.
@@ -471,7 +471,7 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **04** — returns E_PERM if [2] does not have the `bind` cap.
 - [x] **05** — returns E_INVAL if any reserved bits are set.
 - [x] **06** — returns E_INVAL if [1] references a vCPU.
-- [ ] **07** — returns E_INVAL if [1] is already suspended.
+- [x] **07** — returns E_INVAL if [1] is already suspended.
 - [ ] **08** — on success, the target EC stops executing.
 - [ ] **09** — on success, a suspension event is delivered on [2].
 - [ ] **10** — on success, when [1] has the `read` cap, the suspension event payload exposes the target's EC state per §[event_state]; otherwise the state in the payload is zeroed.
@@ -543,7 +543,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **06** — on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
 - [x] **07** — on success, the suspended EC is resumed.
 
-## reply_transfer — 6/15
+## reply_transfer — 7/15
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid reply handle.
 - [x] **02** — returns E_PERM if [1] does not have the `xfer` cap.
@@ -551,7 +551,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **04** — returns E_INVAL if any reserved bits are set in [1] or any pair entry.
 - [x] **05** — returns E_BADCAP if any pair entry's source handle id is not valid in the caller's domain.
 - [x] **06** — returns E_PERM if any pair entry's caps are not a subset of the source handle's current caps.
-- [ ] **07** — returns E_PERM if any pair entry with `move = 1` references a source handle that lacks the `move` cap.
+- [x] **07** — returns E_PERM if any pair entry with `move = 1` references a source handle that lacks the `move` cap.
 - [ ] **08** — returns E_PERM if any pair entry with `move = 0` references a source handle that lacks the `copy` cap.
 - [ ] **09** — returns E_INVAL if two pair entries reference the same source handle.
 - [ ] **10** — returns E_TERM if the suspended EC was terminated before reply could deliver; [1] is consumed and no handle transfer occurs.
@@ -574,7 +574,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **09** — on each fire, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
 - [x] **10** — calling `timer_arm` again yields a fresh, independent timer handle; the prior handle's field0 and field1 are unaffected.
 
-## timer_rearm — 9/10
+## timer_rearm — 10/10
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid timer handle.
 - [x] **02** — returns E_PERM if [1] does not have the `arm` cap.
@@ -585,7 +585,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **07** — on success with [3].periodic = 0, [1].field0 is incremented by 1 once after [2] deadline_ns and `[1].field1.arm` becomes 0; with [3].periodic = 1, [1].field0 is incremented by 1 every [2] deadline_ns until `timer_cancel` or another `timer_rearm`.
 - [x] **08** — on success, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
 - [x] **09** — `timer_rearm` called on a currently-armed timer replaces the prior configuration; the prior pending fire does not occur and field0 reflects the reset to 0 rather than any partial fire.
-- [ ] **10** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+- [x] **10** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 ## timer_cancel — 9/9
 
@@ -628,7 +628,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **03** — returns E_BADADDR if [1] addr is not a valid user address in the caller's domain.
 - [x] **04** — on success, [1] is the number of ECs actually woken (0..count).
 
-## time — 4/5
+## time — 5/5
 
 _§[time] Time_
 
@@ -636,7 +636,7 @@ _§[time] Time_
 - [x] **02** — after `time_setwall(X)` succeeds, a subsequent `time_getwall` returns a value within a small bounded delta of X.
 - [x] **03** — returns E_PERM if the caller's self-handle lacks `setwall`.
 - [x] **04** — returns E_INVAL if any reserved bits are set in [1].
-- [ ] **05** — on success, a subsequent `time_getwall` returns a value within a small bounded delta of [1].
+- [x] **05** — on success, a subsequent `time_getwall` returns a value within a small bounded delta of [1].
 
 ## rng — 2/2
 
@@ -645,25 +645,25 @@ _§[rng] RNG_
 - [x] **01** — returns E_INVAL if count is 0 or count > 127.
 - [x] **02** — on success, vregs `[1..count]` contain qwords (the CSPRNG-source guarantee in the prose above is a kernel implementation contract, not a black-box-testable assertion).
 
-## system_info — 3/6
+## system_info — 4/6
 
 _§[system_info] System Info_
 
 - [x] **01** — on success, [1] equals the number of online CPU cores reported by the platform.
 - [x] **02** — on success, [3] equals the platform's total RAM divided by 4 KiB.
 - [x] **03** — on success, [4] bit 0 is set on every supported architecture.
-- [ ] **04** — returns E_INVAL if [1] core_id is greater than or equal to `info_system`'s `cores`.
+- [x] **04** — returns E_INVAL if [1] core_id is greater than or equal to `info_system`'s `cores`.
 - [ ] **05** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **06** — on success, [1] flag bit 0 reflects whether the queried core is currently online.
 
-## power — 3/15
+## power — 4/15
 
 _§[power] Power Management_
 
 - [x] **01** — returns E_PERM if the caller's self-handle lacks `power`.
 - [x] **02** — returns E_PERM if the caller's self-handle lacks `power`.
 - [x] **03** — returns E_PERM if the caller's self-handle lacks `power`.
-- [ ] **04** — returns E_INVAL if [1] is not 1, 3, or 4.
+- [x] **04** — returns E_INVAL if [1] is not 1, 3, or 4.
 - [ ] **05** — returns E_NODEV if the platform does not support the requested sleep depth.
 - [ ] **06** — returns E_PERM if the caller's self-handle lacks `power`.
 - [ ] **07** — returns E_PERM if the caller's self-handle lacks `power`.
