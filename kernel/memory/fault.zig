@@ -108,6 +108,8 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const ec = scheduler.currentEc() orelse
         @panic("user page fault with no current EC");
 
+    arch.boot.print("[fault] USER PF at 0x{x} rip=0x{x} write={} exec={}\n", .{ faulting_virt.addr, fault.rip, is_write, is_exec });
+
     const dom_ref = ec.domain;
     const dom = dom_ref.lock(@src()) catch {
         // Domain torn down between exception entry and here — fire

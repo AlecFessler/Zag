@@ -124,10 +124,11 @@ pub fn extraVmKind(kind: u1, count: u8) u64 {
     return (@as(u64, kind) << 12) | ((@as(u64, count) & 0xFF) << 13);
 }
 
-// Sole call site of the raw `syscall` instruction. Pushes the word
-// onto the stack so the kernel sees vreg 0 at [rsp + 0]; on return,
-// pops it back. Stack args (vregs 14+) must already be on the stack
-// directly above the word at call time — see `issueStack`.
+// Sole call site of the raw `syscall` instruction. Reserves 16 bytes of
+// stack (avoiding the System V red zone — Zig may have stored locals
+// there) so vreg 0 at [rsp + 0] sits on a stable slot the kernel can
+// load via STAC; on return, frees the slot. Stack args (vregs 14+) are
+// pushed by the caller on top of the slot.
 fn issueRawNoStack(word: u64, in: Regs) Regs {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
@@ -143,9 +144,10 @@ fn issueRawNoStack(word: u64, in: Regs) Regs {
     var ov12: u64 = undefined;
     var ov13: u64 = undefined;
     asm volatile (
-        \\ pushq %%rcx
+        \\ subq $16, %%rsp
+        \\ movq %%rcx, (%%rsp)
         \\ syscall
-        \\ addq $8, %%rsp
+        \\ addq $16, %%rsp
         : [v1] "={rax}" (ov1),
           [v2] "={rbx}" (ov2),
           [v3] "={rdx}" (ov3),
@@ -264,9 +266,11 @@ fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     var ov13: u64 = undefined;
     var word_out: u64 = undefined;
     asm volatile (
-        \\ pushq %%rcx
+        \\ subq $16, %%rsp
+        \\ movq %%rcx, (%%rsp)
         \\ syscall
-        \\ popq %%rcx
+        \\ movq (%%rsp), %%rcx
+        \\ addq $16, %%rsp
         : [v1] "={rax}" (ov1),
           [v2] "={rbx}" (ov2),
           [v3] "={rdx}" (ov3),
