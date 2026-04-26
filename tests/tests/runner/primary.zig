@@ -18,6 +18,7 @@
 
 const lib = @import("lib");
 const embedded_tests = @import("embedded_tests");
+const serial_mod = @import("serial.zig");
 
 const caps = lib.caps;
 const syscall = lib.syscall;
@@ -38,9 +39,10 @@ const MAX_TESTS: usize = 64;
 
 var results_buf: [MAX_TESTS]TestResult = undefined;
 var result_count: usize = 0;
+var serial: serial_mod.Serial = serial_mod.DISABLED;
 
 pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
+    serial = serial_mod.init(cap_table_base);
 
     // §[port] create_port — mint a result port. Caps include
     // bind+recv+xfer so the primary can recv events and the children
@@ -55,6 +57,10 @@ pub fn main(cap_table_base: u64) void {
     const cp = syscall.createPort(@as(u64, port_caps.toU16()) << 48);
     const port_handle: caps.HandleId = @truncate(cp.v1 & 0xFFF);
 
+    serial.print("[runner] starting ");
+    serial.printU64(embedded_tests.manifest.len);
+    serial.print(" tests\n");
+
     // Spawn each embedded test in turn. Tests that touch globally
     // limited resources should be ordered serially here; tests that
     // can run concurrently can be spawned without waiting on prior
@@ -64,13 +70,6 @@ pub fn main(cap_table_base: u64) void {
         spawnAndCollect(entry, port_handle);
     }
 
-    // Summary. Without a kernel-provided print primitive in spec v3,
-    // the actual stdout emission lives outside this primary — the
-    // results array is the runner's externally observable artifact.
-    // SPEC AMBIGUITY: v3 spec defines no debug-output syscall. A
-    // future revision should either expose serial via a
-    // device_region delegated to the test runner, or add a
-    // kdebug_write hook usable from a freestanding root service.
     summarize();
 
     // Stop the system. power_shutdown requires the `power` cap on
@@ -97,6 +96,16 @@ fn spawnAndCollect(entry: embedded_tests.Entry, port_handle: caps.HandleId) void
         .code = result_code,
         .assertion_id = assertion_id,
     });
+
+    serial.print("[runner] ");
+    serial.print(entry.name);
+    if (result_code == .pass) {
+        serial.print(" PASS\n");
+    } else {
+        serial.print(" FAIL (assertion id ");
+        serial.printU64(assertion_id);
+        serial.print(")\n");
+    }
 
     // Resume the child so it can exit cleanly.
     _ = syscall.reply(reply_handle_id);
@@ -220,14 +229,9 @@ fn summarize() void {
         i += 1;
     }
 
-    // Once a debug-output mechanism exists, emit:
-    //   [runner] starting <result_count> tests
-    //   [runner] <name> PASS|FAIL [(assertion id N)]
-    //   [runner] <passed> passed, <failed> failed
-    // For now, the in-memory `results_buf` is the artifact.
-    asm volatile (""
-        :
-        : [_] "r" (passed),
-          [_] "r" (failed),
-        : .{ .memory = true });
+    serial.print("[runner] ");
+    serial.printU64(passed);
+    serial.print(" passed, ");
+    serial.printU64(failed);
+    serial.print(" failed\n");
 }
