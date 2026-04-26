@@ -877,6 +877,17 @@ pub const Process = struct {
                 num_blocked += 1;
             }
             thread.state = .exited;
+            // Release pinned-core ownership eagerly. The schedTimerHandler
+            // .exited branch also calls unpinExclusive, but when the
+            // process is restarted the dying thread's deinit cascades into
+            // performRestart before the next tick on its core fires —
+            // leaving pinned_cores and the per-core pinned_thread slot
+            // pointing at a soon-to-be-freed Thread, which both blocks
+            // pickRestartCore from selecting that core and causes any
+            // later enqueueOnCore(target=that_core) to redirect away.
+            if (thread.pinned_exclusive) {
+                _ = sched.unpinExclusive(thread);
+            }
         }
         self.faulted_thread_slots = 0;
         self.suspended_thread_slots = 0;
