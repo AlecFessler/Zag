@@ -559,19 +559,34 @@ pub export fn syscallEntry() callconv(.naked) void {
         // its first 8 bytes as the bare ptr (SlabRef.ptr). When the
         // PQ goes doubly-linked / SlabRef-aware this 16-byte case
         // gets handled.
-        \\movq 48(%%r11), %%gs:72             // tmp = r11->next (fast_temp[3])
-        \\movq %%gs:72, %%rcx                 // can't mov mem→mem; via gs
         // Wait — the above is wrong; rework:
-        \\movq 48(%%r11), %%rcx               // rcx = r11->next.ptr
         // Now we need &heads[N] back. We trashed rcx. Stash &heads[N]
         // in fast_temp[4] before reading next, restructure required.
         // (Stub limitation; flagged for TDD iteration.)
-        \\movq %%gs:72, %%rcx                 // restore &heads[N] (was saved above)
-        \\movq %%rcx, 0(%%rcx)                // heads[N] = old.next  (placeholder)
+        //
+        // WHY this sequence: x86 has no mem→mem MOV, and both live
+        // values (rcx=&heads[N], r11=*EC) must survive the head update
+        // — r11 is reloaded by Phase-5's later `movq %gs:80,%r11` at
+        // the publish-receiver-EC step (so we *can* clobber r11 here
+        // as long as we publish it first). We publish *EC into fast_temp[4]
+        // (gs:80) — the same slot Phase 2 / line 599 read from — then use
+        // r11 as a one-register bounce: load r11 = (*EC).next.ptr, store
+        // r11 → [rcx]. The duplicate `movq %r11,%gs:80` below is now
+        // redundant but kept for symmetry with the reply path; harmless.
+        // STILL MISSING (TDD iteration): EC.next is `?SlabRef(EC)` so
+        // the literal 48 + treat-as-bare-ptr only works while the optional
+        // payload happens to start at byte 0 of the field; PQ doubly-linked
+        // (EC.prev), tails[N] update, and waiter_kind=.none on empty are
+        // all unimplemented. See specv3.md Phase 5 priority-queue pop.
+        \\movq %%r11, %%gs:80                 // publish *receiver_EC → fast_temp[4]
+        \\movq %[ec_next](%%r11), %%r11       // r11 = (*EC).next.ptr (treat ?SlabRef payload@0)
+        \\movq %%r11, 0(%%rcx)                // heads[N] = next
         // TODO: also walk EC.prev for doubly-linked + tails update +
         // waiter_kind = .none if queue now empty.
 
         // r11 = *receiver_EC. Stash for later phases.
+        // (Already stashed above; this re-stash is dead but kept for now.)
+        \\movq %%gs:80, %%r11                 // reload *receiver_EC into r11
         \\movq %%r11, %%gs:80                 // → fast_temp[5]
 
         // Restore *Port from fast_temp[1] for unlock.
@@ -923,6 +938,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\jmp .L_slow
         :
         : [ec_domain] "i" (Offsets.ec_domain_ptr),
+          [ec_next] "i" (Offsets.ec_next),
     );
 }
 
