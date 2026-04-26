@@ -215,6 +215,15 @@ pub const ExecutionContext = struct {
     /// reply ops comes from this EC's own `_gen_lock`.
     pending_reply_holder: ?*KernelHandle = null,
 
+    /// Write-cap snapshot from the originating EC handle taken at the
+    /// moment this EC was suspended (the suspending EC handle for
+    /// explicit suspend, the EC handle used at `bind_event_route` for
+    /// fault events, the vCPU EC handle for vm_exit). Read at reply time
+    /// so the receiver's vreg modifications are committed back to the
+    /// sender's saved state iff the originating handle had `write`.
+    /// Spec §[reply] tests 05/06.
+    originating_write_cap: bool = false,
+
     /// Kernel-held event route bindings, one slot per registerable event
     /// type. Index follows `EventType` ordering minus the unregisterable
     /// ones: 0=memory_fault, 1=thread_fault, 2=breakpoint, 3=pmu_overflow.
@@ -441,8 +450,9 @@ pub fn suspendOnPort(
     event: EventType,
     subcode: u8,
     addr: u64,
+    originating_write_cap: bool,
 ) i64 {
-    if (ec.vm != null) return errors.E_PERM;
+    if (ec.vm != null and event != .vm_exit) return errors.E_PERM;
     std.debug.assert(ec.state == .running or ec.state == .ready);
 
     if (ec.state == .ready) {
@@ -455,6 +465,7 @@ pub fn suspendOnPort(
     ec.suspend_port = SlabRef(Port).init(port, port._gen_lock.currentGen());
     ec.state = .suspended_on_port;
     ec.pending_reply_holder = null;
+    ec.originating_write_cap = originating_write_cap;
     ec.on_cpu.store(false, .release);
 
     // Enqueue into the port's sender wait queue. WaiterKind tracks
@@ -484,6 +495,7 @@ pub fn resumeFromReply(ec: *ExecutionContext, apply_writes: bool) void {
     ec.event_addr = 0;
     ec.suspend_port = null;
     ec.pending_reply_holder = null;
+    ec.originating_write_cap = false;
     ec.state = .ready;
     scheduler.markReady(ec);
 }
@@ -530,6 +542,7 @@ pub fn restartEntry(ec: *ExecutionContext) void {
     ec.event_subcode = 0;
     ec.event_addr = 0;
     ec.pending_reply_holder = null;
+    ec.originating_write_cap = false;
     ec.iret_frame = null;
     ec.futex_wait_nodes = null;
     ec.futex_bucket_count = 0;
@@ -554,7 +567,7 @@ pub fn restartEntry(ec: *ExecutionContext) void {
 /// stack with guard pages, sets `entry_point` and `affinity`. All
 /// fields receive their spec defaults; the gen-lock has already been
 /// initialized by the slab allocator.
-fn allocExecutionContext(
+pub fn allocExecutionContext(
     domain: *CapabilityDomain,
     entry: VAddr,
     stack_pages: u32,
@@ -608,6 +621,7 @@ fn allocExecutionContext(
     ec.event_addr = 0;
     ec.suspend_port = null;
     ec.pending_reply_holder = null;
+    ec.originating_write_cap = false;
     ec.event_routes = .{ null, null, null, null };
     ec.entry_point = entry;
     ec.vm = if (vm) |v| SlabRef(VirtualMachine).init(v, v._gen_lock.currentGen()) else null;

@@ -1,6 +1,5 @@
 pub const capability = @import("capability.zig");
 pub const capability_domain = @import("capability_domain.zig");
-pub const device_region = @import("device_region.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const errors = @import("errors.zig");
 pub const event_route = @import("event_route.zig");

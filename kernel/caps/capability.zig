@@ -385,8 +385,11 @@ fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) voi
             page_frame.releaseHandle(ref.ptr);
         },
         .virtual_address_range => {
-            const ref = typedRef(VAR, entry.*) orelse return;
-            var_range.releaseHandle(ref.ptr);
+            // VAR is capability-domain lifetime: the range, its
+            // installations, and its address-space mapping all die with
+            // the owning domain. Per-handle delete is a slot clear only
+            // (handled by `clearAndFreeSlot`); no module-level release
+            // hook is needed here.
         },
         .device_region => {
             const ref = typedRef(DeviceRegion, entry.*) orelse return;

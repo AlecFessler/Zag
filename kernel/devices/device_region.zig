@@ -160,6 +160,15 @@ pub fn incHandleRef(dr: *DeviceRegion) void {
     dr._gen_lock.unlock();
 }
 
+/// Public release-handle entry point invoked from the cross-cutting
+/// `caps.capability.delete` path. Acquires `dr._gen_lock` and routes
+/// through the standard `decHandleRef` which owns the teardown
+/// transition.
+pub fn releaseHandle(dr: *DeviceRegion) void {
+    dr._gen_lock.lock(@src());
+    decHandleRef(dr);
+}
+
 /// Decrement the refcount. The decrementer-to-zero owns teardown:
 /// evicts the IRQ-table entry (if any), then destroys the slab slot.
 /// Caller must hold `dr._gen_lock`. On the zero-transition this
