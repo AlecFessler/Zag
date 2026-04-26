@@ -1,12 +1,16 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const dispatch_iommu = zag.arch.dispatch.iommu;
 const vi = zag.arch.x64.amd.vi;
 const vtd = zag.arch.x64.intel.vtd;
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
+const MemoryPerms = dispatch_iommu.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const SharedMemory = zag.memory.shared.SharedMemory;
+const SpecDeviceRegion = zag.devices.device_region.DeviceRegion;
+const VarPageSize = zag.capdom.var_range.PageSize;
 
 const IommuType = enum {
     none,
@@ -116,4 +120,53 @@ pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void 
 
 pub fn isAvailable() bool {
     return active_type != .none;
+}
+
+pub fn createIommuDomain(device: *SpecDeviceRegion) !*anyopaque {
+    _ = device;
+    @panic("not implemented");
+}
+
+pub fn destroyIommuDomain(device: *SpecDeviceRegion) void {
+    _ = device;
+    @panic("not implemented");
+}
+
+pub fn iommuMapPage(
+    device: *SpecDeviceRegion,
+    iova: u64,
+    phys: PAddr,
+    sz: VarPageSize,
+    perms: MemoryPerms,
+) !void {
+    _ = device;
+    _ = iova;
+    _ = phys;
+    _ = sz;
+    _ = perms;
+    @panic("not implemented");
+}
+
+pub fn iommuUnmapPage(
+    device: *SpecDeviceRegion,
+    iova: u64,
+    sz: VarPageSize,
+) ?PAddr {
+    _ = device;
+    _ = iova;
+    _ = sz;
+    @panic("not implemented");
+}
+
+pub fn invalidateIotlbRange(
+    device: *SpecDeviceRegion,
+    iova: u64,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = device;
+    _ = iova;
+    _ = sz;
+    _ = page_count;
+    @panic("not implemented");
 }
