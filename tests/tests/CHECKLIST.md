@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 308.
-**Remaining:** 160.
+**Implemented:** 314.
+**Remaining:** 154.
 
 ## Convention
 
@@ -436,10 +436,10 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **04** — returns E_NOENT if any page_frame is not currently mapped in [1].
 - [x] **05** — on success, each page_frame's installation in [1]'s guest physical address space is removed; subsequent guest accesses to those guest_addr ranges deliver a `vm_exit` event on the vCPU's bound exit_port with sub-code = `ept` (x86-64) or `stage2_fault` (aarch64).
 
-## vm_set_policy — 1/9
+## vm_set_policy — 2/9
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid VM handle.
-- [ ] **02** — returns E_PERM if [1] does not have the `policy` cap.
+- [x] **02** — returns E_PERM if [1] does not have the `policy` cap.
 - [ ] **03** — returns E_INVAL if count exceeds the active (kind, arch)'s MAX_* constant from §[vm_policy].
 - [ ] **04** — returns E_INVAL if any reserved bits are set in [1] or any entry.
 - [ ] **05** — on x86-64 with kind=0, the VM's `cpuid_responses` table is replaced by the count entries; subsequent guest CPUIDs match against this table per §[vm_policy], and the prior contents are no longer matched.
@@ -463,10 +463,10 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **03** — returns E_INVAL if any reserved bits are set in [1].
 - [x] **04** — on success, the caller receives a port handle with caps = `[1].caps`.
 
-## suspend — 0/12
+## suspend — 2/12
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid EC handle.
-- [ ] **02** — returns E_BADCAP if [2] is not a valid port handle.
+- [x] **01** — returns E_BADCAP if [1] is not a valid EC handle.
+- [x] **02** — returns E_BADCAP if [2] is not a valid port handle.
 - [ ] **03** — returns E_PERM if [1] does not have the `susp` cap.
 - [ ] **04** — returns E_PERM if [2] does not have the `bind` cap.
 - [ ] **05** — returns E_INVAL if any reserved bits are set.
@@ -478,9 +478,9 @@ _§[device_irq] Device IRQ Delivery_
 - [ ] **11** — on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's EC state on reply; otherwise modifications are discarded.
 - [ ] **12** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## recv — 0/14
+## recv — 1/14
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid port handle.
+- [x] **01** — returns E_BADCAP if [1] is not a valid port handle.
 - [ ] **02** — returns E_PERM if [1] does not have the `recv` cap.
 - [ ] **03** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **04** — returns E_CLOSED if the port has no bind-cap holders, no event_routes targeting it, and no queued events.
@@ -533,9 +533,9 @@ _§[handle_attachments] Handle Attachments_
 - [ ] **06** — on success, the binding for ([1], [2]) is removed; subsequent firings of [2] for [1] follow the no-route fallback above.
 - [ ] **07** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## reply — 0/7
+## reply — 1/7
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid reply handle.
+- [x] **01** — returns E_BADCAP if [1] is not a valid reply handle.
 - [ ] **02** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **03** — returns E_TERM if the suspended EC was terminated before reply could deliver; [1] is consumed.
 - [ ] **04** — on success, [1] is consumed (removed from the caller's table).
@@ -561,9 +561,9 @@ _§[handle_attachments] Handle Attachments_
 - [ ] **14** — on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
 - [ ] **15** — on success, the suspended EC is resumed.
 
-## timer_arm — 0/10
+## timer_arm — 1/10
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `timer`.
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `timer`.
 - [ ] **02** — returns E_PERM if [1].caps.restart_policy = 1 and the caller's `restart_policy_ceiling.tm_restart_max = 0`.
 - [ ] **03** — returns E_INVAL if [2] deadline_ns is 0.
 - [ ] **04** — returns E_INVAL if any reserved bits are set in [1] or [3].
