@@ -433,7 +433,7 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
 
 Self-handle cap required: `crcd`.
 
-The ELF image is read from `elf_page_frame` starting at byte 0. The pointer to the new domain's read-only view of its capability table is passed as the first argument to the initial EC's entry point.
+The ELF image is read from `elf_page_frame` starting at byte 0. The image must be position-independent; the kernel loads its segments at a randomized base in the ASLR zone (see §[address_space]). The pointer to the new domain's read-only view of its capability table is passed as the first argument to the initial EC's entry point.
 
 The caller receives an IDC handle to the new domain with caps = the caller's own `cridc_ceiling`. The new domain's slot-2 self-IDC handle is minted with caps = the `cridc_ceiling` passed in [2]. The new domain's slot-1 initial-EC handle is minted with caps = the new domain's `ec_inner_ceiling` from [2].
 
@@ -455,6 +455,7 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 [test 14] returns E_BADCAP if any passed handle id is not a valid handle in the caller's table.
 [test 15] returns E_INVAL if the ELF header is malformed.
 [test 16] returns E_INVAL if `elf_page_frame` is smaller than the declared ELF image size.
+[test 16a] returns E_INVAL if the ELF image is not position-independent (no PT_DYNAMIC, or e_type != ET_DYN).
 [test 17] returns E_INVAL if any reserved bits are set in [1], [2], or a passed handle entry.
 [test 18] returns E_INVAL if any two entries in [4+] reference the same source handle.
 [test 19] on success, the caller receives an IDC handle to the new domain with caps = the caller's `cridc_ceiling`.
@@ -467,7 +468,8 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 [test 26] on success, the new domain's `ec_inner_ceiling`, `var_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
 [test 27] on success, the new domain's `ec_outer_ceiling` and `var_outer_ceiling` in field1 are set to the values supplied in [3].
 [test 28] on success, the new domain's `idc_rx` in field0 is set to the value supplied in [1].
-[test 29] the initial EC begins executing at the entry point declared in the ELF header.
+[test 29] the initial EC begins executing at the entry point declared in the ELF header (after the kernel-applied randomized ASLR offset).
+[test 30] on success, two successive `create_capability_domain` calls with the same ELF image place the image at different randomized base addresses with high probability (ASLR jitter test — see §[address_space]).
 
 ### acquire_ecs
 
@@ -640,7 +642,7 @@ Caps required:
 - Caller's self-handle must always have `crec`.
 - If `[4] != 0`: the IDC handle in `[4]` must additionally have `crec`.
 
-The kernel allocates `[3]` pages of stack in the target's address space with unmapped guard pages above and below to catch overflow and underflow. The EC begins executing at `[2] entry` with the stack pointer set to the top of the allocated stack.
+The kernel allocates `[3]` pages of stack in the target's address space at a kernel-chosen randomized base in the ASLR zone (see §[address_space]), with unmapped guard pages above and below to catch overflow and underflow. The EC begins executing at `[2] entry` with the stack pointer set to the top of the allocated stack.
 
 Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the target's address space has insufficient contiguous space for the stack; returns E_FULL if the caller's handle table has no free slot, or if `[4]` is nonzero and the target domain's handle table is full.
 
@@ -658,6 +660,7 @@ Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the target's a
 [test 12] on success, when [4] is nonzero, the target domain also receives a handle with caps = `[1].target_caps`.
 [test 13] on success, the EC's priority is set to `[1].priority`.
 [test 14] on success, the EC's affinity is set to `[5]`.
+[test 15] on success, the EC's stack base lies within the ASLR zone (see §[address_space]).
 
 ### self
 
@@ -870,9 +873,39 @@ Self-handle cap required: `pmu`.
 [test 05] on success, a subsequent `perfmon_read` on the target EC returns E_INVAL (perfmon was not started).
 [test 06] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
+## §[address_space] Address Space Layout
+
+Each capability domain owns a per-domain virtual address space. The user half is split into three zones with distinct placement semantics:
+
+| Zone | Placement |
+|---|---|
+| NULL guard | unmapped; any access faults |
+| ASLR zone | kernel-chosen base, randomized at placement time. Used for ELF segments, EC stacks, and `create_var` with `preferred_base = 0` |
+| Static zone | userspace-chosen base via `create_var` with `preferred_base != 0`. Placement is deterministic |
+
+ELF images loaded by `create_capability_domain` must be position-independent; the kernel relocates them to a randomized base in the ASLR zone. The first faulted page in the NULL guard always faults regardless of any other mapping.
+
+Concrete numeric boundaries are architecture-specific.
+
+x86-64 (4-level paging, 47-bit canonical user VA):
+
+| Zone | Range | Size |
+|---|---|---|
+| NULL guard | `[0x0000_0000_0000_0000, 0x0000_0000_0000_1000)` | 4 KiB |
+| ASLR zone | `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)` | ~16 TiB |
+| Static zone | `[0x0000_1000_0000_0000, 0x0000_8000_0000_0000)` | 112 TiB |
+
+aarch64 (4-level paging, 48-bit TTBR0 user VA):
+
+| Zone | Range | Size |
+|---|---|---|
+| NULL guard | `[0x0000_0000_0000_0000, 0x0000_0000_0000_1000)` | 4 KiB |
+| ASLR zone | `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)` | ~16 TiB |
+| Static zone | `[0x0000_1000_0000_0000, 0x0001_0000_0000_0000)` | 240 TiB |
+
 ## §[var] Virtual Address Range
 
-A virtual address range is a contiguous span of the virtual address space bound to a capability domain. It is available for demand-paged memory, or for installing page frames or device regions.
+A virtual address range is a contiguous span of the virtual address space bound to a capability domain. It is available for demand-paged memory, or for installing page frames or device regions. See §[address_space] for the zone layout governing where VARs are placed.
 
 A regular VAR (`caps.mmio = 0, caps.dma = 0`) created without explicit mapping starts at `map = 0`. The first faulted access transitions it to `map = 3` (demand): the kernel allocates a fresh zero-filled page_frame and installs it at the faulting offset, with effective permissions = `VAR.cur_rwx`. Once `map = 3`, the VAR cannot be `map_pf`'d until it is `unmap`'d back to `map = 0`.
 
@@ -954,7 +987,8 @@ create_var([1] caps, [2] props, [3] pages, [4] preferred_base, [5] device_region
     bits 7-63: _reserved
 
   [3] pages:          number of `sz` pages to reserve
-  [4] preferred_base: 0 = kernel chooses
+  [4] preferred_base: 0 = kernel chooses an ASLR-zone base; nonzero = use this base
+                      (must lie wholly within the static zone — see §[address_space])
   [5] device_region:  device_region handle to bind for the IOMMU mapping
                       (required when caps.dma = 1; ignored otherwise)
 ```
@@ -985,6 +1019,8 @@ Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the address sp
 [test 20] on success, field1 contains `[2].props` together with `[3]` pages.
 [test 21] on success, when [4] preferred_base is nonzero and the range is available, the assigned base address equals `[4]`.
 [test 22] on success, when caps.dma = 1, field1's `device` field equals [5]'s handle id, and a subsequent `map_pf` into this VAR routes the bound device's accesses at field0 + offset to the installed page_frame.
+[test 23] returns E_INVAL if [4] preferred_base is nonzero and the requested range does not lie wholly within the static zone (see §[address_space]).
+[test 24] on success, when [4] preferred_base = 0, the assigned base address lies within the ASLR zone (see §[address_space]).
 
 ### map_pf
 
