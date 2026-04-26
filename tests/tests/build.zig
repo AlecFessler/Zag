@@ -519,11 +519,96 @@ fn buildTestElf(
     return exe.getEmittedBin();
 }
 
+/// Returns true if `name` matches `pattern`, where `*` in `pattern`
+/// matches any (possibly empty) substring of `name`. Match is anchored
+/// at both ends. No other glob metacharacters are recognized — this is
+/// a developer-convenience filter, not a full glob implementation.
+fn patternMatches(pattern: []const u8, name: []const u8) bool {
+    // Fast path: no wildcards → exact compare.
+    if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
+        return std.mem.eql(u8, pattern, name);
+    }
+    // Split pattern on '*'. The first piece must prefix-match `name`,
+    // the last piece must suffix-match the remainder, and each interior
+    // piece must occur in order in between.
+    var pieces = std.mem.splitScalar(u8, pattern, '*');
+    const first = pieces.next() orelse return true;
+    if (!std.mem.startsWith(u8, name, first)) return false;
+    var cursor: usize = first.len;
+    var pending: ?[]const u8 = pieces.next();
+    while (pending) |piece| {
+        const next = pieces.next();
+        if (next == null) {
+            // Last piece: anchor at the end of `name`.
+            if (piece.len > name.len - cursor) return false;
+            const tail_start = name.len - piece.len;
+            if (tail_start < cursor) return false;
+            if (!std.mem.eql(u8, name[tail_start..], piece)) return false;
+            return true;
+        }
+        // Interior piece: must appear at or after cursor.
+        if (piece.len == 0) {
+            pending = next;
+            continue;
+        }
+        const idx = std.mem.indexOfPos(u8, name, cursor, piece) orelse return false;
+        cursor = idx + piece.len;
+        pending = next;
+    }
+    return true;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .freestanding,
     });
+
+    const tests_filter = b.option(
+        []const u8,
+        "tests",
+        "Comma-separated list of test names or glob-style patterns (e.g. recv_01,recv_*) to embed in the runner manifest. Omit to embed all tests.",
+    );
+
+    // Build the filtered list of test entries up front. The same
+    // selection drives both per-test ELF builds and the manifest the
+    // primary runner iterates.
+    var selected = std.array_list.Managed(TestEntry).init(b.allocator);
+    defer selected.deinit();
+    if (tests_filter) |raw| {
+        if (raw.len == 0) {
+            @panic("-Dtests requires at least one test name or pattern");
+        }
+        var patterns = std.array_list.Managed([]const u8).init(b.allocator);
+        defer patterns.deinit();
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |piece| {
+            const trimmed = std.mem.trim(u8, piece, " \t");
+            if (trimmed.len == 0) {
+                @panic("-Dtests contains an empty entry (check for stray commas)");
+            }
+            patterns.append(trimmed) catch @panic("OOM building -Dtests pattern list");
+        }
+        for (test_entries) |t| {
+            for (patterns.items) |pat| {
+                if (patternMatches(pat, t.name)) {
+                    selected.append(t) catch @panic("OOM appending selected test");
+                    break;
+                }
+            }
+        }
+        if (selected.items.len == 0) {
+            const msg = std.fmt.allocPrint(
+                b.allocator,
+                "-Dtests={s}: zero tests matched the supplied patterns",
+                .{raw},
+            ) catch "-Dtests: zero tests matched the supplied patterns";
+            @panic(msg);
+        }
+    } else {
+        selected.appendSlice(&test_entries) catch @panic("OOM seeding default test list");
+    }
+    const selected_entries = selected.items;
 
     const lib_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/lib.zig" },
@@ -536,8 +621,9 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("lib", lib_mod);
 
     const embedded_wf = b.addWriteFiles();
-    var test_elfs: [test_entries.len]std.Build.LazyPath = undefined;
-    for (test_entries, 0..) |t, i| {
+    const test_elfs = b.allocator.alloc(std.Build.LazyPath, selected_entries.len) catch
+        @panic("OOM allocating test_elfs");
+    for (selected_entries, 0..) |t, i| {
         test_elfs[i] = buildTestElf(b, target, lib_mod, t.name, t.path);
         _ = embedded_wf.addCopyFile(test_elfs[i], b.fmt("{s}.elf", .{t.name}));
     }
@@ -555,7 +641,7 @@ pub fn build(b: *std.Build) void {
         \\pub const manifest = [_]Entry{
         \\
     ) catch unreachable;
-    for (test_entries) |t| {
+    for (selected_entries) |t| {
         manifest.writer().print(
             "    .{{ .name = \"{s}\", .bytes = @embedFile(\"{s}.elf\") }},\n",
             .{ t.name, t.name },
@@ -603,7 +689,7 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install.step);
 
     // Install the individual test ELFs alongside for inspection.
-    for (test_entries, 0..) |t, i| {
+    for (selected_entries, 0..) |t, i| {
         const path = b.fmt("../bin/{s}.elf", .{t.name});
         const inst = b.addInstallFile(test_elfs[i], path);
         b.getInstallStep().dependOn(&inst.step);
