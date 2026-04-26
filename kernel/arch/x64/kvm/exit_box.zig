@@ -13,7 +13,7 @@ const vm_mod = kvm.vm;
 
 const ArchCpuContext = zag.arch.x64.interrupts.ArchCpuContext;
 const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
-const EcQueue = zag.sched.execution_context.EcQueue;
+const EcQueue = zag.sched.scheduler.EcQueue;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;

@@ -19,7 +19,7 @@ const vcpu_mod = kvm.vcpu;
 const vm_hw = zag.arch.aarch64.vm;
 const vm_mod = kvm.vm;
 
-const EcQueue = zag.sched.execution_context.EcQueue;
+const EcQueue = zag.sched.scheduler.EcQueue;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;

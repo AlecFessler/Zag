@@ -9,22 +9,21 @@ pub fn PriorityQueue(
     comptime priority_field: []const u8,
     comptime num_levels: comptime_int,
 ) type {
-    // The linked-list `next` field on `T` may be stored as either a
-    // bare `?*T` or a `?SlabRef(T)` (for slab-backed T where all stored
-    // pointers are fat references). The queue itself always operates
-    // on `*T` — items sitting in a run queue / wait queue are live by
-    // construction, since the queue owns them across yields — so we
-    // just need two comptime adapters: one to turn the stored slot
-    // into `?*T`, one to go back.
-    const next_is_slabref = comptime blk: {
-        const SentinelT = @FieldType(T, next_field);
-        break :blk @typeInfo(SentinelT) == .optional and
-            @typeInfo(@typeInfo(SentinelT).optional.child) == .@"struct";
-    };
-
+    // `next_field` on `T` may be stored as either `?*T` or `?SlabRef(T)`
+    // (for slab-backed T). The branch is computed lazily inside each
+    // helper — querying `@FieldType(T, ...)` at this outer scope would
+    // force T's container to be fully resolved at PQ-instantiation time,
+    // which is a cycle when T's queue is owned by a sibling module that
+    // T transitively imports.
     const Helpers = struct {
+        inline fn nextIsSlabRef() bool {
+            const SentinelT = @FieldType(T, next_field);
+            return @typeInfo(SentinelT) == .optional and
+                @typeInfo(@typeInfo(SentinelT).optional.child) == .@"struct";
+        }
+
         inline fn getNext(item: *T) ?*T {
-            if (comptime next_is_slabref) {
+            if (comptime nextIsSlabRef()) {
                 const maybe = @field(item, next_field);
                 if (maybe) |r| {
                     // self-alive: the run/wait queue owns its nodes
@@ -39,7 +38,7 @@ pub fn PriorityQueue(
         }
 
         inline fn setNext(item: *T, next: ?*T) void {
-            if (comptime next_is_slabref) {
+            if (comptime nextIsSlabRef()) {
                 if (next) |n| {
                     @field(item, next_field) = SlabRef(T).init(n, n._gen_lock.currentGen());
                 } else {
