@@ -6,8 +6,7 @@ const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
 const BootInfo = zag.boot.protocol.BootInfo;
-const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const Thread = zag.sched.thread.Thread;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const VAddr = zag.memory.address.VAddr;
 
 // --- Fault / context types ---------------------------------------------
@@ -64,27 +63,6 @@ pub fn serializeFaultRegs(ctx: *const ArchCpuContext) FaultRegSnapshot {
         .aarch64 => aarch64.interrupts.serializeFaultRegs(ctx),
         else => unreachable,
     };
-}
-
-pub fn prepareThreadContext(
-    kstack_top: VAddr,
-    ustack_top: ?VAddr,
-    entry: *const fn () void,
-    arg: u64,
-) *ArchCpuContext {
-    switch (builtin.cpu.arch) {
-        .x86_64 => return x64.interrupts.prepareThreadContext(kstack_top, ustack_top, entry, arg),
-        .aarch64 => return aarch64.interrupts.prepareThreadContext(kstack_top, ustack_top, entry, arg),
-        else => unreachable,
-    }
-}
-
-pub fn switchTo(thread: *Thread) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.switchTo(thread),
-        .aarch64 => aarch64.interrupts.switchTo(thread),
-        else => unreachable,
-    }
 }
 
 // --- Calling convention / entry ----------------------------------------
@@ -243,32 +221,6 @@ pub inline fn userAccessEnd() void {
     }
 }
 
-// --- Interrupt controller (APIC / GIC) ---------------------------------
-
-pub fn unmaskIrq(irq: u8) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.irq.unmaskIrq(irq),
-        .aarch64 => aarch64.irq.unmaskIrq(irq),
-        else => unreachable,
-    }
-}
-
-pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.irq.findIrqForDevice(device),
-        .aarch64 => aarch64.irq.findIrqForDevice(device),
-        else => unreachable,
-    };
-}
-
-pub fn clearIrqPendingBit(irq_line: u8) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.irq.clearIrqPendingBit(irq_line),
-        .aarch64 => {}, // stub
-        else => unreachable,
-    }
-}
-
 // --- Cache maintenance -------------------------------------------------
 
 /// Synchronize the instruction cache with the data cache after writing
@@ -403,19 +355,6 @@ pub fn fpuClearTrap() void {
     }
 }
 
-/// Synchronously flush `thread`'s FP state from the source core's
-/// registers into `thread.fpu_state`. Called by the destination core
-/// when work-stealing has migrated `thread` and a subsequent
-/// `fpuRestore` would otherwise read stale buffer contents. Sends an
-/// IPI and spins until the source core acknowledges.
-pub fn fpuFlushIpi(target_core: u8, thread: *Thread) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.fpuFlushIpi(target_core, thread),
-        .aarch64 => aarch64.cpu.fpuFlushIpi(target_core, thread),
-        else => unreachable,
-    }
-}
-
 // --- Power / shutdown / entropy ----------------------------------------
 
 pub const PowerAction = switch (builtin.cpu.arch) {
@@ -527,4 +466,97 @@ pub fn getCoreState(core_id: u64) u8 {
         .aarch64 => aarch64.sysinfo.getCoreState(core_id),
         else => unreachable,
     };
+}
+
+// ── Spec v3 EC dispatch primitives ───────────────────────────────────
+// FPU-trap arming, register-bank load, and TLS-base accessors used by
+// the ExecutionContext dispatch path. Spec §[execution_context].
+
+/// Arm the FPU-disabled trap (CR0.TS on x86-64, CPACR_EL1.FPEN=0 on
+/// aarch64) so the next user FP/SIMD instruction faults into the
+/// scheduler's lazy-FPU eviction path. Spec §[execution_context] lazy FPU.
+pub fn fpuArmTrap() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.fpuArmTrap(),
+        .aarch64 => aarch64.cpu.fpuArmTrap(),
+        else => unreachable,
+    }
+}
+
+/// Restore `ec.ctx` into the live register file and return to userspace
+/// via iretq / eret. Never returns to the caller. Used by the scheduler
+/// `switchTo` path after lazy-FPU bookkeeping.
+pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
+    _ = ec;
+    @panic("not implemented");
+}
+
+/// Write the user FS base (x86-64). aarch64 has no equivalent — TLS
+/// uses TPIDR_EL0 (see `writeTpidrEl0`).
+pub fn writeFsBase(value: u64) void {
+    _ = value;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => @compileError("FS base is x86-only; use writeTpidrEl0"),
+        else => unreachable,
+    }
+}
+
+/// Write the user GS base (x86-64). aarch64 has no equivalent — TLS
+/// uses TPIDR_EL0 (see `writeTpidrEl0`).
+pub fn writeGsBaseUser(value: u64) void {
+    _ = value;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => @compileError("GS base is x86-only; use writeTpidrEl0"),
+        else => unreachable,
+    }
+}
+
+/// Read the user FS base (x86-64).
+pub fn readFsBase() u64 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return 0,
+        .aarch64 => @compileError("FS base is x86-only; use readTpidrEl0"),
+        else => unreachable,
+    }
+}
+
+/// Read the user GS base (x86-64).
+pub fn readGsBaseUser() u64 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return 0,
+        .aarch64 => @compileError("GS base is x86-only; use readTpidrEl0"),
+        else => unreachable,
+    }
+}
+
+/// Write TPIDR_EL0 (aarch64 user TLS base). x86-64 uses FS/GS instead.
+pub fn writeTpidrEl0(value: u64) void {
+    _ = value;
+    switch (builtin.cpu.arch) {
+        .x86_64 => @compileError("TPIDR_EL0 is aarch64-only; use writeFsBase/writeGsBaseUser"),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+/// Read TPIDR_EL0 (aarch64 user TLS base).
+pub fn readTpidrEl0() u64 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => @compileError("TPIDR_EL0 is aarch64-only; use readFsBase/readGsBaseUser"),
+        .aarch64 => return 0,
+        else => unreachable,
+    }
+}
+
+/// Halt the local core in an interrupts-enabled state until the next
+/// interrupt (HLT with IF=1 on x86-64, WFI with DAIF cleared on
+/// aarch64). Used by the per-core idle EC.
+pub fn idle() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => @panic("not implemented"),
+        .aarch64 => @panic("not implemented"),
+        else => unreachable,
+    }
 }

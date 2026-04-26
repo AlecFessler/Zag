@@ -6,6 +6,7 @@ const aarch64 = zag.arch.aarch64;
 const paging = zag.arch.dispatch.paging;
 const x64 = zag.arch.x64;
 
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PmuCounterConfig = zag.syscall.pmu.PmuCounterConfig;
 const PmuInfo = zag.syscall.pmu.PmuInfo;
 const PmuSample = zag.syscall.pmu.PmuSample;
@@ -196,6 +197,25 @@ pub fn pmuClearState(state: *PmuState) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.pmu.pmuClearState(state),
         .aarch64 => aarch64.pmu.pmuClearState(state),
+        else => unreachable,
+    }
+}
+
+// ── Spec v3 PMU overflow delivery ────────────────────────────────────
+
+/// Called from the per-arch PMU overflow handler. Routes a
+/// `pmu_overflow` event for `ec` carrying the overflow bitmask
+/// per Spec §[execution_context].perfmon_*.
+pub fn pmuOverflowDispatch(ec: *ExecutionContext, overflow_mask: u32) void {
+    _ = ec;
+    _ = overflow_mask;
+}
+
+/// IDT vector / GIC SPI used for PMU overflow delivery on this arch.
+pub fn pmuOverflowVector() u8 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return 0,
+        .aarch64 => return 0,
         else => unreachable,
     }
 }

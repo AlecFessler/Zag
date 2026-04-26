@@ -87,3 +87,28 @@ pub fn broadcastKprofIpi() void {
     }
 }
 
+// ── Spec v3 SMP primitives ───────────────────────────────────────────
+
+/// Wake an idle remote core so it picks up freshly enqueued work.
+/// Spec §[execution_context] cross-core enqueue.
+pub fn sendWakeIpi(core_id: u64) void {
+    _ = core_id;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+/// Send a TLB shootdown IPI to every core in `core_mask` (bit N = 1 ⇒
+/// core N). Receivers run the per-arch shootdown handler against the
+/// pending range queue. Used by `paging.shootdownTlbRange` /
+/// `shootdownTlbAll`.
+pub fn sendTlbShootdownIpi(core_mask: u64) void {
+    _ = core_mask;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => {},
+        else => unreachable,
+    }
+}

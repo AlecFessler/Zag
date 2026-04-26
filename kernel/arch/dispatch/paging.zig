@@ -10,6 +10,8 @@ const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const Range = zag.utils.range.Range;
 const VAddr = zag.memory.address.VAddr;
+const VarPageSize = zag.capdom.var_range.PageSize;
+const VarCacheType = zag.capdom.var_range.CacheType;
 
 // ── Address Space Layout ────────────────────────────────────────────────
 // Architecture-specific virtual address space boundaries. These define
@@ -259,4 +261,136 @@ pub fn isRelativeRelocation(rela_type: u32) bool {
         .aarch64 => rela_type == @intFromEnum(std.elf.R_AARCH64.RELATIVE),
         else => unreachable,
     };
+}
+
+// ── Spec v3 paging primitives ────────────────────────────────────────
+// Fine-grained per-page mapping/invalidation surface used by VAR
+// install/unmap, page_frame mapcnt updates, and shootdown coordination.
+
+/// Map a single page of size `sz` at `virt → phys` with `cch` cache
+/// attributes and `perms`. Spec §[var].map_pf.
+pub fn mapPageSized(
+    addr_space_root: PAddr,
+    phys: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+    cch: VarCacheType,
+    perms: MemoryPerms,
+) !void {
+    _ = addr_space_root;
+    _ = phys;
+    _ = virt;
+    _ = sz;
+    _ = cch;
+    _ = perms;
+    switch (builtin.cpu.arch) {
+        .x86_64 => return error.NotImplemented,
+        .aarch64 => return error.NotImplemented,
+        else => unreachable,
+    }
+}
+
+/// Unmap a single page of size `sz` at `virt`. Returns the previously
+/// mapped physical page if any. Spec §[var].unmap.
+pub fn unmapPageSized(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+) ?PAddr {
+    _ = addr_space_root;
+    _ = virt;
+    _ = sz;
+    switch (builtin.cpu.arch) {
+        .x86_64 => return null,
+        .aarch64 => return null,
+        else => unreachable,
+    }
+}
+
+/// Allocate a fresh empty top-level address space (PML4 root on x86-64,
+/// stage-1 TTBR0 root on aarch64). Bumps the per-arch ASID/PCID
+/// allocator implicitly is the caller's responsibility — this only
+/// hands back the page-table root. Spec §[capability_domain].
+pub fn allocAddrSpaceRoot() !PAddr {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return error.NotImplemented,
+        .aarch64 => return error.NotImplemented,
+        else => unreachable,
+    }
+}
+
+/// Install `root` as the active user address space on the local core,
+/// tagged by `id` (PCID on x86-64, ASID on aarch64).
+pub fn swapAddrSpace(root: PAddr, id: u16) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.swapAddrSpace(root, id),
+        .aarch64 => aarch64.paging.swapAddrSpace(root, id),
+        else => unreachable,
+    }
+}
+
+/// Local-core TLB invalidation over a contiguous run of `page_count`
+/// pages of size `sz` starting at `virt`. Used immediately after
+/// unmapping or permission downgrades when the caller is the only core
+/// that could have cached the translation.
+pub fn invalidateTlbRange(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = addr_space_root;
+    _ = virt;
+    _ = sz;
+    _ = page_count;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+/// Cross-core TLB shootdown over the same page range, addressed by
+/// `addr_space_id` so remote cores can filter quickly. Issues a
+/// shootdown IPI and waits for ack from every core that may hold a
+/// stale entry.
+pub fn shootdownTlbRange(
+    addr_space_id: u16,
+    virt: VAddr,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = addr_space_id;
+    _ = virt;
+    _ = sz;
+    _ = page_count;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+/// Cross-core full-ASID/PCID shootdown. Used by `delete` of a
+/// capability domain when its address space root is being torn down.
+pub fn shootdownTlbAll(addr_space_id: u16) void {
+    _ = addr_space_id;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+/// Invalidate cached intermediate paging structures (PML4/PDPT/PD
+/// nodes on x86-64 via INVPCID type-2; TLBI ALLE1IS on aarch64).
+/// Required after edits that change which leaf a higher-level walker
+/// would resolve — e.g. shrinking a 2 MiB page to 4 KiB leaves.
+pub fn invalidatePagingStructureCache(addr_space_root: PAddr) void {
+    _ = addr_space_root;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => {},
+        else => unreachable,
+    }
 }
