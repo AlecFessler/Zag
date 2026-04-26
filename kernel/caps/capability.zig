@@ -24,6 +24,7 @@
 const zag = @import("zag");
 
 const capability_domain = zag.capdom.capability_domain;
+const derivation = zag.caps.derivation;
 const device_region = zag.devices.device_region;
 const errors = zag.syscall.errors;
 const execution_context = zag.sched.execution_context;
@@ -140,6 +141,33 @@ pub const ErasedSlabRef = extern struct {
     ptr: ?*anyopaque = null,
     gen: u32 = 0,
     _pad: u32 = 0,
+
+    /// Reconstitute a typed `SlabRef(T)` and acquire its gen-lock.
+    /// Returns `StaleHandle` if the slot has been freed since this
+    /// reference was minted, or null on a structurally-empty link
+    /// (`ptr == null`). Caller pairs with `unlockTyped`.
+    pub fn lockTyped(self: ErasedSlabRef, comptime T: type) secure_slab.AccessError!*T {
+        const raw = self.ptr orelse return error.StaleHandle;
+        const ref = secure_slab.SlabRef(T){
+            .ptr = @ptrCast(@alignCast(raw)),
+            .gen = self.gen,
+            ._pad = self._pad,
+        };
+        return ref.lock(@src());
+    }
+
+    /// Release the lock acquired via `lockTyped`. Idempotent across
+    /// the typed/erased boundary — the underlying GenLock is identified
+    /// by `ptr` only.
+    pub fn unlockTyped(self: ErasedSlabRef, comptime T: type) void {
+        const raw = self.ptr orelse return;
+        const ref = secure_slab.SlabRef(T){
+            .ptr = @ptrCast(@alignCast(raw)),
+            .gen = self.gen,
+            ._pad = self._pad,
+        };
+        ref.unlock();
+    }
 };
 
 comptime {
@@ -162,6 +190,34 @@ comptime {
     }
 }
 
+/// Cross-domain link to a `KernelHandle` in another (or this) capability
+/// domain. Used for revoke-ancestry tree links — parent, first_child,
+/// next_sibling — embedded in `KernelHandle`.
+///
+/// Carries the holder domain as an `ErasedSlabRef` so each traversal step
+/// goes through `SlabRef.lock` for gen validation: if the target domain
+/// has been freed since the link was installed, the lock raises
+/// `StaleHandle` and the descendant is treated as already gone.
+///
+/// `slot` is the 12-bit handle id within `domain`'s `kernel_table`. The
+/// remaining bits in the trailing word are reserved.
+///
+/// Two-state encoding mirrors `ErasedSlabRef` itself:
+///   - Linked  : `domain.ptr != null`. `slot` is the linked slot id.
+///   - Unlinked: `domain.ptr == null`. `slot` is meaningful only on the
+///               `parent` link of a free slot, where it carries the
+///               next-free-slot index (see `KernelHandle` doc).
+pub const HandleLink = extern struct {
+    domain: ErasedSlabRef = .{},
+    slot: u16 = 0,
+    _reserved: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
+};
+
+comptime {
+    if (@sizeOf(HandleLink) != 24) @compileError("HandleLink must be 24 bytes");
+    if (@offsetOf(HandleLink, "domain") != 0) @compileError("HandleLink.domain must be at offset 0");
+}
+
 /// Kernel-side mirror entry. One per slot in the domain's handle table,
 /// indexed identically to the user-visible `Capability` table. Lives in
 /// kernel-only memory.
@@ -169,21 +225,29 @@ comptime {
 /// Two states distinguished by `ref.ptr`:
 ///   - **Used** (`ref.ptr != null`): the embedded `SlabRef` references
 ///     the kernel object. Combine with the user table's type tag to
-///     reconstruct a typed `SlabRef(T)` via `typedRef`.
-///   - **Free** (`ref.ptr == null`): `metadata` low 16 bits hold the
-///     index of the next free slot (`FREE_LIST_TAIL` = end of list).
-///     The domain holds the head of the free list.
-///
-/// `metadata` in the used state is reserved for revoke ancestry tracking
-/// (parent / first-child / next-sibling links across domains). Layout
-/// TBD — see TODO at the end of this file.
+///     reconstruct a typed `SlabRef(T)` via `typedRef`. The three link
+///     fields (`parent`, `first_child`, `next_sibling`) describe this
+///     handle's position in the cross-domain copy-derivation tree used
+///     by `revoke` (Spec §[capabilities].revoke). A null `parent.domain`
+///     in the used state means the handle was minted as a tree root
+///     (e.g. via `create_*`) and has no copy ancestor.
+///   - **Free** (`ref.ptr == null`): the parent link doubles as the
+///     free-slot list link — `parent.slot` low 16 bits hold the next
+///     free slot index (`FREE_LIST_TAIL` = end of list). The
+///     `first_child` and `next_sibling` fields are zeroed. The two
+///     states are unambiguous because a free slot has no copy ancestor
+///     and no descendants.
 pub const KernelHandle = extern struct {
     ref: ErasedSlabRef = .{},
-    metadata: u64 = 0,
+    parent: HandleLink = .{},
+    first_child: HandleLink = .{},
+    next_sibling: HandleLink = .{},
 };
 
 comptime {
-    if (@sizeOf(KernelHandle) != 24) @compileError("KernelHandle must be 24 bytes");
+    if (@sizeOf(KernelHandle) != 88) @compileError("KernelHandle must be 88 bytes");
+    if (@offsetOf(KernelHandle, "ref") != 0) @compileError("KernelHandle.ref must be at offset 0");
+    if (@offsetOf(KernelHandle, "parent") != 16) @compileError("KernelHandle.parent must be at offset 16");
 }
 
 /// Reconstruct a typed `SlabRef(T)` from a kernel entry. Returns `null`
@@ -213,14 +277,16 @@ fn SlabRefOf(comptime T: type) type {
 
 // ── Free-list helpers ─────────────────────────────────────────────────
 
-/// Encode a next-free-slot pointer into a free entry's `metadata`.
-pub inline fn encodeFreeNext(next: u16) u64 {
-    return @as(u64, next);
+/// Compose the free-list cell stored in a free entry's `parent` link.
+/// In the free state `parent.domain` is null and `parent.slot` carries
+/// the next free slot index (`FREE_LIST_TAIL` for end of list).
+pub inline fn encodeFreeNext(next: u16) HandleLink {
+    return .{ .domain = .{}, .slot = next };
 }
 
-/// Decode the next-free-slot pointer from a free entry's `metadata`.
-pub inline fn decodeFreeNext(metadata: u64) u16 {
-    return @truncate(metadata & 0xFFFF);
+/// Read the next free slot index from a free entry's `parent` link.
+pub inline fn decodeFreeNext(link: HandleLink) u16 {
+    return link.slot;
 }
 
 // ── External API (cross-cutting capability operations) ───────────────
@@ -253,39 +319,43 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
 }
 
 /// `delete` syscall handler. Spec §[capabilities].delete.
+///
+/// Detaches the handle from the copy-derivation tree (reparenting any
+/// children to the deleted handle's parent so a subsequent revoke on
+/// an ancestor still reaches them — Spec §[capabilities].revoke
+/// test 04), then runs the per-type release and clears the slot.
+///
+/// Lock order: `tree_mutex` → caller's domain gen-lock. Matches the
+/// order taken by `derivation.revoke`/`derivation.derive`.
 pub fn delete(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer cd_ref.unlock();
+    const caller_dom_ref: ErasedSlabRef = .{
+        .ptr = ec.domain.ptr,
+        .gen = ec.domain.gen,
+        ._pad = ec.domain._pad,
+    };
 
     const slot: u12 = @truncate(handle);
-    const entry = resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
-
-    releaseHandle(cd, slot, entry);
-    clearAndFreeSlot(cd, slot, entry);
-    return 0;
+    return derivation.deleteAndDetach(caller_dom_ref, slot);
 }
 
 /// `revoke` syscall handler. Spec §[capabilities].revoke.
+///
+/// Walks the copy-derivation subtree under `handle` and releases every
+/// transitive descendant; `handle` itself is left in place. See
+/// `caps.derivation.revoke`.
 pub fn revoke(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer cd_ref.unlock();
-
-    const slot: u12 = @truncate(handle);
-    const entry = resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
-
-    // Walk every descendant and release it from its holding domain.
-    // Layout of the descendant chain itself is deferred — see the TODO
-    // at the end of this file.
-    forEachCopyDescendant(entry, releaseDescendant);
-    return 0;
+    const caller_dom_ref: ErasedSlabRef = .{
+        .ptr = ec.domain.ptr,
+        .gen = ec.domain.gen,
+        ._pad = ec.domain._pad,
+    };
+    return derivation.revoke(caller_dom_ref, handle);
 }
 
 /// `sync` syscall handler. Spec §[capabilities].sync.
@@ -340,7 +410,7 @@ pub fn resolveHandleOnDomain(
     const entry = &cd.kernel_table[slot];
     // Free slots are flagged by `ref.ptr == null` (see KernelHandle
     // doc comment for the two-state encoding). The free-list link
-    // lives in `metadata`; an in-use entry has `ref.ptr` set to the
+    // lives in `parent`; an in-use entry has `ref.ptr` set to the
     // underlying kernel object.
     if (entry.ref.ptr == null) return null;
 
@@ -358,7 +428,7 @@ pub fn resolveHandleOnDomain(
 /// increment; capability-domain-lifetime types (EC, VAR, VM) and
 /// system-lifetime IDC handles do not — those die only with the
 /// owning domain. Spec §[capabilities].delete table.
-fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
+pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
     const user_entry = &holder.user_table[slot];
     const type_tag = Word0.typeTag(user_entry.word0);
     const caps_word = Word0.caps(user_entry.word0);
@@ -424,11 +494,15 @@ fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) voi
 
 /// Zero out both halves of `slot` in `holder`'s tables and push it
 /// back onto the free list. Pure handle-table bookkeeping — caller has
-/// already applied any object-side release semantics via `releaseHandle`.
-fn clearAndFreeSlot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
+/// already applied any object-side release semantics via `releaseHandle`
+/// and unlinked the handle from any copy-derivation tree it participated
+/// in (see `caps.derivation`).
+pub fn clearAndFreeSlot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
     holder.user_table[slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
     entry.ref = .{};
-    entry.metadata = encodeFreeNext(holder.free_head);
+    entry.parent = encodeFreeNext(holder.free_head);
+    entry.first_child = .{};
+    entry.next_sibling = .{};
     holder.free_head = @as(u16, slot);
     holder.free_count += 1;
 }
@@ -555,58 +629,7 @@ fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) v
     }
 }
 
-/// Walk every handle transitively derived from `target` via copy
-/// across all capability domains, invoking `visit` once per
-/// descendant. Layout-dependent on the revoke-ancestry encoding (see
-/// TODO below).
-fn forEachCopyDescendant(
-    target: *KernelHandle,
-    visit: *const fn (entry: *KernelHandle) void,
-) void {
-    _ = target;
-    _ = visit;
-    // The descendant chain lives in `KernelHandle.metadata` for
-    // in-use slots, but its concrete encoding is unresolved — see
-    // the TODO block at the end of this file. Until that lands,
-    // revoke walks no descendants.
-}
-
-/// Visitor function `forEachCopyDescendant` invokes for each released
-/// descendant. Reaches back into the descendant's holding domain
-/// through pointer arithmetic on `entry` (it points into that domain's
-/// `kernel_table`); cross-domain locking sequence TBD with the
-/// ancestry layout decision.
-fn releaseDescendant(entry: *KernelHandle) void {
-    _ = entry;
-    // Pending the ancestry layout — see TODO.
-}
-
 // Per-object release entry points live in each object's own file.
 // They wrap the type-specific refcount/teardown machinery; this file
 // invokes them through the per-module `releaseHandle` symbol so the
 // switch in `releaseHandle` below stays purely dispatch.
-
-// ── TODO: revoke ancestry ─────────────────────────────────────────────
-//
-// Spec §[capabilities] revoke walks every handle transitively derived
-// from the target via `copy`, across all capability domains. Move keeps
-// the handle on the copy ancestry chain (relocation only).
-//
-// Candidate layouts for `KernelHandle.metadata` in the used state:
-//
-//   (a) Tree links: parent (8B), first_child (8B), next_sibling (8B).
-//       Each link is a `(domain_ptr, slot_id)` pair; revoke is O(N)
-//       in descendants. Costs 24B per used handle on top of the 24B
-//       base entry → 48B/used.
-//
-//   (b) Per-object handle list: every kernel object holds a list of
-//       all KernelHandle entries referencing it (across all domains);
-//       revoke walks that list and checks ancestry by some other
-//       criterion. Cheaper per-handle, more bookkeeping per object.
-//
-//   (c) Generation epochs: each handle carries a copy-generation
-//       counter; revoke increments the source's epoch invalidating
-//       all derivatives at once. Doesn't preserve per-handle revoke
-//       semantics — likely wrong for this spec.
-//
-// Decision deferred until we stub revoke itself.

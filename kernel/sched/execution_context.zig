@@ -496,10 +496,9 @@ pub fn resumeFromReply(ec: *ExecutionContext, apply_writes: bool) void {
 /// chance to record the cause for debug output before the gen flips.
 pub fn abandonPendingReply(ec: *ExecutionContext) void {
     const holder = ec.pending_reply_holder orelse return;
-    // Real impl marks `holder` as abandoned in its capability metadata
-    // so the receiver gets E_ABANDONED rather than E_TERM. Awaits
-    // KernelHandle metadata layout decision (see caps/capability.zig
-    // TODO at end).
+    // Real impl marks `holder` as abandoned so the receiver gets
+    // E_ABANDONED rather than E_TERM on its next op. Hook is here;
+    // the abandoned-state encoding is still TBD on the reply handle.
     _ = holder;
     ec.pending_reply_holder = null;
 }
