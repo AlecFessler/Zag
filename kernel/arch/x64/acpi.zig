@@ -542,8 +542,8 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
 
             var func: u8 = 0;
             while (func < max_func) {
-                const vendor: u16 = @truncate(pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0));
-                if (vendor == 0xFFFF) {
+                const func_vendor: u16 = @truncate(pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0));
+                if (func_vendor == 0xFFFF) {
                     func += 1;
                     continue;
                 }
@@ -688,8 +688,8 @@ fn enumeratePciLegacy() void {
 
             var func: u8 = 0;
             while (func < max_func) {
-                const vendor: u16 = @truncate(pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0));
-                if (vendor == 0xFFFF) {
+                const func_vendor: u16 = @truncate(pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0));
+                if (func_vendor == 0xFFFF) {
                     func += 1;
                     continue;
                 }
