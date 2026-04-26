@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 184.
-**Remaining:** 284.
+**Implemented:** 194.
+**Remaining:** 274.
 
 ## Convention
 
@@ -279,20 +279,20 @@ _§[restart_semantics] Restart Semantics_
 - [x] **08** — on success, CPU accesses to the VAR's range use effective permissions = `VAR.cur_rwx`.
 - [x] **09** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## unmap — 0/12
+## unmap — 10/12
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
-- [ ] **02** — returns E_INVAL if [1].field1 `map` is 0 (nothing to unmap).
-- [ ] **03** — returns E_INVAL if [1].field1 `map` is 2 (mmio) and N > 0.
-- [ ] **04** — returns E_BADCAP if [1].field1 `map` is 1 and any selector is not a valid page_frame handle.
-- [ ] **05** — returns E_NOENT if [1].field1 `map` is 1 and any page_frame selector is not currently installed in [1].
-- [ ] **06** — returns E_INVAL if [1].field1 `map` is 3 and any offset selector is not aligned to [1]'s `sz`.
-- [ ] **07** — returns E_NOENT if [1].field1 `map` is 3 and no demand-allocated page exists at any offset selector.
-- [ ] **08** — on success, when N is 0, all installations or demand-allocated pages are removed and `map` is set to 0.
+- [x] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
+- [x] **02** — returns E_INVAL if [1].field1 `map` is 0 (nothing to unmap).
+- [x] **03** — returns E_INVAL if [1].field1 `map` is 2 (mmio) and N > 0.
+- [x] **04** — returns E_BADCAP if [1].field1 `map` is 1 and any selector is not a valid page_frame handle.
+- [x] **05** — returns E_NOENT if [1].field1 `map` is 1 and any page_frame selector is not currently installed in [1].
+- [x] **06** — returns E_INVAL if [1].field1 `map` is 3 and any offset selector is not aligned to [1]'s `sz`.
+- [x] **07** — returns E_NOENT if [1].field1 `map` is 3 and no demand-allocated page exists at any offset selector.
+- [x] **08** — on success, when N is 0, all installations or demand-allocated pages are removed and `map` is set to 0.
 - [ ] **09** — on success, when N is 0 and `map` was 2, the device_region installation is removed and `device` is cleared to 0.
-- [ ] **10** — on success, when N > 0 and `map` is 1, only the specified page_frames are removed; `map` stays 1 unless every installed page_frame has been removed, in which case it becomes 0.
+- [x] **10** — on success, when N > 0 and `map` is 1, only the specified page_frames are removed; `map` stays 1 unless every installed page_frame has been removed, in which case it becomes 0.
 - [ ] **11** — on success, when N > 0 and `map` is 3, only the pages at the specified offsets are freed; `map` stays 3 unless every demand-allocated page has been freed, in which case it becomes 0.
-- [ ] **12** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+- [x] **12** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 ## remap — 0/9
 
