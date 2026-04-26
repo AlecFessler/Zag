@@ -92,6 +92,12 @@ pub const Function = struct {
     /// that depends on it, not just fns whose own line range was edited.
     /// Empty when the pass hasn't run (e.g. older snapshots).
     def_deps: []const DefId = &.{},
+    /// Number of distinct entry points (boot/syscall/trap/irq) that can
+    /// transitively reach this function via the same edge rules
+    /// `reachable` uses. Surfaces "load-bearing" hubs in `find` output:
+    /// a helper called from one syscall vs reached from twenty look very
+    /// different in blast radius. 0 when not computed.
+    entry_reach: u32 = 0,
 };
 
 pub const EnrichedEdge = struct {

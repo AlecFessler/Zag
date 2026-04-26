@@ -29,8 +29,10 @@
 const std = @import("std");
 
 const commits = @import("commits.zig");
+const render = @import("render.zig");
 const types = @import("types.zig");
 
+const Function = types.Function;
 const Graph = types.Graph;
 
 const index_html = @embedFile("assets/index.html");
@@ -54,6 +56,13 @@ const ServerState = struct {
     /// Per-commit graph registry. Lookups by sha; missing/empty sha
     /// means "live" (use `blobs`).
     registry: *commits.Registry,
+    /// In-memory live graphs (HEAD). Used by /api/trace and /api/fn_source
+    /// to walk the call tree without re-parsing JSON. Key matches the keys
+    /// in `blobs`.
+    graphs: *const GraphMap,
+    /// Per-arch render lookup tables (by_id + by_name). Built once at
+    /// startup; reused across requests. Key matches the arch tag.
+    lookups: std.StringHashMap(render.Maps),
 };
 
 pub fn serve(
@@ -132,12 +141,26 @@ fn buildState(
     try arches_buf.appendSlice(allocator, default_arch);
     try arches_buf.appendSlice(allocator, "\"}");
 
+    var lookups = std.StringHashMap(render.Maps).init(allocator);
+    errdefer {
+        var lit = lookups.valueIterator();
+        while (lit.next()) |m| m.deinit();
+        lookups.deinit();
+    }
+    var git2 = graphs.iterator();
+    while (git2.next()) |entry| {
+        const m = try render.buildLookups(allocator, entry.value_ptr);
+        try lookups.put(entry.key_ptr.*, m);
+    }
+
     return .{
         .blobs = blobs,
         .arches_blob = try arches_buf.toOwnedSlice(allocator),
         .default_arch = default_arch,
         .git_root = git_root,
         .registry = registry,
+        .graphs = graphs,
+        .lookups = lookups,
     };
 }
 
@@ -146,6 +169,9 @@ fn freeState(allocator: std.mem.Allocator, state: *ServerState) void {
     while (it.next()) |e| allocator.free(e.value_ptr.*);
     state.blobs.deinit();
     allocator.free(state.arches_blob);
+    var lit = state.lookups.valueIterator();
+    while (lit.next()) |m| m.deinit();
+    state.lookups.deinit();
 }
 
 fn handleRequest(
@@ -178,6 +204,33 @@ fn handleRequest(
     }
     if (std.mem.eql(u8, path, "/api/source")) {
         return handleSource(allocator, request, query);
+    }
+    if (std.mem.eql(u8, path, "/api/trace")) {
+        return handleTrace(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/fn_source")) {
+        return handleFnSource(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/find")) {
+        return handleFind(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/entries")) {
+        return handleEntries(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/callers")) {
+        return handleCallers(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/modules")) {
+        return handleModules(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/loc")) {
+        return handleLoc(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/reaches")) {
+        return handleReaches(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/type")) {
+        return handleType(allocator, request, query, state);
     }
     if (std.mem.eql(u8, path, "/api/commits")) {
         return handleCommits(allocator, request, query, state);
@@ -431,6 +484,821 @@ fn handleSource(
     const blob = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(blob);
     return respondBytes(request, .ok, "application/json; charset=utf-8", blob);
+}
+
+// ---- Agent / MCP endpoints (trace, fn_source, find, entries) -------------
+
+const TraceQuery = struct {
+    arch: ?[]const u8 = null,
+    sha: ?[]const u8 = null,
+    entry: ?[]const u8 = null,
+    depth: u32 = 6,
+    // Default-on: most exploratory traces want debug/stdlib leaves folded.
+    // Pass `hide_debug=0` / `hide_library=0` to opt back into full fidelity.
+    hide_debug: bool = true,
+    hide_library: bool = true,
+    /// Output format: "text" (default, indented tree) or "json" (compact
+    /// machine-readable tree with stats wrapper).
+    format: []const u8 = "text",
+    /// Comma-separated list of patterns to exclude from the trace as
+    /// folded `-` leaves. Empty by default. Supports `module.*` prefix
+    /// globs and bare substrings.
+    excludes: []const u8 = "",
+};
+
+fn parseTraceQuery(query: []const u8) TraceQuery {
+    var q: TraceQuery = .{};
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const k = pair[0..eq];
+        const v = pair[eq + 1 ..];
+        if (std.mem.eql(u8, k, "arch")) q.arch = v;
+        if (std.mem.eql(u8, k, "sha")) q.sha = v;
+        if (std.mem.eql(u8, k, "entry") or std.mem.eql(u8, k, "name") or std.mem.eql(u8, k, "fn")) q.entry = v;
+        if (std.mem.eql(u8, k, "depth")) q.depth = std.fmt.parseInt(u32, v, 10) catch q.depth;
+        if (std.mem.eql(u8, k, "hide_debug")) q.hide_debug = isTruthy(v);
+        if (std.mem.eql(u8, k, "hide_library")) q.hide_library = isTruthy(v);
+        if (std.mem.eql(u8, k, "format")) q.format = v;
+        if (std.mem.eql(u8, k, "exclude") or std.mem.eql(u8, k, "excludes")) q.excludes = v;
+    }
+    return q;
+}
+
+fn isTruthy(v: []const u8) bool {
+    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "on");
+}
+
+/// Resolve a `(sha, arch)` pair to an in-memory live graph + lookup maps.
+/// `sha` is treated as HEAD when null/empty/"HEAD"; non-HEAD lookups are
+/// rejected since the registry only stores serialized blobs for those.
+fn resolveLiveGraph(
+    state: *const ServerState,
+    sha_opt: ?[]const u8,
+    arch_opt: ?[]const u8,
+) !struct { graph: *const Graph, maps: render.Maps, arch: []const u8 } {
+    if (sha_opt) |s| {
+        if (s.len > 0 and !std.mem.eql(u8, s, "HEAD")) return error.NonHeadNotSupported;
+    }
+    const arch = arch_opt orelse state.default_arch;
+    const arch_eff = if (arch.len == 0) state.default_arch else arch;
+    const g = state.graphs.getPtr(arch_eff) orelse return error.UnknownArch;
+    const m = state.lookups.get(arch_eff) orelse return error.UnknownArch;
+    return .{ .graph = g, .maps = m, .arch = arch_eff };
+}
+
+fn handleTrace(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    const q = parseTraceQuery(query);
+    const entry_name_raw = q.entry orelse return respondBytes(
+        request,
+        .bad_request,
+        "text/plain; charset=utf-8",
+        "missing ?entry=<fn name>\n",
+    );
+
+    const entry_name = try percentDecodeAlloc(allocator, entry_name_raw);
+    defer allocator.free(entry_name);
+
+    const live = resolveLiveGraph(state, q.sha, q.arch) catch |err| switch (err) {
+        error.NonHeadNotSupported => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "non-HEAD sha not supported by /api/trace yet (HEAD only)\n",
+        ),
+        error.UnknownArch => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "unknown arch (try /api/arches)\n",
+        ),
+        else => return err,
+    };
+
+    const fp: *const Function = live.maps.by_name.get(entry_name) orelse return respondBytes(
+        request,
+        .not_found,
+        "text/plain; charset=utf-8",
+        "function not found\n",
+    );
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+
+    // Parse exclude patterns (comma-separated, percent-decoded as a whole
+    // string). Empty list when none requested. Owned by the per-request
+    // arena so the slices stay valid for the renderer.
+    const excludes_raw = try percentDecodeAlloc(allocator, q.excludes);
+    defer allocator.free(excludes_raw);
+    var excludes_list = std.ArrayList([]const u8){};
+    defer excludes_list.deinit(allocator);
+    if (excludes_raw.len > 0) {
+        var eit = std.mem.splitScalar(u8, excludes_raw, ',');
+        while (eit.next()) |pat| {
+            const trimmed = std.mem.trim(u8, pat, " \t");
+            if (trimmed.len > 0) try excludes_list.append(allocator, trimmed);
+        }
+    }
+
+    const ctx: render.Ctx = .{
+        .by_id = &live.maps.by_id,
+        .by_name = &live.maps.by_name,
+        .hide_debug = q.hide_debug,
+        .hide_library = q.hide_library,
+        .excludes = excludes_list.items,
+    };
+    // Stats walk feeds either the JSON wrapper or the text header.
+    const stats = render.statsTrace(arena.allocator(), ctx, fp, q.depth) catch render.TraceStats{};
+
+    if (std.mem.eql(u8, q.format, "json")) {
+        render.renderTraceJson(arena.allocator(), &aw.writer, ctx, fp, q.depth, stats) catch |err| {
+            return respondBytes(
+                request,
+                .internal_server_error,
+                "text/plain; charset=utf-8",
+                @errorName(err),
+            );
+        };
+        return respondBytes(request, .ok, "application/json; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    }
+    if (std.mem.eql(u8, q.format, "compact")) {
+        render.renderTraceCompact(arena.allocator(), &aw.writer, ctx, fp, q.depth, stats) catch |err| {
+            return respondBytes(
+                request,
+                .internal_server_error,
+                "text/plain; charset=utf-8",
+                @errorName(err),
+            );
+        };
+        return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    }
+
+    if (stats.top_fanout > 0) {
+        try aw.writer.print(
+            "trace: {d} fns, {d} at depth cap (depth={d}), top fanout {s} ({d} calls)\n\n",
+            .{ stats.fns_visited, stats.at_cap, q.depth, stats.top_name, stats.top_fanout },
+        );
+    } else {
+        try aw.writer.print(
+            "trace: {d} fns, {d} at depth cap (depth={d})\n\n",
+            .{ stats.fns_visited, stats.at_cap, q.depth },
+        );
+    }
+    render.renderTrace(arena.allocator(), &aw.writer, ctx, fp, q.depth) catch |err| {
+        return respondBytes(
+            request,
+            .internal_server_error,
+            "text/plain; charset=utf-8",
+            @errorName(err),
+        );
+    };
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+}
+
+fn handleFnSource(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    const q = parseTraceQuery(query);
+    const name_raw = q.entry orelse return respondBytes(
+        request,
+        .bad_request,
+        "text/plain; charset=utf-8",
+        "missing ?name=<fn name>\n",
+    );
+    const name = try percentDecodeAlloc(allocator, name_raw);
+    defer allocator.free(name);
+
+    const live = resolveLiveGraph(state, q.sha, q.arch) catch |err| switch (err) {
+        error.NonHeadNotSupported => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "non-HEAD sha not supported (HEAD only)\n",
+        ),
+        error.UnknownArch => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "unknown arch\n",
+        ),
+        else => return err,
+    };
+
+    const fp: *const Function = live.maps.by_name.get(name) orelse return respondBytes(
+        request,
+        .not_found,
+        "text/plain; charset=utf-8",
+        "function not found\n",
+    );
+
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    render.printFnSource(allocator, &aw.writer, fp) catch |err| return respondBytes(
+        request,
+        .internal_server_error,
+        "text/plain; charset=utf-8",
+        @errorName(err),
+    );
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+}
+
+fn handleFind(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    var q_arch: ?[]const u8 = null;
+    var q_sha: ?[]const u8 = null;
+    var q_query: ?[]const u8 = null;
+    var q_limit: u32 = 200;
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const k = pair[0..eq];
+        const v = pair[eq + 1 ..];
+        if (std.mem.eql(u8, k, "arch")) q_arch = v;
+        if (std.mem.eql(u8, k, "sha")) q_sha = v;
+        if (std.mem.eql(u8, k, "q") or std.mem.eql(u8, k, "query")) q_query = v;
+        if (std.mem.eql(u8, k, "limit")) q_limit = std.fmt.parseInt(u32, v, 10) catch q_limit;
+    }
+    const needle_raw = q_query orelse return respondBytes(
+        request,
+        .bad_request,
+        "text/plain; charset=utf-8",
+        "missing ?q=<substr>\n",
+    );
+    const needle = try percentDecodeAlloc(allocator, needle_raw);
+    defer allocator.free(needle);
+
+    const live = resolveLiveGraph(state, q_sha, q_arch) catch |err| switch (err) {
+        error.NonHeadNotSupported => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "non-HEAD sha not supported (HEAD only)\n",
+        ),
+        error.UnknownArch => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "unknown arch\n",
+        ),
+        else => return err,
+    };
+
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    var matches: u32 = 0;
+    var aux_buf: [128]u8 = undefined;
+    for (live.graph.functions) |f| {
+        if (std.mem.indexOf(u8, f.name, needle) == null) continue;
+        // Concatenate entry tag + reach count into the aux column.
+        // `(reached by N)` makes hub functions visually distinct from
+        // local helpers — same name lookup, very different blast radius.
+        const tag = render.entryTag(f);
+        const aux: []const u8 = if (f.entry_reach > 0 and tag.len > 0)
+            (std.fmt.bufPrint(&aux_buf, "{s} (reached by {d})", .{ tag, f.entry_reach }) catch tag)
+        else if (f.entry_reach > 0)
+            (std.fmt.bufPrint(&aux_buf, "(reached by {d})", .{f.entry_reach}) catch "")
+        else
+            tag;
+        try render.writePaddedName(&aw.writer, "", f.name, aux);
+        try render.writeLoc(&aw.writer, f.def_loc, "");
+        try aw.writer.writeAll("\n");
+        matches += 1;
+        if (matches >= q_limit) {
+            try aw.writer.writeAll("(truncated)\n");
+            break;
+        }
+    }
+    if (matches == 0) try aw.writer.writeAll("(no matches)\n");
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+}
+
+fn handleType(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    const q = parseTraceQuery(query);
+    const name_raw = q.entry orelse return respondBytes(
+        request,
+        .bad_request,
+        "text/plain; charset=utf-8",
+        "missing ?name=<type qname>\n",
+    );
+    const name = try percentDecodeAlloc(allocator, name_raw);
+    defer allocator.free(name);
+
+    const live = resolveLiveGraph(state, q.sha, q.arch) catch |err| switch (err) {
+        error.NonHeadNotSupported => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "non-HEAD sha not supported (HEAD only)\n",
+        ),
+        error.UnknownArch => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "unknown arch\n",
+        ),
+        else => return err,
+    };
+
+    // Look up the Definition by qualified name. Linear scan over the
+    // per-arch definitions list — small enough (~hundreds) that an
+    // index isn't worth the maintenance cost yet.
+    var def_opt: ?*const types.Definition = null;
+    for (live.graph.definitions) |*d| {
+        if (std.mem.eql(u8, d.qualified_name, name) or std.mem.eql(u8, d.name, name)) {
+            def_opt = d;
+            break;
+        }
+    }
+    const def = def_opt orelse {
+        // Fallback: maybe the user passed a function name instead — give
+        // a hint so they don't waste a second tool call.
+        if (live.maps.by_name.get(name)) |fp| {
+            var aw = std.io.Writer.Allocating.init(allocator);
+            defer aw.deinit();
+            try aw.writer.print("{s} is a function, not a type — use callgraph_src or callgraph_loc.\nat {s}:{d}\n", .{ fp.name, render.shortFile(fp.def_loc.file), fp.def_loc.line });
+            return respondBytes(request, .not_found, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+        }
+        return respondBytes(
+            request,
+            .not_found,
+            "text/plain; charset=utf-8",
+            "type not found\n",
+        );
+    };
+
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const visibility: []const u8 = if (def.is_pub) "pub " else "";
+    try aw.writer.print(
+        "{s}{s} ({s}) — {s}:{d}-{d}\n---\n",
+        .{ visibility, def.qualified_name, @tagName(def.kind), render.shortFile(def.file), def.line_start, def.line_end },
+    );
+
+    // Read just the line range out of the source file. Definitions can be
+    // sizeable (full struct bodies), so cap at 64KB to avoid pathological
+    // payload growth.
+    const file = std.fs.openFileAbsolute(def.file, .{}) catch |err| {
+        try aw.writer.print("(open {s}: {s})\n", .{ def.file, @errorName(err) });
+        return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    };
+    defer file.close();
+    const contents = try file.readToEndAlloc(allocator, 8 * 1024 * 1024);
+    defer allocator.free(contents);
+
+    // Compute byte offsets for [line_start, line_end].
+    var line: u32 = 1;
+    var off: usize = 0;
+    var start_off: usize = 0;
+    var end_off: usize = contents.len;
+    while (off < contents.len) : (off += 1) {
+        if (line == def.line_start and start_off == 0) start_off = off;
+        if (contents[off] == '\n') {
+            line += 1;
+            if (line > def.line_end) {
+                end_off = off + 1;
+                break;
+            }
+        }
+    }
+    if (start_off == 0 and def.line_start > 1) start_off = contents.len; // line not found
+    const slice = contents[start_off..@min(end_off, contents.len)];
+    const cap: usize = 64 * 1024;
+    if (slice.len > cap) {
+        try aw.writer.writeAll(slice[0..cap]);
+        try aw.writer.print("\n... (truncated; full body is {d} bytes)\n", .{slice.len});
+    } else {
+        try aw.writer.writeAll(slice);
+    }
+    if (slice.len == 0 or slice[slice.len - 1] != '\n') try aw.writer.writeAll("\n");
+    try aw.writer.writeAll("---\n");
+
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+}
+
+fn handleReaches(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    var q_arch: ?[]const u8 = null;
+    var q_sha: ?[]const u8 = null;
+    var q_from: ?[]const u8 = null;
+    var q_to: ?[]const u8 = null;
+    var q_max: u32 = 24;
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const k = pair[0..eq];
+        const v = pair[eq + 1 ..];
+        if (std.mem.eql(u8, k, "arch")) q_arch = v;
+        if (std.mem.eql(u8, k, "sha")) q_sha = v;
+        if (std.mem.eql(u8, k, "from")) q_from = v;
+        if (std.mem.eql(u8, k, "to")) q_to = v;
+        if (std.mem.eql(u8, k, "max")) q_max = std.fmt.parseInt(u32, v, 10) catch q_max;
+    }
+    const from_raw = q_from orelse return respondBytes(
+        request,
+        .bad_request,
+        "text/plain; charset=utf-8",
+        "missing ?from=<fn name>\n",
+    );
+    const to_raw = q_to orelse return respondBytes(
+        request,
+        .bad_request,
+        "text/plain; charset=utf-8",
+        "missing ?to=<fn name>\n",
+    );
+    const from = try percentDecodeAlloc(allocator, from_raw);
+    defer allocator.free(from);
+    const to = try percentDecodeAlloc(allocator, to_raw);
+    defer allocator.free(to);
+
+    const live = resolveLiveGraph(state, q_sha, q_arch) catch |err| switch (err) {
+        error.NonHeadNotSupported => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "non-HEAD sha not supported (HEAD only)\n",
+        ),
+        error.UnknownArch => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "unknown arch\n",
+        ),
+        else => return err,
+    };
+
+    const from_fp: *const Function = live.maps.by_name.get(from) orelse return respondBytes(
+        request,
+        .not_found,
+        "text/plain; charset=utf-8",
+        "from function not found\n",
+    );
+    const to_fp: *const Function = live.maps.by_name.get(to) orelse return respondBytes(
+        request,
+        .not_found,
+        "text/plain; charset=utf-8",
+        "to function not found\n",
+    );
+
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+
+    const path = findShortestPath(allocator, live.graph, &live.maps, from_fp.id, to_fp.id, q_max) catch |err| switch (err) {
+        error.OutOfMemory => return respondBytes(
+            request,
+            .internal_server_error,
+            "text/plain; charset=utf-8",
+            "out of memory\n",
+        ),
+    };
+    defer if (path) |p| allocator.free(p);
+
+    if (path == null) {
+        try aw.writer.print("no path from {s} to {s} within {d} hops (try increasing max)\n", .{ from_fp.name, to_fp.name, q_max });
+        return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    }
+
+    try aw.writer.print("path ({d} hops):\n", .{path.?.len - 1});
+    for (path.?, 0..) |id, i| {
+        const fp = live.maps.by_id.get(id) orelse continue;
+        try aw.writer.print("{d} {s}\n", .{ i, fp.name });
+    }
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+}
+
+/// BFS forward from `from` looking for `to`, walking the same intra-atom
+/// edges as `computeEntryReach`. Returns the shortest path as an owned
+/// slice of FnIds (caller frees), or null if no path within `max_hops`.
+fn findShortestPath(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    maps: *const render.Maps,
+    from: types.FnId,
+    to: types.FnId,
+    max_hops: u32,
+) std.mem.Allocator.Error!?[]types.FnId {
+    if (from == to) {
+        const buf = try allocator.alloc(types.FnId, 1);
+        buf[0] = from;
+        return buf;
+    }
+    const fns = graph.functions;
+    if (from >= fns.len or to >= fns.len) return null;
+
+    // BFS with parent pointers. parent[id] = predecessor on shortest path,
+    // or sentinel `null_id` for unvisited (we use fns.len as the sentinel).
+    const null_id: u32 = @intCast(fns.len);
+    var parent = try allocator.alloc(u32, fns.len);
+    defer allocator.free(parent);
+    @memset(parent, null_id);
+    const depth = try allocator.alloc(u32, fns.len);
+    defer allocator.free(depth);
+    @memset(depth, 0);
+
+    var queue = std.ArrayList(types.FnId){};
+    defer queue.deinit(allocator);
+    try queue.append(allocator, from);
+    parent[from] = from; // mark visited (self-parent for the source)
+
+    var head: usize = 0;
+    while (head < queue.items.len) {
+        const cur = queue.items[head];
+        head += 1;
+        if (depth[cur] >= max_hops) continue;
+        try walkIntraReachable(allocator, fns, &maps.by_name, cur, fns[cur].intra, &queue, parent, depth);
+        if (parent[to] != null_id) break;
+    }
+
+    if (parent[to] == null_id) return null;
+
+    // Reconstruct path: walk parent chain from `to` back to `from`.
+    var rev = std.ArrayList(types.FnId){};
+    defer rev.deinit(allocator);
+    var cur: types.FnId = to;
+    while (true) {
+        try rev.append(allocator, cur);
+        if (cur == from) break;
+        cur = parent[cur];
+    }
+    const out = try allocator.alloc(types.FnId, rev.items.len);
+    var i: usize = 0;
+    while (i < rev.items.len) : (i += 1) out[i] = rev.items[rev.items.len - 1 - i];
+    return out;
+}
+
+fn walkIntraReachable(
+    allocator: std.mem.Allocator,
+    fns: []types.Function,
+    by_name: *const std.StringHashMap(*const types.Function),
+    parent_id: types.FnId,
+    atoms: []const types.Atom,
+    queue: *std.ArrayList(types.FnId),
+    parent: []u32,
+    depth: []u32,
+) std.mem.Allocator.Error!void {
+    for (atoms) |atom| {
+        switch (atom) {
+            .call => |c| {
+                if (c.kind == .indirect or c.kind == .vtable or c.kind == .leaf_userspace) continue;
+                var to_id: ?types.FnId = c.to;
+                if (to_id == null) {
+                    if (by_name.get(c.name)) |fp| to_id = fp.id;
+                }
+                const id = to_id orelse continue;
+                if (id >= fns.len) continue;
+                if (parent[id] != @as(u32, @intCast(fns.len))) continue; // already visited
+                parent[id] = parent_id;
+                depth[id] = depth[parent_id] + 1;
+                try queue.append(allocator, id);
+            },
+            .branch => |b| for (b.arms) |arm| try walkIntraReachable(allocator, fns, by_name, parent_id, arm.seq, queue, parent, depth),
+            .loop => |l| try walkIntraReachable(allocator, fns, by_name, parent_id, l.body, queue, parent, depth),
+        }
+    }
+}
+
+fn handleLoc(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    const q = parseTraceQuery(query);
+    const name_raw = q.entry orelse return respondBytes(
+        request,
+        .bad_request,
+        "text/plain; charset=utf-8",
+        "missing ?name=<fn name>\n",
+    );
+    const name = try percentDecodeAlloc(allocator, name_raw);
+    defer allocator.free(name);
+
+    const live = resolveLiveGraph(state, q.sha, q.arch) catch |err| switch (err) {
+        error.NonHeadNotSupported => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "non-HEAD sha not supported (HEAD only)\n",
+        ),
+        error.UnknownArch => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "unknown arch\n",
+        ),
+        else => return err,
+    };
+
+    const fp: *const Function = live.maps.by_name.get(name) orelse return respondBytes(
+        request,
+        .not_found,
+        "text/plain; charset=utf-8",
+        "function not found\n",
+    );
+
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try aw.writer.print("{s}  {s}:{d}", .{ fp.name, render.shortFile(fp.def_loc.file), fp.def_loc.line });
+    if (fp.is_entry) {
+        if (fp.entry_kind) |k| try aw.writer.print("  {s}", .{render.kindLabel(k)});
+    }
+    if (fp.is_ast_only) try aw.writer.writeAll("  inlined");
+    try aw.writer.writeAll("\n");
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+}
+
+fn handleModules(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    var q_arch: ?[]const u8 = null;
+    var q_sha: ?[]const u8 = null;
+    var q_level: u32 = 1;
+    var q_intra: bool = false;
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const k = pair[0..eq];
+        const v = pair[eq + 1 ..];
+        if (std.mem.eql(u8, k, "arch")) q_arch = v;
+        if (std.mem.eql(u8, k, "sha")) q_sha = v;
+        if (std.mem.eql(u8, k, "level")) q_level = std.fmt.parseInt(u32, v, 10) catch q_level;
+        if (std.mem.eql(u8, k, "intra")) q_intra = isTruthy(v);
+    }
+
+    const live = resolveLiveGraph(state, q_sha, q_arch) catch |err| switch (err) {
+        error.NonHeadNotSupported => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "non-HEAD sha not supported (HEAD only)\n",
+        ),
+        error.UnknownArch => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "unknown arch\n",
+        ),
+        else => return err,
+    };
+
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    render.renderModuleGraph(allocator, &aw.writer, live.graph, live.maps, q_level, q_intra) catch |err| {
+        return respondBytes(
+            request,
+            .internal_server_error,
+            "text/plain; charset=utf-8",
+            @errorName(err),
+        );
+    };
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+}
+
+fn handleCallers(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    const q = parseTraceQuery(query);
+    const name_raw = q.entry orelse return respondBytes(
+        request,
+        .bad_request,
+        "text/plain; charset=utf-8",
+        "missing ?name=<fn name>\n",
+    );
+    const name = try percentDecodeAlloc(allocator, name_raw);
+    defer allocator.free(name);
+
+    const live = resolveLiveGraph(state, q.sha, q.arch) catch |err| switch (err) {
+        error.NonHeadNotSupported => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "non-HEAD sha not supported (HEAD only)\n",
+        ),
+        error.UnknownArch => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "unknown arch\n",
+        ),
+        else => return err,
+    };
+
+    const fp: *const Function = live.maps.by_name.get(name) orelse return respondBytes(
+        request,
+        .not_found,
+        "text/plain; charset=utf-8",
+        "function not found\n",
+    );
+
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    const sites_opt = live.maps.callers.get(fp.id);
+    const sites: []const render.CallerSite = if (sites_opt) |list| list.items else &.{};
+    if (sites.len == 0) {
+        try aw.writer.writeAll("(no callers found in graph — may be unreachable, indirect-only, or an entry point)\n");
+        return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    }
+
+    // Sort by caller name then site line so output is deterministic and
+    // groupable by caller.
+    const sorted = try allocator.dupe(render.CallerSite, sites);
+    defer allocator.free(sorted);
+    std.mem.sort(render.CallerSite, sorted, {}, callerSiteLessThan);
+
+    try aw.writer.print("{d} call sites for {s}:\n", .{ sorted.len, fp.name });
+    var kind_buf: [64]u8 = undefined;
+    var prev_from_id: ?types.FnId = null;
+    for (sorted) |cs| {
+        const tag = try std.fmt.bufPrint(&kind_buf, "({s})", .{@tagName(cs.kind)});
+        // Repeat-caller sites get a continuation marker so the eye groups
+        // them under one caller name without the caller line being noise.
+        const display: []const u8 = if (prev_from_id != null and prev_from_id.? == cs.from.id)
+            "  ↳"
+        else
+            cs.from.name;
+        try render.writePaddedName(&aw.writer, "  ", display, tag);
+        try render.writeLoc(&aw.writer, cs.site, "@ ");
+        try aw.writer.writeAll("\n");
+        prev_from_id = cs.from.id;
+    }
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+}
+
+fn callerSiteLessThan(_: void, a: render.CallerSite, b: render.CallerSite) bool {
+    const cmp = std.mem.order(u8, a.from.name, b.from.name);
+    if (cmp != .eq) return cmp == .lt;
+    if (a.site.line != b.site.line) return a.site.line < b.site.line;
+    return std.mem.order(u8, a.site.file, b.site.file) == .lt;
+}
+
+fn handleEntries(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    const q = parseTraceQuery(query);
+    const live = resolveLiveGraph(state, q.sha, q.arch) catch |err| switch (err) {
+        error.NonHeadNotSupported => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "non-HEAD sha not supported (HEAD only)\n",
+        ),
+        error.UnknownArch => return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "unknown arch\n",
+        ),
+        else => return err,
+    };
+    var aw = std.io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    var name_buf: [512]u8 = undefined;
+    for (live.graph.entry_points) |ep| {
+        const fp_opt = live.maps.by_id.get(ep.fn_id);
+        const loc: ?types.SourceLoc = if (fp_opt) |fp| fp.def_loc else null;
+        // Append `-> <qualified_name>` after the label so callers know
+        // the exact identifier to feed to callgraph_trace / callgraph_src
+        // (the entry label is the userspace ABI name, often snake_case).
+        const display: []const u8 = if (fp_opt) |fp| blk: {
+            const slice = std.fmt.bufPrint(&name_buf, "{s} -> {s}", .{ ep.label, fp.name }) catch break :blk ep.label;
+            break :blk slice;
+        } else ep.label;
+        try render.writePaddedName(&aw.writer, "", display, render.kindLabel(ep.kind));
+        if (loc) |l| try render.writeLoc(&aw.writer, l, "");
+        try aw.writer.writeAll("\n");
+    }
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
 }
 
 fn computeLineRange(contents: []const u8, start: u32, end: u32) RangeBounds {

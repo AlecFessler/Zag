@@ -6,7 +6,9 @@ const def_deps = @import("def_deps.zig");
 const entry = @import("entry.zig");
 const ir = @import("ir/parse.zig");
 const join = @import("join.zig");
+const mcp = @import("mcp.zig");
 const reachability = @import("reachability.zig");
+const repl_mod = @import("repl.zig");
 const server = @import("server.zig");
 const types = @import("types.zig");
 const verify = @import("verify.zig");
@@ -26,6 +28,8 @@ const Args = struct {
     verify: bool = false,
     no_build: bool = false,
     demo_graph: bool = false,
+    repl: bool = false,
+    mcp: bool = false,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -53,6 +57,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             args.no_build = true;
         } else if (std.mem.eql(u8, arg, "--demo-graph")) {
             args.demo_graph = true;
+        } else if (std.mem.eql(u8, arg, "--repl")) {
+            args.repl = true;
+        } else if (std.mem.eql(u8, arg, "--mcp")) {
+            args.mcp = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printHelp();
             std.process.exit(0);
@@ -80,6 +88,8 @@ fn printHelp() !void {
         \\  --no-build          Skip auto-build; reuse existing kernel.*.ll files
         \\  --verify            Run AST/IR diff and print discrepancies, then exit
         \\  --demo-graph        Skip IR parsing; serve a synthetic 3-function graph
+        \\  --repl              Drop into an interactive REPL instead of starting the HTTP server
+        \\  --mcp               Run as an MCP server over stdio (auto-spawns the daemon)
         \\  --help              Show this help
         \\
     , .{});
@@ -115,6 +125,16 @@ pub fn main() !void {
             &arch_specs,
         );
         try server.serve(allocator, &graphs, "x86_64", args.build_root, &registry, args.port);
+        return;
+    }
+
+    if (args.mcp) {
+        // MCP shim: never load graphs in-process. The daemon does that.
+        try mcp.run(allocator, .{
+            .daemon_port = if (args.port == 8080) 18845 else args.port,
+            .build_root = try arena_allocator.dupe(u8, args.build_root),
+            .kernel_root = try arena_allocator.dupe(u8, args.kernel_root),
+        });
         return;
     }
 
@@ -238,6 +258,7 @@ pub fn main() !void {
             .{ spec.api_tag, stats.ast_only },
         );
 
+        try reachability.computeEntryReach(allocator, &graph);
         const reach_stats = try reachability.compute(allocator, &graph);
         const reach_pct: f64 = if (reach_stats.total == 0)
             0.0
@@ -276,6 +297,19 @@ pub fn main() !void {
         "/var/tmp/cg-worktrees",
         &arch_specs,
     );
+
+    if (args.repl) {
+        try repl_mod.run(
+            allocator,
+            &graphs,
+            default_arch,
+            args.build_root,
+            args.kernel_root,
+            &registry,
+        );
+        return;
+    }
+
     try server.serve(allocator, &graphs, default_arch, args.build_root, &registry, args.port);
 }
 
