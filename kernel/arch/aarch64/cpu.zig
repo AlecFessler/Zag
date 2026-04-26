@@ -26,6 +26,7 @@ const zag = @import("zag");
 
 const gic = zag.arch.aarch64.gic;
 
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const VAddr = zag.memory.address.VAddr;
 
 /// True when the target CPU advertises the ARMv8.1 PAN (Privileged
@@ -399,4 +400,30 @@ pub fn zeroPage4K(ptr: *anyopaque) void {
     }
     const bytes: [*]u8 = @ptrCast(ptr);
     @memset(bytes[0..4096], 0);
+}
+
+// ── Spec v3 EC dispatch primitives ────────────────────────────────────
+
+/// Restore `ec.ctx` into the live register file and ERET to userspace.
+/// Spec §[execution_context] dispatch.
+pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
+    _ = ec;
+    @panic("not implemented");
+}
+
+/// Write TPIDR_EL0 (the ARMv8 user-mode TLS base). Spec §[execution_context].
+pub fn writeTpidrEl0(value: u64) void {
+    _ = value;
+    @panic("not implemented");
+}
+
+/// Read TPIDR_EL0 (the ARMv8 user-mode TLS base). Spec §[execution_context].
+pub fn readTpidrEl0() u64 {
+    @panic("not implemented");
+}
+
+/// Halt the local core with DAIF.{I,F} clear until the next IRQ (WFI).
+/// Spec §[execution_context] idle EC.
+pub fn idle() void {
+    @panic("not implemented");
 }

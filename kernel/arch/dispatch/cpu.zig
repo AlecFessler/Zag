@@ -487,16 +487,18 @@ pub fn fpuArmTrap() void {
 /// via iretq / eret. Never returns to the caller. Used by the scheduler
 /// `switchTo` path after lazy-FPU bookkeeping.
 pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
-    _ = ec;
-    @panic("not implemented");
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.loadEcContextAndReturn(ec),
+        .aarch64 => aarch64.cpu.loadEcContextAndReturn(ec),
+        else => unreachable,
+    }
 }
 
 /// Write the user FS base (x86-64). aarch64 has no equivalent — TLS
 /// uses TPIDR_EL0 (see `writeTpidrEl0`).
 pub fn writeFsBase(value: u64) void {
-    _ = value;
     switch (builtin.cpu.arch) {
-        .x86_64 => {},
+        .x86_64 => x64.cpu.writeFsBase(value),
         .aarch64 => @compileError("FS base is x86-only; use writeTpidrEl0"),
         else => unreachable,
     }
@@ -505,9 +507,8 @@ pub fn writeFsBase(value: u64) void {
 /// Write the user GS base (x86-64). aarch64 has no equivalent — TLS
 /// uses TPIDR_EL0 (see `writeTpidrEl0`).
 pub fn writeGsBaseUser(value: u64) void {
-    _ = value;
     switch (builtin.cpu.arch) {
-        .x86_64 => {},
+        .x86_64 => x64.cpu.writeGsBaseUser(value),
         .aarch64 => @compileError("GS base is x86-only; use writeTpidrEl0"),
         else => unreachable,
     }
@@ -515,39 +516,38 @@ pub fn writeGsBaseUser(value: u64) void {
 
 /// Read the user FS base (x86-64).
 pub fn readFsBase() u64 {
-    switch (builtin.cpu.arch) {
-        .x86_64 => return 0,
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.readFsBase(),
         .aarch64 => @compileError("FS base is x86-only; use readTpidrEl0"),
         else => unreachable,
-    }
+    };
 }
 
 /// Read the user GS base (x86-64).
 pub fn readGsBaseUser() u64 {
-    switch (builtin.cpu.arch) {
-        .x86_64 => return 0,
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.readGsBaseUser(),
         .aarch64 => @compileError("GS base is x86-only; use readTpidrEl0"),
         else => unreachable,
-    }
+    };
 }
 
 /// Write TPIDR_EL0 (aarch64 user TLS base). x86-64 uses FS/GS instead.
 pub fn writeTpidrEl0(value: u64) void {
-    _ = value;
     switch (builtin.cpu.arch) {
         .x86_64 => @compileError("TPIDR_EL0 is aarch64-only; use writeFsBase/writeGsBaseUser"),
-        .aarch64 => {},
+        .aarch64 => aarch64.cpu.writeTpidrEl0(value),
         else => unreachable,
     }
 }
 
 /// Read TPIDR_EL0 (aarch64 user TLS base).
 pub fn readTpidrEl0() u64 {
-    switch (builtin.cpu.arch) {
+    return switch (builtin.cpu.arch) {
         .x86_64 => @compileError("TPIDR_EL0 is aarch64-only; use readFsBase/readGsBaseUser"),
-        .aarch64 => return 0,
+        .aarch64 => aarch64.cpu.readTpidrEl0(),
         else => unreachable,
-    }
+    };
 }
 
 /// Halt the local core in an interrupts-enabled state until the next
@@ -555,8 +555,8 @@ pub fn readTpidrEl0() u64 {
 /// aarch64). Used by the per-core idle EC.
 pub fn idle() void {
     switch (builtin.cpu.arch) {
-        .x86_64 => @panic("not implemented"),
-        .aarch64 => @panic("not implemented"),
+        .x86_64 => x64.cpu.idle(),
+        .aarch64 => aarch64.cpu.idle(),
         else => unreachable,
     }
 }

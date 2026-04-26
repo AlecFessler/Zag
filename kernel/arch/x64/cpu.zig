@@ -5,6 +5,7 @@ const zag = @import("zag");
 const apic = zag.arch.x64.apic;
 const interrupts = zag.arch.x64.interrupts;
 
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const VAddr = zag.memory.address.VAddr;
 
 pub const CpuidFeatureEcx = enum(u32) {
@@ -836,4 +837,43 @@ pub fn zeroPage4K(ptr: *anyopaque) void {
     }
     const bytes: [*]u8 = @ptrCast(ptr);
     @memset(bytes[0..4096], 0);
+}
+
+// ── Spec v3 EC dispatch primitives ────────────────────────────────────
+
+/// Restore `ec.ctx` into the live register file and IRETQ to userspace.
+/// Spec §[execution_context] dispatch.
+pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
+    _ = ec;
+    @panic("not implemented");
+}
+
+/// Write IA32_FS_BASE (MSR C000_0100h). Spec §[execution_context].
+pub fn writeFsBase(value: u64) void {
+    _ = value;
+    @panic("not implemented");
+}
+
+/// Write IA32_KERNEL_GS_BASE (MSR C000_0102h) — the user GS.base value
+/// loaded by the next SWAPGS into the userspace GS.base. Spec
+/// §[execution_context].
+pub fn writeGsBaseUser(value: u64) void {
+    _ = value;
+    @panic("not implemented");
+}
+
+/// Read IA32_FS_BASE (MSR C000_0100h). Spec §[execution_context].
+pub fn readFsBase() u64 {
+    @panic("not implemented");
+}
+
+/// Read IA32_KERNEL_GS_BASE (MSR C000_0102h). Spec §[execution_context].
+pub fn readGsBaseUser() u64 {
+    @panic("not implemented");
+}
+
+/// Halt the local core with interrupts enabled until the next IRQ.
+/// Spec §[execution_context] idle EC.
+pub fn idle() void {
+    @panic("not implemented");
 }
