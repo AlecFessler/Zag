@@ -107,6 +107,20 @@ pub const WalkResult = struct {
     /// own line range was edited. `qualified_name` mirrors AstFunction's
     /// shape so cross-file resolution works against the same indexes.
     definitions: []AstDefinition,
+    /// Per-worker arenas backing the parsed trees + record strings. The
+    /// parallel walker spawns N workers each with its own arena (because
+    /// std.heap.ArenaAllocator is not thread-safe); slices in `fns`,
+    /// `asts`, etc. can point into any of these arenas. The caller MUST
+    /// keep them alive (and call deinit) for as long as the records are
+    /// used. `null` for the single-threaded path, where everything lives
+    /// in the caller-provided arena directly.
+    thread_arenas: ?[]*std.heap.ArenaAllocator = null,
+
+    pub fn deinit(self: *WalkResult) void {
+        if (self.thread_arenas) |tas| {
+            for (tas) |ta| ta.deinit();
+        }
+    }
 };
 
 /// Convert the walker's AstDefinition records into the Graph's
@@ -134,35 +148,216 @@ pub fn buildDefinitionList(
     return out;
 }
 
+/// Per-walk timing counters. Mutated from walkFile; reset/reported in
+/// walkKernelFull. Single-threaded so a plain struct is fine.
+const WalkStats = struct {
+    files: u64 = 0,
+    read_us: u64 = 0,
+    parse_us: u64 = 0,
+    decl_walk_us: u64 = 0,
+
+    fn reset(self: *WalkStats) void {
+        self.* = .{};
+    }
+    fn report(self: *const WalkStats) void {
+        std.debug.print(
+            "  ast walk_stats: files={d} read={d}ms parse={d}ms decl_walk={d}ms\n",
+            .{ self.files, self.read_us / 1000, self.parse_us / 1000, self.decl_walk_us / 1000 },
+        );
+    }
+};
+var walk_stats: WalkStats = .{};
+
 pub fn walkKernel(arena: std.mem.Allocator, kernel_root: []const u8) ![]AstFunction {
     const r = try walkKernelFull(arena, kernel_root);
     return r.fns;
 }
 
 pub fn walkKernelFull(arena: std.mem.Allocator, kernel_root: []const u8) !WalkResult {
-    var results = std.ArrayList(AstFunction){};
-    var asts = std.ArrayList(FileAst){};
-    var struct_types = std.ArrayList(StructTypeInfo){};
-    var definitions = std.ArrayList(AstDefinition){};
+    walk_stats.reset();
 
-    // Walk the kernel sources first.
-    try walkRoot(arena, kernel_root, &results, &asts, &struct_types, &definitions);
-
-    // Also walk the Zig stdlib + ubsan_rt so compiler-builtin functions
-    // (`ubsan_rt.handler`, `fmt.format.X`, etc.) can be enriched too.
-    walkRoot(arena, "/usr/lib/zig", &results, &asts, &struct_types, &definitions) catch |err| {
+    // Collect file paths first (single-threaded, fast — only directory
+    // walks). Then parallelize the per-file work, which is where 95%+
+    // of the AST walk's time is spent (decl walking + parsing).
+    var paths = std.ArrayList([]const u8){};
+    defer paths.deinit(arena);
+    try collectZigFiles(arena, kernel_root, &paths);
+    const kernel_path_count = paths.items.len;
+    collectZigFiles(arena, "/usr/lib/zig", &paths) catch |err| {
         std.debug.print("warning: skipping /usr/lib/zig walk: {s}\n", .{@errorName(err)});
     };
 
-    const aliases = try buildAliasIndex(arena, asts.items);
+    // Number of worker threads. Caps at 16 — beyond that we spend more
+    // on coordination than we gain. Falls back to single-threaded for
+    // small file lists (no point spinning up threads for <32 files).
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    var n_threads: usize = if (cpu_count > 16) 16 else cpu_count;
+    if (n_threads < 1) n_threads = 1;
+    if (paths.items.len < 32) n_threads = 1;
 
-    return .{
-        .fns = try results.toOwnedSlice(arena),
-        .asts = try asts.toOwnedSlice(arena),
-        .struct_types = try struct_types.toOwnedSlice(arena),
-        .aliases = aliases,
-        .definitions = try definitions.toOwnedSlice(arena),
+    if (n_threads == 1) {
+        var results = std.ArrayList(AstFunction){};
+        var asts = std.ArrayList(FileAst){};
+        var struct_types = std.ArrayList(StructTypeInfo){};
+        var definitions = std.ArrayList(AstDefinition){};
+        for (paths.items) |abs_file| {
+            try walkFile(arena, abs_file, &results, &asts, &struct_types, &definitions);
+        }
+        walk_stats.report();
+        const aliases = try buildAliasIndex(arena, asts.items);
+        return .{
+            .fns = try results.toOwnedSlice(arena),
+            .asts = try asts.toOwnedSlice(arena),
+            .struct_types = try struct_types.toOwnedSlice(arena),
+            .aliases = aliases,
+            .definitions = try definitions.toOwnedSlice(arena),
+        };
+    }
+    _ = kernel_path_count;
+
+    // Each worker has its own arena (backed by std.heap.page_allocator,
+    // which is thread-safe) and its own per-thread output lists. After
+    // all workers finish, the master concatenates the lists into the
+    // caller's `arena` for downstream use. Records inside the lists
+    // contain string slices that point into the per-thread arenas, so
+    // we keep those arenas alive by giving the WalkResult ownership of
+    // them via thread_arenas + a thin deinit hook.
+    const Worker = struct {
+        arena_state: std.heap.ArenaAllocator,
+        fns: std.ArrayList(AstFunction) = .{},
+        asts: std.ArrayList(FileAst) = .{},
+        struct_types: std.ArrayList(StructTypeInfo) = .{},
+        definitions: std.ArrayList(AstDefinition) = .{},
+        err: ?anyerror = null,
     };
+
+    const next_idx = try arena.create(std.atomic.Value(usize));
+    next_idx.* = std.atomic.Value(usize).init(0);
+
+    const workers = try arena.alloc(Worker, n_threads);
+    for (workers) |*w| {
+        w.* = .{ .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    }
+
+    const Job = struct {
+        fn run(
+            paths_ptr: []const []const u8,
+            idx: *std.atomic.Value(usize),
+            worker: *Worker,
+        ) void {
+            const a = worker.arena_state.allocator();
+            while (true) {
+                const i = idx.fetchAdd(1, .monotonic);
+                if (i >= paths_ptr.len) break;
+                walkFile(
+                    a,
+                    paths_ptr[i],
+                    &worker.fns,
+                    &worker.asts,
+                    &worker.struct_types,
+                    &worker.definitions,
+                ) catch |err| {
+                    worker.err = err;
+                };
+            }
+        }
+    };
+
+    const threads = try arena.alloc(std.Thread, n_threads);
+    for (threads, workers) |*t, *w| {
+        t.* = try std.Thread.spawn(.{}, Job.run, .{ paths.items, next_idx, w });
+    }
+    for (threads) |t| t.join();
+
+    // Compute total counts so the master allocates exactly once per list.
+    var total_fns: usize = 0;
+    var total_asts: usize = 0;
+    var total_struct_types: usize = 0;
+    var total_definitions: usize = 0;
+    for (workers) |*w| {
+        total_fns += w.fns.items.len;
+        total_asts += w.asts.items.len;
+        total_struct_types += w.struct_types.items.len;
+        total_definitions += w.definitions.items.len;
+    }
+
+    const merged_fns = try arena.alloc(AstFunction, total_fns);
+    const merged_asts = try arena.alloc(FileAst, total_asts);
+    const merged_struct_types = try arena.alloc(StructTypeInfo, total_struct_types);
+    const merged_definitions = try arena.alloc(AstDefinition, total_definitions);
+
+    var i_fns: usize = 0;
+    var i_asts: usize = 0;
+    var i_st: usize = 0;
+    var i_defs: usize = 0;
+    for (workers) |*w| {
+        for (w.fns.items) |x| {
+            merged_fns[i_fns] = x;
+            i_fns += 1;
+        }
+        for (w.asts.items) |x| {
+            merged_asts[i_asts] = x;
+            i_asts += 1;
+        }
+        for (w.struct_types.items) |x| {
+            merged_struct_types[i_st] = x;
+            i_st += 1;
+        }
+        for (w.definitions.items) |x| {
+            merged_definitions[i_defs] = x;
+            i_defs += 1;
+        }
+    }
+
+    // Per-thread arenas hold the actual string/tree storage. Hand them
+    // to the caller via WalkResult so they live as long as the records
+    // do.
+    const thread_arenas = try arena.alloc(*std.heap.ArenaAllocator, workers.len);
+    for (workers, 0..) |*w, k| {
+        const boxed = try arena.create(std.heap.ArenaAllocator);
+        boxed.* = w.arena_state;
+        thread_arenas[k] = boxed;
+    }
+
+    walk_stats.report();
+    const aliases = try buildAliasIndex(arena, merged_asts);
+    return .{
+        .fns = merged_fns,
+        .asts = merged_asts,
+        .struct_types = merged_struct_types,
+        .aliases = aliases,
+        .definitions = merged_definitions,
+        .thread_arenas = thread_arenas,
+    };
+}
+
+/// Sentinel-suffix-filtered recursive enumeration of the .zig files
+/// under `root`. Mirrors the filter that walkRoot used to apply inline.
+fn collectZigFiles(
+    arena: std.mem.Allocator,
+    root: []const u8,
+    out: *std.ArrayList([]const u8),
+) !void {
+    const abs_root = std.fs.realpathAlloc(arena, root) catch |err| {
+        std.debug.print("warning: could not resolve root '{s}': {s}\n", .{ root, @errorName(err) });
+        return;
+    };
+    var dir = std.fs.openDirAbsolute(abs_root, .{ .iterate = true }) catch |err| {
+        std.debug.print("warning: could not open root '{s}': {s}\n", .{ abs_root, @errorName(err) });
+        return;
+    };
+    defer dir.close();
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        if (std.mem.endsWith(u8, entry.path, "_test.zig")) continue;
+        if (std.mem.startsWith(u8, entry.path, "tests/")) continue;
+        if (std.mem.indexOf(u8, entry.path, "/tests/") != null) continue;
+        const abs_file = try std.fs.path.join(arena, &.{ abs_root, entry.path });
+        try out.append(arena, abs_file);
+    }
 }
 
 /// Scan every parsed file's top-level decls. For each `pub const X = expr;`
@@ -326,6 +521,7 @@ fn walkFile(
         return;
     }
 
+    const t_read_start = std.time.microTimestamp();
     // Read the whole file into a sentinel-terminated buffer for the parser.
     const src_buf = arena.allocSentinel(u8, @intCast(stat.size), 0) catch |err| {
         std.debug.print("warning: skip {s}: {s}\n", .{ abs_file, @errorName(err) });
@@ -339,12 +535,17 @@ fn walkFile(
         std.debug.print("warning: skip {s}: short read\n", .{abs_file});
         return;
     }
+    const t_parse_start = std.time.microTimestamp();
+    walk_stats.read_us += @intCast(t_parse_start - t_read_start);
 
     const tree_box = try arena.create(std.zig.Ast);
     tree_box.* = std.zig.Ast.parse(arena, src_buf, .zig) catch |err| {
         std.debug.print("warning: skip {s}: parse error {s}\n", .{ abs_file, @errorName(err) });
         return;
     };
+    const t_parse_done = std.time.microTimestamp();
+    walk_stats.parse_us += @intCast(t_parse_done - t_parse_start);
+    walk_stats.files += 1;
     // Don't deinit; we let the arena own everything.
 
     if (tree_box.errors.len != 0) {
@@ -382,10 +583,12 @@ fn walkFile(
     // keyed by the file's module path. The receiver-type code already
     // recognizes that pattern, so a chain like `self.field.method()` against
     // a file-as-struct receiver can resolve through this table.
+    const t_walk_start = std.time.microTimestamp();
     try collectFieldsForContainer(&ctx, ctx.module_path, root_decls, "");
     for (root_decls) |decl| {
         try walkDecl(&ctx, decl, "");
     }
+    walk_stats.decl_walk_us += @intCast(std.time.microTimestamp() - t_walk_start);
 
     try asts.append(arena, .{
         .file = abs_file,
