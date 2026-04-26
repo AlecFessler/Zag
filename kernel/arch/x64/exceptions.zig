@@ -213,7 +213,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
                 .breakpoint => port.fireBreakpoint(ec, 0),
             }
             cpu.enableInterrupts();
-            scheduler.yield();
+            scheduler.yieldTo(null);
             return;
         }
     }
