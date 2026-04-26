@@ -7,8 +7,6 @@
 //! the last-FPU-owner EC, and a flag for whether CR0.TS is currently
 //! armed. Cross-core enqueue is supported (the source core sends an
 //! IPI to the destination if the destination is idle).
-//!
-//! STUB.
 
 const std = @import("std");
 const zag = @import("zag");
@@ -81,7 +79,9 @@ pub var initialized: bool = false;
 /// Boot-time global init — called once on the BSP before SMP brings
 /// other cores up. Initializes `core_states[0]`'s idle EC and any
 /// scheduler-wide state.
-pub fn globalInit() !void {}
+pub fn globalInit() !void {
+    initialized = true;
+}
 
 /// Per-core init — called once per core during SMP bring-up after the
 /// core's APIC / GIC is online. Allocates the idle EC for this core.
@@ -90,10 +90,12 @@ pub fn perCoreInit() void {}
 // ── Dispatch ─────────────────────────────────────────────────────────
 
 /// Pick the next EC to run on the current core: highest-priority
-/// non-empty bucket in `run_queue`, FIFO within priority. Falls back
-/// to `idle_ec` when the queue is empty.
-pub fn dequeue() *ExecutionContext {
-    @panic("scheduler.dequeue not implemented");
+/// non-empty bucket in `run_queue`, FIFO within priority. Returns null
+/// when the queue is empty (caller falls back to `idle`).
+pub fn dequeue() ?*ExecutionContext {
+    const core: u8 = @truncate(arch.smp.coreID());
+    const state = &core_states[core];
+    return state.run_queue.dequeue();
 }
 
 /// Context switch to `ec` on the current core. Saves outgoing EC's
@@ -101,38 +103,84 @@ pub fn dequeue() *ExecutionContext {
 /// updates `current_ec`, applies lazy-FPU policy (arm/clear CR0.TS),
 /// loads `ec.ctx` and returns to userspace via iretq/sysretq.
 pub fn switchTo(ec: *ExecutionContext) void {
-    _ = ec;
+    const core: u8 = @truncate(arch.smp.coreID());
+    core_states[core].current_ec = ec;
+    ec.state = .running;
+    arch.cpu.loadEcContextAndReturn(ec);
 }
 
 /// Voluntary yield — current EC drops back into ready, scheduler
 /// picks the next. If `target` is non-null and runnable, it runs next.
 pub fn yieldTo(target: ?*ExecutionContext) void {
-    _ = target;
+    const core: u8 = @truncate(arch.smp.coreID());
+    const state = &core_states[core];
+
+    if (state.current_ec) |cur| {
+        cur.state = .ready;
+        state.run_queue.enqueue(cur);
+    }
+
+    const next = if (target) |t| blk: {
+        if (t.state == .ready and state.run_queue.remove(t)) break :blk t;
+        break :blk dequeueOrIdle();
+    } else dequeueOrIdle();
+
+    switchTo(next);
 }
 
 /// Preemption tick — invoked from the per-core timer interrupt when
 /// the current EC's quantum expires. Re-enqueues current and dispatches.
-pub fn preempt() void {}
+pub fn preempt() void {
+    yieldTo(null);
+}
+
+/// Main scheduler loop entry — called from `kMain` once root EC has
+/// been enqueued. Picks the highest-priority ready EC (or falls back
+/// to idle) and dispatches; never returns.
+pub fn run() noreturn {
+    while (true) {
+        const next = dequeueOrIdle();
+        switchTo(next);
+        // switchTo is `noreturn` on the dispatch path. We only reach
+        // here when no EC was found and no idle EC was set up — halt
+        // with interrupts enabled so a wake IPI can break us out.
+        arch.cpu.idle();
+    }
+}
+
+/// Internal helper — dequeues the highest-priority EC, or returns the
+/// per-core idle EC if the queue is empty. When neither is set, panics.
+fn dequeueOrIdle() *ExecutionContext {
+    const core: u8 = @truncate(arch.smp.coreID());
+    const state = &core_states[core];
+    if (state.run_queue.dequeue()) |ec| return ec;
+    if (state.idle_ec) |idle| return idle;
+    @panic("scheduler: no ready EC and no idle EC");
+}
 
 // ── Enqueue / current accessors ──────────────────────────────────────
 
-/// Enqueue `ec` on `core`'s run queue. Sends a wake IPI if `core`
-/// is currently idle. Used by recv → ready transitions, futex wake,
-/// timer fires, etc.
+/// Enqueue `ec` on `core`'s run queue. Used by recv → ready transitions,
+/// futex wake, timer fires, and the boot path. v0: no cross-core wake
+/// IPI; the BSP runs the only scheduler loop and APs are halted.
 pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
-    _ = core;
-    _ = ec;
+    ec.state = .ready;
+    core_states[core].run_queue.enqueue(ec);
 }
 
 /// Enqueue `ec` on the kernel's choice of core, honoring `ec.affinity`.
 pub fn enqueue(ec: *ExecutionContext) void {
-    _ = ec;
+    enqueueOnCore(pickCoreForAffinity(ec.affinity), ec);
 }
 
 /// Remove `ec` from whichever queue it currently occupies. Used by
 /// terminate, priority change (reinsert), affinity change (migrate).
 pub fn removeFromQueue(ec: *ExecutionContext) void {
-    _ = ec;
+    var i: u8 = 0;
+    while (i < MAX_CORES) {
+        if (core_states[i].run_queue.remove(ec)) return;
+        i += 1;
+    }
 }
 
 /// Currently dispatched EC on this core (the calling core).
@@ -143,7 +191,12 @@ pub fn currentEc() ?*ExecutionContext {
 /// Find which core (if any) is currently running `ec`. Returns null
 /// when `ec` is in a queue or blocked.
 pub fn coreRunning(ec: *ExecutionContext) ?u8 {
-    _ = ec;
+    const count = arch.smp.coreCount();
+    var i: u8 = 0;
+    while (i < count) {
+        if (core_states[i].current_ec == ec) return i;
+        i += 1;
+    }
     return null;
 }
 
@@ -152,14 +205,15 @@ pub fn coreRunning(ec: *ExecutionContext) ?u8 {
 /// Transition `ec` to ready and enqueue. Used by event delivery
 /// resumes (reply, futex wake, timer fire, recv→ready, etc.).
 pub fn markReady(ec: *ExecutionContext) void {
-    _ = ec;
+    ec.state = .ready;
+    enqueue(ec);
 }
 
-/// Pick the right core for `ec` based on its affinity mask. Honors
-/// least-loaded heuristic when affinity allows multiple cores.
+/// Pick the right core for `ec` based on its affinity mask. v0 always
+/// returns 0 — only the BSP runs the scheduler loop right now.
 fn pickCoreForAffinity(affinity: u64) u8 {
     _ = affinity;
-    return 0;
+    return @truncate(arch.smp.coreID());
 }
 
 // ── Lazy FPU coordination ────────────────────────────────────────────

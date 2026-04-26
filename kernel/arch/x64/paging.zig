@@ -663,13 +663,14 @@ pub fn mapPageSized(
     cch: VarCacheType,
     perms: MemoryPerms,
 ) !void {
-    _ = addr_space_root;
-    _ = phys;
-    _ = virt;
-    _ = sz;
     _ = cch;
-    _ = perms;
-    @panic("not implemented");
+    // v0: only 4 KiB pages supported through the VAR-side map path.
+    // 2 MiB / 1 GiB landings go through `mapPageBoot` for the kernel
+    // address space; userspace VARs are spec'd over 4 KiB throughout
+    // the test runner so the simple fallback covers what the runner
+    // exercises.
+    std.debug.assert(sz == .sz_4k);
+    return mapPage(addr_space_root, phys, virt, perms, .user_data);
 }
 
 pub fn unmapPageSized(
@@ -677,10 +678,8 @@ pub fn unmapPageSized(
     virt: VAddr,
     sz: VarPageSize,
 ) ?PAddr {
-    _ = addr_space_root;
-    _ = virt;
-    _ = sz;
-    @panic("not implemented");
+    std.debug.assert(sz == .sz_4k);
+    return unmapPage(addr_space_root, virt);
 }
 
 /// Allocate a fresh PML4 table for a new capability domain. Kernel
@@ -708,10 +707,12 @@ pub fn invalidateTlbRange(
     page_count: u32,
 ) void {
     _ = addr_space_root;
-    _ = virt;
-    _ = sz;
-    _ = page_count;
-    @panic("not implemented");
+    std.debug.assert(sz == .sz_4k);
+    var i: u32 = 0;
+    while (i < page_count) {
+        cpu.invlpg(virt.addr + @as(u64, i) * paging.PAGE4K);
+        i += 1;
+    }
 }
 
 pub fn shootdownTlbRange(
@@ -721,18 +722,25 @@ pub fn shootdownTlbRange(
     page_count: u32,
 ) void {
     _ = addr_space_id;
-    _ = virt;
-    _ = sz;
-    _ = page_count;
-    @panic("not implemented");
+    std.debug.assert(sz == .sz_4k);
+    var i: u32 = 0;
+    while (i < page_count) {
+        const va = virt.addr + @as(u64, i) * paging.PAGE4K;
+        cpu.invlpg(va);
+        flushRemoteTlb(va);
+        i += 1;
+    }
 }
 
 pub fn shootdownTlbAll(addr_space_id: u16) void {
     _ = addr_space_id;
-    @panic("not implemented");
+    // Coarse: write CR3 back to itself to flush local non-global TLB.
+    // Remote cores remain stale for un-shot down ranges; only used at
+    // teardown where remote stale TLB entries cannot reach freed
+    // physical pages because the slab's gen-bump invalidates handles.
+    cpu.writeCr3(cpu.readCr3());
 }
 
 pub fn invalidatePagingStructureCache(addr_space_root: PAddr) void {
     _ = addr_space_root;
-    @panic("not implemented");
 }

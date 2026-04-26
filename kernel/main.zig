@@ -101,5 +101,10 @@ fn kMain(boot_info: *BootInfo) !void {
     sched.perCoreInit();
     try kprof_log.init();
     kprof_log.start();
-    arch.cpu.halt();
+    // Spec v3: BSP enters the scheduler loop. Root EC was enqueued by
+    // userspace_init.init; sched.run picks it up and dispatches. Until
+    // root-service ELF segments + user stack are mapped into the root
+    // domain's address space, first dispatch will page-fault on
+    // entry_point — that's the next blocker (see capdom layer).
+    sched.run();
 }

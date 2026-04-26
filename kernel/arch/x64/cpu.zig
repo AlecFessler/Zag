@@ -853,8 +853,11 @@ pub fn zeroPage4K(ptr: *anyopaque) void {
 /// Restore `ec.ctx` into the live register file and IRETQ to userspace.
 /// Spec §[execution_context] dispatch.
 pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
-    _ = ec;
-    @panic("not implemented");
+    interrupts.switchTo(ec);
+    // `switchTo` jmps to interruptStubEpilogue with rsp pointing at
+    // `ec.ctx`, which iretq's into userspace and never returns to this
+    // frame. Mark unreachable for the type system.
+    unreachable;
 }
 
 /// Write IA32_FS_BASE (MSR C000_0100h). Spec §[execution_context].
@@ -884,5 +887,8 @@ pub fn readGsBaseUser() u64 {
 /// Halt the local core with interrupts enabled until the next IRQ.
 /// Spec §[execution_context] idle EC.
 pub fn idle() void {
-    @panic("not implemented");
+    asm volatile (
+        \\sti
+        \\hlt
+    );
 }
