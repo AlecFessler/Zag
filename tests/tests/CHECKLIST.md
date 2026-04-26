@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 244.
-**Remaining:** 224.
+**Implemented:** 254.
+**Remaining:** 214.
 
 ## Convention
 
@@ -355,19 +355,19 @@ _§[restart_semantics] Restart Semantics_
 - [x] **09** — on success, the caller receives a page frame handle with caps = `[1].caps`.
 - [x] **10** — on success, field0 contains `[3]` pages and `[2].props.sz`.
 
-## port_io_virtualization — 2/11
+## port_io_virtualization — 9/11
 
 _§[port_io_virtualization] x86-64 Port I/O Virtualization_
 
 - [x] **01** — `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and the running architecture is not x86-64.
 - [x] **02** — `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and [1].field1.cch != 1 (uc).
-- [ ] **03** — `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and [1].caps.x is set.
-- [ ] **04** — a 1-, 2-, or 4-byte MOV load from `VAR.base + offset` (offset < port_count, `cur_rwx.r = 1`) leaves the destination GPR holding the value an x86-64 `in` of the matching operand width at port `base_port + offset` would produce, and execution resumes at the instruction immediately following the MOV.
-- [ ] **05** — a 1-, 2-, or 4-byte MOV store to `VAR.base + offset` (offset < port_count, `cur_rwx.w = 1`) commits the source value to port `base_port + offset` (observable on a loopback device_region as a subsequent MOV load returning that value), and execution resumes at the instruction immediately following the MOV.
-- [ ] **06** — a MOV access to `VAR.base + offset` with `offset >= port_count` delivers a `memory_fault` event.
-- [ ] **07** — a MOV load when `VAR.cur_rwx.r = 0` delivers a `memory_fault` event.
-- [ ] **08** — a MOV store when `VAR.cur_rwx.w = 0` delivers a `memory_fault` event.
-- [ ] **09** — an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
+- [x] **03** — `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and [1].caps.x is set.
+- [x] **04** — a 1-, 2-, or 4-byte MOV load from `VAR.base + offset` (offset < port_count, `cur_rwx.r = 1`) leaves the destination GPR holding the value an x86-64 `in` of the matching operand width at port `base_port + offset` would produce, and execution resumes at the instruction immediately following the MOV.
+- [x] **05** — a 1-, 2-, or 4-byte MOV store to `VAR.base + offset` (offset < port_count, `cur_rwx.w = 1`) commits the source value to port `base_port + offset` (observable on a loopback device_region as a subsequent MOV load returning that value), and execution resumes at the instruction immediately following the MOV.
+- [x] **06** — a MOV access to `VAR.base + offset` with `offset >= port_count` delivers a `memory_fault` event.
+- [x] **07** — a MOV load when `VAR.cur_rwx.r = 0` delivers a `memory_fault` event.
+- [x] **08** — a MOV store when `VAR.cur_rwx.w = 0` delivers a `memory_fault` event.
+- [x] **09** — an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
 - [ ] **10** — a `LOCK`-prefixed MOV targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
 - [ ] **11** — an 8-byte MOV access targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
 
@@ -456,11 +456,11 @@ _§[device_irq] Device IRQ Delivery_
 - [ ] **04** — on success with [3].assert = 1, IRQ line [2] is asserted on the VM's emulated interrupt controller; if a vCPU is unmasked for the line, an interrupt event is delivered to the vCPU on its next runnable opportunity (observable as an exception/interrupt vm_exit or as a guest interrupt handler invocation per the guest's IDT/GIC configuration).
 - [ ] **05** — on success with [3].assert = 0 immediately after a prior `vm_inject_irq([1], [2], assert = 1)`, no interrupt vm_exit corresponding to line [2] is delivered to any vCPU even when the vCPU's interrupt window opens or it becomes runnable with the line unmasked.
 
-## create_port — 0/4
+## create_port — 3/4
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `crpt`.
-- [ ] **02** — returns E_PERM if caps is not a subset of the caller's `port_ceiling`.
-- [ ] **03** — returns E_INVAL if any reserved bits are set in [1].
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `crpt`.
+- [x] **02** — returns E_PERM if caps is not a subset of the caller's `port_ceiling`.
+- [x] **03** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **04** — on success, the caller receives a port handle with caps = `[1].caps`.
 
 ## suspend — 0/12
