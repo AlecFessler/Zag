@@ -148,12 +148,16 @@ comptime {
     }
 }
 
-/// Offsets pinned for the L4 fast-path inline asm. The asm references
-/// these as immediate displacements (no operand interpolation in the
-/// naked stub), so a layout drift on any referenced struct trips a
-/// compile error rather than silently corrupting the path.
+/// SyscallScratch displacements pinned for the syscall-entry inline
+/// asm. The slow-path prologue references these as immediate `gs:N`
+/// memory operands rather than going through operand interpolation in
+/// a naked stub, so layout drift on `SyscallScratch` must trip a
+/// compile error here rather than silently corrupting the path. The
+/// future L4 IPC fast path will share the same scratch layout, hence
+/// the slot bookkeeping for `current_ec`, `current_domain`,
+/// `per_core_ptr`, and the `fast_temp` band stays parked here for
+/// when those slots become live again.
 const Offsets = struct {
-    // SyscallScratch (extern; deterministic).
     const sc_kernel_rsp: usize = 0;
     const sc_user_rsp: usize = 8;
     const sc_user_rip: usize = 16;
@@ -161,51 +165,11 @@ const Offsets = struct {
     const sc_current_ec: usize = 32;
     const sc_current_domain: usize = 40;
     const sc_fast_temp_0: usize = 48;
-    const sc_fast_temp_1: usize = 56;
-    const sc_fast_temp_2: usize = 64;
-    const sc_fast_temp_3: usize = 72;
-    const sc_fast_temp_4: usize = 80;
-    const sc_fast_temp_5: usize = 88;
-    const sc_fast_temp_6: usize = 96;
-    const sc_fast_temp_7: usize = 104;
     const sc_per_core_ptr: usize = 112;
     const sc_pcid_enabled: usize = 120;
 
-    // PerCore fields the fast path touches for lazy-FPU.
-    const pc_current_ec: usize = @offsetOf(scheduler.PerCore, "current_ec");
-    const pc_last_fpu_owner: usize = @offsetOf(scheduler.PerCore, "last_fpu_owner");
-    const pc_fpu_trap_armed: usize = @offsetOf(scheduler.PerCore, "fpu_trap_armed");
-
-    // ExecutionContext.ctx (pointer to saved cpu.Context iret frame).
-    const ec_ctx: usize = @offsetOf(zag.sched.execution_context.ExecutionContext, "ctx");
-    // ExecutionContext.domain — SlabRef(CapabilityDomain): { ptr, gen, _pad }.
-    const ec_domain_ptr: usize = @offsetOf(zag.sched.execution_context.ExecutionContext, "domain");
-    // ExecutionContext.next — ?SlabRef(EC). Bare pointer at +0 of the optional payload.
-    const ec_next: usize = @offsetOf(zag.sched.execution_context.ExecutionContext, "next");
-
-    // CapabilityDomain.addr_space_root (PAddr.addr is the raw u64).
-    const dom_addr_space_root: usize = @offsetOf(zag.capdom.capability_domain.CapabilityDomain, "addr_space_root");
-    const dom_addr_space_id: usize = @offsetOf(zag.capdom.capability_domain.CapabilityDomain, "addr_space_id");
-    const dom_kernel_table: usize = @offsetOf(zag.capdom.capability_domain.CapabilityDomain, "kernel_table");
-    const dom_user_table: usize = @offsetOf(zag.capdom.capability_domain.CapabilityDomain, "user_table");
-
-    // KernelHandle (extern, 88 bytes): { ref: ErasedSlabRef, parent,
-    // first_child, next_sibling: HandleLink (24B each) }.
-    // ErasedSlabRef = { ptr, gen, _pad } at offset 0.
-    const kh_ref_ptr: usize = 0;
-    const kh_ref_gen: usize = 8;
-    const kh_size: usize = @sizeOf(zag.caps.capability.KernelHandle);
-
-    // Capability (extern, 24 bytes): { word0, field0, field1 }.
-    const cap_word0: usize = 0;
-    const cap_size: usize = @sizeOf(zag.caps.capability.Capability);
-
-    // Port._gen_lock starts at offset 0 (lock bit = bit 0 of GenLock.word).
-    const port_gen_lock_word: usize = 0;
-    const port_waiters: usize = @offsetOf(zag.sched.port.Port, "waiters");
-    const port_waiter_kind: usize = @offsetOf(zag.sched.port.Port, "waiter_kind");
-
-    // cpu.Context iret-frame field offsets.
+    // cpu.Context iret-frame field offsets — referenced by the slow-path
+    // Context-build literals (136/152/160).
     const ctx_rip: usize = @offsetOf(cpu.Context, "rip");
     const ctx_rflags: usize = @offsetOf(cpu.Context, "rflags");
     const ctx_rsp: usize = @offsetOf(cpu.Context, "rsp");
@@ -227,40 +191,6 @@ comptime {
     if (Offsets.ctx_rip != 136) @compileError("cpu.Context.rip not at 136");
     if (Offsets.ctx_rflags != 152) @compileError("cpu.Context.rflags not at 152");
     if (Offsets.ctx_rsp != 160) @compileError("cpu.Context.rsp not at 160");
-
-    // Phase 2 stashes *receiver_EC at scratch+80 (slot fast_temp[4];
-    // some code comments use a [5] label that's off-by-one from the
-    // slot index but consistent with the asm). Phase 5 reads from
-    // the same slot.
-    if (Offsets.sc_fast_temp_4 != 80) @compileError("Phase 2/5 receiver slot expected at scratch+80");
-}
-
-// PerCore offsets the Phase 5 asm hardcodes (immediate displacements).
-// PerCore is now an `extern struct` (see `scheduler.zig`) so declaration
-// order is fixed and these literals are stable across Zig versions.
-// The asserts catch any later field reorder before the asm reads from
-// the wrong slot.
-comptime {
-    if (Offsets.pc_last_fpu_owner != 72) @compileError(
-        "Phase 5 asm hardcodes PerCore.last_fpu_owner at +72; @offsetOf disagrees — update the asm or PerCore",
-    );
-    if (Offsets.pc_fpu_trap_armed != 80) @compileError(
-        "Phase 5 asm hardcodes PerCore.fpu_trap_armed at +80; @offsetOf disagrees — update the asm or PerCore",
-    );
-}
-
-// ExecutionContext.domain offset — Phase 5 walks receiver.domain.ptr
-// via a single load. EC carries optional-of-extern-struct fields
-// (`?SlabRef(...)`, `?Stack`) that block converting it to extern, so
-// its layout is at the mercy of Zig's auto-reorder. The asm therefore
-// substitutes `Offsets.ec_domain_ptr` as an `"i"` immediate operand at
-// the Phase 5 publish-domain site; the assert below only sanity-checks
-// that `domain` is 8-aligned — the actual numeric value is whatever
-// Zig hands us.
-comptime {
-    if (Offsets.ec_domain_ptr % 8 != 0) @compileError(
-        "EC.domain must be 8-aligned for the Phase 5 SlabRef.ptr load",
-    );
 }
 
 pub var per_cpu_scratch: [64]SyscallScratch align(4096) =
@@ -322,44 +252,34 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
 /// On exit (Intel SDM Vol 2B, "SYSRET—Return From Fast System Call"):
 ///   RIP=RCX, RFLAGS=R11&3C7FD7H|2, CS=STAR[63:48]+16|3, SS=STAR[63:48]+8|3.
 ///   Non-canonical RCX → #GP at CPL3 on kernel stack; checked before SYSRET.
-/// L4-style IPC fast-path entry. Everything inlined; no `call`s in
-/// the fast path so we don't burn cycles on SysV save/restore around
-/// helpers. Vregs 1-13 (= rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10,
-/// r12, r13, r14, r15) are the IPC payload and MUST stay pristine
-/// through the entire suspend/reply path; only rcx, r11, rsp, and
-/// gs-scratch / kstack-scratch are usable.
 ///
-/// Phase structure (suspend with waiting receiver / reply):
-///   1. Prologue: swapgs, stash user RSP/RIP/RFLAGS to gs scratch,
-///      switch to kstack, peek vreg 0 from user stack, branch on
-///      syscall_num.
-///   2. Resolve handle, lock target, validate, dequeue receiver
-///      (suspend) or load suspended sender (reply). All under sender's
-///      CR3 — handle table is mapped read-only here.
-///   3. Capture sender's TLS bases (rdfsbase / rdgsbase post-swapgs),
-///      switch CR3 to receiver's domain (PCID-aware via
-///      `cpu.pcid_enabled`).
-///   4. Write event payload (syscall word + stack vregs) to receiver's
-///      user stack. Vregs 1-13 stay in their GPRs untouched.
-///   5. Re-establish kernel GS, publish current_ec/current_domain on
-///      this core, apply lazy-FPU policy (arm/clear CR0.TS based on
-///      receiver vs per-core last_fpu_owner), restore rcx (resume
-///      RIP) / r11 (resume RFLAGS) / rsp (receiver user RSP) from
-///      the kstack scratch frame, swapgs back to user GS, sysretq.
-///      Vregs 1-13 remain pristine across the whole transition.
+/// All syscalls currently route through the slow path: a 176-byte
+/// `cpu.Context` save, followed by the generic `syscallDispatch`
+/// trampoline into `zag.syscall.dispatch`, then iretq. The slow path
+/// preserves vregs 1-13 (= rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10,
+/// r12, r13, r14, r15) across the call by saving them into the
+/// Context frame on entry and restoring them on exit, so any handler
+/// (including suspend/recv/reply) that does not modify those slots
+/// returns to userspace with them unchanged — matching the contract
+/// the eventual L4-style IPC fast path is intended to preserve in
+/// registers.
 ///
-/// Slow path: any other syscall, or suspend with no waiting receiver,
-/// or suspend with `read`/`write` cap mismatches we don't yet handle
-/// in asm — falls through to the existing 176-byte Context save +
-/// `syscallDispatch` + iretq.
-///
-/// Placeholder offset constants in Phase 2's handle-table walk are
-/// marked TODO_OFF — they get pinned down as the consuming structs
-/// (HandleTableEntry, EcQueue layout, Reply, Port internals,
-/// CapabilityDomain) finish stabilizing. Pinned offsets used by
-/// Phase 3 (PCID byte) and Phase 5 (PerCore lazy-FPU slots, EC.domain
-/// SlabRef, SyscallScratch) are guarded by the `Offsets` table +
-/// comptime asserts above.
+/// L4 IPC fast path — design intent (NOT YET WIRED): a future
+/// implementation can short-circuit suspend/reply pairs that satisfy
+/// the hot-path predicate (handle lookup hits, target waiter queued,
+/// no attachments / no cap mismatches) by handling the rendezvous
+/// inline in this naked stub, without touching vregs 1-13. The Phase
+/// 1 prologue below already stashes user RSP/RIP/RFLAGS to per-CPU
+/// scratch and peeks the syscall word from vreg 0; downstream phases
+/// (handle resolve, port lock, PQ pop, CR3 + GS switch, lazy-FPU
+/// policy, sysretq) require offsets pinned against the consuming
+/// structs (CapabilityDomain handle tables, Port._gen_lock + waiters,
+/// ExecutionContext.ctx + domain SlabRef) and a derivation-tree-aware
+/// reply minting helper. Until those land the prologue falls straight
+/// through to the slow path so suspend/reply executes via
+/// `kernel/sched/port.zig` (`suspendEc`, `recv`, `reply`,
+/// `replyTransfer`) — observable state matches what the fast path is
+/// specified to produce per spec §[port], §[reply], §[event_state].
 pub export fn syscallEntry() callconv(.naked) void {
     // Slow-path Context layout:
     //   [RSP+0..112]   r15..rax (15 GPRs, 120 bytes)
@@ -367,7 +287,10 @@ pub export fn syscallEntry() callconv(.naked) void {
     //   [RSP+136..168] iret frame (rip, cs, rflags, rsp, ss)
     asm volatile (
     // ═══════════════════════════════════════════════════════════════
-    // PHASE 1 — common prologue + syscall_num peek
+    // PHASE 1 — common prologue: swapgs, stash user RSP/RIP/RFLAGS,
+    // switch to kernel stack. Kept distinct from the slow-path body
+    // because it is the shared entry the future fast path will branch
+    // out of without paying the full Context save.
     // ═══════════════════════════════════════════════════════════════
         \\swapgs                              // GS.base → SyscallScratch
         \\movq %%rsp, %%gs:8                  // user_rsp
@@ -375,29 +298,17 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%r11, %%gs:24                 // user_rflags (r11 ditto)
         \\movq %%gs:0, %%rsp                  // switch to kernel stack
 
-        // Read syscall_num from user vreg 0 = [user_rsp+0].
-        // rcx is free (we stashed it). Bits 0-11 = syscall_num.
-        \\movq %%gs:8, %%rcx
-        \\stac                                // SMAP allow CPL3 access
-        \\movq (%%rcx), %%rcx
-        \\clac
-        \\andl $0xFFF, %%ecx
-
-        // TODO: SYS_SUSPEND, SYS_REPLY are placeholders until the new
-        // syscall enum is defined.
-        \\cmpl $0x10, %%ecx                   // SYS_SUSPEND (placeholder)
-        \\je .L_fast_suspend
-        \\cmpl $0x11, %%ecx                   // SYS_REPLY   (placeholder)
-        \\je .L_fast_reply
-        \\jmp .L_slow
-
     // ═══════════════════════════════════════════════════════════════
-    // SLOW PATH — existing 176-byte Context save + dispatch + iretq.
-    // We restore rcx and r11 from gs scratch first so the iret-frame
-    // builder (which references them directly) sees the original
-    // SYSCALL-saved values, not the syscall_num that overwrote rcx.
+    // SLOW PATH — 176-byte Context save + dispatch + iretq.
+    // Restores rcx and r11 from gs scratch first so the iret frame
+    // sees the original SYSCALL-saved values, not whatever the
+    // prologue may have spilled into those regs. Vregs 1-13 (rax,
+    // rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15) are
+    // saved into the Context on entry and restored on exit, so any
+    // handler that leaves them alone returns them to userspace
+    // unchanged — matching the L4 fast-path register-preservation
+    // contract via the long route.
     // ═══════════════════════════════════════════════════════════════
-        \\.L_slow:
         \\movq %%gs:16, %%rcx                 // restore user_rip
         \\movq %%gs:24, %%r11                 // restore user_rflags
         \\subq $176, %%rsp
@@ -445,498 +356,6 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\addq $120, %%rsp
         \\addq $16, %%rsp
         \\iretq
-
-    // ═══════════════════════════════════════════════════════════════
-    // FAST SUSPEND — vreg 1 (rax) = target_handle,
-    //                vreg 2 (rbx) = port_handle.
-    // Both must remain untouched (they're the IPC payload to the
-    // receiver). Free: rcx, r11; gs scratch slots fast_temp[0..7];
-    // kstack scratch (subq).
-    // ═══════════════════════════════════════════════════════════════
-        \\.L_fast_suspend:
-
-        // ── Resolve port handle → *Port via current domain's table ──
-        // current_domain is at gs:40 (kept up-to-date by switchTo).
-        \\movq %%gs:40, %%rcx                 // *CapabilityDomain
-        // TODO_OFF: handle table base on CapabilityDomain. Use 16
-        // as placeholder (after _gen_lock + handle_count or similar).
-        \\movq 16(%%rcx), %%rcx               // *HandleTableEntry[]
-        \\movq %%rbx, %%r11
-        \\andl $0xFFF, %%r11d                 // handle_id
-        // TODO_OFF: handle table entry size. Spec says 24 bytes (cap
-        // word + field0 + field1) plus a kernel ptr+gen → ~40 bytes.
-        // Using shift-by-5 (32) as placeholder until layout pinned.
-        \\shlq $5, %%r11
-        \\addq %%r11, %%rcx                   // rcx = &table[port_id]
-
-        // Type-tag check: cap word bits 12-15 = type. TAG_PORT = 5
-        // (placeholder). Bail to slow path on mismatch — dispatch
-        // will return E_BADCAP cleanly.
-        \\movw (%%rcx), %%r11w                // cap word low 16 bits
-        \\andw $0xF000, %%r11w
-        \\cmpw $0x5000, %%r11w                // (TAG_PORT << 12)
-        \\jne .L_fast_bail
-
-        // Capture expected slab gen for UAF check after lock.
-        // TODO_OFF: kernel-side slot stores {*Port, gen}; gen offset
-        // within entry. Using 32 as placeholder.
-        \\movq 32(%%rcx), %%r11               // expected_gen
-        \\movq %%r11, %%gs:48                 // → fast_temp[0]
-        \\movq 24(%%rcx), %%rcx               // *Port (placeholder offset)
-        \\movq %%rcx, %%gs:56                 // → fast_temp[1] (kept for unlock)
-
-        // ── Inline spinlock acquire on Port._gen_lock ──
-        // SpinLock is u32 at PORT_LOCK_OFF; 0=free, 1=held.
-        // cmpxchg requires expected in rax. Spill rax (vreg 1) once
-        // for the loop, restore after. PORT_LOCK_OFF placeholder = 0
-        // (assume _gen_lock is the first field on Port).
-        \\movq %%rax, %%gs:64                 // spill vreg 1 → fast_temp[2]
-        \\.L_port_spin:
-        \\xorl %%eax, %%eax                   // expected = 0
-        \\movl $1, %%r11d                     // new = 1
-        \\lock cmpxchgl %%r11d, 0(%%rcx)      // PORT_LOCK_OFF = 0 (placeholder)
-        \\jz .L_port_acquired
-        \\pause
-        \\jmp .L_port_spin
-        \\.L_port_acquired:
-        \\movq %%gs:64, %%rax                 // restore vreg 1
-
-        // Slab gen check — TODO_OFF: gen field within Port._gen_lock.
-        // Using offset 8 as placeholder (after the lock word).
-        \\movq 8(%%rcx), %%r11
-        \\cmpq %%gs:48, %%r11
-        \\jne .L_port_stale_unlock_bail
-
-        // ── waiter_kind check ──
-        // TODO_OFF: WaiterKind is the byte field after counters and
-        // the EcQueue. Using 200 as placeholder (very rough). Values:
-        // 0=none, 1=senders, 2=receivers (per WaiterKind enum order).
-        \\cmpb $2, 200(%%rcx)                 // WK_RECEIVERS
-        \\jne .L_no_receiver_unlock_bail
-
-        // ── Inline PriorityQueue dequeue, 4 priority levels ──
-        // Walk heads[3..0] (highest priority first). Heads array
-        // assumed at PORT_HEADS_OFF = 100 (placeholder); each entry
-        // is ?*EC = 8 bytes (8-byte ptr; null = 0). FIFO within
-        // priority via tails[] which we update on pop.
-        // (When PQ is upgraded to ?SlabRef(EC), entries become 16
-        // bytes; this asm needs a follow-up.)
-        \\.L_pq_pop:
-        \\movq 124(%%rcx), %%r11              // heads[3] (realtime)
-        \\testq %%r11, %%r11
-        \\jne .L_pq_pop_lvl3
-        \\movq 116(%%rcx), %%r11              // heads[2] (high)
-        \\testq %%r11, %%r11
-        \\jne .L_pq_pop_lvl2
-        \\movq 108(%%rcx), %%r11              // heads[1] (normal)
-        \\testq %%r11, %%r11
-        \\jne .L_pq_pop_lvl1
-        \\movq 100(%%rcx), %%r11              // heads[0] (idle)
-        \\testq %%r11, %%r11
-        \\jz .L_pq_empty_unlock_bail          // shouldn't reach if WK_RECEIVERS
-
-        // Generic pop trampoline: the four lvl labels each set rcx to
-        // the head-slot address before jumping here.
-        // For the lvl0 fall-through case, set up rcx pointing at
-        // heads[0] explicitly:
-        \\addq $100, %%rcx                    // rcx → &heads[0]
-        \\jmp .L_pq_pop_common
-
-        \\.L_pq_pop_lvl3:
-        \\addq $124, %%rcx
-        \\jmp .L_pq_pop_common
-        \\.L_pq_pop_lvl2:
-        \\addq $116, %%rcx
-        \\jmp .L_pq_pop_common
-        \\.L_pq_pop_lvl1:
-        \\addq $108, %%rcx
-        \\jmp .L_pq_pop_common
-
-        \\.L_pq_pop_common:
-        // r11 = *EC of dequeued receiver, rcx = &heads[N].
-        // Update head: heads[N] = r11->next.
-        // EC_NEXT_OFF placeholder = 48 (after _gen_lock, ctx ptrs).
-        // EC.next is currently `?SlabRef(EC)` — for the stub we treat
-        // its first 8 bytes as the bare ptr (SlabRef.ptr). When the
-        // PQ goes doubly-linked / SlabRef-aware this 16-byte case
-        // gets handled.
-        // Wait — the above is wrong; rework:
-        // Now we need &heads[N] back. We trashed rcx. Stash &heads[N]
-        // in fast_temp[4] before reading next, restructure required.
-        // (Stub limitation; flagged for TDD iteration.)
-        //
-        // WHY this sequence: x86 has no mem→mem MOV, and both live
-        // values (rcx=&heads[N], r11=*EC) must survive the head update
-        // — r11 is reloaded by Phase-5's later `movq %gs:80,%r11` at
-        // the publish-receiver-EC step (so we *can* clobber r11 here
-        // as long as we publish it first). We publish *EC into fast_temp[4]
-        // (gs:80) — the same slot Phase 2 / line 599 read from — then use
-        // r11 as a one-register bounce: load r11 = (*EC).next.ptr, store
-        // r11 → [rcx]. The duplicate `movq %r11,%gs:80` below is now
-        // redundant but kept for symmetry with the reply path; harmless.
-        // STILL MISSING (TDD iteration): EC.next is `?SlabRef(EC)` so
-        // the literal 48 + treat-as-bare-ptr only works while the optional
-        // payload happens to start at byte 0 of the field; PQ doubly-linked
-        // (EC.prev), tails[N] update, and waiter_kind=.none on empty are
-        // all unimplemented. See specv3.md Phase 5 priority-queue pop.
-        \\movq %%r11, %%gs:80                 // publish *receiver_EC → fast_temp[4]
-    ++ std.fmt.comptimePrint("        movq {d}(%%r11), %%r11      // r11 = (*EC).next.ptr (treat ?SlabRef payload@0)\n", .{Offsets.ec_next}) ++
-        \\movq %%r11, 0(%%rcx)                // heads[N] = next
-        // TODO: also walk EC.prev for doubly-linked + tails update +
-        // waiter_kind = .none if queue now empty.
-
-        // r11 = *receiver_EC. Stash for later phases.
-        // (Already stashed above; this re-stash is dead but kept for now.)
-        \\movq %%gs:80, %%r11                 // reload *receiver_EC into r11
-        \\movq %%r11, %%gs:80                 // → fast_temp[5]
-
-        // Restore *Port from fast_temp[1] for unlock.
-        \\movq %%gs:56, %%rcx
-
-        // ── Read receiver state from saved Context onto kstack ──
-        // We're still on this EC's kstack. subq for scratch frame.
-        // Layout (kstack scratch):
-        //   [rsp+0]  receiver_resume_rip
-        //   [rsp+8]  receiver_resume_rflags
-        //   [rsp+16] receiver_user_rsp
-        //   [rsp+24] receiver_cr3_root
-        //   [rsp+32] receiver_pcid (16-bit)
-        //   [rsp+40] receiver_syscall_word_return
-        //   [rsp+48] sender_rip   (from gs:16)
-        //   [rsp+56] sender_rflags(from gs:24)
-        //   [rsp+64] sender_user_rsp(from gs:8)
-        //   [rsp+72] sender_fs_base
-        //   [rsp+80] sender_gs_base
-        //   [rsp+88] receiver_fs_base
-        //   [rsp+96] receiver_gs_base
-        \\subq $112, %%rsp
-
-        // EC_CTX_OFF placeholder = 16 (after _gen_lock).
-        \\movq %%gs:80, %%r11                 // *receiver_EC
-        \\movq 16(%%r11), %%rcx               // *Context (receiver's saved iret frame)
-        // CTX_RIP/RFLAGS/USER_RSP offsets follow cpu.Context layout
-        // above: rip=136, rflags=152, rsp=160.
-        \\movq 136(%%rcx), %%r11
-        \\movq %%r11, 0(%%rsp)                // receiver_resume_rip
-        \\movq 152(%%rcx), %%r11
-        \\movq %%r11, 8(%%rsp)                // receiver_resume_rflags
-        \\movq 160(%%rcx), %%r11
-        \\movq %%r11, 16(%%rsp)               // receiver_user_rsp
-
-        // Receiver's domain → CR3 root + PCID.
-        // EC_DOMAIN_OFF placeholder = 24.
-        \\movq %%gs:80, %%r11
-        \\movq 24(%%r11), %%rcx               // *receiver_domain
-        // DOM_CR3_ROOT_OFF placeholder = 8, DOM_PCID_OFF = 16.
-        \\movq 8(%%rcx), %%r11
-        \\movq %%r11, 24(%%rsp)               // receiver_cr3_root
-        \\movzwq 16(%%rcx), %%r11
-        \\movq %%r11, 32(%%rsp)               // receiver_pcid
-
-        // Ferry sender's stashed RIP/RFLAGS/RSP from gs to kstack
-        // (we lose gs after swapgs in Phase 3).
-        \\movq %%gs:16, %%r11
-        \\movq %%r11, 48(%%rsp)               // sender_rip
-        \\movq %%gs:24, %%r11
-        \\movq %%r11, 56(%%rsp)               // sender_rflags
-        \\movq %%gs:8,  %%r11
-        \\movq %%r11, 64(%%rsp)               // sender_user_rsp
-
-        // ── INLINE buildSuspendReturn ──
-        // Build the syscall word return value for the receiver:
-        //   bits 12-19: pair_count   = 0  (no attachments in fast path)
-        //   bits 20-31: tstart       = 0
-        //   bits 32-43: reply_handle_id = (mint reply slot in receiver)
-        //   bits 44-48: event_type   = 4 (suspension)
-        //
-        // Reply handle minting (most complex inline op):
-        //   1. Get *receiver_domain handle table
-        //   2. Acquire receiver's domain table lock (similar
-        //      cmpxchg-spin to port lock)
-        //   3. Find a free slot via per-domain freelist:
-        //      - Domain has `next_free: u16`; pop and follow chain
-        //        encoded in unused entries
-        //      - If freelist empty → bail to slow path so dispatch
-        //        returns E_FULL
-        //   4. Allocate Reply object from per-cpu Reply freelist
-        //      (lock-free pop, cmpxchg on freelist head)
-        //   5. Initialize Reply: back-pointer to current EC (the
-        //      suspending sender, which is gs:32 = current_ec),
-        //      port pointer, event_type
-        //   6. Write handle table entry: cap word with type=reply
-        //      (TAG_REPLY << 12) | xfer_bit_if_port_had_xfer | id,
-        //      kernel ptr+gen for the Reply object
-        //   7. Release receiver's domain table lock
-        //   8. Compose syscall word: (slot_id << 32) | (4 << 44)
-        //
-        // For the stub: write a placeholder syscall word with
-        // event_type=4 and slot_id=0. TDD pass fleshes out the
-        // handle table + Reply slab inline expansions.
-        // TODO_INLINE buildSuspendReturn — full inline expansion
-        // pending stubs for HandleTableEntry, Reply, and the
-        // receiver's domain freelist layout.
-        \\movq $0x40000000000, %%r11          // event_type=4 << 44
-        \\movq %%r11, 40(%%rsp)               // receiver_syscall_word_return
-
-    // ═══════════════════════════════════════════════════════════════
-    // PHASE 3 — capture sender TLS bases, switch CR3
-    // ═══════════════════════════════════════════════════════════════
-        // Snapshot the cached pcid_enabled byte from SyscallScratch
-        // BEFORE swapgs (gs flips to user GS below and the byte is
-        // unreachable without another swapgs). Stash low byte of rcx
-        // into the high byte of kstack[32] alongside receiver_pcid so
-        // the CR3-switch code can read both with a single qword load.
-        // pcid_enabled lives at gs:120 (Offsets.sc_pcid_enabled).
-        \\movzbq %%gs:120, %%rcx              // pcid_enabled flag (0/1)
-
-        // Read sender's FS.base while GS is still kernel-scratch.
-        \\rdfsbase %%r11
-        \\movq %%r11, 72(%%rsp)               // sender_fs_base
-        // Swap GS out so rdgsbase reads sender's user GS.base.
-        \\swapgs
-        \\rdgsbase %%r11
-        \\movq %%r11, 80(%%rsp)               // sender_gs_base
-
-        // TODO_LOCK: ideally the port lock release happens at the end
-        // of Phase 2 — once the receiver has been popped, no further
-        // mutation of the port queue is needed and the lock could be
-        // dropped immediately. The current asm leaves it held until
-        // teardown of the slow-path bail; pulling that release earlier
-        // requires an additional fast_temp slot (the *Port pointer is
-        // currently lost after the swapgs invalidates gs:56). Defer
-        // until Phase 2 grows that scratch slot.
-
-        // ── CR3 switch (PCID-aware) ──
-        // pcid_enabled flag is in rcx (captured pre-swapgs above).
-        // When PCID is on, OR the receiver_pcid into bits 0-11 of CR3
-        // and set bit 63 ("preserve TLB" hint per Intel SDM Vol 3A
-        // §4.10.4.1) so the cross-domain switch keeps the receiver's
-        // existing TLB entries hot. When off, load CR3 raw (full
-        // TLB flush — old/new domain entries collide otherwise).
-        \\movq 24(%%rsp), %%r11               // receiver_cr3_root
-        \\testb %%cl, %%cl
-        \\jz .L_cr3_no_pcid
-        \\orq 32(%%rsp), %%r11                // OR receiver_pcid (bits 0-11)
-        \\btsq $63, %%r11                     // set CR3.NOFLUSH (bit 63)
-        \\.L_cr3_no_pcid:
-        \\movq %%r11, %%cr3
-
-    // ═══════════════════════════════════════════════════════════════
-    // PHASE 4 — write event payload to receiver's user stack
-    // ═══════════════════════════════════════════════════════════════
-        // CR3 = receiver; receiver's user stack mapped. SMAP allow.
-        \\movq 16(%%rsp), %%rcx               // receiver_user_rsp
-        \\stac
-        \\movq 40(%%rsp), %%r11
-        \\movq %%r11, 0(%%rcx)                // vreg 0 = syscall word return
-        \\movq 48(%%rsp), %%r11
-        \\movq %%r11, 8(%%rcx)                // vreg 14 = sender RIP
-        \\movq 56(%%rsp), %%r11
-        \\movq %%r11, 16(%%rcx)               // vreg 15 = sender RFLAGS
-        \\movq 64(%%rsp), %%r11
-        \\movq %%r11, 24(%%rcx)               // vreg 16 = sender RSP
-        \\movq 72(%%rsp), %%r11
-        \\movq %%r11, 32(%%rcx)               // vreg 17 = sender FS.base
-        \\movq 80(%%rsp), %%r11
-        \\movq %%r11, 40(%%rcx)               // vreg 18 = sender GS.base
-
-        // TODO_ZERO: zero stack vregs 19..127 in receiver's user
-        // stack (per event_type-specific upper bound; for a plain
-        // suspension, no event-specific payload, so just zero the
-        // band 48..1024 to avoid leaking kernel-side stack contents
-        // across the boundary).
-
-        // TODO_READCAP: if suspending EC handle's `read` cap = 0,
-        // also zero vregs 1-13 (the GPRs) — would xor rax, rbx,
-        // rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15 here.
-        // For the stub we always pass through (assume read=1).
-        \\clac
-
-    // ═══════════════════════════════════════════════════════════════
-    // PHASE 5 — receiver context restore + lazy FPU + sysret.
-    //
-    // State at entry:
-    //   CR3 = receiver's (Phase 3), GS = sender user GS (Phase 3
-    //   swapgs), RSP = kernel kstack with the 112-byte scratch frame,
-    //   vregs 1-13 = sender payload (pristine — must remain so unless
-    //   the suspending handle's `read` cap = 0, which we treat as the
-    //   slow path for now). rcx and r11 are scratch.
-    //
-    // Steps:
-    //   a. swapgs → GS = kernel SyscallScratch. We need scratch
-    //      access to read the stashed receiver EC pointer
-    //      (fast_temp[5]) and to publish current_ec / current_domain
-    //      to the per-core slot.
-    //   b. Set per-core SyscallScratch.current_ec / current_domain so
-    //      switchTo-equivalent state is observable on this core.
-    //   c. Lazy-FPU policy. Read per_core_ptr from scratch[112]; if
-    //      receiver != last_fpu_owner, arm CR0.TS (mark
-    //      fpu_trap_armed=1). Else clear CR0.TS (mark
-    //      fpu_trap_armed=0). Skip the CR0 write entirely when
-    //      fpu_trap_armed already matches the desired state — each
-    //      MOV-to-CR0 is a vmexit under KVM. Cross-core FPU
-    //      migration (last_fpu_core != current core, != null) is
-    //      delegated to the slow path; here we only treat that as a
-    //      fast-path bail through .L_fast_bail.
-    //   d. Restore rcx / r11 / rsp from the kstack scratch frame
-    //      (these hold the receiver's resume_rip / resume_rflags /
-    //      user_rsp prepped in Phase 2). swapgs back to user GS,
-    //      then sysretq.
-    //
-    // Receiver TLS (FS.base/GS.base) restoration is intentionally
-    // deferred — `cpu.Context` does not yet carry FS/GS bases as
-    // saved state, so the receiver runs with whatever the previous
-    // context loaded. Userspace TLS-aware code re-establishes TLS
-    // through `wr{fs,gs}base` itself; the FAST_TLS_TODO marks the
-    // hook for when the EC iret frame grows TLS-base fields.
-    //
-    // Spec §[port].suspend / §[reply].reply observable state: this
-    // matches sched/execution_context.zig:resumeFromReply (slow path)
-    // — receiver state=running, current_ec=receiver, vregs 1-13 carry
-    // the IPC payload, no FXSAVE/FXRSTOR happened (lazy).
-
-        // (a) Re-establish kernel GS so we can reach SyscallScratch.
-        \\swapgs
-
-        // (b) Publish current_ec / current_domain on this core. We
-        // stashed *receiver_EC at gs:80 in Phase 2. Pull it into r11
-        // (scratch), then walk receiver.domain.ptr (SlabRef.ptr is
-        // the first field of SlabRef) for the domain pointer.
-        \\movq %%gs:80, %%r11                 // *receiver_EC
-        \\movq %%r11, %%gs:32                 // current_ec = receiver
-        // Read receiver.domain.ptr — SlabRef(CapabilityDomain) starts
-        // at @offsetOf(EC,"domain"); SlabRef.ptr is the first field
-        // (offset 0 within the SlabRef). EC is non-extern (carries
-        // optional-of-struct fields that bar the conversion) so its
-        // layout is whatever Zig's auto-reorder produces; the
-        // displacement is supplied as an `"i"` operand resolved at
-        // comptime from `Offsets.ec_domain_ptr`.
-    ++ std.fmt.comptimePrint("        movq {d}(%%r11), %%rcx\n", .{Offsets.ec_domain_ptr}) ++
-        \\movq %%rcx, %%gs:40                 // current_domain = receiver.domain.ptr
-
-        // (c) Lazy-FPU policy. per_core_ptr is at scratch[112].
-        \\movq %%gs:112, %%rcx                // *PerCore
-        // Read PerCore.last_fpu_owner. PerCore is `extern struct`
-        // (declaration order pinned), so the displacement is the
-        // canonical `Offsets.pc_last_fpu_owner = 72`. The comptime
-        // assert above guards against future reorders.
-        \\movq 72(%%rcx), %%r11               // PerCore.last_fpu_owner
-        \\cmpq %%r11, %%gs:80                 // == receiver?
-        \\je .L_phase5_clear_ts
-
-        // desired: CR0.TS armed (receiver != last_fpu_owner).
-        // Check current fpu_trap_armed; skip the CR-write if already 1.
-        \\cmpb $1, 80(%%rcx)                  // PerCore.fpu_trap_armed
-        \\je .L_phase5_after_fpu
-        \\movb $1, 80(%%rcx)                  // mark armed
-        // Set CR0.TS (bit 3) — minimum-cost RMW.
-        \\movq %%cr0, %%r11
-        \\orq $0x8, %%r11
-        \\movq %%r11, %%cr0
-        \\jmp .L_phase5_after_fpu
-
-        \\.L_phase5_clear_ts:
-        // desired: CR0.TS clear (receiver IS the FPU owner).
-        \\cmpb $0, 80(%%rcx)
-        \\je .L_phase5_after_fpu
-        \\movb $0, 80(%%rcx)
-        // CLTS clears CR0.TS in one byte; cheaper than MOV-to-CR0.
-        \\clts
-
-        \\.L_phase5_after_fpu:
-
-        // FAST_TLS_TODO: load receiver FS.base/GS.base via wrfsbase /
-        // wrgsbase once cpu.Context grows fs_base/gs_base fields.
-        // For now the receiver inherits whatever TLS state the prior
-        // context left; userspace re-establishes TLS itself.
-
-        // (d) Restore rcx (resume_rip), r11 (resume_rflags), rsp
-        // (receiver_user_rsp) from the 112-byte kstack scratch frame.
-        // Layout (set up in Phase 2):
-        //   [rsp+0]  receiver_resume_rip
-        //   [rsp+8]  receiver_resume_rflags
-        //   [rsp+16] receiver_user_rsp
-        \\movq 0(%%rsp), %%rcx                // user RIP for sysret
-        \\movq 8(%%rsp), %%r11                // user RFLAGS for sysret
-        \\movq 16(%%rsp), %%rsp               // restore receiver user RSP
-
-        // swapgs out — receiver runs with its own user GS.base.
-        \\swapgs
-        \\sysretq
-
-    // ═══════════════════════════════════════════════════════════════
-    // FAST REPLY — vreg 1 (rax) = reply_handle.
-    // Symmetrical to fast_suspend but the resolve targets a Reply
-    // object (always has a suspended sender — no PQ pop), and the
-    // delivery direction is reversed (resume sender, not receiver).
-    // ═══════════════════════════════════════════════════════════════
-        \\.L_fast_reply:
-        // ── Resolve reply handle → *Reply ──
-        \\movq %%gs:40, %%rcx                 // *CapabilityDomain
-        \\movq 16(%%rcx), %%rcx               // *HandleTableEntry[]
-        \\movq %%rax, %%r11
-        \\andl $0xFFF, %%r11d                 // handle_id
-        \\shlq $5, %%r11
-        \\addq %%r11, %%rcx                   // &table[reply_id]
-        \\movw (%%rcx), %%r11w
-        \\andw $0xF000, %%r11w
-        \\cmpw $0x6000, %%r11w                // (TAG_REPLY << 12)
-        \\jne .L_fast_bail
-
-        // *Reply contains back-pointer to suspended *EC (the sender).
-        // TODO_OFF: REPLY_SENDER_OFF placeholder = 16.
-        \\movq 24(%%rcx), %%rcx               // *Reply
-        // Lock the Reply (similar inline cmpxchg pattern as port).
-        // Validate not E_TERM/E_ABANDONED via state byte on Reply.
-        // Pull *suspended_sender_EC.
-        \\movq 16(%%rcx), %%r11               // *suspended_sender (placeholder)
-        \\movq %%r11, %%gs:80                 // → fast_temp[5] (mirror suspend path)
-
-        // From here, identical structure to suspend Phase 2 tail:
-        // capture suspended_sender's saved Context (RIP/RFLAGS/RSP),
-        // its domain CR3 root + PCID, then proceed through Phases 3-5.
-        //
-        // Two key differences vs suspend:
-        //   - WRITE-cap gating: if originating EC handle's `write` = 1,
-        //     receiver's CURRENT GPRs (the modifications) become
-        //     sender's resumed state — meaning we leave vregs 1-13 in
-        //     CPU and they pass through. If `write` = 0, we instead
-        //     load sender's saved Context.regs into the GPRs before
-        //     sysret, discarding the receiver's modifications.
-        //   - Sender resumes from the suspend syscall — its return
-        //     value goes in rax (= vreg 1 / first GPR), set to E_OK
-        //     (or kernel-supplied) before sysret.
-        //
-        // For the stub, jump back into the common Phase 3-5 path.
-        // TODO_REPLY_FULL: factor the common phase into a label both
-        // suspend and reply branch into; for now stub trap.
-        \\ud2
-
-    // ═══════════════════════════════════════════════════════════════
-    // BAIL labels — fall back to slow path on rare/error conditions.
-    // ═══════════════════════════════════════════════════════════════
-        \\.L_port_stale_unlock_bail:
-        // Release port lock (PORT_LOCK_OFF=0 placeholder).
-        \\movq %%gs:56, %%rcx
-        \\movl $0, 0(%%rcx)
-        \\jmp .L_fast_bail
-
-        \\.L_no_receiver_unlock_bail:
-        \\movq %%gs:56, %%rcx
-        \\movl $0, 0(%%rcx)
-        \\jmp .L_fast_bail
-
-        \\.L_pq_empty_unlock_bail:
-        \\movq %%gs:56, %%rcx
-        \\movl $0, 0(%%rcx)
-        \\jmp .L_fast_bail
-
-        \\.L_fast_bail:
-        // Common bail: reset to slow-path entry. Vregs 1-13 are
-        // still pristine (we didn't touch them), so the slow path
-        // sees the same state the user invoked with. We've added a
-        // few gs scratch writes (negligible).
-        \\jmp .L_slow
     );
 }
 
