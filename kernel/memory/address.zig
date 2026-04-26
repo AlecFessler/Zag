@@ -199,6 +199,13 @@ comptime {
     }
 }
 
+pub const MemoryPerms = packed struct(u8) {
+    read: bool = false,
+    write: bool = false,
+    exec: bool = false,
+    _: u5 = 0,
+};
+
 pub const PAddr = extern struct {
     addr: u64,
 

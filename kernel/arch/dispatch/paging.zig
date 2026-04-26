@@ -5,7 +5,7 @@ const zag = @import("zag");
 const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const Range = zag.utils.range.Range;
@@ -277,15 +277,9 @@ pub fn mapPageSized(
     cch: VarCacheType,
     perms: MemoryPerms,
 ) !void {
-    _ = addr_space_root;
-    _ = phys;
-    _ = virt;
-    _ = sz;
-    _ = cch;
-    _ = perms;
     switch (builtin.cpu.arch) {
-        .x86_64 => return error.NotImplemented,
-        .aarch64 => return error.NotImplemented,
+        .x86_64 => try x64.paging.mapPageSized(addr_space_root, phys, virt, sz, cch, perms),
+        .aarch64 => try aarch64.paging.mapPageSized(addr_space_root, phys, virt, sz, cch, perms),
         else => unreachable,
     }
 }
@@ -297,14 +291,11 @@ pub fn unmapPageSized(
     virt: VAddr,
     sz: VarPageSize,
 ) ?PAddr {
-    _ = addr_space_root;
-    _ = virt;
-    _ = sz;
-    switch (builtin.cpu.arch) {
-        .x86_64 => return null,
-        .aarch64 => return null,
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.unmapPageSized(addr_space_root, virt, sz),
+        .aarch64 => aarch64.paging.unmapPageSized(addr_space_root, virt, sz),
         else => unreachable,
-    }
+    };
 }
 
 /// Allocate a fresh empty top-level address space (PML4 root on x86-64,
@@ -312,11 +303,11 @@ pub fn unmapPageSized(
 /// allocator implicitly is the caller's responsibility — this only
 /// hands back the page-table root. Spec §[capability_domain].
 pub fn allocAddrSpaceRoot() !PAddr {
-    switch (builtin.cpu.arch) {
-        .x86_64 => return error.NotImplemented,
-        .aarch64 => return error.NotImplemented,
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.allocAddrSpaceRoot(),
+        .aarch64 => aarch64.paging.allocAddrSpaceRoot(),
         else => unreachable,
-    }
+    };
 }
 
 /// Install `root` as the active user address space on the local core,
@@ -339,13 +330,9 @@ pub fn invalidateTlbRange(
     sz: VarPageSize,
     page_count: u32,
 ) void {
-    _ = addr_space_root;
-    _ = virt;
-    _ = sz;
-    _ = page_count;
     switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => {},
+        .x86_64 => x64.paging.invalidateTlbRange(addr_space_root, virt, sz, page_count),
+        .aarch64 => aarch64.paging.invalidateTlbRange(addr_space_root, virt, sz, page_count),
         else => unreachable,
     }
 }
@@ -360,13 +347,9 @@ pub fn shootdownTlbRange(
     sz: VarPageSize,
     page_count: u32,
 ) void {
-    _ = addr_space_id;
-    _ = virt;
-    _ = sz;
-    _ = page_count;
     switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => {},
+        .x86_64 => x64.paging.shootdownTlbRange(addr_space_id, virt, sz, page_count),
+        .aarch64 => aarch64.paging.shootdownTlbRange(addr_space_id, virt, sz, page_count),
         else => unreachable,
     }
 }
@@ -374,10 +357,9 @@ pub fn shootdownTlbRange(
 /// Cross-core full-ASID/PCID shootdown. Used by `delete` of a
 /// capability domain when its address space root is being torn down.
 pub fn shootdownTlbAll(addr_space_id: u16) void {
-    _ = addr_space_id;
     switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => {},
+        .x86_64 => x64.paging.shootdownTlbAll(addr_space_id),
+        .aarch64 => aarch64.paging.shootdownTlbAll(addr_space_id),
         else => unreachable,
     }
 }
@@ -387,10 +369,9 @@ pub fn shootdownTlbAll(addr_space_id: u16) void {
 /// Required after edits that change which leaf a higher-level walker
 /// would resolve — e.g. shrinking a 2 MiB page to 4 KiB leaves.
 pub fn invalidatePagingStructureCache(addr_space_root: PAddr) void {
-    _ = addr_space_root;
     switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => {},
+        .x86_64 => x64.paging.invalidatePagingStructureCache(addr_space_root),
+        .aarch64 => aarch64.paging.invalidatePagingStructureCache(addr_space_root),
         else => unreachable,
     }
 }

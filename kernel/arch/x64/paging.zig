@@ -14,6 +14,8 @@ const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
+const VarCacheType = zag.capdom.var_range.CacheType;
+const VarPageSize = zag.capdom.var_range.PageSize;
 
 /// TLB shootdown: per-core pending invalidation addresses.
 /// Each core checks its slot before returning to userspace.
@@ -612,4 +614,72 @@ fn freePhysPage(paddr: PAddr, pmm_mgr: *pmm.PhysicalMemoryManager) void {
 fn freeTablePage(table: *[page_entry_table_size]PageEntry, pmm_mgr: *pmm.PhysicalMemoryManager) void {
     const page: *paging.PageMem(.page4k) = @ptrCast(@alignCast(table));
     pmm_mgr.destroy(page);
+}
+
+pub fn mapPageSized(
+    addr_space_root: PAddr,
+    phys: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+    cch: VarCacheType,
+    perms: MemoryPerms,
+) !void {
+    _ = addr_space_root;
+    _ = phys;
+    _ = virt;
+    _ = sz;
+    _ = cch;
+    _ = perms;
+    @panic("not implemented");
+}
+
+pub fn unmapPageSized(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+) ?PAddr {
+    _ = addr_space_root;
+    _ = virt;
+    _ = sz;
+    @panic("not implemented");
+}
+
+pub fn allocAddrSpaceRoot() !PAddr {
+    @panic("not implemented");
+}
+
+pub fn invalidateTlbRange(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = addr_space_root;
+    _ = virt;
+    _ = sz;
+    _ = page_count;
+    @panic("not implemented");
+}
+
+pub fn shootdownTlbRange(
+    addr_space_id: u16,
+    virt: VAddr,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = addr_space_id;
+    _ = virt;
+    _ = sz;
+    _ = page_count;
+    @panic("not implemented");
+}
+
+pub fn shootdownTlbAll(addr_space_id: u16) void {
+    _ = addr_space_id;
+    @panic("not implemented");
+}
+
+pub fn invalidatePagingStructureCache(addr_space_root: PAddr) void {
+    _ = addr_space_root;
+    @panic("not implemented");
 }

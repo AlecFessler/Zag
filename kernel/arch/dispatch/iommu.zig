@@ -5,19 +5,9 @@ const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
 const DeviceRegion = zag.devices.device_region.DeviceRegion;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VarPageSize = zag.capdom.var_range.PageSize;
-
-// `zag.perms.memory.MemoryPerms` was removed in spec v3. Until a v3
-// home for it lands, define the minimum shape the IOMMU map path
-// needs locally so the per-arch backings can match against fields
-// without a cross-tree import.
-pub const MemoryPerms = packed struct(u8) {
-    read: bool = false,
-    write: bool = false,
-    exec: bool = false,
-    _reserved: u5 = 0,
-};
 
 pub fn isDmaRemapAvailable() bool {
     return switch (builtin.cpu.arch) {

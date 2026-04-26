@@ -65,6 +65,8 @@ const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const VAddr = zag.memory.address.VAddr;
+const VarCacheType = zag.capdom.var_range.CacheType;
+const VarPageSize = zag.capdom.var_range.PageSize;
 
 /// AArch64 page table descriptor for VMSAv8-64 with 4KB granule.
 ///
@@ -841,3 +843,70 @@ fn tlbiVae1is(vaddr: u64) void {
     isb();
 }
 
+pub fn mapPageSized(
+    addr_space_root: PAddr,
+    phys: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+    cch: VarCacheType,
+    perms: MemoryPerms,
+) !void {
+    _ = addr_space_root;
+    _ = phys;
+    _ = virt;
+    _ = sz;
+    _ = cch;
+    _ = perms;
+    @panic("not implemented");
+}
+
+pub fn unmapPageSized(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+) ?PAddr {
+    _ = addr_space_root;
+    _ = virt;
+    _ = sz;
+    @panic("not implemented");
+}
+
+pub fn allocAddrSpaceRoot() !PAddr {
+    @panic("not implemented");
+}
+
+pub fn invalidateTlbRange(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = addr_space_root;
+    _ = virt;
+    _ = sz;
+    _ = page_count;
+    @panic("not implemented");
+}
+
+pub fn shootdownTlbRange(
+    addr_space_id: u16,
+    virt: VAddr,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = addr_space_id;
+    _ = virt;
+    _ = sz;
+    _ = page_count;
+    @panic("not implemented");
+}
+
+pub fn shootdownTlbAll(addr_space_id: u16) void {
+    _ = addr_space_id;
+    @panic("not implemented");
+}
+
+pub fn invalidatePagingStructureCache(addr_space_root: PAddr) void {
+    _ = addr_space_root;
+    @panic("not implemented");
+}
