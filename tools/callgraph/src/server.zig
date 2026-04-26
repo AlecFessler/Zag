@@ -497,8 +497,8 @@ const TraceQuery = struct {
     // Pass `hide_debug=0` / `hide_library=0` to opt back into full fidelity.
     hide_debug: bool = true,
     hide_library: bool = true,
-    /// Output format: "text" (default, indented tree) or "json" (compact
-    /// machine-readable tree with stats wrapper).
+    /// Output format: "text" (default for HTTP, indented tree) or "compact"
+    /// (the agent-optimized line format; see render.renderTraceCompact).
     format: []const u8 = "text",
     /// Comma-separated list of patterns to exclude from the trace as
     /// folded `-` leaves. Empty by default. Supports `module.*` prefix
@@ -617,17 +617,6 @@ fn handleTrace(
     // Stats walk feeds either the JSON wrapper or the text header.
     const stats = render.statsTrace(arena.allocator(), ctx, fp, q.depth) catch render.TraceStats{};
 
-    if (std.mem.eql(u8, q.format, "json")) {
-        render.renderTraceJson(arena.allocator(), &aw.writer, ctx, fp, q.depth, stats) catch |err| {
-            return respondBytes(
-                request,
-                .internal_server_error,
-                "text/plain; charset=utf-8",
-                @errorName(err),
-            );
-        };
-        return respondBytes(request, .ok, "application/json; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
-    }
     if (std.mem.eql(u8, q.format, "compact")) {
         render.renderTraceCompact(arena.allocator(), &aw.writer, ctx, fp, q.depth, stats) catch |err| {
             return respondBytes(
