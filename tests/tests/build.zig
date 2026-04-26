@@ -88,6 +88,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "create_var_17", .path = "tests/create_var_17.zig" },
     .{ .name = "create_var_18", .path = "tests/create_var_18.zig" },
     .{ .name = "create_var_19", .path = "tests/create_var_19.zig" },
+    .{ .name = "create_var_20", .path = "tests/create_var_20.zig" },
     .{ .name = "delete_01", .path = "tests/delete_01.zig" },
     .{ .name = "delete_02", .path = "tests/delete_02.zig" },
     .{ .name = "delete_03", .path = "tests/delete_03.zig" },

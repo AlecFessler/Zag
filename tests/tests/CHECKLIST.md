@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 153.
-**Remaining:** 315.
+**Implemented:** 154.
+**Remaining:** 314.
 
 ## Convention
 
@@ -225,7 +225,7 @@ _§[restart_semantics] Restart Semantics_
 - [x] **05** — on success, a subsequent `perfmon_read` on the target EC returns E_INVAL (perfmon was not started).
 - [x] **06** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## create_var — 14/22
+## create_var — 15/22
 
 - [x] **01** — returns E_PERM if the caller's self-handle lacks `crvr`.
 - [x] **02** — returns E_PERM if caps' r/w/x bits are not a subset of the caller's `var_inner_ceiling`'s r/w/x bits.
@@ -246,7 +246,7 @@ _§[restart_semantics] Restart Semantics_
 - [x] **17** — returns E_INVAL if any reserved bits are set in [1] or [2].
 - [x] **18** — on success, the caller receives a VAR handle with caps = `[1].caps`.
 - [x] **19** — on success, field0 contains the assigned base address.
-- [ ] **20** — on success, field1 contains `[2].props` together with `[3]` pages.
+- [x] **20** — on success, field1 contains `[2].props` together with `[3]` pages.
 - [ ] **21** — on success, when [4] preferred_base is nonzero and the range is available, the assigned base address equals `[4]`.
 - [ ] **22** — on success, when caps.dma = 1, field1's `device` field equals [5]'s handle id, and a subsequent `map_pf` into this VAR routes the bound device's accesses at field0 + offset to the installed page_frame.
 
