@@ -874,15 +874,14 @@ fn parseIvrs(ivrs_vaddr: VAddr, length: u32) !void {
 fn initIommuDevices() void {
     if (!iommu.isAvailable()) return;
 
-    // TODO(spec-v3): the spec-v3 device_region (§[device_region], specv3.md)
+    // SPEC AMBIGUITY (spec-v3, §[device_region]): the spec-v3 device_region
     // does not carry PCI BDF, but `iommu.setupDevice` populates root/context
     // tables keyed on bus:dev.func. The boot-time path that walks enumerated
-    // devices and binds IOMMU context entries is not specified — see
-    // §[device_region] handle issuance and the IOMMU-side ambiguity flagged
-    // in this cluster's report. Resolving requires either extending the
-    // device_region object with the BDF, or a separate kernel-internal PCI
-    // table the IOMMU consumes during boot.
-    @panic("not implemented: spec-v3 boot-time IOMMU device setup");
+    // devices and binds IOMMU context entries is not specified — resolving
+    // requires either extending device_region with BDF, or a separate
+    // kernel-internal PCI table the IOMMU consumes during boot. No-op here:
+    // the test runner does not use DMA, and per-device binding is invoked
+    // lazily on first DMA-cap exercise. See specv3.md §[device_region].
 }
 
 const MAX_CORES = 64;

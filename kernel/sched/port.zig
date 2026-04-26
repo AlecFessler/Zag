@@ -104,6 +104,14 @@ pub const Port = struct {
 pub const Allocator = SecureSlab(Port, 256);
 pub var slab_instance: Allocator = undefined;
 
+pub fn initSlab(
+    data_range: zag.utils.range.Range,
+    ptrs_range: zag.utils.range.Range,
+    links_range: zag.utils.range.Range,
+) void {
+    slab_instance = Allocator.init(data_range, ptrs_range, links_range);
+}
+
 /// Bit positions used to encode the recv-side syscall return word per
 /// §[event_state]: pair_count[12-19], tstart[20-31], reply_handle_id
 /// [32-43], event_type[44-48].

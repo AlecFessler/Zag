@@ -683,8 +683,22 @@ pub fn unmapPageSized(
     @panic("not implemented");
 }
 
+/// Allocate a fresh PML4 table for a new capability domain. Kernel
+/// mappings (entries 256..511) are copied from the current address
+/// space so kernel addresses translate identically; user-half entries
+/// (0..255) come up empty for the caller to populate.
+///
+/// Intel SDM Vol 3A, Section 5.5.4: PML4 = 4 KiB-aligned table of 512
+/// PageEntry slots. Section 5.10.4: kernel-shared mappings rely on
+/// CR4.PGE = 1 and PageEntry.global = 1, but the PML4 entries themselves
+/// (the table pointers) must be replicated into every address-space
+/// root because the L4 walk indexes them by linear address bits 47:39.
 pub fn allocAddrSpaceRoot() !PAddr {
-    @panic("not implemented");
+    const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
+    const new_table = try pmm_mgr.create(paging.PageMem(.page4k));
+    const new_virt = VAddr.fromInt(@intFromPtr(new_table));
+    copyKernelMappings(new_virt);
+    return PAddr.fromVAddr(new_virt, null);
 }
 
 pub fn invalidateTlbRange(

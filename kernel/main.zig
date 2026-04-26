@@ -63,8 +63,8 @@ export fn kEntry(boot_info: *BootInfo) callconv(arch.cpu.cc()) noreturn {
 }
 
 export fn kTrampoline(boot_info: *BootInfo) callconv(arch.cpu.cc()) noreturn {
-    kMain(boot_info) catch {
-        @panic("Exiting...");
+    kMain(boot_info) catch |err| {
+        @panic(@errorName(err));
     };
     unreachable;
 }

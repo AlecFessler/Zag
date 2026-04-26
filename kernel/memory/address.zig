@@ -135,9 +135,113 @@ pub const KernelVA = struct {
             .end = proc_slab_ptrs.end + SLAB_RESERVATION,
         };
 
+        // Spec-v3 §[device_region] slab (kernel/devices/device_region.zig).
+        // Distinct from the legacy `device_region_slab` above, which still
+        // backs the IOMMU PCI/DMA shape pending its spec-v3 rework.
+        pub const dev_region_slab: Range = .{
+            .start = proc_slab_links.end,
+            .end = proc_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const dev_region_slab_ptrs: Range = .{
+            .start = dev_region_slab.end,
+            .end = dev_region_slab.end + SLAB_RESERVATION,
+        };
+        pub const dev_region_slab_links: Range = .{
+            .start = dev_region_slab_ptrs.end,
+            .end = dev_region_slab_ptrs.end + SLAB_RESERVATION,
+        };
+
+        // Spec-v3 SecureSlab regions for the new typed kernel objects.
+        // Each typed slab needs a parallel data + ptrs + links region
+        // (see SecureSlab init).
+        pub const capability_domain_slab: Range = .{
+            .start = dev_region_slab_links.end,
+            .end = dev_region_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const capability_domain_slab_ptrs: Range = .{
+            .start = capability_domain_slab.end,
+            .end = capability_domain_slab.end + SLAB_RESERVATION,
+        };
+        pub const capability_domain_slab_links: Range = .{
+            .start = capability_domain_slab_ptrs.end,
+            .end = capability_domain_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const execution_context_slab: Range = .{
+            .start = capability_domain_slab_links.end,
+            .end = capability_domain_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const execution_context_slab_ptrs: Range = .{
+            .start = execution_context_slab.end,
+            .end = execution_context_slab.end + SLAB_RESERVATION,
+        };
+        pub const execution_context_slab_links: Range = .{
+            .start = execution_context_slab_ptrs.end,
+            .end = execution_context_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const var_range_slab: Range = .{
+            .start = execution_context_slab_links.end,
+            .end = execution_context_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const var_range_slab_ptrs: Range = .{
+            .start = var_range_slab.end,
+            .end = var_range_slab.end + SLAB_RESERVATION,
+        };
+        pub const var_range_slab_links: Range = .{
+            .start = var_range_slab_ptrs.end,
+            .end = var_range_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const port_slab: Range = .{
+            .start = var_range_slab_links.end,
+            .end = var_range_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const port_slab_ptrs: Range = .{
+            .start = port_slab.end,
+            .end = port_slab.end + SLAB_RESERVATION,
+        };
+        pub const port_slab_links: Range = .{
+            .start = port_slab_ptrs.end,
+            .end = port_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const page_frame_slab: Range = .{
+            .start = port_slab_links.end,
+            .end = port_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const page_frame_slab_ptrs: Range = .{
+            .start = page_frame_slab.end,
+            .end = page_frame_slab.end + SLAB_RESERVATION,
+        };
+        pub const page_frame_slab_links: Range = .{
+            .start = page_frame_slab_ptrs.end,
+            .end = page_frame_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const timer_slab: Range = .{
+            .start = page_frame_slab_links.end,
+            .end = page_frame_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const timer_slab_ptrs: Range = .{
+            .start = timer_slab.end,
+            .end = timer_slab.end + SLAB_RESERVATION,
+        };
+        pub const timer_slab_links: Range = .{
+            .start = timer_slab_ptrs.end,
+            .end = timer_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const virtual_machine_slab: Range = .{
+            .start = timer_slab_links.end,
+            .end = timer_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const virtual_machine_slab_ptrs: Range = .{
+            .start = virtual_machine_slab.end,
+            .end = virtual_machine_slab.end + SLAB_RESERVATION,
+        };
+        pub const virtual_machine_slab_links: Range = .{
+            .start = virtual_machine_slab_ptrs.end,
+            .end = virtual_machine_slab_ptrs.end + SLAB_RESERVATION,
+        };
+
         pub const range: Range = .{
             .start = vm_node_slab.start,
-            .end = proc_slab_links.end,
+            .end = virtual_machine_slab_links.end,
         };
     };
 };

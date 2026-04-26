@@ -23,7 +23,9 @@
 
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
+const pmm = zag.memory.pmm;
 
 const Capability = zag.caps.capability.Capability;
 const CapabilityType = zag.caps.capability.CapabilityType;
@@ -36,6 +38,7 @@ const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const VAR = zag.capdom.var_range.VAR;
 const VAddr = zag.memory.address.VAddr;
 const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
+const Word0 = zag.caps.capability.Word0;
 
 /// Cap bits in `Capability.word0[48..63]` for the capability_domain
 /// self-handle (slot 0). Spec §[capability_domain] self handle.
@@ -153,6 +156,14 @@ pub const CapabilityDomain = struct {
 pub const Allocator = SecureSlab(CapabilityDomain, 256);
 pub var slab_instance: Allocator = undefined;
 
+pub fn initSlab(
+    data_range: zag.utils.range.Range,
+    ptrs_range: zag.utils.range.Range,
+    links_range: zag.utils.range.Range,
+) void {
+    slab_instance = Allocator.init(data_range, ptrs_range, links_range);
+}
+
 // ── External API ─────────────────────────────────────────────────────
 
 /// `create_capability_domain` syscall handler.
@@ -192,20 +203,100 @@ pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
 
 // ── Internal API ─────────────────────────────────────────────────────
 
-/// Allocate a new CapabilityDomain — slab slot, two 96 KiB handle-
-/// table pages from PMM, address-space root, slot-0 self-handle,
-/// slot-1 initial EC handle (filled by caller), slot-2 self-IDC.
+/// Round handle-table size up to a power-of-two-page block. Buddy
+/// `allocBlock` requires power-of-two multiples of 4 KiB. Wastes some
+/// memory at the tail but keeps the alloc path simple.
+fn handleTableBlockBytes(comptime T: type) u64 {
+    const raw: u64 = @as(u64, MAX_HANDLES_PER_DOMAIN) * @sizeOf(T);
+    const pages: u64 = (raw + 0xFFF) / 0x1000;
+    var pow: u64 = 1;
+    while (pow < pages) pow <<= 1;
+    return pow * 0x1000;
+}
+
+const USER_TABLE_BYTES: u64 = handleTableBlockBytes(Capability);
+const KERNEL_TABLE_BYTES: u64 = handleTableBlockBytes(KernelHandle);
+
+/// Allocate a new CapabilityDomain — slab slot, handle tables from PMM,
+/// address-space root, slot-0 self-handle, slot-1 placeholder for the
+/// initial EC handle (filled by caller via `mintHandle`), slot-2 self-IDC.
+/// Spec §[capability_domain].
 pub fn allocCapabilityDomain(
     self_caps: u16,
     field0_ceilings: u64,
     field1_ceilings: u64,
     initial_entry: VAddr,
 ) !*CapabilityDomain {
-    _ = self_caps;
-    _ = field0_ceilings;
-    _ = field1_ceilings;
     _ = initial_entry;
-    return error.NotImplemented;
+
+    const ref = try slab_instance.create();
+    const cd = ref.ptr;
+    errdefer slab_instance.destroy(cd, cd._gen_lock.currentGen()) catch {};
+
+    const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
+
+    // Handle tables live in kernel physmap RAM. PMM zero-on-free
+    // guarantees the pages come up cleared.
+    const user_buf = pmm_mgr.allocBlock(USER_TABLE_BYTES) orelse return error.OutOfMemory;
+    errdefer pmm_mgr.freeBlock(user_buf[0..USER_TABLE_BYTES]);
+    const kernel_buf = pmm_mgr.allocBlock(KERNEL_TABLE_BYTES) orelse return error.OutOfMemory;
+    errdefer pmm_mgr.freeBlock(kernel_buf[0..KERNEL_TABLE_BYTES]);
+
+    const user_table: *[MAX_HANDLES_PER_DOMAIN]Capability = @ptrCast(@alignCast(user_buf));
+    const kernel_table: *[MAX_HANDLES_PER_DOMAIN]KernelHandle = @ptrCast(@alignCast(kernel_buf));
+
+    cd.user_table = user_table;
+    cd.kernel_table = kernel_table;
+
+    // Free-list links cover slots 3..MAX-1; slots 0/1/2 are reserved by
+    // spec and are NOT on the free list.
+    var i: u16 = 3;
+    while (i < MAX_HANDLES_PER_DOMAIN - 1) {
+        kernel_table[i].parent = zag.caps.capability.encodeFreeNext(i + 1);
+        i += 1;
+    }
+    kernel_table[MAX_HANDLES_PER_DOMAIN - 1].parent =
+        zag.caps.capability.encodeFreeNext(zag.caps.capability.FREE_LIST_TAIL);
+    cd.free_head = 3;
+    cd.free_count = MAX_HANDLES_PER_DOMAIN - 3;
+    cd.var_count = 0;
+    cd.vm = null;
+    @memset(cd.vars[0..], null);
+
+    // Address space root + ASID. The new domain needs a fresh page-table
+    // root so the ELF + handle tables can be installed; the ASID tags TLB
+    // entries.
+    cd.addr_space_root = try arch.paging.allocAddrSpaceRoot();
+    cd.addr_space_id = arch.paging.allocAddrSpaceId() orelse 0;
+
+    // Slot 0 — self-handle. Carries ceilings + caps; the rest of the
+    // kernel reads them back through `user_table[0]` per the doc on
+    // `CapabilityDomain.user_table`.
+    user_table[0].word0 = Word0.pack(0, .capability_domain_self, self_caps);
+    user_table[0].field0 = field0_ceilings;
+    user_table[0].field1 = field1_ceilings;
+    kernel_table[0].ref = .{
+        .ptr = cd,
+        .gen = @intCast(cd._gen_lock.currentGen()),
+    };
+
+    // Slot 1 — placeholder for the initial EC handle; populated by the
+    // caller (root bringup or `create_capability_domain`).
+    user_table[1] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
+    kernel_table[1].ref = .{};
+
+    // Slot 2 — self-IDC. Caps = `cridc_ceiling` from field0_ceilings
+    // bits 24-31 per spec §[cridc_ceiling].
+    const cridc_ceiling: u16 = @truncate((field0_ceilings >> 24) & 0xFF);
+    user_table[2].word0 = Word0.pack(2, .capability_domain, cridc_ceiling);
+    user_table[2].field0 = 0;
+    user_table[2].field1 = 0;
+    kernel_table[2].ref = .{
+        .ptr = cd,
+        .gen = @intCast(cd._gen_lock.currentGen()),
+    };
+
+    return cd;
 }
 
 /// Final teardown — walks `vars` freeing each VAR, walks
@@ -218,34 +309,48 @@ fn destroyCapabilityDomain(cd: *CapabilityDomain) void {
 /// Pop the head of the free-slot list. Returns `null` (E_FULL) if the
 /// table is full.
 fn allocFreeSlot(cd: *CapabilityDomain) ?u12 {
-    _ = cd;
-    return null;
+    if (cd.free_count == 0) return null;
+    const head = cd.free_head;
+    if (head == zag.caps.capability.FREE_LIST_TAIL) return null;
+    const slot: u12 = @truncate(head);
+    const next = zag.caps.capability.decodeFreeNext(cd.kernel_table[slot].parent);
+    cd.free_head = next;
+    cd.free_count -= 1;
+    return slot;
 }
 
 /// Push a slot back onto the free-slot list. Zeros the user/kernel
 /// entries.
 fn returnSlotToFreeList(cd: *CapabilityDomain, slot: u12) void {
-    _ = cd;
-    _ = slot;
+    cd.user_table[slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
+    cd.kernel_table[slot].ref = .{};
+    cd.kernel_table[slot].parent = zag.caps.capability.encodeFreeNext(cd.free_head);
+    cd.kernel_table[slot].first_child = .{};
+    cd.kernel_table[slot].next_sibling = .{};
+    cd.free_head = @as(u16, slot);
+    cd.free_count += 1;
 }
 
 /// Look up a slot, validate type tag against `expected`, return the
 /// kernel-side entry. Returns null on free-slot, out-of-range, or
 /// type mismatch.
 fn lookupSlot(cd: *CapabilityDomain, slot: u12, expected: CapabilityType) ?*KernelHandle {
-    _ = cd;
-    _ = slot;
-    _ = expected;
-    return null;
+    return zag.caps.capability.resolveHandleOnDomain(cd, slot, expected);
 }
 
 /// Linear scan for an existing handle to `obj` in this domain, used
 /// to enforce the at-most-one-per-(domain, object) invariant.
 /// Returns the existing slot id if found.
 fn findExistingHandle(cd: *CapabilityDomain, obj: ErasedSlabRef, t: CapabilityType) ?u12 {
-    _ = cd;
-    _ = obj;
-    _ = t;
+    var i: u16 = 0;
+    while (i < MAX_HANDLES_PER_DOMAIN) {
+        const entry = &cd.kernel_table[i];
+        if (entry.ref.ptr != null and entry.ref.ptr == obj.ptr and entry.ref.gen == obj.gen) {
+            const tag = Word0.typeTag(cd.user_table[i].word0);
+            if (tag == t) return @truncate(i);
+        }
+        i += 1;
+    }
     return null;
 }
 
@@ -260,29 +365,34 @@ pub fn mintHandle(
     field0: u64,
     field1: u64,
 ) !u12 {
-    _ = cd;
-    _ = obj;
-    _ = obj_type;
-    _ = caps;
-    _ = field0;
-    _ = field1;
-    return error.NotImplemented;
+    if (findExistingHandle(cd, obj, obj_type)) |existing| {
+        // Coalesce: keep the original entry, return its slot. Spec
+        // semantics: at most one handle per (domain, object).
+        return existing;
+    }
+
+    const slot = allocFreeSlot(cd) orelse return error.OutOfHandles;
+    cd.user_table[slot].word0 = Word0.pack(slot, obj_type, caps);
+    cd.user_table[slot].field0 = field0;
+    cd.user_table[slot].field1 = field1;
+    cd.kernel_table[slot].ref = obj;
+    cd.kernel_table[slot].parent = .{};
+    cd.kernel_table[slot].first_child = .{};
+    cd.kernel_table[slot].next_sibling = .{};
+    return slot;
 }
 
 /// Read a self-handle ceiling sub-field. All ceilings live in slot-0's
 /// `field0`/`field1`; centralized here so future spec changes touch
 /// one place.
 fn readSelfField0(cd: *const CapabilityDomain) u64 {
-    _ = cd;
-    return 0;
+    return cd.user_table[0].field0;
 }
 fn readSelfField1(cd: *const CapabilityDomain) u64 {
-    _ = cd;
-    return 0;
+    return cd.user_table[0].field1;
 }
 fn readSelfCaps(cd: *const CapabilityDomain) u16 {
-    _ = cd;
-    return 0;
+    return Word0.caps(cd.user_table[0].word0);
 }
 
 /// Append `v` to `vars[var_count]`. Returns E_FULL when at MAX.

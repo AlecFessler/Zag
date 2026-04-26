@@ -72,6 +72,14 @@ pub const PageFrame = struct {
 pub const Allocator = SecureSlab(PageFrame, 256);
 pub var slab_instance: Allocator = undefined;
 
+pub fn initSlab(
+    data_range: zag.utils.range.Range,
+    ptrs_range: zag.utils.range.Range,
+    links_range: zag.utils.range.Range,
+) void {
+    slab_instance = Allocator.init(data_range, ptrs_range, links_range);
+}
+
 // ── External API ─────────────────────────────────────────────────────
 
 /// `create_page_frame` syscall handler. Spec §[page_frame].
