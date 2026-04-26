@@ -15,8 +15,19 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 
-const EcQueue = zag.sched.execution_context.EcQueue;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const Priority = zag.sched.execution_context.Priority;
+
+/// Intrusive priority queue of ECs, linked through the EC's `next`
+/// field and ordered by `priority`. Shared by per-core run queues and
+/// port wait queues. Futex buckets use a separate WaitNode-based queue
+/// (see sched/futex.zig).
+pub const EcQueue = zag.utils.containers.priority_queue.PriorityQueue(
+    ExecutionContext,
+    "next",
+    "priority",
+    @typeInfo(Priority).@"enum".fields.len,
+);
 
 /// Maximum cores the scheduler supports. Matches `affinity` mask width.
 pub const MAX_CORES: u8 = 64;

@@ -275,17 +275,6 @@ pub const ExecutionContext = struct {
     last_fpu_core: ?u8 = null,
 };
 
-/// Intrusive priority queue of ECs, linked through the EC's `next`
-/// field and ordered by `priority`. Shared by per-core run queues and
-/// port wait queues. Futex buckets use a separate WaitNode-based queue
-/// (see sched/futex.zig).
-pub const EcQueue = zag.utils.containers.priority_queue.PriorityQueue(
-    ExecutionContext,
-    "next",
-    "priority",
-    @typeInfo(Priority).@"enum".fields.len,
-);
-
 pub const Allocator = SecureSlab(ExecutionContext, 256);
 pub var slab_instance: Allocator = undefined;
 
