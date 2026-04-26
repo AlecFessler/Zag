@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 204.
-**Remaining:** 264.
+**Implemented:** 214.
+**Remaining:** 254.
 
 ## Convention
 
@@ -294,7 +294,7 @@ _§[restart_semantics] Restart Semantics_
 - [x] **11** — on success, when N > 0 and `map` is 3, only the pages at the specified offsets are freed; `map` stays 3 unless every demand-allocated page has been freed, in which case it becomes 0.
 - [x] **12** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## remap — 8/9
+## remap — 9/9
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
 - [x] **02** — returns E_INVAL if [1].field1 `map` is 0 or 2 (no pf or demand mapping to remap).
@@ -304,19 +304,19 @@ _§[restart_semantics] Restart Semantics_
 - [x] **06** — returns E_INVAL if any reserved bits are set in [2].
 - [x] **07** — on success, [1].field1 `cur_rwx` is set to [2] new_cur_rwx.
 - [x] **08** — on success, subsequent accesses to mapped pages use effective permissions = `cur_rwx` ∩ `page_frame.r/w/x` (for map=1) or `cur_rwx` (for map=3).
-- [ ] **09** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+- [x] **09** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## snapshot — 0/11
+## snapshot — 9/11
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
-- [ ] **02** — returns E_BADCAP if [2] is not a valid VAR handle.
-- [ ] **03** — returns E_INVAL if [1].caps.restart_policy is not 3 (snapshot).
-- [ ] **04** — returns E_INVAL if [2].caps.restart_policy is not 2 (preserve).
-- [ ] **05** — returns E_INVAL if [1] and [2] have different sizes (`page_count` × `sz`).
-- [ ] **06** — returns E_INVAL if any reserved bits are set in [1] or [2].
-- [ ] **07** — calling `snapshot` a second time on the same target replaces the prior source binding.
-- [ ] **08** — if the source [2] is deleted before restart, the binding is cleared; on restart with no source bound, the domain is terminated rather than restarted.
-- [ ] **09** — on domain restart, when the source's stability constraints hold, [1]'s contents are replaced by a copy of [2]'s contents before the domain resumes.
+- [x] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
+- [x] **02** — returns E_BADCAP if [2] is not a valid VAR handle.
+- [x] **03** — returns E_INVAL if [1].caps.restart_policy is not 3 (snapshot).
+- [x] **04** — returns E_INVAL if [2].caps.restart_policy is not 2 (preserve).
+- [x] **05** — returns E_INVAL if [1] and [2] have different sizes (`page_count` × `sz`).
+- [x] **06** — returns E_INVAL if any reserved bits are set in [1] or [2].
+- [x] **07** — calling `snapshot` a second time on the same target replaces the prior source binding.
+- [x] **08** — if the source [2] is deleted before restart, the binding is cleared; on restart with no source bound, the domain is terminated rather than restarted.
+- [x] **09** — on domain restart, when the source's stability constraints hold, [1]'s contents are replaced by a copy of [2]'s contents before the domain resumes.
 - [ ] **10** — on domain restart, when [2].map = 1 and any backing page_frame has `mapcnt > 1` or the source's effective write permission is nonzero, the restart fails and the domain is terminated.
 - [ ] **11** — on domain restart, when [2].map = 3 and `[2].cur_rwx.w = 1`, the restart fails and the domain is terminated.
 
