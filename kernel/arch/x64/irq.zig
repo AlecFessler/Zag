@@ -1,11 +1,10 @@
-const std = @import("std");
 const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
+const device_region = zag.devices.device_region;
 const exceptions = zag.arch.x64.exceptions;
 const fpu = zag.sched.fpu;
-const futex = zag.proc.futex;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
@@ -13,17 +12,11 @@ const kprof_dump = zag.kprof.dump;
 const paging_mod = zag.arch.x64.paging;
 const sched = zag.sched.scheduler;
 
-const DeviceRegion = zag.memory.device_region.DeviceRegion;
+const DeviceRegion = zag.devices.device_region.DeviceRegion;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GateType = zag.arch.x64.idt.GateType;
-const PAddr = zag.memory.address.PAddr;
-const Process = zag.proc.process.Process;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const SchedInterruptContext = zag.sched.scheduler.SchedInterruptContext;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
-const Thread = zag.sched.thread.Thread;
-const UserViewEntry = zag.perms.permissions.UserViewEntry;
-const VAddr = zag.memory.address.VAddr;
 
 /// 16 IRQ lines (vectors 32-47) — legacy ISA IRQs remapped above the 32 exception
 /// vectors reserved by the architecture.
@@ -32,20 +25,6 @@ const VAddr = zag.memory.address.VAddr;
 const num_irq_entries = 16;
 
 var spurious_interrupts: u64 = 0;
-
-/// Maps IRQ line numbers to the DeviceRegion that owns each line.
-/// Populated during firmware table parsing. Static after boot.
-/// Systems.md §24.
-pub var irq_table: [256]?*DeviceRegion = [_]?*DeviceRegion{null} ** 256;
-
-/// Per-IRQ-line owner info for the IRQ pending bit path.
-/// Set by registerIrqOwner when a process takes ownership of a device IRQ.
-pub const IrqOwner = struct {
-    process: SlabRef(Process),
-    slot_index: u16,
-};
-
-pub var irq_owners: [256]?IrqOwner = [_]?IrqOwner{null} ** 256;
 
 /// I/O APIC MMIO base virtual address. Set during ACPI parsing.
 var ioapic_base: u64 = 0;
@@ -112,10 +91,10 @@ pub fn init() void {
     );
 
     // Lazy-FPU cross-core flush IPI vector. Sent by `cpu.fpuFlushIpi`
-    // when the scheduler migrates a thread whose FP regs still live on
+    // when the scheduler migrates an EC whose FP regs still live on
     // a remote core's hardware. Receiver runs `fpuFlushIpiHandler` to
-    // FXSAVE the requested thread's state from this core's regs into
-    // the thread's `fpu_state` buffer, then acks the mailbox.
+    // FXSAVE the requested EC's state from this core's regs into
+    // the EC's `fpu_state` buffer, then acks the mailbox.
     const fpu_flush_vec = @intFromEnum(interrupts.IntVecs.fpu_flush);
     idt.openInterruptGate(
         fpu_flush_vec,
@@ -160,67 +139,18 @@ pub fn init() void {
     // control without the IDT, using IA32_LSTAR for the entry point RIP.
 }
 
-/// IRQ pending bit position within the user view entry's field0.
-/// Bit 16 is used because the lower bits carry device_type/device_class
-/// metadata; bit 16 is otherwise unused padding in the device entry layout.
-const IRQ_PENDING_BIT: u64 = 1 << 16;
-
 /// Device IRQ handler — called for vectors 32-47 (ISA IRQ lines 0-15).
-/// Masks the IRQ line, sets bit 16 of field0 in the device's user view entry
-/// to signal the pending IRQ, and wakes any futex waiters on that address.
+/// Resolves the firing vector to its bound device_region and delegates
+/// to the generic `device_region.onIrq` path which masks the line, bumps
+/// every domain-local copy of `field1.irq_count`, and futex-wakes
+/// waiters per Spec §[device_irq].
 fn deviceIrqHandler(ctx: *cpu.Context) void {
     // The vector number is embedded in the Context by the interrupt stub.
-    // IRQ line = vector - 32 (ISA IRQ remapping).
+    // The IRQ source identifier the device_region table is keyed on is
+    // the LAPIC vector itself.
     const vector: u8 = @truncate(ctx.int_num);
-    const irq_line = vector - 32;
-
-    // Mask the IRQ to prevent re-entry until userspace acknowledges.
-    maskIrq(irq_line);
-
-    // Look up the owner info for this IRQ line.
-    const owner = irq_owners[irq_line] orelse return;
-    setIrqPendingBitForOwner(owner);
-}
-
-/// Set bit 16 of field0 in the device's user view entry via atomic OR,
-/// then wake any futex waiters on that physical address.
-/// Called from the device IRQ handler (interrupts disabled).
-fn setIrqPendingBitForOwner(owner: IrqOwner) void {
-    const proc = owner.process.lock(@src()) catch return;
-    defer owner.process.unlock();
-    if (proc.perm_view_phys.addr == 0) return;
-
-    // Calculate physical address of field0 in the user view entry.
-    // Each UserViewEntry is 32 bytes; field0 is at offset 16.
-    const field0_paddr = PAddr.fromInt(
-        proc.perm_view_phys.addr + @as(u64, owner.slot_index) * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"),
-    );
-    const field0_vaddr = VAddr.fromPAddr(field0_paddr, null);
-    const field0_ptr: *u64 = @ptrFromInt(field0_vaddr.addr);
-
-    // Atomic OR to set bit 16.
-    _ = @atomicRmw(u64, field0_ptr, .Or, IRQ_PENDING_BIT, .release);
-
-    // Wake all futex waiters on the physical address of field0.
-    _ = futex.wake(field0_paddr, std.math.maxInt(u32));
-}
-
-/// Clear bit 16 of field0 in the device's user view entry via atomic AND.
-/// Called from sysIrqAck after unmasking the IRQ line.
-pub fn clearIrqPendingBit(irq_line: u8) void {
-    const owner = irq_owners[irq_line] orelse return;
-    const proc = owner.process.lock(@src()) catch return;
-    defer owner.process.unlock();
-    if (proc.perm_view_phys.addr == 0) return;
-
-    const field0_paddr = PAddr.fromInt(
-        proc.perm_view_phys.addr + @as(u64, owner.slot_index) * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"),
-    );
-    const field0_vaddr = VAddr.fromPAddr(field0_paddr, null);
-    const field0_ptr: *u64 = @ptrFromInt(field0_vaddr.addr);
-
-    // Atomic AND to clear bit 16.
-    _ = @atomicRmw(u64, field0_ptr, .And, ~IRQ_PENDING_BIT, .release);
+    const dr = device_region.findDeviceByIrqSource(vector) orelse return;
+    device_region.onIrq(dr);
 }
 
 /// Intel SDM Vol 3A, §13.9 — spurious interrupt handler must return without EOI
@@ -238,7 +168,7 @@ fn kprofDumpHandler(_: *cpu.Context) void {
 }
 
 /// IPI handler for the lazy-FPU cross-core flush. Reads the requested
-/// thread from this core's mailbox, calls into the generic FPU module
+/// EC from this core's mailbox, calls into the generic FPU module
 /// (which checks if this core is still the owner and FXSAVEs if so),
 /// then acks the mailbox so the requester unblocks.
 fn fpuFlushIpiHandler(_: *cpu.Context) void {
@@ -248,20 +178,17 @@ fn fpuFlushIpiHandler(_: *cpu.Context) void {
         slot.ackDone();
         return;
     };
-    const thread: *Thread = @ptrCast(@alignCast(opaque_ptr));
-    fpu.flushIpiHandler(thread);
+    const ec: *ExecutionContext = @ptrCast(@alignCast(opaque_ptr));
+    fpu.flushIpiHandler(ec);
     slot.ackDone();
 }
 
+/// LAPIC-timer preemption tick. The scheduler reads the current EC and
+/// per-core state from `core_states[apic.coreID()]` directly, so the
+/// vector handler just delegates.
 fn schedTimerHandler(ctx: *cpu.Context) void {
-    const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
-    const from_user = (ctx.cs & ring_3) == 3;
-
-    var sched_interrupt_ctx: SchedInterruptContext = undefined;
-    sched_interrupt_ctx.privilege = if (from_user) .user else .kernel;
-    sched_interrupt_ctx.thread_ctx = @ptrCast(ctx);
-
-    sched.schedTimerHandler(sched_interrupt_ctx);
+    _ = ctx;
+    sched.preempt();
 }
 
 /// Mask an IRQ line by setting bit 16 (interrupt mask) of the low dword of
@@ -291,12 +218,18 @@ pub fn unmaskIrq(irq_line: u8) void {
     ioapic_lock.unlockIrqRestore(irq_state);
 }
 
-/// Look up which IRQ line, if any, is assigned to the given device region.
-pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {
-    for (irq_table, 0..) |dev_ptr, i| {
-        if (dev_ptr == device) return @truncate(i);
-    }
-    return null;
+/// Bind a hardware IRQ source to a DeviceRegion so device IRQs route into
+/// its `irq_count` and futex-wake every domain-local copy. Spec §[device_irq].
+pub fn registerDeviceIrq(device: *DeviceRegion, irq_source: u32) !void {
+    _ = device;
+    _ = irq_source;
+    @panic("not implemented");
+}
+
+/// Tear down the binding installed by `registerDeviceIrq`. Spec §[device_irq].
+pub fn unregisterDeviceIrq(device: *DeviceRegion) void {
+    _ = device;
+    @panic("not implemented");
 }
 
 /// Bind a hardware IRQ source to a DeviceRegion so device IRQs route into
