@@ -263,7 +263,31 @@ fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
 
     _ = syscall.mapPf(var_handle, &.{ 0, pf_handle });
 
-    const dst: [*]u8 = @ptrFromInt(var_base);
+    // KNOWN BUG (step 7g diagnosis, INCOMPLETE FIX): the user write
+    // below does not reach the page_frame's physical page. The kernel
+    // reads `48 83 ec 68` (this runner's own _start prologue bytes)
+    // when the user is supposed to be writing the test ELF magic
+    // `7f 45 4c 46`. Working theory: the inline asm in
+    // libz/syscall.zig::issueRawNoStack declares r12..r15 as outputs
+    // (vregs 10..13), and Zig/LLVM mis-tracks register liveness across
+    // a `volatile` asm where the same register appears as both an
+    // input and an output. The optimizer caches one of {var_base,
+    // bytes.ptr, bytes.len} in a callee-saved register across the
+    // map_pf syscall, then uses the post-syscall (clobbered) value
+    // when emitting the byte-copy loop. Multiple workarounds tried
+    // (volatile slice, noinline wrapper, explicit stack spill into
+    // *volatile, inline rep-movsb) all produce identical wrong bytes
+    // — disassembly confirms the rep-movsb args ARE reloaded from the
+    // stack, but the page_frame physical page still ends up filled
+    // with the runner's _start text.
+    //
+    // Next angle to investigate: the actual SOURCE pointer (bytes.ptr)
+    // may be wrong. Is `entry.bytes` from `inline for (manifest)`
+    // resolving to the runner's .text rather than .rodata @embedFile
+    // data? Probe by adding a syscall after the user write that
+    // surfaces (bytes.ptr, bytes.len) as args so the kernel can read
+    // them via the user PTE walk and dump.
+    const dst: [*]volatile u8 = @ptrFromInt(var_base);
     var i: usize = 0;
     while (i < bytes.len) {
         dst[i] = bytes[i];
