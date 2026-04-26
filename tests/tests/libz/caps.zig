@@ -42,6 +42,39 @@ pub const Cap = extern struct {
 
 pub const HANDLE_BYTES: usize = @sizeOf(Cap);
 
+// §[capabilities]: "Some handles carry kernel-mutable snapshots in their
+// field0/field1." Reads here are non-atomic snapshots; the holding
+// domain accepts that the kernel may have mutated the slot mid-read.
+// Use `sync` to force a fresh kernel-authoritative snapshot when that
+// matters.
+pub fn readCap(cap_table_base: u64, slot: u32) Cap {
+    const tbl: [*]const Cap = @ptrFromInt(cap_table_base);
+    return tbl[slot];
+}
+
+// §[device_region] field0 layout. dev_type at bits 0-3 distinguishes
+// mmio (0) vs port_io (1). For port_io, base_port at bits 4-19 and
+// port_count at bits 20-35 carry the x86-64 I/O port range.
+pub const DevType = enum(u4) {
+    mmio = 0,
+    port_io = 1,
+    _,
+};
+
+pub const DeviceRegionFields = struct {
+    dev_type: DevType,
+    base_port: u16,
+    port_count: u16,
+};
+
+pub fn deviceRegionFields(c: Cap) DeviceRegionFields {
+    return .{
+        .dev_type = @enumFromInt(@as(u4, @truncate(c.field0 & 0xF))),
+        .base_port = @truncate((c.field0 >> 4) & 0xFFFF),
+        .port_count = @truncate((c.field0 >> 20) & 0xFFFF),
+    };
+}
+
 // The 12-bit handle id is the only field a syscall ever takes. Upper
 // bits of the syscall word slot are _reserved.
 pub fn handleArg(slot: HandleId) u64 {
