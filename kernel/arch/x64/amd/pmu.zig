@@ -33,6 +33,7 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const pmu_facade = zag.arch.x64.pmu;
 const pmu_sched = zag.syscall.pmu;
+const port = zag.sched.port;
 const sched = zag.sched.scheduler;
 
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
@@ -459,11 +460,12 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
 }
 
 fn pmiHandler(ctx: *cpu.Context) void {
+    _ = ctx;
     // Registered as `.external`; `dispatchInterrupt` EOIs after we return.
-    const thread = sched.currentThread() orelse return;
-    // self-alive: PMI fires on the core running `thread`; pmu_state
+    const ec = sched.currentEc() orelse return;
+    // self-alive: PMI fires on the core running `ec`; pmu_state
     // can't be freed out from under us during the handler.
-    const state_ref = thread.pmu_state orelse return;
+    const state_ref = ec.pmu_state orelse return;
     const state_ptr = state_ref.ptr;
     if (state_ptr.num_counters == 0) return;
 
@@ -471,12 +473,16 @@ fn pmiHandler(ctx: *cpu.Context) void {
     // near its preload (i.e. is far below (2^48 - threshold_small)) is
     // treated as the overflowing one. Simpler policy: if at least one
     // counter's high bit cleared — meaning it overflowed past the 48-bit
-    // boundary — attribute the PMI to this thread. Otherwise drop as stale.
+    // boundary — attribute the PMI to this EC. Otherwise drop as stale.
     var overflowed = false;
+    var fired_idx: u64 = 0;
     var i: u8 = 0;
     while (i < state_ptr.num_counters) {
         const raw = cpu.rdmsr(perfctrMsr(i)) & COUNTER_MASK;
-        if (raw < state_ptr.values[i]) overflowed = true;
+        if (raw < state_ptr.values[i]) {
+            if (!overflowed) fired_idx = i;
+            overflowed = true;
+        }
         state_ptr.values[i] = raw;
         // Disable this counter so it can't re-fire before we hand off to
         // the fault handler.
@@ -485,21 +491,7 @@ fn pmiHandler(ctx: *cpu.Context) void {
     }
     if (!overflowed) return;
 
-    const rip_at_pmi = ctx.rip;
-    // self-alive: PMI fires on the core where `thread` is running;
-    // its owning Process is alive across this handler.
-    const proc = thread.process.ptr;
-    const delivered = proc.faultBlock(
-        thread,
-        .pmu_overflow,
-        rip_at_pmi,
-        rip_at_pmi,
-        ctx,
-    );
-
-    if (!delivered) {
-        proc.kill(.pmu_overflow);
-    }
+    port.firePmuOverflow(ec, fired_idx);
 
     cpu.enableInterrupts();
     sched.yield();

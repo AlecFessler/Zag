@@ -27,6 +27,7 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const pmu_facade = zag.arch.x64.pmu;
 const pmu_sched = zag.syscall.pmu;
+const port = zag.sched.port;
 const sched = zag.sched.scheduler;
 
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
@@ -370,6 +371,7 @@ pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
 }
 
 fn pmiHandler(ctx: *cpu.Context) void {
+    _ = ctx;
     // The PMI vector is registered as `.external`, so `dispatchInterrupt`
     // already issues `apic.endOfInterrupt()` after this handler returns.
     // Do NOT EOI here.
@@ -378,16 +380,16 @@ fn pmiHandler(ctx: *cpu.Context) void {
 
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, 0);
 
-    const thread = sched.currentThread() orelse return;
-    // self-alive: PMI fires on the core running `thread`; its pmu_state
+    const ec = sched.currentEc() orelse return;
+    // self-alive: PMI fires on the core running `ec`; its pmu_state
     // slot can't be freed under us because sysPmuStop would need to IPI
     // this core to clear the MSRs before destroying the slot.
-    const state_ref = thread.pmu_state orelse return;
+    const state_ref = ec.pmu_state orelse return;
     const state_ptr = state_ref.ptr;
 
     // Stale-PMI filter: require at least one overflow bit in the current
-    // thread's counter range. Otherwise this is a masked PMI from a prior
-    // thread being delivered after the context switch.
+    // EC's counter range. Otherwise this is a masked PMI from a prior
+    // EC being delivered after the context switch.
     if (state_ptr.num_counters == 0) return;
     const nbits: u6 = @intCast(state_ptr.num_counters);
     const owned_mask: u64 = (@as(u64, 1) << nbits) - 1;
@@ -399,21 +401,20 @@ fn pmiHandler(ctx: *cpu.Context) void {
         i += 1;
     }
 
-    const rip_at_pmi = ctx.rip;
-    // self-alive: PMI fires on the core where `thread` is running;
-    // its owning Process is alive across this handler.
-    const proc = thread.process.ptr;
-    const delivered = proc.faultBlock(
-        thread,
-        .pmu_overflow,
-        rip_at_pmi,
-        rip_at_pmi,
-        ctx,
-    );
-
-    if (!delivered) {
-        proc.kill(.pmu_overflow);
+    // The first overflow bit in the EC's counter range names the
+    // counter that fired. Pass it as the pmu_overflow event sub-code so
+    // a bound route can attribute the sample.
+    var fired_idx: u64 = 0;
+    var bit: u8 = 0;
+    while (bit < state_ptr.num_counters) {
+        const sh: u6 = @intCast(bit);
+        if (((status >> sh) & 1) != 0) {
+            fired_idx = bit;
+            break;
+        }
+        bit += 1;
     }
+    port.firePmuOverflow(ec, fired_idx);
 
     cpu.enableInterrupts();
     sched.yield();

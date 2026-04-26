@@ -2,7 +2,7 @@
 //!
 //! This is the aarch64 equivalent of x64/interrupts.zig. It defines the
 //! ArchCpuContext layout, implements syscall/IPC register accessors, and
-//! provides the thread context switch mechanism.
+//! provides the EC context switch mechanism.
 //!
 //! ArchCpuContext layout — saved on exception entry by the vector stub:
 //!   x0-x30:    31 general-purpose registers (248 bytes)
@@ -33,7 +33,7 @@
 //!   Software must save x0-x30 and SP_EL0 manually in the vector stub.
 //!
 //! Context switch:
-//!   switchTo() restores the target thread's ArchCpuContext and executes ERET.
+//!   switchTo() restores the target EC's ArchCpuContext and executes ERET.
 //!   ARM ARM D1.10.1: ERET restores PC from ELR_EL1, PSTATE from SPSR_EL1.
 //!
 //! Key functions to implement:
@@ -60,7 +60,7 @@ const paging = zag.arch.aarch64.paging;
 const scheduler = zag.sched.scheduler;
 const sync_debug = zag.utils.sync.debug;
 
-const Thread = zag.sched.thread.Thread;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const VAddr = zag.memory.address.VAddr;
 
 /// Number of general-purpose registers saved in a fault snapshot.
@@ -73,7 +73,7 @@ pub const fault_regs_size: usize = (3 + fault_gpr_count) * @sizeOf(u64);
 /// Total size of a FaultMessage written to userspace (32-byte header + regs).
 pub const fault_msg_size: usize = 32 + fault_regs_size;
 
-/// Architecture-neutral snapshot of a faulted thread's registers.
+/// Architecture-neutral snapshot of a faulted EC's registers.
 /// Used by fault delivery to serialize register state without the
 /// generic kernel referencing arch-specific register names.
 pub const FaultRegSnapshot = struct {
@@ -216,11 +216,11 @@ pub fn prepareThreadContext(
     return ctx;
 }
 
-/// Switch to the given thread by restoring its saved ArchCpuContext and
-/// executing ERET to return to the thread's execution context.
+/// Switch to the given EC by restoring its saved ArchCpuContext and
+/// executing ERET to return to the EC's userspace.
 ///
 /// Before restoring registers, this function:
-///   1. Swaps address space if the target process differs (TTBR0_EL1).
+///   1. Swaps address space if the target capability domain differs (TTBR0_EL1).
 ///
 /// ARM ARM D1.10.1: ERET restores PC from ELR_EL1, PSTATE from SPSR_EL1.
 ///
@@ -228,13 +228,13 @@ pub fn prepareThreadContext(
 /// and SPSR_EL1 from their slots past the 31 GPRs, then restores x1-x30
 /// from the context, and finally restores x0 last (since it held the base
 /// pointer), then executes ERET.
-pub fn switchTo(thread: *Thread) noreturn {
-    // self-alive: scheduler dispatched `thread` to this core; its
-    // owning Process stays alive through the switch window.
-    const proc = thread.process.ptr;
-    const new_root = proc.addr_space_root;
+pub fn switchTo(ec: *ExecutionContext) noreturn {
+    // self-alive: scheduler dispatched `ec` to this core; its bound
+    // capability domain stays alive through the switch window.
+    const domain = ec.domain.ptr;
+    const new_root = domain.addr_space_root;
     if (new_root.addr != paging.getAddrSpaceRoot().addr) {
-        paging.swapAddrSpace(new_root, proc.addr_space_id);
+        paging.swapAddrSpace(new_root, domain.addr_space_id);
     }
 
     // lockdep: this asm `eret` abandons the call stack the IRQ-handler
@@ -245,40 +245,41 @@ pub fn switchTo(thread: *Thread) noreturn {
     // (the depth is already zero there).
     sync_debug.resetIrqContextOnSwitch();
 
-    // Lazy FPU: CPACR_EL1.FPEN should trap iff `thread` isn't the
-    // current FPU owner on this core. Track the desired state in a
-    // shadow var and only touch CPACR when it changes — MSRs to
-    // CPACR_EL1 ISB-fence and may trap to EL2 under some hypervisors,
-    // so skipping no-op writes matters.
+    // Lazy FPU: CPACR_EL1.FPEN should trap iff `ec` isn't the current
+    // FPU owner on this core. Track the desired state per-core and only
+    // touch CPACR when it changes — MSRs to CPACR_EL1 ISB-fence and may
+    // trap to EL2 under some hypervisors, so skipping no-op writes
+    // matters.
     //
-    // Cross-core migration: if the thread's FP regs live on another
-    // core, IPI it to flush before we can safely fxrstor here.
+    // Cross-core migration: if the EC's FP regs live on another core,
+    // IPI it to flush before we can safely fxrstor here.
     //
     // Skipped under -Dlazy_fpu=false (eager baseline): the FPU regs
     // were already swapped in scheduler.switchToWithPmu and FPEN stays
     // open, so no migration flush is needed either.
     if (comptime fpu.lazy_enabled) {
-        fpu.migrateFlush(thread);
+        fpu.migrateFlush(ec);
         const cid: u8 = @truncate(gic.coreID());
-        const desired_armed = (scheduler.last_fpu_owner[cid] != thread);
-        if (desired_armed != scheduler.fpu_trap_armed[cid]) {
+        const per_core = &scheduler.core_states[cid];
+        const desired_armed = (per_core.last_fpu_owner != ec);
+        if (desired_armed != per_core.fpu_trap_armed) {
             if (desired_armed) cpu.fpuArmTrap() else cpu.fpuClearTrap();
-            scheduler.fpu_trap_armed[cid] = desired_armed;
+            per_core.fpu_trap_armed = desired_armed;
         }
     }
 
-    // Restore SP_EL1 so the incoming thread's in-progress kernel frames
-    // (if it was preempted inside EL1) are reachable, and fresh threads
-    // start with their kernel stack empty. `thread.ctx` always points at
-    // the saved ArchCpuContext; adding 288 bytes pops the full trampoline
-    // frame (16-byte vector-stub push + 272-byte context). Prior to this
-    // fix, SP_EL1 was left pointing at whatever stack switchTo() happened
-    // to be running on, which was the *outgoing* thread's kernel stack —
-    // subsequent exception entries from EL0 then trampled unrelated
-    // frames. (x64 handles the EL0-entry case via TSS.rsp0 and never
-    // needs this because interrupted kernel code just continues on its
-    // own rsp through the standard epilogue.)
-    const new_sp = @intFromPtr(thread.ctx) + 288;
+    // Restore SP_EL1 so the incoming EC's in-progress kernel frames (if
+    // it was preempted inside EL1) are reachable, and fresh ECs start
+    // with their kernel stack empty. `ec.ctx` always points at the
+    // saved ArchCpuContext; adding 288 bytes pops the full trampoline
+    // frame (16-byte vector-stub push + 272-byte context). Prior to
+    // this fix, SP_EL1 was left pointing at whatever stack switchTo()
+    // happened to be running on, which was the *outgoing* EC's kernel
+    // stack — subsequent exception entries from EL0 then trampled
+    // unrelated frames. (x64 handles the EL0-entry case via TSS.rsp0
+    // and never needs this because interrupted kernel code just
+    // continues on its own rsp through the standard epilogue.)
+    const new_sp = @intFromPtr(ec.ctx) + 288;
 
     // ctx points to the saved ArchCpuContext (regs x0-x30, sp_el0, elr_el1, spsr_el1).
     // Register file layout: x0 at offset 0, x1 at offset 8, ..., x30 at offset 240,
@@ -329,7 +330,7 @@ pub fn switchTo(thread: *Thread) noreturn {
         // Return to the thread (ARM ARM D1.10.1).
         \\eret
         :
-        : [ctx] "r" (@intFromPtr(thread.ctx)),
+        : [ctx] "r" (@intFromPtr(ec.ctx)),
           [new_sp] "r" (new_sp),
     );
     unreachable;

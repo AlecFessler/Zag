@@ -31,6 +31,7 @@
 const zag = @import("zag");
 
 const pmu_sched = zag.syscall.pmu;
+const port = zag.sched.port;
 const sched = zag.sched.scheduler;
 
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
@@ -568,18 +569,19 @@ fn clearAllOverflowStatus(num_counters: u8) void {
 ///   * ARM ARM DDI 0487 K.a §D13.3.21 PMINTENCLR_EL1 — masking removes
 ///     the counter's contribution to PMUIRQ without losing PMOVSSET state.
 pub fn pmiHandler(ctx: *ArchCpuContext) void {
-    const thread = sched.currentThread() orelse {
-        // No thread context (can happen during early boot transitions).
+    _ = ctx;
+    const ec = sched.currentEc() orelse {
+        // No EC context (can happen during early boot transitions).
         // Just scrub any pending overflow bits so the PPI deasserts.
         writePMINTENCLR(~@as(u64, 0));
         writePMOVSCLR(~@as(u64, 0));
         return;
     };
-    // self-alive: PMI fires on the core running `thread`; its pmu_state
+    // self-alive: PMI fires on the core running `ec`; its pmu_state
     // slot can't be freed under us during this handler.
-    const state_ref = thread.pmu_state orelse {
-        // No PMU state on this thread — another thread's overflow that
-        // was latched before the context switch. Mask and clear so the
+    const state_ref = ec.pmu_state orelse {
+        // No PMU state on this EC — another EC's overflow that was
+        // latched before the context switch. Mask and clear so the
         // level-sensitive PPI line drops, then return.
         writePMINTENCLR(~@as(u64, 0));
         writePMOVSCLR(~@as(u64, 0));
@@ -588,7 +590,7 @@ pub fn pmiHandler(ctx: *ArchCpuContext) void {
     const state_ptr = state_ref.ptr;
 
     // Stale-PMI filter: require at least one overflow bit that maps to
-    // a counter owned by the current thread. Matches the Intel PMI
+    // a counter owned by the current EC. Matches the Intel PMI
     // filter in `arch/x64/intel/pmu.zig`.
     if (state_ptr.num_counters == 0) {
         writePMINTENCLR(~@as(u64, 0));
@@ -599,13 +601,13 @@ pub fn pmiHandler(ctx: *ArchCpuContext) void {
     const owned_mask: u64 = (@as(u64, 1) << nbits) - 1;
     const status = readPMOVSCLR();
     if ((status & owned_mask) == 0) {
-        // Overflow bit belongs to a different thread or a slot we no
+        // Overflow bit belongs to a different EC or a slot we no
         // longer own; just clear every bit to drop the PPI and return.
         writePMOVSCLR(status);
         return;
     }
 
-    // Snapshot every counter's live value so the faulted thread's
+    // Snapshot every counter's live value so the faulted EC's
     // userspace fault handler can observe the sample.
     var i: u8 = 0;
     while (i < state_ptr.num_counters) {
@@ -621,23 +623,23 @@ pub fn pmiHandler(ctx: *ArchCpuContext) void {
     writePMINTENCLR(owned_mask);
     writePMOVSCLR(status);
 
-    const rip_at_pmi = ctx.elr_el1;
-    // self-alive: PMU overflow fires on the core where `thread` is
-    // running; its owning Process is alive across this handler.
-    const proc = thread.process.ptr;
-    const delivered = proc.faultBlock(
-        thread,
-        .pmu_overflow,
-        rip_at_pmi,
-        rip_at_pmi,
-        ctx,
-    );
-
-    if (!delivered) {
-        proc.kill(.pmu_overflow);
+    // Identify the first overflowing counter slot as the event sub-code
+    // payload. Routes that bind pmu_overflow get the index of the
+    // counter that fired; no-route fallback drops the event.
+    var fired_idx: u64 = 0;
+    var bit: u8 = 0;
+    while (bit < state_ptr.num_counters) {
+        const sh: u6 = @intCast(bit);
+        if (((status >> sh) & 1) != 0) {
+            fired_idx = bit;
+            break;
+        }
+        bit += 1;
     }
+    port.firePmuOverflow(ec, fired_idx);
 
-    // Hand off to the scheduler so the fault handler (or a new thread,
-    // if this process was killed) can run. schedYield is noreturn.
+    // Hand off to the scheduler so the route's bound port handler (or
+    // the next ready EC, if no route was bound) can run. yield is
+    // noreturn.
     sched.yield();
 }
