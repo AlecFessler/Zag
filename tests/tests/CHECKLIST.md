@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 234.
-**Remaining:** 234.
+**Implemented:** 244.
+**Remaining:** 224.
 
 ## Convention
 
@@ -342,25 +342,25 @@ _§[restart_semantics] Restart Semantics_
 - [x] **07** — on success, the qwords from vregs `[3..2+count]` are written into the VAR starting at [2] offset.
 - [x] **08** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## create_page_frame — 2/10
+## create_page_frame — 10/10
 
 - [x] **01** — returns E_PERM if the caller's self-handle lacks `crpf`.
 - [x] **02** — returns E_PERM if caps' r/w/x bits are not a subset of the caller's `pf_ceiling.max_rwx`.
-- [ ] **03** — returns E_PERM if caps.max_sz exceeds the caller's `pf_ceiling.max_sz`.
-- [ ] **04** — returns E_INVAL if [3] pages is 0.
-- [ ] **05** — returns E_INVAL if caps.max_sz is 3 (reserved).
-- [ ] **06** — returns E_INVAL if props.sz is 3 (reserved).
-- [ ] **07** — returns E_INVAL if props.sz exceeds caps.max_sz.
-- [ ] **08** — returns E_INVAL if any reserved bits are set in [1] or [2].
-- [ ] **09** — on success, the caller receives a page frame handle with caps = `[1].caps`.
-- [ ] **10** — on success, field0 contains `[3]` pages and `[2].props.sz`.
+- [x] **03** — returns E_PERM if caps.max_sz exceeds the caller's `pf_ceiling.max_sz`.
+- [x] **04** — returns E_INVAL if [3] pages is 0.
+- [x] **05** — returns E_INVAL if caps.max_sz is 3 (reserved).
+- [x] **06** — returns E_INVAL if props.sz is 3 (reserved).
+- [x] **07** — returns E_INVAL if props.sz exceeds caps.max_sz.
+- [x] **08** — returns E_INVAL if any reserved bits are set in [1] or [2].
+- [x] **09** — on success, the caller receives a page frame handle with caps = `[1].caps`.
+- [x] **10** — on success, field0 contains `[3]` pages and `[2].props.sz`.
 
-## port_io_virtualization — 0/11
+## port_io_virtualization — 2/11
 
 _§[port_io_virtualization] x86-64 Port I/O Virtualization_
 
-- [ ] **01** — `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and the running architecture is not x86-64.
-- [ ] **02** — `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and [1].field1.cch != 1 (uc).
+- [x] **01** — `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and the running architecture is not x86-64.
+- [x] **02** — `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and [1].field1.cch != 1 (uc).
 - [ ] **03** — `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and [1].caps.x is set.
 - [ ] **04** — a 1-, 2-, or 4-byte MOV load from `VAR.base + offset` (offset < port_count, `cur_rwx.r = 1`) leaves the destination GPR holding the value an x86-64 `in` of the matching operand width at port `base_port + offset` would produce, and execution resumes at the instruction immediately following the MOV.
 - [ ] **05** — a 1-, 2-, or 4-byte MOV store to `VAR.base + offset` (offset < port_count, `cur_rwx.w = 1`) commits the source value to port `base_port + offset` (observable on a loopback device_region as a subsequent MOV load returning that value), and execution resumes at the instruction immediately following the MOV.
