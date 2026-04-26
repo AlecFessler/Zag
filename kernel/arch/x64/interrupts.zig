@@ -235,12 +235,10 @@ comptime {
 }
 
 // PerCore offsets the Phase 5 asm hardcodes (immediate displacements).
-// PerCore is a non-extern struct so layout is technically unspecified
-// per Zig, but in practice declaration order is preserved when no
-// alignment/packed annotation forces otherwise. These asserts pin the
-// hardcoded immediates against `@offsetOf` so any future reorder of
-// PerCore fields trips a clean compile error instead of silently
-// reading the wrong slot from the fast path.
+// PerCore is now an `extern struct` (see `scheduler.zig`) so declaration
+// order is fixed and these literals are stable across Zig versions.
+// The asserts catch any later field reorder before the asm reads from
+// the wrong slot.
 comptime {
     if (Offsets.pc_last_fpu_owner != 72) @compileError(
         "Phase 5 asm hardcodes PerCore.last_fpu_owner at +72; @offsetOf disagrees — update the asm or PerCore",
@@ -251,12 +249,16 @@ comptime {
 }
 
 // ExecutionContext.domain offset — Phase 5 walks receiver.domain.ptr
-// via a single load `56(%%r11)`. EC is non-extern, so the assert
-// pins the hardcoded immediate against the actual @offsetOf at
-// comptime; layout drift fails the build with a clear pointer.
+// via a single load. EC carries optional-of-extern-struct fields
+// (`?SlabRef(...)`, `?Stack`) that block converting it to extern, so
+// its layout is at the mercy of Zig's auto-reorder. The asm therefore
+// substitutes `Offsets.ec_domain_ptr` as an `"i"` immediate operand at
+// the Phase 5 publish-domain site; the assert below only sanity-checks
+// that `domain` is 8-aligned — the actual numeric value is whatever
+// Zig hands us.
 comptime {
-    if (Offsets.ec_domain_ptr != 56) @compileError(
-        "Phase 5 asm hardcodes EC.domain at +56; @offsetOf disagrees — update the asm or EC layout",
+    if (Offsets.ec_domain_ptr % 8 != 0) @compileError(
+        "EC.domain must be 8-aligned for the Phase 5 SlabRef.ptr load",
     );
 }
 
@@ -788,17 +790,20 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%r11, %%gs:32                 // current_ec = receiver
         // Read receiver.domain.ptr — SlabRef(CapabilityDomain) starts
         // at @offsetOf(EC,"domain"); SlabRef.ptr is the first field
-        // (offset 0 within the SlabRef). Hardcoded immediate is
-        // asserted equal to Offsets.ec_domain_ptr.
-        \\movq 56(%%r11), %%rcx               // SlabRef.ptr at EC+56
+        // (offset 0 within the SlabRef). EC is non-extern (carries
+        // optional-of-struct fields that bar the conversion) so its
+        // layout is whatever Zig's auto-reorder produces; the
+        // displacement is supplied as an `"i"` operand resolved at
+        // comptime from `Offsets.ec_domain_ptr`.
+        \\movq %[ec_domain](%%r11), %%rcx
         \\movq %%rcx, %%gs:40                 // current_domain = receiver.domain.ptr
 
         // (c) Lazy-FPU policy. per_core_ptr is at scratch[112].
         \\movq %%gs:112, %%rcx                // *PerCore
-        // Read PerCore.last_fpu_owner. The actual offset is captured
-        // at comptime via Offsets.pc_last_fpu_owner; the asm uses
-        // immediate `64(%%rcx)` matching that comptime value (see
-        // assert below).
+        // Read PerCore.last_fpu_owner. PerCore is `extern struct`
+        // (declaration order pinned), so the displacement is the
+        // canonical `Offsets.pc_last_fpu_owner = 72`. The comptime
+        // assert above guards against future reorders.
         \\movq 72(%%rcx), %%r11               // PerCore.last_fpu_owner
         \\cmpq %%r11, %%gs:80                 // == receiver?
         \\je .L_phase5_clear_ts
@@ -916,6 +921,8 @@ pub export fn syscallEntry() callconv(.naked) void {
         // sees the same state the user invoked with. We've added a
         // few gs scratch writes (negligible).
         \\jmp .L_slow
+        :
+        : [ec_domain] "i" (Offsets.ec_domain_ptr),
     );
 }
 

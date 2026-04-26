@@ -37,7 +37,13 @@ pub const MAX_CORES: u8 = 64;
 pub const TIMESLICE_NS: u64 = 2_000_000;
 
 /// Per-core scheduler state. One entry per active core in `core_states[]`.
-pub const PerCore = struct {
+///
+/// `extern struct` pins field declaration order so the Phase-5 IPC
+/// fast-path asm in `arch/x64/interrupts.zig` can keep its hardcoded
+/// immediate displacements (`72(%%rcx)` for `last_fpu_owner`,
+/// `80(%%rcx)` for `fpu_trap_armed`) regardless of Zig's auto-reorder
+/// rules across versions.
+pub const PerCore = extern struct {
     /// Priority-ordered intrusive PQ over EC.next. Drained by
     /// `dequeue` on context switch / yield / preempt.
     run_queue: EcQueue = .{},

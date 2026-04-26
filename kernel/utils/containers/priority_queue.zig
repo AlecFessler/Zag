@@ -54,10 +54,14 @@ pub fn PriorityQueue(
         }
     };
 
-    return struct {
+    // `extern struct` here pins the field layout so dependents that
+    // hardcode immediate displacements (Phase-5 IPC fast path on x64
+    // referencing PerCore.run_queue + waiter heads) are not at the mercy
+    // of Zig's auto-reorder.
+    return extern struct {
         const Self = @This();
 
-        const Level = struct {
+        const Level = extern struct {
             head: ?*T = null,
             tail: ?*T = null,
         };
