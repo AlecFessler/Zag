@@ -36,6 +36,10 @@ rsp, rcx, and r11 are not GPR-backed: rsp is the stack pointer anchor, and rcx/r
 | 1..31 | x0..x30 |
 | 32..127 | `[sp + (N - 31) * 8]` — stack |
 
+### syscall word
+
+Bits 0-11 of vreg 0 carry the syscall number (0..4095). Higher bits are reserved unless a syscall claims them — when claimed, each syscall's spec calls out the layout (e.g., `pair_count` in bits 12-19, `tstart` in bits 20-31, `reply_handle_id` in bits 32-43, `event_type` in bits 44-48). Bits not assigned by the invoked syscall must be zero on entry; the kernel returns E_INVAL if a reserved bit is set.
+
 ## §[error_codes] Error Codes
 
 Error codes are returned in vreg 1 by syscalls that fail. Zero indicates success.
@@ -431,7 +435,7 @@ Self-handle cap required: `crcd`.
 
 The ELF image is read from `elf_page_frame` starting at byte 0. The pointer to the new domain's read-only view of its capability table is passed as the first argument to the initial EC's entry point.
 
-The caller receives an IDC handle to the new domain with caps = the caller's own `cridc_ceiling`. The new domain's slot-2 self-IDC handle is minted with caps = the `cridc_ceiling` passed in [2].
+The caller receives an IDC handle to the new domain with caps = the caller's own `cridc_ceiling`. The new domain's slot-2 self-IDC handle is minted with caps = the `cridc_ceiling` passed in [2]. The new domain's slot-1 initial-EC handle is minted with caps = the new domain's `ec_inner_ceiling` from [2].
 
 Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's handle table has no free slot for the returned IDC handle.
 
@@ -455,7 +459,7 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 [test 18] returns E_INVAL if any two entries in [4+] reference the same source handle.
 [test 19] on success, the caller receives an IDC handle to the new domain with caps = the caller's `cridc_ceiling`.
 [test 20] on success, the new domain's handle table contains the self-handle at slot 0 with caps = `self_caps`.
-[test 21] on success, the new domain's handle table contains the initial EC at slot 1.
+[test 21] on success, the new domain's handle table contains the initial EC at slot 1 with caps = the `ec_inner_ceiling` supplied in [2].
 [test 22] on success, the new domain's handle table contains an IDC handle to itself at slot 2 with caps = the passed `cridc_ceiling`.
 [test 23] on success, passed handles occupy slots 3+ of the new domain's handle table in the order supplied, each with the caps specified in its entry.
 [test 24] a passed handle entry with `move = 1` is removed from the caller's handle table after the call.
