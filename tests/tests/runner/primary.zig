@@ -2,13 +2,26 @@
 //
 // Architecture (per the task brief):
 //   - The primary owns all rights and orchestrates tests.
-//   - It mints a result port and spawns each test as its own child
-//     capability domain, passing the port handle with `bind | xfer`
-//     caps. The kernel scheduler/SMP gives parallelism for free.
+//   - It mints a single result port and spawns each test as its own
+//     child capability domain, passing the port handle with `bind |
+//     xfer` caps. The kernel scheduler/SMP gives parallelism for free.
 //   - Each child performs its assertion logic and calls `suspend` on
 //     the port with vregs 3 (result_code) and 4 (assertion_id) loaded.
 //     The primary `recv`s the suspension event, records the result,
 //     and `reply`s to resume the child. The child then exits.
+//
+// Orchestration shape (parallel):
+//   1. create_port (once).
+//   2. Spawn ALL embedded tests up front via `spawnOne`. Each spawn
+//      that succeeds is counted; failed spawns are dropped on the floor
+//      (no recv is ever queued for them).
+//   3. Run a fixed-iteration recv loop sized to the count of successful
+//      spawns. Per iteration: recv on the shared port, decode the
+//      reply_handle_id / result_code / assertion_id, log a single
+//      `[runner] result: code=X aid=Y` line, record, reply.
+//   Per §[recv], when multiple senders are queued the kernel selects
+//   the highest-priority sender (FIFO on ties), so the primary drains
+//   the queue one suspended child at a time.
 //
 // v0 limitation: test ELFs are embedded directly into this primary's
 // .rodata via @embedFile, surfaced through the `embedded_tests`
@@ -30,12 +43,12 @@ pub const ResultCode = enum(u64) {
 };
 
 pub const TestResult = struct {
-    name: []const u8,
     code: ResultCode,
     assertion_id: u64,
 };
 
-const MAX_TESTS: usize = 64;
+// Sized to comfortably exceed the current manifest length (~291).
+const MAX_TESTS: usize = 512;
 
 var results_buf: [MAX_TESTS]TestResult = undefined;
 var result_count: usize = 0;
@@ -44,9 +57,10 @@ var serial: serial_mod.Serial = serial_mod.DISABLED;
 pub fn main(cap_table_base: u64) void {
     serial = serial_mod.init(cap_table_base);
 
-    // §[port] create_port — mint a result port. Caps include
-    // bind+recv+xfer so the primary can recv events and the children
-    // can suspend with attached handles if a future test needs them.
+    // §[port] / §[create_port] — mint a single shared result port.
+    // Caps include bind+recv+xfer so the primary can recv events and
+    // the children can suspend with attached handles if a future test
+    // needs them.
     const port_caps = caps.PortCap{
         .move = true,
         .copy = true,
@@ -61,13 +75,52 @@ pub fn main(cap_table_base: u64) void {
     serial.printU64(embedded_tests.manifest.len);
     serial.print(" tests\n");
 
-    // Spawn each embedded test in turn. Tests that touch globally
-    // limited resources should be ordered serially here; tests that
-    // can run concurrently can be spawned without waiting on prior
-    // recvs and harvested by a later batched recv loop. v0 spawns
-    // sequentially with one recv per spawn — simplest correct shape.
+    // Phase 1: spawn every embedded test against the same port. Track
+    // the count of successful spawns so the recv loop knows how many
+    // suspension events to expect.
+    var successful_spawns: usize = 0;
     inline for (embedded_tests.manifest) |entry| {
-        spawnAndCollect(entry, port_handle);
+        if (spawnOne(entry, port_handle)) {
+            successful_spawns += 1;
+        }
+    }
+
+    serial.print("[runner] spawned ");
+    serial.printU64(successful_spawns);
+    serial.print(" / ");
+    serial.printU64(embedded_tests.manifest.len);
+    serial.print("\n");
+
+    // Phase 2: drain exactly `successful_spawns` suspension events
+    // from the shared port. Per §[recv] the kernel dequeues the
+    // highest-priority queued sender (FIFO on ties); we cannot tell
+    // which test sent which result because §[event_state] for a
+    // `suspension` event does not carry a name — it only carries the
+    // suspended EC's vreg snapshot. We log result_code + assertion_id
+    // per event and let `summarize()` produce the aggregate counts.
+    var collected: usize = 0;
+    while (collected < successful_spawns) {
+        const got = syscall.recv(port_handle);
+
+        const reply_handle_id: caps.HandleId = @truncate((got.word >> 32) & 0xFFF);
+        const result_code: ResultCode = @enumFromInt(got.regs.v3);
+        const assertion_id: u64 = got.regs.v4;
+
+        record(.{
+            .code = result_code,
+            .assertion_id = assertion_id,
+        });
+
+        serial.print("[runner] result: code=");
+        serial.printU64(@intFromEnum(result_code));
+        serial.print(" aid=");
+        serial.printU64(assertion_id);
+        serial.print("\n");
+
+        // Resume the child so it can exit cleanly.
+        _ = syscall.reply(reply_handle_id);
+
+        collected += 1;
     }
 
     summarize();
@@ -78,40 +131,11 @@ pub fn main(cap_table_base: u64) void {
     _ = syscall.powerShutdown();
 }
 
-fn spawnAndCollect(entry: embedded_tests.Entry, port_handle: caps.HandleId) void {
-    spawnOne(entry, port_handle);
-
-    // Block on recv. v3 §[recv]: returns the dequeued sender's vreg
-    // snapshot in our vregs, plus a syscall word with reply_handle_id
-    // and event_type. The result encoding lives in vregs 3 and 4 by
-    // the protocol the mock test follows.
-    const got = syscall.recv(port_handle);
-
-    const reply_handle_id: caps.HandleId = @truncate((got.word >> 32) & 0xFFF);
-    const result_code: ResultCode = @enumFromInt(got.regs.v3);
-    const assertion_id: u64 = got.regs.v4;
-
-    record(.{
-        .name = entry.name,
-        .code = result_code,
-        .assertion_id = assertion_id,
-    });
-
-    serial.print("[runner] ");
-    serial.print(entry.name);
-    if (result_code == .pass) {
-        serial.print(" PASS\n");
-    } else {
-        serial.print(" FAIL (assertion id ");
-        serial.printU64(assertion_id);
-        serial.print(")\n");
-    }
-
-    // Resume the child so it can exit cleanly.
-    _ = syscall.reply(reply_handle_id);
-}
-
-fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) void {
+// Spawns a single test capability domain bound to the shared result
+// port. Returns true on success, false if create_capability_domain
+// reported an error in vreg 1 — the caller skips queueing a recv for
+// failed spawns so the recv loop's iteration count stays accurate.
+fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
     // Stage the ELF bytes into a fresh page frame. v0 path:
     //   1. create_page_frame sized to ceil(elf_len, 4 KiB).
     //   2. create_var with caps.r|w to give us a temporary VAR.
@@ -187,13 +211,27 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) void {
     };
     const self_caps: u64 = @as(u64, child_self.toU16());
 
-    _ = syscall.createCapabilityDomain(
+    const r = syscall.createCapabilityDomain(
         self_caps,
         ceilings_inner,
         ceilings_outer,
         pf_handle,
         passed[0..],
     );
+
+    // §[error_codes]: vreg 1 holds an E_* code (1..15) on failure and
+    // a handle word (slot in bits 0-11, type tag in bits 12-15, caps
+    // in bits 48-63) on success. Per `lib.testing.isHandleError`, any
+    // vreg-1 value in [1, 15] is unambiguously an error. Skip
+    // queueing a recv for failed spawns so the recv loop's iteration
+    // count stays accurate.
+    if (lib.testing.isHandleError(r.v1)) {
+        serial.print("[runner] spawn FAILED (");
+        serial.print(entry.name);
+        serial.print(")\n");
+        return false;
+    }
+    return true;
 }
 
 fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
