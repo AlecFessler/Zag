@@ -186,6 +186,13 @@ pub const ExecutionContext = struct {
     /// single-addr waits, up to MAX_FUTEX_ADDRS (63) for multi-addr.
     futex_bucket_count: u8 = 0,
 
+    /// Pointer to an array of N caller-domain user vaddrs paired with
+    /// `futex_wait_nodes` (entry i corresponds to wait-node i). The wake
+    /// path reads `futex_wait_vaddrs[futex_wake_index]` to surface the
+    /// matched user vaddr per spec §[futex_wait_val]/[futex_wait_change]
+    /// vreg-1 contract. `null` outside `.futex_wait`.
+    futex_wait_vaddrs: ?[*]const u64 = null,
+
     // ── Event metadata — meaningful iff state == .suspended_on_port ───
 
     /// Type of event that triggered the suspension. `none` when the EC
@@ -591,6 +598,7 @@ pub fn restartEntry(ec: *ExecutionContext) void {
     ec.originating_write_cap = false;
     ec.iret_frame = null;
     ec.futex_wait_nodes = null;
+    ec.futex_wait_vaddrs = null;
     ec.futex_bucket_count = 0;
     ec.futex_deadline_ns = 0;
     ec.futex_wake_index = 0;
