@@ -23,6 +23,8 @@
 
 const zag = @import("zag");
 
+const errors = zag.syscall.errors;
+
 const Capability = zag.caps.capability.Capability;
 const CapabilityType = zag.caps.capability.CapabilityType;
 const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
@@ -191,7 +193,7 @@ pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
 /// Allocate a new CapabilityDomain — slab slot, two 96 KiB handle-
 /// table pages from PMM, address-space root, slot-0 self-handle,
 /// slot-1 initial EC handle (filled by caller), slot-2 self-IDC.
-fn allocCapabilityDomain(
+pub fn allocCapabilityDomain(
     self_caps: u16,
     field0_ceilings: u64,
     field1_ceilings: u64,
@@ -282,25 +284,50 @@ fn readSelfCaps(cd: *const CapabilityDomain) u16 {
 }
 
 /// Append `v` to `vars[var_count]`. Returns E_FULL when at MAX.
-fn appendVar(cd: *CapabilityDomain, v: *VAR) i64 {
-    _ = cd;
-    _ = v;
-    return -1;
+pub fn appendVar(cd: *CapabilityDomain, v: *VAR) i64 {
+    if (cd.var_count >= cd.vars.len) return errors.E_FULL;
+    cd.vars[cd.var_count] = v;
+    cd.var_count += 1;
+    return 0;
 }
 
 /// Remove `v` from `vars` by tail-swap; decrements var_count.
-fn removeVar(cd: *CapabilityDomain, v: *VAR) void {
-    _ = cd;
-    _ = v;
+pub fn removeVar(cd: *CapabilityDomain, v: *VAR) void {
+    var i: u16 = 0;
+    while (i < cd.var_count) {
+        if (cd.vars[i] == v) {
+            cd.var_count -= 1;
+            cd.vars[i] = cd.vars[cd.var_count];
+            cd.vars[cd.var_count] = null;
+            return;
+        }
+        i += 1;
+    }
 }
 
 /// Linear-scan `vars[]` for any range overlapping `[base, base + bytes)`.
 /// Returns E_NOSPC on overlap, 0 otherwise. Spec §[var].create_var.
-fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64) i64 {
-    _ = cd;
-    _ = base;
-    _ = bytes;
-    return -1;
+pub fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64) i64 {
+    const new_start = base.addr;
+    const new_end = new_start + bytes;
+    var i: u16 = 0;
+    while (i < cd.var_count) {
+        const v = cd.vars[i] orelse {
+            i += 1;
+            continue;
+        };
+        const sz_bytes: u64 = switch (v.sz) {
+            .sz_4k => 0x1000,
+            .sz_2m => 0x20_0000,
+            .sz_1g => 0x4000_0000,
+            ._reserved => 0,
+        };
+        const v_start = v.base_vaddr.addr;
+        const v_end = v_start + @as(u64, v.page_count) * sz_bytes;
+        if (new_start < v_end and v_start < new_end) return errors.E_NOSPC;
+        i += 1;
+    }
+    return 0;
 }
 
 /// Top-level domain restart driver. Walks handle table applying per-

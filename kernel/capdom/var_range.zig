@@ -20,7 +20,7 @@ const DeviceRegion = zag.devices.device_region.DeviceRegion;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = secure_slab.GenLock;
 const KernelHandle = zag.caps.capability.KernelHandle;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PageFrame = zag.memory.page_frame.PageFrame;
 const SecureSlab = secure_slab.SecureSlab;
 const VAddr = zag.memory.address.VAddr;
@@ -220,13 +220,13 @@ pub fn createVar(
     const base = vaRangeAllocate(domain, @intCast(pages), sz, base_in) orelse
         return errors.E_NOSPC;
 
-    const overlap = checkVaRangeOverlapShim(domain, base, @as(u64, @intCast(pages)) * sz_bytes);
+    const overlap = zag.capdom.capability_domain.checkVaRangeOverlap(domain, base, @as(u64, @intCast(pages)) * sz_bytes);
     if (overlap != 0) return overlap;
 
     const v = allocVar(domain, base, @intCast(pages), sz, cch, cur_rwx, dev_ptr) catch
         return errors.E_NOMEM;
 
-    const append_rc = appendVarShim(domain, v);
+    const append_rc = zag.capdom.capability_domain.appendVar(domain, v);
     if (append_rc != 0) {
         destroyVar(v);
         return append_rc;
@@ -637,7 +637,7 @@ fn destroyVar(v: *VAR) void {
             v.page_count,
         );
     }
-    removeVarShim(domain, v);
+    zag.capdom.capability_domain.removeVar(domain, v);
     slab_instance.destroy(v, gen) catch {};
 }
 
@@ -783,40 +783,6 @@ fn restartCleanup(v: *VAR, policy: u2) i64 {
             const src = v.snapshot_source orelse return errors.E_TERM;
             return copySnapshot(v, src);
         },
-    }
-}
-
-// ── Local shims for helpers whose pub status hasn't been declared ────
-// `appendVar`, `removeVar`, and `checkVaRangeOverlap` live in
-// capability_domain.zig as file-private fn signatures. The orchestrator
-// rewires these shims to those callees in a follow-up pass once the
-// inter-file pub surface is settled. Until then, the shims do the
-// minimum work to keep the protocol observable.
-
-fn checkVaRangeOverlapShim(cd: *const CapabilityDomain, base: VAddr, bytes: u64) i64 {
-    _ = cd;
-    _ = base;
-    _ = bytes;
-    return 0;
-}
-
-fn appendVarShim(cd: *CapabilityDomain, v: *VAR) i64 {
-    if (cd.var_count >= cd.vars.len) return errors.E_FULL;
-    cd.vars[cd.var_count] = v;
-    cd.var_count += 1;
-    return 0;
-}
-
-fn removeVarShim(cd: *CapabilityDomain, v: *VAR) void {
-    var i: u16 = 0;
-    while (i < cd.var_count) {
-        if (cd.vars[i] == v) {
-            cd.var_count -= 1;
-            cd.vars[i] = cd.vars[cd.var_count];
-            cd.vars[cd.var_count] = null;
-            return;
-        }
-        i += 1;
     }
 }
 

@@ -35,6 +35,17 @@ pub const DeviceType = enum(u8) {
     port_io = 1,
 };
 
+/// Cap bits in `Capability.word0[48..63]` for device_region handles.
+/// Spec §[device_region] cap layout (table at bits 0-4).
+pub const DeviceRegionCaps = packed struct(u16) {
+    move: bool = false,
+    copy: bool = false,
+    dma: bool = false,
+    irq: bool = false,
+    restart_policy: u1 = 0,
+    _reserved: u11 = 0,
+};
+
 pub const Mmio = extern struct {
     phys_base: PAddr,
     size: u64,
