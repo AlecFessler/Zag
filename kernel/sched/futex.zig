@@ -27,6 +27,13 @@ const BUCKET_COUNT = 256;
 const MAX_TIMED_WAITERS = 64;
 pub const MAX_FUTEX_ADDRS = 63;
 
+// Internal sentinel stored in `EC.futex_deadline_ns` by the timer
+// pass to mark "this EC was woken by deadline expiry, not by a peer
+// `futex_wake`". `0` is reserved for "no wait active"; any real
+// deadline is the wall clock at the time the wait was entered, so
+// UINT64_MAX is far enough in the future to be unambiguous.
+const FUTEX_TIMEOUT_SENTINEL: u64 = ~@as(u64, 0);
+
 /// Per-(EC, bucket) wait entry. Allocated on the waiting EC's kernel
 /// stack — one per address in a multi-address wait — and threaded into
 /// bucket queues via its own `next` field. Each node carries its own
@@ -221,7 +228,7 @@ pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, ec: *ExecutionContext)
     arch.cpu.enableInterrupts();
     sched.yieldTo(null);
 
-    const was_timeout: bool = ec.futex_deadline_ns == @as(u64, @bitCast(errors.E_TIMEOUT));
+    const was_timeout: bool = ec.futex_deadline_ns == FUTEX_TIMEOUT_SENTINEL;
     ec.futex_deadline_ns = 0;
     return if (was_timeout) errors.E_TIMEOUT else 0;
 }
@@ -414,7 +421,7 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
     arch.cpu.enableInterrupts();
     sched.yieldTo(null);
 
-    const was_timeout: bool = ec.futex_deadline_ns == @as(u64, @bitCast(errors.E_TIMEOUT));
+    const was_timeout: bool = ec.futex_deadline_ns == FUTEX_TIMEOUT_SENTINEL;
     ec.futex_deadline_ns = 0;
     if (was_timeout) return errors.E_TIMEOUT;
     return @intCast(ec.futex_wake_index);
@@ -493,7 +500,7 @@ pub fn waitChange(addrs: []const PAddr, targets: []const u64, count: usize, time
     arch.cpu.enableInterrupts();
     sched.yieldTo(null);
 
-    const was_timeout: bool = ec.futex_deadline_ns == @as(u64, @bitCast(errors.E_TIMEOUT));
+    const was_timeout: bool = ec.futex_deadline_ns == FUTEX_TIMEOUT_SENTINEL;
     ec.futex_deadline_ns = 0;
     if (was_timeout) return errors.E_TIMEOUT;
     return @intCast(ec.futex_wake_index);
@@ -599,7 +606,7 @@ pub fn expireTimedWaiters() void {
 
         if (removed) {
             while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-            ec.futex_deadline_ns = @bitCast(errors.E_TIMEOUT);
+            ec.futex_deadline_ns = FUTEX_TIMEOUT_SENTINEL;
             ec.futex_bucket_count = 0;
             ec.futex_wait_nodes = null;
             ec.state = .ready;
