@@ -205,6 +205,7 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
         .crvm = true,
         .crpt = true,
         .pmu = true,
+        .setwall = true,
         .fut_wake = true,
         .timer = true,
         .pri = 3,

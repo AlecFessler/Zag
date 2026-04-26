@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 415.
-**Remaining:** 53.
+**Implemented:** 420.
+**Remaining:** 48.
 
 ## Convention
 
@@ -574,7 +574,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **09** — on each fire, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
 - [x] **10** — calling `timer_arm` again yields a fresh, independent timer handle; the prior handle's field0 and field1 are unaffected.
 
-## timer_rearm — 6/10
+## timer_rearm — 7/10
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid timer handle.
 - [x] **02** — returns E_PERM if [1] does not have the `arm` cap.
@@ -582,7 +582,7 @@ _§[handle_attachments] Handle Attachments_
 - [x] **04** — returns E_INVAL if any reserved bits are set in [1] or [3].
 - [x] **05** — on success, the calling domain's copy of [1] has `field0 = 0` immediately on return; every other domain-local copy returns 0 from a fresh `sync` within a bounded delay.
 - [x] **06** — on success, [1].field1.arm = 1 and [1].field1.pd = [3].periodic.
-- [ ] **07** — on success with [3].periodic = 0, [1].field0 is incremented by 1 once after [2] deadline_ns and `[1].field1.arm` becomes 0; with [3].periodic = 1, [1].field0 is incremented by 1 every [2] deadline_ns until `timer_cancel` or another `timer_rearm`.
+- [x] **07** — on success with [3].periodic = 0, [1].field0 is incremented by 1 once after [2] deadline_ns and `[1].field1.arm` becomes 0; with [3].periodic = 1, [1].field0 is incremented by 1 every [2] deadline_ns until `timer_cancel` or another `timer_rearm`.
 - [ ] **08** — on success, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
 - [ ] **09** — `timer_rearm` called on a currently-armed timer replaces the prior configuration; the prior pending fire does not occur and field0 reflects the reset to 0 rather than any partial fire.
 - [ ] **10** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
@@ -628,39 +628,39 @@ _§[handle_attachments] Handle Attachments_
 - [x] **03** — returns E_BADADDR if [1] addr is not a valid user address in the caller's domain.
 - [x] **04** — on success, [1] is the number of ECs actually woken (0..count).
 
-## time — 1/5
+## time — 2/5
 
 _§[time] Time_
 
 - [x] **01** — on success, [1] is a u64 nanosecond count strictly greater than the value returned by any prior call to `time_monotonic`.
-- [ ] **02** — after `time_setwall(X)` succeeds, a subsequent `time_getwall` returns a value within a small bounded delta of X.
+- [x] **02** — after `time_setwall(X)` succeeds, a subsequent `time_getwall` returns a value within a small bounded delta of X.
 - [ ] **03** — returns E_PERM if the caller's self-handle lacks `setwall`.
 - [ ] **04** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **05** — on success, a subsequent `time_getwall` returns a value within a small bounded delta of [1].
 
-## rng — 1/2
+## rng — 2/2
 
 _§[rng] RNG_
 
 - [x] **01** — returns E_INVAL if count is 0 or count > 127.
-- [ ] **02** — on success, vregs `[1..count]` contain qwords (the CSPRNG-source guarantee in the prose above is a kernel implementation contract, not a black-box-testable assertion).
+- [x] **02** — on success, vregs `[1..count]` contain qwords (the CSPRNG-source guarantee in the prose above is a kernel implementation contract, not a black-box-testable assertion).
 
-## system_info — 0/6
+## system_info — 1/6
 
 _§[system_info] System Info_
 
-- [ ] **01** — on success, [1] equals the number of online CPU cores reported by the platform.
+- [x] **01** — on success, [1] equals the number of online CPU cores reported by the platform.
 - [ ] **02** — on success, [3] equals the platform's total RAM divided by 4 KiB.
 - [ ] **03** — on success, [4] bit 0 is set on every supported architecture.
 - [ ] **04** — returns E_INVAL if [1] core_id is greater than or equal to `info_system`'s `cores`.
 - [ ] **05** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **06** — on success, [1] flag bit 0 reflects whether the queried core is currently online.
 
-## power — 0/15
+## power — 1/15
 
 _§[power] Power Management_
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `power`.
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `power`.
 - [ ] **02** — returns E_PERM if the caller's self-handle lacks `power`.
 - [ ] **03** — returns E_PERM if the caller's self-handle lacks `power`.
 - [ ] **04** — returns E_INVAL if [1] is not 1, 3, or 4.
