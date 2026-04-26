@@ -382,6 +382,14 @@ fn tryStealWork(my_core_id: u64) ?*Thread {
     return null;
 }
 
+/// Bitmask of cores that have run `schedTimerHandler` at least once
+/// since boot. Used by `pickRestartCore` to avoid pinning restart work
+/// onto cores that never deliver scheduler ticks (Pi 5 KVM vGICv2 can
+/// silently drop both PPI 30 and SGI deliveries to secondaries — see
+/// kernel/arch/aarch64/gic.zig). A core is added to this mask the
+/// first time its handler runs, so the bitmask is monotone and lock-free.
+pub var ticking_cores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     kprof.point(.sched_timer_tick, 0);
     if (comptime kprof_mode.any_enabled) {
@@ -391,6 +399,13 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     }
     const core_id = arch.smp.coreID();
     const state = &core_states[core_id];
+
+    // Mark this core as live for `pickRestartCore`. Cheap monotone OR
+    // gated on a relaxed load so the steady-state cost is one cache hit.
+    const core_bit = @as(u64, 1) << @intCast(core_id);
+    if (ticking_cores.load(.monotonic) & core_bit == 0) {
+        _ = ticking_cores.fetchOr(core_bit, .monotonic);
+    }
 
     // self-alive: same-core read; running_thread is non-null once
     // perCoreInit has set the idle thread.
@@ -912,6 +927,19 @@ fn pickCoreForThread(thread: *Thread, current_core: u64) ?u64 {
 pub fn pickRestartCore(thread: *Thread, current_core: u64) u64 {
     const count = arch.smp.coreCount();
     const pinned = pinned_cores.load(.acquire);
+    // Only consider cores that have actually delivered at least one
+    // scheduler tick. On Pi 5 KVM vGICv2 secondaries can come up
+    // (cpu_on returns success, the stub trampoline runs) but never
+    // deliver a single PPI/SGI to their CPU interface; queueing the
+    // restart there would silently strand the thread and hang any
+    // observer waiting on its progress (e.g. §2.1.5 polling a shared
+    // counter that the restarted child increments). Routing only to
+    // ticking cores keeps the original §2.1.93 anti-starvation spread
+    // wherever SMP is healthy and degrades gracefully to the calling
+    // core when no live secondary exists.
+    const live = ticking_cores.load(.monotonic);
+    const current_bit = @as(u64, 1) << @intCast(current_core);
+    const other_live = live & ~current_bit;
 
     if (thread.core_affinity) |mask| {
         // Respect affinity. Within the mask, prefer the first eligible
@@ -921,7 +949,8 @@ pub fn pickRestartCore(thread: *Thread, current_core: u64) u64 {
         var i: u64 = 0;
         while (i < count) {
             const bit = @as(u64, 1) << @intCast(i);
-            if (mask & bit != 0 and pinned & bit == 0) {
+            const live_or_self = (live & bit != 0) or (i == current_core);
+            if (mask & bit != 0 and pinned & bit == 0 and live_or_self) {
                 if (i != current_core) return i;
                 fallback = i;
             }
@@ -930,7 +959,12 @@ pub fn pickRestartCore(thread: *Thread, current_core: u64) u64 {
         return fallback orelse current_core;
     }
 
-    // No affinity. Prefer an empty, non-pinned core other than the caller.
+    // No affinity. With no live remote core, stay on the caller — the
+    // §2.1.93 spread can't help if there's nowhere else to spread to,
+    // and migrating to a dead core silently strands the thread.
+    if (other_live == 0) return current_core;
+
+    // Prefer an empty, non-pinned, ticking core other than the caller.
     var i: u64 = 0;
     while (i < count) {
         if (i == current_core) {
@@ -938,7 +972,7 @@ pub fn pickRestartCore(thread: *Thread, current_core: u64) u64 {
             continue;
         }
         const bit = @as(u64, 1) << @intCast(i);
-        if (pinned & bit != 0) {
+        if (pinned & bit != 0 or live & bit == 0) {
             i += 1;
             continue;
         }
@@ -950,7 +984,7 @@ pub fn pickRestartCore(thread: *Thread, current_core: u64) u64 {
         i += 1;
     }
 
-    // No empty queue elsewhere; pick any non-pinned core other than caller.
+    // No empty queue elsewhere; pick any ticking, non-pinned core other than caller.
     i = 0;
     while (i < count) {
         if (i == current_core) {
@@ -958,7 +992,7 @@ pub fn pickRestartCore(thread: *Thread, current_core: u64) u64 {
             continue;
         }
         const bit = @as(u64, 1) << @intCast(i);
-        if (pinned & bit == 0) return i;
+        if (pinned & bit == 0 and live & bit != 0) return i;
         i += 1;
     }
 
