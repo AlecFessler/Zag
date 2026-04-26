@@ -61,12 +61,55 @@ const paging = zag.memory.paging;
 const physmap = zag.memory.address.AddrSpacePartition.physmap;
 const pmm = zag.memory.pmm;
 
+const MappingKind = zag.memory.address.MappingKind;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const VAddr = zag.memory.address.VAddr;
 const VarCacheType = zag.capdom.var_range.CacheType;
 const VarPageSize = zag.capdom.var_range.PageSize;
+
+/// Per-MappingKind descriptor attributes. cache/global/user fields are
+/// owned by the arch backend (ARM ARM D5.4, D13.2.97).
+const KindAttrs = struct {
+    user: bool,
+    /// nG bit. Kernel mappings are global (TLB-pinned across context
+    /// switches under TTBR1); user mappings are non-global.
+    not_global: bool,
+    /// MAIR_EL1 index. mair_normal = WB cacheable, mair_device = UC.
+    attr_indx: u3,
+    /// SH[1:0] shareability. Normal mem = Inner Shareable, device = none.
+    sh: u2,
+};
+
+fn kindAttrs(kind: MappingKind) KindAttrs {
+    return switch (kind) {
+        .kernel_data => .{
+            .user = false,
+            .not_global = false,
+            .attr_indx = mair_normal,
+            .sh = 0b11,
+        },
+        .kernel_mmio => .{
+            .user = false,
+            .not_global = true,
+            .attr_indx = mair_device,
+            .sh = 0b00,
+        },
+        .user_data => .{
+            .user = true,
+            .not_global = true,
+            .attr_indx = mair_normal,
+            .sh = 0b11,
+        },
+        .user_mmio => .{
+            .user = true,
+            .not_global = true,
+            .attr_indx = mair_device,
+            .sh = 0b00,
+        },
+    };
+}
 
 /// AArch64 page table descriptor for VMSAv8-64 with 4KB granule.
 ///
@@ -268,18 +311,17 @@ pub fn mapPage(
     phys: PAddr,
     virt: VAddr,
     perms: MemoryPerms,
+    kind: MappingKind,
 ) !void {
     std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
 
     const pmm_mgr = &pmm.global_pmm.?;
 
-    const ap = permsToAp(perms);
-    const xn = perms.execute_perm == .no_execute;
+    const attrs = kindAttrs(kind);
+    const ap = permsToAp(perms, attrs.user);
+    const xn = !perms.exec;
     const pxn = xn;
-    const ng = perms.global_perm == .not_global;
-    const attr_indx = if (perms.cache_perm == .not_cacheable) mair_device else mair_normal;
-    const sh: u2 = if (perms.cache_perm == .not_cacheable) 0b00 else 0b11;
 
     const parent_entry = PageEntry{
         .valid = true,
@@ -293,11 +335,11 @@ pub fn mapPage(
     const leaf_entry = PageEntry{
         .valid = true,
         .is_table = true, // Level 3 page descriptor: bits [1:0] = 0b11
-        .attr_indx = attr_indx,
+        .attr_indx = attrs.attr_indx,
         .ap = ap,
-        .sh = sh,
+        .sh = attrs.sh,
         .af = true,
-        .ng = ng,
+        .ng = attrs.not_global,
         .xn = xn,
         .pxn = pxn,
     };
@@ -344,17 +386,16 @@ pub fn mapPageBoot(
     virt: VAddr,
     size: PageSize,
     perms: MemoryPerms,
+    kind: MappingKind,
     allocator: std.mem.Allocator,
 ) !void {
     std.debug.assert(std.mem.isAligned(phys.addr, paging.pageAlign(size).toByteUnits()));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.pageAlign(size).toByteUnits()));
 
-    const ap = permsToAp(perms);
-    const xn = perms.execute_perm == .no_execute;
+    const attrs = kindAttrs(kind);
+    const ap = permsToAp(perms, attrs.user);
+    const xn = !perms.exec;
     const pxn = xn;
-    const ng = perms.global_perm == .not_global;
-    const attr_indx = if (perms.cache_perm == .not_cacheable) mair_device else mair_normal;
-    const sh: u2 = if (perms.cache_perm == .not_cacheable) 0b00 else 0b11;
 
     const parent_entry = PageEntry{
         .valid = true,
@@ -370,11 +411,11 @@ pub fn mapPageBoot(
     const leaf_entry = PageEntry{
         .valid = true,
         .is_table = true,
-        .attr_indx = attr_indx,
+        .attr_indx = attrs.attr_indx,
         .ap = ap,
-        .sh = sh,
+        .sh = attrs.sh,
         .af = true,
-        .ng = ng,
+        .ng = attrs.not_global,
         .xn = xn,
         .pxn = pxn,
     };
@@ -551,6 +592,7 @@ pub fn updatePagePerms(
     addr_space_root: PAddr,
     virt: VAddr,
     new_perms: MemoryPerms,
+    kind: MappingKind,
 ) void {
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
@@ -566,12 +608,13 @@ pub fn updatePagePerms(
     const l0_entry = &table[l0Idx(virt)];
     if (!l0_entry.valid) return;
 
-    l0_entry.ap = permsToAp(new_perms);
-    l0_entry.xn = new_perms.execute_perm == .no_execute;
-    l0_entry.pxn = new_perms.execute_perm == .no_execute;
-    l0_entry.ng = new_perms.global_perm == .not_global;
-    l0_entry.attr_indx = if (new_perms.cache_perm == .not_cacheable) mair_device else mair_normal;
-    l0_entry.sh = if (new_perms.cache_perm == .not_cacheable) 0b00 else 0b11;
+    const attrs = kindAttrs(kind);
+    l0_entry.ap = permsToAp(new_perms, attrs.user);
+    l0_entry.xn = !new_perms.exec;
+    l0_entry.pxn = !new_perms.exec;
+    l0_entry.ng = attrs.not_global;
+    l0_entry.attr_indx = attrs.attr_indx;
+    l0_entry.sh = attrs.sh;
 
     // ARM ARM D5.9: TLBI VAE1IS invalidates the VA across all cores.
     tlbiVae1is(virt.addr);
@@ -642,9 +685,8 @@ pub fn resolveVaddr(
 ///   AP[2:1] = 0b01: EL1 RW, EL0 RW
 ///   AP[2:1] = 0b10: EL1 RO, EL0 no access
 ///   AP[2:1] = 0b11: EL1 RO, EL0 RO
-fn permsToAp(perms: MemoryPerms) u2 {
-    const writable = perms.write_perm == .write;
-    const user = perms.privilege_perm == .user;
+fn permsToAp(perms: MemoryPerms, user: bool) u2 {
+    const writable = perms.write;
 
     if (writable and user) return 0b01;
     if (writable) return 0b00;

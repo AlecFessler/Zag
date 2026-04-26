@@ -24,14 +24,7 @@ const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
-/// MMIO pages are mapped uncacheable, non-executable, kernel-only.
-const MMIO_PERMS: MemoryPerms = .{
-    .write_perm = .write,
-    .execute_perm = .no_execute,
-    .cache_perm = .not_cacheable,
-    .global_perm = .not_global,
-    .privilege_perm = .kernel,
-};
+const MMIO_PERMS: MemoryPerms = .{ .read = true, .write = true };
 
 // ---------------------------------------------------------------------------
 // MMIO register offsets (spec Section 3.3.1, Section 3.3.13)
@@ -274,7 +267,7 @@ pub fn init(reg_base_phys: PAddr) !void {
     while (i < num_mmio_pages) {
         const page_phys = PAddr.fromInt(reg_base_phys.addr + @as(u64, i) * paging.PAGE4K);
         const page_virt = VAddr.fromPAddr(page_phys, null);
-        arch_paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
+        arch_paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS, .kernel_mmio) catch {
             i += 1;
             continue;
         };

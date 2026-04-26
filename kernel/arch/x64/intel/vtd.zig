@@ -19,13 +19,7 @@ const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
-const MMIO_PERMS: MemoryPerms = .{
-    .write_perm = .write,
-    .execute_perm = .no_execute,
-    .cache_perm = .not_cacheable,
-    .global_perm = .not_global,
-    .privilege_perm = .kernel,
-};
+const MMIO_PERMS: MemoryPerms = .{ .read = true, .write = true };
 
 // ── Register offsets (Section 11.4, Table 1) ────────────────────────────
 
@@ -210,7 +204,7 @@ fn issueGlobalCommand(cmd_bit: u32, status_bit: u32) void {
 pub fn init(reg_base_phys: PAddr) !void {
     const reg_base_virt = VAddr.fromPAddr(reg_base_phys, null);
 
-    try arch_paging.mapPage(memory_init.kernel_addr_space_root, reg_base_phys, reg_base_virt, MMIO_PERMS);
+    try arch_paging.mapPage(memory_init.kernel_addr_space_root, reg_base_phys, reg_base_virt, MMIO_PERMS, .kernel_mmio);
     iommu_base = reg_base_virt.addr;
 
     // ECAP.IRO (Section 11.4.3): bits 17:8 give the IOTLB register offset

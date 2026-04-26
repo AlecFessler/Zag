@@ -73,13 +73,7 @@ pub fn init(firmware_mmap: MMap) !void {
                 break :blk paging.PageSize.page4k;
             };
 
-            const physmap_perms: MemoryPerms = .{
-                .write_perm = .write,
-                .execute_perm = .no_execute,
-                .cache_perm = .write_back,
-                .global_perm = .global,
-                .privilege_perm = .kernel,
-            };
+            const physmap_perms: MemoryPerms = .{ .read = true, .write = true };
 
             try arch.paging.mapPageBoot(
                 addr_space_root_id_virt,
@@ -87,6 +81,7 @@ pub fn init(firmware_mmap: MMap) !void {
                 physmap_virt,
                 chosen_size,
                 physmap_perms,
+                .kernel_data,
                 bump_alloc_iface,
             );
 

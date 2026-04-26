@@ -387,19 +387,14 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
             const lapic_phys = PAddr.fromInt(std.mem.alignBackward(u64, lapic_base, paging.PAGE4K));
             const lapic_virt = VAddr.fromPAddr(lapic_phys, null);
 
-            const mmio_perms: MemoryPerms = .{
-                .write_perm = .write,
-                .execute_perm = .no_execute,
-                .cache_perm = .not_cacheable,
-                .global_perm = .not_global,
-                .privilege_perm = .kernel,
-            };
+            const mmio_perms: MemoryPerms = .{ .read = true, .write = true };
 
             try arch_paging.mapPage(
                 memory_init.kernel_addr_space_root,
                 lapic_phys,
                 lapic_virt,
                 mmio_perms,
+                .kernel_mmio,
             );
 
             apic.init(lapic_virt);
@@ -412,19 +407,14 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
             const hpet_phys = PAddr.fromInt(hpet_table.base_address.address);
             const hpet_virt = VAddr.fromPAddr(hpet_phys, null);
 
-            const mmio_perms: MemoryPerms = .{
-                .write_perm = .write,
-                .execute_perm = .no_execute,
-                .cache_perm = .not_cacheable,
-                .global_perm = .not_global,
-                .privilege_perm = .kernel,
-            };
+            const mmio_perms: MemoryPerms = .{ .read = true, .write = true };
 
             try arch_paging.mapPage(
                 memory_init.kernel_addr_space_root,
                 hpet_phys,
                 hpet_virt,
                 mmio_perms,
+                .kernel_mmio,
             );
 
             timers.hpet_timer = timers.Hpet.init(hpet_virt);
@@ -451,13 +441,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
     initIommuDevices();
 }
 
-const MMIO_PERMS: MemoryPerms = .{
-    .write_perm = .write,
-    .execute_perm = .no_execute,
-    .cache_perm = .not_cacheable,
-    .global_perm = .not_global,
-    .privilege_perm = .kernel,
-};
+const MMIO_PERMS: MemoryPerms = .{ .read = true, .write = true };
 
 /// PCI Firmware Specification §4.1.2 — MCFG table; maps ECAM base addresses per segment/bus range.
 fn parseMcfg(mcfg_vaddr: VAddr, length: u32) !void {
@@ -486,7 +470,7 @@ fn parseMcfg(mcfg_vaddr: VAddr, length: u32) !void {
         while (offset < ecam_size) {
             const page_phys = PAddr.fromInt(base_address + offset);
             const page_virt = VAddr.fromPAddr(page_phys, null);
-            arch_paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
+            arch_paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS, .kernel_mmio) catch {
                 offset += paging.PAGE4K;
                 continue;
             };

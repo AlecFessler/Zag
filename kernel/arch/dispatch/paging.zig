@@ -5,6 +5,7 @@ const zag = @import("zag");
 const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
+const MappingKind = zag.memory.address.MappingKind;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
@@ -77,10 +78,11 @@ pub fn mapPage(
     phys: PAddr,
     virt: VAddr,
     perms: MemoryPerms,
+    kind: MappingKind,
 ) !void {
     switch (builtin.cpu.arch) {
-        .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, perms),
-        .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, perms),
+        .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, perms, kind),
+        .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, perms, kind),
         else => unreachable,
     }
 }
@@ -91,11 +93,12 @@ pub fn mapPageBoot(
     virt: VAddr,
     size: PageSize,
     perms: MemoryPerms,
+    kind: MappingKind,
     allocator: std.mem.Allocator,
 ) !void {
     switch (builtin.cpu.arch) {
-        .x86_64 => try x64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, allocator),
-        .aarch64 => try aarch64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, allocator),
+        .x86_64 => try x64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, kind, allocator),
+        .aarch64 => try aarch64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, kind, allocator),
         else => unreachable,
     }
 }
@@ -115,10 +118,11 @@ pub fn updatePagePerms(
     addr_space_root: PAddr,
     virt: VAddr,
     new_perms: MemoryPerms,
+    kind: MappingKind,
 ) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.updatePagePerms(addr_space_root, virt, new_perms),
-        .aarch64 => aarch64.paging.updatePagePerms(addr_space_root, virt, new_perms),
+        .x86_64 => x64.paging.updatePagePerms(addr_space_root, virt, new_perms, kind),
+        .aarch64 => aarch64.paging.updatePagePerms(addr_space_root, virt, new_perms, kind),
         else => unreachable,
     }
 }

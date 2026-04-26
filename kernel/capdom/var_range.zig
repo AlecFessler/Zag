@@ -145,18 +145,11 @@ inline fn pageSizeBytes(sz: PageSize) u64 {
     };
 }
 
-inline fn rwxToPerms(rwx: u3, cch: CacheType) MemoryPerms {
+inline fn rwxToPerms(rwx: u3) MemoryPerms {
     return .{
-        .write_perm = if (rwx & 0b010 != 0) .write else .read,
-        .execute_perm = if (rwx & 0b100 != 0) .execute else .no_execute,
-        .cache_perm = switch (cch) {
-            .wb => .write_back,
-            .uc => .not_cacheable,
-            .wc => .write_combining,
-            .wt => .write_through,
-        },
-        .global_perm = .non_global,
-        .privilege_perm = .user,
+        .read = (rwx & 0b001) != 0,
+        .write = (rwx & 0b010) != 0,
+        .exec = (rwx & 0b100) != 0,
     };
 }
 
@@ -329,7 +322,7 @@ pub fn mapMmio(caller: *ExecutionContext, var_handle: u64, device_region: u64) i
                 .fromInt(v.base_vaddr.addr + off),
                 v.sz,
                 v.cch,
-                rwxToPerms(v.cur_rwx, v.cch),
+                rwxToPerms(v.cur_rwx),
             ) catch return errors.E_NOMEM;
             off += sz_bytes;
         }
@@ -432,7 +425,7 @@ pub fn remap(caller: *ExecutionContext, var_handle: u64, new_cur_rwx: u64) i64 {
             .fromInt(v.base_vaddr.addr + off),
             v.sz,
             v.cch,
-            rwxToPerms(new_rwx, v.cch),
+            rwxToPerms(new_rwx),
         ) catch {};
         off += sz_bytes;
     }
@@ -667,7 +660,7 @@ fn mappingInstall(v: *VAR, offset: u64, pf: *PageFrame) i64 {
     else
         0;
     const var_caps: VarCaps = @bitCast(caps_word);
-    const perms = rwxToPerms(v.cur_rwx, v.cch);
+    const perms = rwxToPerms(v.cur_rwx);
 
     if (var_caps.dma) {
         const dev = v.device orelse return errors.E_INVAL;
