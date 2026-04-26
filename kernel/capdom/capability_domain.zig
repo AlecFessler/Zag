@@ -371,7 +371,13 @@ pub fn createCapabilityDomain(
     // Enqueue the initial EC on the calling core; SMP can pull it.
     scheduler.enqueueOnCore(@intCast(arch.smp.coreID()), child_ec);
 
-    return @intCast(idc_slot);
+    // Spec §[error_codes] / §[capabilities]: success returns the
+    // packed Word0 (id | type<<12 | caps<<48) so the type tag in bits
+    // 12..15 always disambiguates a real handle word from the error
+    // range 1..15. Returning the bare slot would alias slots 1..15
+    // with the spec error codes, so userspace's standard error check
+    // would treat valid handle slots as failures.
+    return @intCast(Word0.pack(idc_slot, .capability_domain, caller_cridc));
 }
 
 inline fn pageFrameSizeBytes(sz: zag.capdom.var_range.PageSize) u64 {

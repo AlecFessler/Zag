@@ -237,11 +237,12 @@ pub fn createVar(
     // base vaddr; field1 = packed page_count|sz|cch|cur_rwx|map|device.
     const field0: u64 = base.addr;
     const field1: u64 = packField1(@intCast(pages), sz, cch, cur_rwx, .unmapped, 0);
+    const handle_caps: u16 = @truncate(caps);
     const slot = zag.capdom.capability_domain.mintHandle(
         domain,
         .{ .ptr = v, .gen = @intCast(v._gen_lock.currentGen()) },
         .virtual_address_range,
-        @as(u16, @truncate(caps)),
+        handle_caps,
         field0,
         field1,
     ) catch return errors.E_FULL;
@@ -255,7 +256,10 @@ pub fn createVar(
     dispatch.syscall.setSyscallVreg2(caller.ctx, field0);
     dispatch.syscall.setSyscallVreg3(caller.ctx, field1);
 
-    return @intCast(slot);
+    // Spec §[error_codes] / §[capabilities]: pack Word0 so the type
+    // tag in bits 12..15 disambiguates a real handle word from the
+    // small-positive error range 1..15.
+    return @intCast(Word0.pack(slot, .virtual_address_range, handle_caps));
 }
 
 /// `map_pf` syscall handler. Spec §[var].map_pf.

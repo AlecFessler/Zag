@@ -143,7 +143,10 @@ pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64
     };
 
     domain.vm = new_vm;
-    return @intCast(slot);
+    // Spec §[error_codes] / §[capabilities]: pack Word0 so the type
+    // tag in bits 12..15 disambiguates a real handle word from the
+    // small-positive error range 1..15.
+    return @intCast(capability.Word0.pack(slot, .virtual_machine, requested_caps));
 }
 
 /// `create_vcpu` syscall handler. Spec §[virtual_machine].create_vcpu.
@@ -211,7 +214,10 @@ pub fn createVcpu(
     // entry state through the standard recv/reply lifecycle.
     port_mod.fireVmExit(vcpu_ec, INITIAL_STATE_SUBCODE, .{ 0, 0, 0 });
 
-    return @intCast(slot);
+    // Spec §[error_codes] / §[capabilities]: pack Word0 so the type
+    // tag in bits 12..15 disambiguates a real handle word from the
+    // small-positive error range 1..15.
+    return @intCast(capability.Word0.pack(slot, .execution_context, requested_caps));
 }
 
 /// `map_guest` syscall handler. Spec §[virtual_machine].map_guest.

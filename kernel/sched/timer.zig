@@ -140,7 +140,10 @@ pub fn timerArm(caller: *anyopaque, caps: u64, deadline_ns: u64, flags: u64) i64
     };
 
     wheelInsert(t, t.deadline_ns);
-    return @as(i64, slot);
+    // Spec §[error_codes] / §[capabilities]: pack Word0 so the type
+    // tag in bits 12..15 disambiguates a real handle word from the
+    // small-positive error range 1..15.
+    return @intCast(zag.caps.capability.Word0.pack(slot, .timer, requested_caps));
 }
 
 /// `timer_rearm` syscall handler. Spec §[timer].
