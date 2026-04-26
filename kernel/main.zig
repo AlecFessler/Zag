@@ -86,10 +86,8 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.vm.bspBootHandoff(boot_info.arrived_at_el2 != 0);
     arch.pmu.pmuInit();
     arch.cpu.sysInfoInit();
-    // Wall clock offset init: read RTC once at boot (systems.md §wall-clock).
-    const rtc_nanos = arch.time.readRtc();
-    const monotonic_now = arch.time.getMonotonicClock().now();
-    syscall.clock.wall_offset = @as(i64, @bitCast(rtc_nanos)) -% @as(i64, @bitCast(monotonic_now));
+    // TODO(spec-v3): wall-clock is now read directly via arch.time.readRtc()
+    // in syscall/system.zig; no kernel-side wall_offset state remains.
     device_registry.registerDisplayDevice(boot_info.framebuffer);
     try sched.globalInit();
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));

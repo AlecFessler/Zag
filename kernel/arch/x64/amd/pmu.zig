@@ -462,37 +462,10 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
 fn pmiHandler(ctx: *cpu.Context) void {
     _ = ctx;
     // Registered as `.external`; `dispatchInterrupt` EOIs after we return.
-    const ec = sched.currentEc() orelse return;
-    // self-alive: PMI fires on the core running `ec`; pmu_state
-    // can't be freed out from under us during the handler.
-    const state_ref = ec.pmu_state orelse return;
-    const state_ptr = state_ref.ptr;
-    if (state_ptr.num_counters == 0) return;
-
-    // Stale-PMI filter: any counter whose current value has wrapped back
-    // near its preload (i.e. is far below (2^48 - threshold_small)) is
-    // treated as the overflowing one. Simpler policy: if at least one
-    // counter's high bit cleared — meaning it overflowed past the 48-bit
-    // boundary — attribute the PMI to this EC. Otherwise drop as stale.
-    var overflowed = false;
-    var fired_idx: u64 = 0;
-    var i: u8 = 0;
-    while (i < state_ptr.num_counters) {
-        const raw = cpu.rdmsr(perfctrMsr(i)) & COUNTER_MASK;
-        if (raw < state_ptr.values[i]) {
-            if (!overflowed) fired_idx = i;
-            overflowed = true;
-        }
-        state_ptr.values[i] = raw;
-        // Disable this counter so it can't re-fire before we hand off to
-        // the fault handler.
-        cpu.wrmsr(perfevtselMsr(i), 0);
-        i += 1;
-    }
-    if (!overflowed) return;
-
-    port.firePmuOverflow(ec, fired_idx);
-
-    cpu.enableInterrupts();
-    sched.yield();
+    // TODO(spec-v3): pmu_state has been removed from ExecutionContext;
+    // PMI ownership / state lookup needs to be re-wired against the new
+    // PMU storage location (per-core or per-port?). Until then we panic
+    // — userspace cannot start counters, so this should be unreachable
+    // in practice.
+    @panic("not implemented: PMI handler — pmu_state migrated off ExecutionContext");
 }

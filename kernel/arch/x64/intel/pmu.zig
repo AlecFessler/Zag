@@ -100,7 +100,6 @@ fn eventEncoding(e: PmuEvent) EventEncoding {
             .unit_mask = 0x00,
             .arch_idx = null,
         },
-        else => .{ .event_select = 0x00, .unit_mask = 0x00, .arch_idx = null },
     };
 }
 
@@ -380,42 +379,10 @@ fn pmiHandler(ctx: *cpu.Context) void {
 
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, 0);
 
-    const ec = sched.currentEc() orelse return;
-    // self-alive: PMI fires on the core running `ec`; its pmu_state
-    // slot can't be freed under us because sysPmuStop would need to IPI
-    // this core to clear the MSRs before destroying the slot.
-    const state_ref = ec.pmu_state orelse return;
-    const state_ptr = state_ref.ptr;
-
-    // Stale-PMI filter: require at least one overflow bit in the current
-    // EC's counter range. Otherwise this is a masked PMI from a prior
-    // EC being delivered after the context switch.
-    if (state_ptr.num_counters == 0) return;
-    const nbits: u6 = @intCast(state_ptr.num_counters);
-    const owned_mask: u64 = (@as(u64, 1) << nbits) - 1;
-    if ((status & owned_mask) == 0) return;
-
-    var i: u8 = 0;
-    while (i < state_ptr.num_counters) {
-        state_ptr.values[i] = cpu.rdmsr(IA32_PMC_BASE + @as(u32, i));
-        i += 1;
-    }
-
-    // The first overflow bit in the EC's counter range names the
-    // counter that fired. Pass it as the pmu_overflow event sub-code so
-    // a bound route can attribute the sample.
-    var fired_idx: u64 = 0;
-    var bit: u8 = 0;
-    while (bit < state_ptr.num_counters) {
-        const sh: u6 = @intCast(bit);
-        if (((status >> sh) & 1) != 0) {
-            fired_idx = bit;
-            break;
-        }
-        bit += 1;
-    }
-    port.firePmuOverflow(ec, fired_idx);
-
-    cpu.enableInterrupts();
-    sched.yield();
+    // TODO(spec-v3): pmu_state has been removed from ExecutionContext;
+    // PMI ownership / state lookup needs to be re-wired against the new
+    // PMU storage location (per-core or per-port?). Until then we panic
+    // — userspace cannot start counters, so this should be unreachable
+    // in practice.
+    @panic("not implemented: PMI handler — pmu_state migrated off ExecutionContext");
 }
