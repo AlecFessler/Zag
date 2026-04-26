@@ -71,13 +71,7 @@ var mpidr_valid: [MAX_CORES]bool = [_]bool{false} ** MAX_CORES;
 /// Number of secondary cores successfully brought online.
 var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 
-const KERNEL_PERMS = MemoryPerms{
-    .write_perm = .write,
-    .execute_perm = .no_execute,
-    .cache_perm = .write_back,
-    .global_perm = .global,
-    .privilege_perm = .kernel,
-};
+const KERNEL_PERMS = MemoryPerms{ .read = true, .write = true };
 
 /// Boot parameters passed to secondary cores via PSCI context_id (x0).
 /// The secondary reads this struct at its physical address with MMU off,
@@ -360,7 +354,7 @@ fn smpInitFull() !void {
                 break;
             };
             const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-            aarch64_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
+            aarch64_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS, .kernel_data) catch {
                 pmm_mgr.destroy(kpage);
                 map_ok = false;
                 break;

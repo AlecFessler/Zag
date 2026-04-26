@@ -206,6 +206,26 @@ pub const MemoryPerms = packed struct(u8) {
     _: u5 = 0,
 };
 
+/// Classifies a page mapping site. The arch backend derives cache,
+/// global, and privilege bits from the kind. Cache attributes follow
+/// the same defaults Linux applies to its analogous mappings.
+///
+/// `kernel_data`: kernel RAM (heap, stacks, kernel ELF, physmap of free
+///   memory). WB cache, global, supervisor-only.
+/// `kernel_mmio`: kernel-mapped device MMIO (IOMMU registers, ACPI
+///   tables, LAPIC). UC cache, non-global, supervisor-only.
+/// `user_data`: VAR-installed RAM exposed to userspace. Cache attribute
+///   comes from the VAR's `cch` field via `mapPageSized`. Non-global,
+///   user-accessible.
+/// `user_mmio`: VAR-installed MMIO exposed to userspace. UC cache,
+///   non-global, user-accessible.
+pub const MappingKind = enum {
+    kernel_data,
+    kernel_mmio,
+    user_data,
+    user_mmio,
+};
+
 pub const PAddr = extern struct {
     addr: u64,
 

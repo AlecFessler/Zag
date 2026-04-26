@@ -48,13 +48,7 @@ const VAddr = zag.memory.address.VAddr;
 /// until we add one here. We map Device memory (not_cacheable) because
 /// the regions are peripheral MMIO.
 fn mapDeviceRange(phys_start: u64, length: u64) !u64 {
-    const perms: MemoryPerms = .{
-        .write_perm = .write,
-        .execute_perm = .no_execute,
-        .cache_perm = .not_cacheable,
-        .global_perm = .global,
-        .privilege_perm = .kernel,
-    };
+    const perms: MemoryPerms = .{ .read = true, .write = true };
     const page = paging.PAGE4K;
     const start_aligned = std.mem.alignBackward(u64, phys_start, page);
     const end_aligned = std.mem.alignForward(u64, phys_start + length, page);
@@ -65,6 +59,7 @@ fn mapDeviceRange(phys_start: u64, length: u64) !u64 {
             PAddr.fromInt(pa),
             VAddr.fromPAddr(PAddr.fromInt(pa), null),
             perms,
+            .kernel_mmio,
         );
         pa += page;
     }

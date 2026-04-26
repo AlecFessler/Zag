@@ -274,7 +274,7 @@ pub const VirtualMemoryManager = struct {
         const top_page = pmm_mgr.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
         const top_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(top_page)), null);
         const stack_perms = MemoryPerms{ .read = true, .write = true };
-        arch.paging.mapPage(self.addr_space_root, top_phys, top_page_va, stack_perms) catch {
+        arch.paging.mapPage(self.addr_space_root, top_phys, top_page_va, stack_perms, .user_data) catch {
             pmm_mgr.destroy(top_page);
             return error.OutOfMemory;
         };
@@ -332,7 +332,7 @@ pub const VirtualMemoryManager = struct {
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
         const perms = rwxToMemPerms(node.rights);
 
-        arch.paging.mapPage(self.addr_space_root, phys, page_base, perms) catch {
+        arch.paging.mapPage(self.addr_space_root, phys, page_base, perms, .user_data) catch {
             pmm_mgr.destroy(page);
             return error.OutOfMemory;
         };

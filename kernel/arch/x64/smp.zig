@@ -33,13 +33,7 @@ const TRAMPOLINE_PHYS: u64 = 0x8000;
 const TRAMPOLINE_VECTOR: u8 = @intCast(TRAMPOLINE_PHYS >> 12);
 const params_offset = trampoline_code.len - @sizeOf(TrampolineParams);
 
-const KERNEL_PERMS = MemoryPerms{
-    .write_perm = .write,
-    .execute_perm = .no_execute,
-    .cache_perm = .write_back,
-    .global_perm = .global,
-    .privilege_perm = .kernel,
-};
+const KERNEL_PERMS = MemoryPerms{ .read = true, .write = true };
 
 var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 
@@ -65,13 +59,8 @@ pub fn smpInit() !void {
         memory_init.kernel_addr_space_root,
         trampoline_phys,
         trampoline_virt,
-        .{
-            .write_perm = .write,
-            .execute_perm = .execute,
-            .cache_perm = .write_back,
-            .global_perm = .not_global,
-            .privilege_perm = .kernel,
-        },
+        .{ .read = true, .write = true, .exec = true },
+        .kernel_data,
     );
 
     const dest: [*]u8 = @ptrFromInt(trampoline_virt.addr);
@@ -102,7 +91,7 @@ pub fn smpInit() !void {
                 break;
             };
             const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-            arch_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
+            arch_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS, .kernel_data) catch {
                 pmm_mgr.destroy(kpage);
                 map_ok = false;
                 break;

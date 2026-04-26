@@ -221,13 +221,13 @@ fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
     while (page_addr < stack.top.addr) {
         const kpage = try pmm_mgr.create(paging.PageMem(.page4k));
         const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-        try arch_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), .{
-            .write_perm = .write,
-            .execute_perm = .no_execute,
-            .cache_perm = .write_back,
-            .global_perm = .global,
-            .privilege_perm = .kernel,
-        });
+        try arch_paging.mapPage(
+            memory_init.kernel_addr_space_root,
+            kphys,
+            VAddr.fromInt(page_addr),
+            .{ .read = true, .write = true },
+            .kernel_data,
+        );
         page_addr += paging.PAGE4K;
     }
 }

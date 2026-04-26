@@ -45,7 +45,7 @@ fn demandPageKernel(faulting_virt: VAddr) void {
         @panic("OOM in kernel demand page fault");
 
     const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
-    arch.paging.mapPage(kroot, phys, page_base, KERNEL_PERMS) catch
+    arch.paging.mapPage(kroot, phys, page_base, KERNEL_PERMS, .kernel_data) catch
         @panic("mapPage failed in kernel demand page fault");
 }
 

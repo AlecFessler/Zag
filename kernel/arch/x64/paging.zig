@@ -9,6 +9,7 @@ const paging = zag.memory.paging;
 const physmap = zag.memory.address.AddrSpacePartition.physmap;
 const pmm = zag.memory.pmm;
 
+const MappingKind = zag.memory.address.MappingKind;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
@@ -16,6 +17,49 @@ const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
 const VarCacheType = zag.capdom.var_range.CacheType;
 const VarPageSize = zag.capdom.var_range.PageSize;
+
+/// Per-MappingKind page-attribute derivation. cache/global/user fields
+/// are owned by the arch backend (Intel SDM Vol 3A §5.10, §11.11).
+const KindAttrs = struct {
+    user_accessible: bool,
+    global: bool,
+    not_cacheable: bool,
+    write_through: bool,
+    write_combining: bool,
+};
+
+fn kindAttrs(kind: MappingKind) KindAttrs {
+    return switch (kind) {
+        .kernel_data => .{
+            .user_accessible = false,
+            .global = true,
+            .not_cacheable = false,
+            .write_through = false,
+            .write_combining = false,
+        },
+        .kernel_mmio => .{
+            .user_accessible = false,
+            .global = false,
+            .not_cacheable = true,
+            .write_through = false,
+            .write_combining = false,
+        },
+        .user_data => .{
+            .user_accessible = true,
+            .global = false,
+            .not_cacheable = false,
+            .write_through = false,
+            .write_combining = false,
+        },
+        .user_mmio => .{
+            .user_accessible = true,
+            .global = false,
+            .not_cacheable = true,
+            .write_through = false,
+            .write_combining = false,
+        },
+    };
+}
 
 /// TLB shootdown: per-core pending invalidation addresses.
 /// Each core checks its slot before returning to userspace.
@@ -233,6 +277,7 @@ pub fn mapPage(
     phys: PAddr,
     virt: VAddr,
     perms: MemoryPerms,
+    kind: MappingKind,
 ) !void {
     kprof.point(.map_page, virt.addr);
     std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
@@ -240,29 +285,25 @@ pub fn mapPage(
 
     const pmm_mgr = &pmm.global_pmm.?;
 
-    const user_accessible = perms.privilege_perm == .user;
-    const writable = perms.write_perm == .write;
-    const not_executable = perms.execute_perm == .no_execute;
-    const wc = perms.cache_perm == .write_combining;
-    const not_cacheable = perms.cache_perm == .not_cacheable;
-    const write_through = perms.cache_perm == .write_through or wc;
-    const global = perms.global_perm == .global;
+    const attrs = kindAttrs(kind);
+    const writable = perms.write;
+    const not_executable = !perms.exec;
 
     const parent_entry = PageEntry{
         .present = true,
         .writable = true,
-        .user_accessible = user_accessible,
+        .user_accessible = attrs.user_accessible,
     };
 
     // For L1 leaf entries, bit 7 (huge_page) is the PAT index bit
     const leaf_entry = PageEntry{
         .present = true,
         .writable = writable,
-        .user_accessible = user_accessible,
-        .write_through = write_through,
-        .not_cacheable = not_cacheable,
-        .huge_page = wc,
-        .global = global,
+        .user_accessible = attrs.user_accessible,
+        .write_through = attrs.write_through or attrs.write_combining,
+        .not_cacheable = attrs.not_cacheable,
+        .huge_page = attrs.write_combining,
+        .global = attrs.global,
         .not_executable = not_executable,
     };
 
@@ -299,34 +340,31 @@ pub fn mapPageBoot(
     virt: VAddr,
     size: PageSize,
     perms: MemoryPerms,
+    kind: MappingKind,
     allocator: std.mem.Allocator,
 ) !void {
     std.debug.assert(std.mem.isAligned(phys.addr, paging.pageAlign(size).toByteUnits()));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.pageAlign(size).toByteUnits()));
 
-    const user_accessible = perms.privilege_perm == .user;
-    const writable = perms.write_perm == .write;
-    const not_executable = perms.execute_perm == .no_execute;
-    const wc = perms.cache_perm == .write_combining;
-    const not_cacheable = perms.cache_perm == .not_cacheable;
-    const write_through = perms.cache_perm == .write_through or wc;
-    const global = perms.global_perm == .global;
+    const attrs = kindAttrs(kind);
+    const writable = perms.write;
+    const not_executable = !perms.exec;
 
     const parent_entry = PageEntry{
         .present = true,
         .writable = true,
-        .user_accessible = user_accessible,
+        .user_accessible = attrs.user_accessible,
     };
 
     // For L1 leaf entries, bit 7 (huge_page) is the PAT index bit
     const leaf_entry = PageEntry{
         .present = true,
         .writable = writable,
-        .user_accessible = user_accessible,
-        .write_through = write_through,
-        .not_cacheable = not_cacheable,
-        .huge_page = wc,
-        .global = global,
+        .user_accessible = attrs.user_accessible,
+        .write_through = attrs.write_through or attrs.write_combining,
+        .not_cacheable = attrs.not_cacheable,
+        .huge_page = attrs.write_combining,
+        .global = attrs.global,
         .not_executable = not_executable,
     };
 
@@ -535,6 +573,7 @@ pub fn updatePagePerms(
     addr_space_root: PAddr,
     virt: VAddr,
     new_perms: MemoryPerms,
+    kind: MappingKind,
 ) void {
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
@@ -550,13 +589,13 @@ pub fn updatePagePerms(
     const l1_entry = &table[l1Idx(virt)];
     if (!l1_entry.present) return;
 
-    l1_entry.writable = new_perms.write_perm == .write;
-    l1_entry.not_executable = new_perms.execute_perm == .no_execute;
-    const wc = new_perms.cache_perm == .write_combining;
-    l1_entry.not_cacheable = new_perms.cache_perm == .not_cacheable;
-    l1_entry.write_through = new_perms.cache_perm == .write_through or wc;
-    l1_entry.huge_page = wc;
-    l1_entry.user_accessible = new_perms.privilege_perm == .user;
+    const attrs = kindAttrs(kind);
+    l1_entry.writable = new_perms.write;
+    l1_entry.not_executable = !new_perms.exec;
+    l1_entry.not_cacheable = attrs.not_cacheable;
+    l1_entry.write_through = attrs.write_through or attrs.write_combining;
+    l1_entry.huge_page = attrs.write_combining;
+    l1_entry.user_accessible = attrs.user_accessible;
 
     cpu.invlpg(virt.addr);
 
