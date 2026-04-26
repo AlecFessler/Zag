@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 224.
-**Remaining:** 244.
+**Implemented:** 233.
+**Remaining:** 235.
 
 ## Convention
 
@@ -331,20 +331,20 @@ _§[restart_semantics] Restart Semantics_
 - [x] **07** — on success, vregs `[3..2+count]` contain the qwords from the VAR starting at [2] offset.
 - [x] **08** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## idc_write — 0/8
+## idc_write — 8/8
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
-- [ ] **02** — returns E_PERM if [1] does not have the `w` cap.
-- [ ] **03** — returns E_INVAL if [2] offset is not 8-byte aligned.
-- [ ] **04** — returns E_INVAL if count is 0 or count > 125.
-- [ ] **05** — returns E_INVAL if [2] + count*8 exceeds the VAR's size.
-- [ ] **06** — returns E_INVAL if any reserved bits are set in [1] or [2].
-- [ ] **07** — on success, the qwords from vregs `[3..2+count]` are written into the VAR starting at [2] offset.
-- [ ] **08** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+- [x] **01** — returns E_BADCAP if [1] is not a valid VAR handle.
+- [x] **02** — returns E_PERM if [1] does not have the `w` cap.
+- [x] **03** — returns E_INVAL if [2] offset is not 8-byte aligned.
+- [x] **04** — returns E_INVAL if count is 0 or count > 125.
+- [x] **05** — returns E_INVAL if [2] + count*8 exceeds the VAR's size.
+- [x] **06** — returns E_INVAL if any reserved bits are set in [1] or [2].
+- [x] **07** — on success, the qwords from vregs `[3..2+count]` are written into the VAR starting at [2] offset.
+- [x] **08** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## create_page_frame — 0/10
+## create_page_frame — 1/10
 
-- [ ] **01** — returns E_PERM if the caller's self-handle lacks `crpf`.
+- [x] **01** — returns E_PERM if the caller's self-handle lacks `crpf`.
 - [ ] **02** — returns E_PERM if caps' r/w/x bits are not a subset of the caller's `pf_ceiling.max_rwx`.
 - [ ] **03** — returns E_PERM if caps.max_sz exceeds the caller's `pf_ceiling.max_sz`.
 - [ ] **04** — returns E_INVAL if [3] pages is 0.

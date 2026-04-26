@@ -39,13 +39,8 @@ pub fn decodePortIoMov(
     base_port: u16,
     port_count: u16,
 ) ?PortIoDecoded {
-    _ = ctx;
-    _ = fault_vaddr;
-    _ = var_base;
-    _ = base_port;
-    _ = port_count;
     switch (builtin.cpu.arch) {
-        .x86_64 => return null,
+        .x86_64 => return x64.portio.decodePortIoMov(ctx, fault_vaddr, var_base, base_port, port_count),
         .aarch64 => @compileError("port I/O is x86-only"),
         else => unreachable,
     }
@@ -55,10 +50,8 @@ pub fn decodePortIoMov(
 /// commit the result back to the GPR named in `decoded`. Spec
 /// §[port_io_virtualization].
 pub fn executePortIo(ctx: *ArchCpuContext, decoded: PortIoDecoded) void {
-    _ = ctx;
-    _ = decoded;
     switch (builtin.cpu.arch) {
-        .x86_64 => {},
+        .x86_64 => x64.portio.executePortIo(ctx, decoded),
         .aarch64 => @compileError("port I/O is x86-only"),
         else => unreachable,
     }
@@ -66,10 +59,8 @@ pub fn executePortIo(ctx: *ArchCpuContext, decoded: PortIoDecoded) void {
 
 /// Advance RIP past the emulated MOV so the guest does not retry it.
 pub fn advanceRipPastInsn(ctx: *ArchCpuContext, insn_len: u8) void {
-    _ = ctx;
-    _ = insn_len;
     switch (builtin.cpu.arch) {
-        .x86_64 => {},
+        .x86_64 => x64.portio.advanceRipPastInsn(ctx, insn_len),
         .aarch64 => @compileError("port I/O is x86-only"),
         else => unreachable,
     }
