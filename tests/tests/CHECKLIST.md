@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 298.
-**Remaining:** 170.
+**Implemented:** 303.
+**Remaining:** 165.
 
 ## Convention
 
@@ -403,7 +403,7 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **08** — returns E_INVAL if any reserved bits are set in [1].
 - [x] **09** — on success, the caller receives a VM handle with caps = `[1].caps`.
 
-## create_vcpu — 11/12
+## create_vcpu — 12/12
 
 - [x] **01** — returns E_PERM if the caller's self-handle lacks `crec`.
 - [x] **02** — returns E_PERM if caps is not a subset of the VM's owning domain's `ec_inner_ceiling`.
@@ -416,7 +416,7 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **09** — on success, `suspend` on the returned EC handle returns E_INVAL, and after `recv` on [4] consumes the initial vm_exit and `reply` on its reply handle, a subsequent `recv` on [4] returns a vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s architecture.
 - [x] **10** — on success, the EC's priority is set to `[1].priority`.
 - [x] **11** — on success, the EC's affinity is set to `[3]`.
-- [ ] **12** — immediately after creation, an initial vm_exit event is delivered on `[4] exit_port` with zeroed guest state in the vregs and the initial-state sub-code.
+- [x] **12** — immediately after creation, an initial vm_exit event is delivered on `[4] exit_port` with zeroed guest state in the vregs and the initial-state sub-code.
 
 ## map_guest — 5/7
 
@@ -428,12 +428,12 @@ _§[device_irq] Device IRQ Delivery_
 - [ ] **06** — returns E_INVAL if any pair's range overlaps an existing mapping in the VM's guest physical address space.
 - [ ] **07** — on success, a guest read from `guest_addr` returns the paired page_frame's contents, and a guest access whose required rwx is not a subset of `page_frame.r/w/x` delivers a `vm_exit` event on the vCPU's bound exit_port with sub-code = `ept` (x86-64) or `stage2_fault` (aarch64).
 
-## unmap_guest — 2/5
+## unmap_guest — 4/5
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid VM handle.
 - [x] **02** — returns E_BADCAP if any [2 + i] is not a valid page_frame handle.
-- [ ] **03** — returns E_INVAL if N is 0.
-- [ ] **04** — returns E_NOENT if any page_frame is not currently mapped in [1].
+- [x] **03** — returns E_INVAL if N is 0.
+- [x] **04** — returns E_NOENT if any page_frame is not currently mapped in [1].
 - [ ] **05** — on success, each page_frame's installation in [1]'s guest physical address space is removed; subsequent guest accesses to those guest_addr ranges deliver a `vm_exit` event on the vCPU's bound exit_port with sub-code = `ept` (x86-64) or `stage2_fault` (aarch64).
 
 ## vm_set_policy — 0/9
@@ -448,12 +448,12 @@ _§[device_irq] Device IRQ Delivery_
 - [ ] **08** — on aarch64 with kind=1, the VM's `sysreg_policies` table is replaced by the count entries; subsequent guest sysreg accesses match against this table per §[vm_policy].
 - [ ] **09** — on success, the table for the other kind is unchanged.
 
-## vm_inject_irq — 2/5
+## vm_inject_irq — 4/5
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid VM handle.
 - [x] **02** — returns E_INVAL if [2] exceeds the maximum IRQ line supported by the VM's emulated interrupt controller.
-- [ ] **03** — returns E_INVAL if any reserved bits are set in [1] or [3].
-- [ ] **04** — on success with [3].assert = 1, IRQ line [2] is asserted on the VM's emulated interrupt controller; if a vCPU is unmasked for the line, an interrupt event is delivered to the vCPU on its next runnable opportunity (observable as an exception/interrupt vm_exit or as a guest interrupt handler invocation per the guest's IDT/GIC configuration).
+- [x] **03** — returns E_INVAL if any reserved bits are set in [1] or [3].
+- [x] **04** — on success with [3].assert = 1, IRQ line [2] is asserted on the VM's emulated interrupt controller; if a vCPU is unmasked for the line, an interrupt event is delivered to the vCPU on its next runnable opportunity (observable as an exception/interrupt vm_exit or as a guest interrupt handler invocation per the guest's IDT/GIC configuration).
 - [ ] **05** — on success with [3].assert = 0 immediately after a prior `vm_inject_irq([1], [2], assert = 1)`, no interrupt vm_exit corresponding to line [2] is delivered to any vCPU even when the vCPU's interrupt window opens or it becomes runnable with the line unmasked.
 
 ## create_port — 4/4
