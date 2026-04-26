@@ -278,11 +278,7 @@ pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
     const reply_caps: ReplyCaps = @bitCast(Word0.caps(cd.user_table[slot].word0));
     _ = reply_caps;
 
-    cd.user_table[slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
-    entry.ref = .{};
-    entry.metadata = capability.encodeFreeNext(cd.free_head);
-    cd.free_head = @as(u16, slot);
-    cd.free_count += 1;
+    capability.clearAndFreeSlot(cd, slot, entry);
 
     cd_ref.unlock();
 

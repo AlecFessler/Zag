@@ -189,7 +189,8 @@ const Offsets = struct {
     const dom_kernel_table: usize = @offsetOf(zag.capdom.capability_domain.CapabilityDomain, "kernel_table");
     const dom_user_table: usize = @offsetOf(zag.capdom.capability_domain.CapabilityDomain, "user_table");
 
-    // KernelHandle (extern, 24 bytes): { ref: ErasedSlabRef, metadata: u64 }.
+    // KernelHandle (extern, 88 bytes): { ref: ErasedSlabRef, parent,
+    // first_child, next_sibling: HandleLink (24B each) }.
     // ErasedSlabRef = { ptr, gen, _pad } at offset 0.
     const kh_ref_ptr: usize = 0;
     const kh_ref_gen: usize = 8;

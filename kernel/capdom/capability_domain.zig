@@ -106,9 +106,10 @@ pub const CapabilityDomain = struct {
     //                  device IRQ counters, etc.) directly through
     //                  the kernel R/W view of the same physical pages.
     //
-    //   kernel_table — 96 KiB. Kernel-only. Holds ErasedSlabRef +
-    //                  metadata (revoke ancestry when used, free-list
-    //                  link when free).
+    //   kernel_table — kernel-only. Holds ErasedSlabRef + revoke
+    //                  ancestry tree links (parent / first_child /
+    //                  next_sibling) when used, with `parent` doubling
+    //                  as the free-slot list link when free.
     //
     // Pointer-based rather than inline so the domain struct itself
     // stays slab-allocatable. Tables are page-aligned PMM allocations
@@ -118,8 +119,9 @@ pub const CapabilityDomain = struct {
     kernel_table: *[MAX_HANDLES_PER_DOMAIN]KernelHandle,
 
     /// Head of the free-slot list. `FREE_LIST_TAIL` (0xFFFF) when the
-    /// table is full. Free entries' `kernel_table[i].metadata` low 16
-    /// bits hold the next free index, terminated by `FREE_LIST_TAIL`.
+    /// table is full. Free entries store the next-free slot index in
+    /// `kernel_table[i].parent.slot` (see `KernelHandle` doc), terminated
+    /// by `FREE_LIST_TAIL`.
     free_head: u16 = FREE_LIST_TAIL,
 
     /// Number of free slots. Lets `copy`/`acquire_*` early-bail with
