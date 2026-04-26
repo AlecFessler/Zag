@@ -11,9 +11,14 @@ const TestEntry = struct {
 // resources should be ordered serially here. New tests: add a file
 // under tests/ then add an entry below.
 const test_entries = [_]TestEntry{
+    .{ .name = "delete_01", .path = "tests/delete_01.zig" },
     .{ .name = "restrict_01", .path = "tests/restrict_01.zig" },
     .{ .name = "restrict_02", .path = "tests/restrict_02.zig" },
     .{ .name = "restrict_03", .path = "tests/restrict_03.zig" },
+    .{ .name = "restrict_04", .path = "tests/restrict_04.zig" },
+    .{ .name = "restrict_05", .path = "tests/restrict_05.zig" },
+    .{ .name = "restrict_06", .path = "tests/restrict_06.zig" },
+    .{ .name = "restrict_07", .path = "tests/restrict_07.zig" },
 };
 
 fn buildTestElf(

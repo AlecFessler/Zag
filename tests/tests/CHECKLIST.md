@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 3.  
-**Remaining:** 465.
+**Implemented:** 8.  
+**Remaining:** 460.
 
 ## Convention
 
@@ -25,19 +25,19 @@ entry is in `test_entries`.
 
 ---
 
-## restrict — 3/7
+## restrict — 7/7
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid handle.
 - [x] **02** — returns E_PERM if any cap field in [2].caps using bitwise semantics has a bit set that is not set in the handle's current caps.
 - [x] **03** — returns E_PERM if the handle is an EC handle and [2].caps' `restart_policy` (bits 8-9) numeric value exceeds the handle's current `restart_policy`.
-- [ ] **04** — returns E_PERM if the handle is a VAR handle and [2].caps' `restart_policy` (bits 9-10) numeric value exceeds the handle's current `restart_policy`.
-- [ ] **05** — returns E_INVAL if any reserved bits are set in [1] or [2].
-- [ ] **06** — on success, the handle's caps field equals [2].caps.
-- [ ] **07** — on success, syscalls gated by caps cleared by restrict return E_PERM when invoked via this handle.
+- [x] **04** — returns E_PERM if the handle is a VAR handle and [2].caps' `restart_policy` (bits 9-10) numeric value exceeds the handle's current `restart_policy`.
+- [x] **05** — returns E_INVAL if any reserved bits are set in [1] or [2].
+- [x] **06** — on success, the handle's caps field equals [2].caps.
+- [x] **07** — on success, syscalls gated by caps cleared by restrict return E_PERM when invoked via this handle.
 
-## delete — 0/3
+## delete — 1/3
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid handle.
+- [x] **01** — returns E_BADCAP if [1] is not a valid handle.
 - [ ] **02** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **03** — on success, the handle is released and subsequent operations on it return E_BADCAP.
 
