@@ -44,6 +44,14 @@ const PmuSample = pmu_sched.PmuSample;
 /// `zag.syscall.pmu.MAX_COUNTERS` for the rationale.
 pub const MAX_COUNTERS: u8 = pmu_sched.MAX_COUNTERS;
 
+/// GIC INTID used by the PMU overflow interrupt on aarch64.
+/// ARM ARM DDI 0487 K.a §D13.3.1: PMU overflow connects as a
+/// per-core, level-sensitive PPI at INTID 23 on GICv3-compatible
+/// implementations. Exposed for the arch-dispatch layer
+/// (`pmuOverflowVector`) so generic code can identify the line
+/// without reaching into this backend's exception wiring.
+pub const OVERFLOW_PPI: u8 = 23;
+
 const default_config: PmuCounterConfig = .{
     .event = .cycles,
     .has_threshold = false,
