@@ -22,19 +22,23 @@ fn resolveCallerVa(caller: *ExecutionContext, vaddr: u64) ?PAddr {
     return paging.resolveVaddr(dom.addr_space_root, VAddr.fromInt(vaddr));
 }
 
-/// Read `fut_wait_max` (slot-0 self-handle field0 bits 32-37). Stub —
-/// real reader lives in capdom.capability_domain alongside the other
-/// ceiling helpers.
+/// Read `fut_wait_max` (slot-0 self-handle outer-ceiling, field1 bits
+/// 32-37) from the caller's domain self-handle. Spec §[capability_domain]
+/// outer-ceiling encoding.
 fn readSelfFutWaitMax(domain_ref: SlabRef(CapabilityDomain)) u8 {
-    _ = domain_ref;
-    @panic("not implemented");
+    const dom = domain_ref.lock(@src()) catch return 0;
+    defer domain_ref.unlock();
+    const f1 = dom.user_table[0].field1;
+    return @truncate((f1 >> 32) & 0x3F);
 }
 
-/// Read the slot-0 self-handle `fut_wake` cap bit. Stub — real reader
-/// lives in capdom.capability_domain.
+/// Read the slot-0 self-handle `fut_wake` cap bit. Spec §[capability_domain]
+/// self-handle cap layout — `fut_wake` at bit 11 of the cap word.
 fn readSelfHasFutWake(domain_ref: SlabRef(CapabilityDomain)) bool {
-    _ = domain_ref;
-    @panic("not implemented");
+    const dom = domain_ref.lock(@src()) catch return false;
+    defer domain_ref.unlock();
+    const caps_word: u16 = zag.caps.capability.Word0.caps(dom.user_table[0].word0);
+    return (caps_word & (1 << 11)) != 0;
 }
 
 /// Blocks while every `(addr, expected)` pair satisfies `*addr ==

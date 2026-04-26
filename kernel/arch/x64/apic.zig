@@ -226,9 +226,14 @@ pub fn armTscDeadline(deadline_tsc: u64) void {
 
 /// Arm the LAPIC TSC-deadline timer to fire at absolute monotonic-clock
 /// time `deadline_ns`. Spec §[timer].
+///
+/// STUB step 7h: timer wheel arming is unwired in this skeleton; until
+/// the LAPIC TSC-deadline programming code lands, callers see a no-op
+/// instead of a panic. Timer-bound spec tests (timer_arm/cancel/rearm,
+/// futex with timeout) report incorrect results but the kernel does
+/// not abort, which lets the rest of the corpus run.
 pub fn armDeadline(deadline_ns: u64) void {
     _ = deadline_ns;
-    @panic("not implemented");
 }
 
 /// Signal end-of-interrupt by writing 0 to the EOI register. For level-triggered

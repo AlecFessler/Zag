@@ -633,6 +633,32 @@ fn deliverEvent(
     return 0;
 }
 
+/// Sender-side rendezvous with a waiting receiver. Caller is the
+/// suspended sender EC (state already set to `.suspended_on_port` by
+/// the suspendOnPort path); we dequeue the highest-priority waiting
+/// receiver, mint a reply handle in the receiver's domain, write the
+/// event-state syscall return into the receiver's iret frame, and
+/// enqueue the receiver as ready.
+///
+/// Returns `true` if a receiver was woken — the caller must NOT then
+/// also enqueue the sender as a port waiter (already parked, awaiting
+/// reply). Returns `false` if no receiver was eligible.
+pub fn rendezvousWithReceiver(
+    sender: *ExecutionContext,
+    p: *Port,
+    event_type: EventType,
+    subcode: u8,
+    event_addr: u64,
+) bool {
+    const receiver = popHighestPriorityReceiver(p) orelse return false;
+    receiver.event_type = .none;
+    receiver.suspend_port = null;
+    _ = deliverEvent(sender, receiver, p, event_type, subcode, event_addr, 0);
+    receiver.state = .ready;
+    scheduler.markReady(receiver);
+    return true;
+}
+
 /// Mint a reply handle in `receiver_domain`'s table pointing at the
 /// suspended `sender` EC. Sets `sender.pending_reply_holder` back-pointer.
 fn mintReply(receiver_domain: *CapabilityDomain, sender: *ExecutionContext, xfer: bool) !u12 {
