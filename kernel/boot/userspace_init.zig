@@ -3,14 +3,11 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 const capability = zag.caps.capability;
 const capdom = zag.capdom.capability_domain;
-const device_region = zag.devices.device_region;
-const device_registry = zag.devices.registry;
 const elf_util = zag.utils.elf;
 const execution_context = zag.sched.execution_context;
 const sched = zag.sched.scheduler;
 
 const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
-const DeviceRegionCaps = zag.devices.device_region.DeviceRegionCaps;
 const EcCaps = zag.sched.execution_context.EcCaps;
 const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -105,29 +102,9 @@ fn resolveOrSpawnRootEc(root_cd: *CapabilityDomain, entry: VAddr) !*ExecutionCon
 }
 
 fn grantDevices(root_cd: *CapabilityDomain) void {
-    var i: u32 = 0;
-    while (i < device_registry.count()) {
-        const dev = device_registry.getDevice(i).?;
-        // Devices without an IRQ source (e.g. VGA framebuffer) don't get
-        // the irq cap. All others get every transferable privilege the
-        // root service is permitted to delegate.
-        const has_irq = dev.irq_source != device_region.IRQ_SOURCE_NONE;
-        const caps: DeviceRegionCaps = if (has_irq)
-            .{ .move = true, .copy = true, .dma = true, .irq = true }
-        else
-            .{ .move = true, .copy = true, .dma = true };
-        const obj_ref: ErasedSlabRef = .{
-            .ptr = dev,
-            .gen = @intCast(dev._gen_lock.currentGen()),
-        };
-        _ = capdom.mintHandle(
-            root_cd,
-            obj_ref,
-            .device_region,
-            @bitCast(caps),
-            0,
-            0,
-        ) catch {};
-        i += 1;
-    }
+    _ = root_cd;
+    // TODO(spec-v3): zag.devices.registry was removed; the discovery →
+    // root-handout pipeline now needs to either (a) iterate over
+    // device_region's owning store directly, or (b) be relocated into a
+    // post-ACPI hook that mints handles inline. Pending spec decision.
 }
