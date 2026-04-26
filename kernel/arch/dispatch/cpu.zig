@@ -355,6 +355,19 @@ pub fn fpuClearTrap() void {
     }
 }
 
+/// Cross-core lazy-FPU eviction IPI. Sent by the destination core when
+/// `ec.last_fpu_core` names a different core: the source core saves
+/// `ec`'s live FP regs into `ec.fpu_state`, clears its `last_fpu_owner`
+/// slot, then ACKs. Synchronous — caller spins until the source core
+/// finishes. Spec §[execution_context] lazy FPU.
+pub fn fpuFlushIpiEc(target_core: u8, ec: *ExecutionContext) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.fpuFlushIpiEc(target_core, ec),
+        .aarch64 => aarch64.cpu.fpuFlushIpiEc(target_core, ec),
+        else => unreachable,
+    }
+}
+
 // --- Power / shutdown / entropy ----------------------------------------
 
 pub const PowerAction = switch (builtin.cpu.arch) {
