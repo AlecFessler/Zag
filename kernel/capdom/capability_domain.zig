@@ -21,11 +21,17 @@
 //! STUB. Forward refs to VAR and VirtualMachine point at intended future
 //! paths.
 
+const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const elf_util = zag.utils.elf;
 const errors = zag.syscall.errors;
+const execution_context_mod = zag.sched.execution_context;
+const page_frame_mod = zag.memory.page_frame;
 const pmm = zag.memory.pmm;
+const scheduler = zag.sched.scheduler;
+const userspace_init = zag.boot.userspace_init;
 
 const Capability = zag.caps.capability.Capability;
 const CapabilityType = zag.caps.capability.CapabilityType;
@@ -34,6 +40,9 @@ const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const KernelHandle = zag.caps.capability.KernelHandle;
 const PAddr = zag.memory.address.PAddr;
+const PageFrame = zag.memory.page_frame.PageFrame;
+const ParsedElf = zag.utils.elf.ParsedElf;
+const Priority = zag.sched.execution_context.Priority;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const VAR = zag.capdom.var_range.VAR;
 const VAddr = zag.memory.address.VAddr;
@@ -183,6 +192,30 @@ pub fn initSlab(
 
 /// `create_capability_domain` syscall handler.
 /// Spec §[capability_domain].create_capability_domain.
+///
+/// v0 implementation focused on getting the test runner's spawnOne path
+/// working end-to-end. Behavior:
+///   1. Resolve `elf_pf` in the caller's table; bail E_BADCAP if missing.
+///   2. Read ELF bytes from the page frame's kernel mapping (physmap VA).
+///   3. allocCapabilityDomain with self caps from `caps[0..15]` and the
+///      passed ceilings_inner/outer.
+///   4. loadElfSegments / mapUserStack / mapUserTableView from boot
+///      reused — the child gets the ELF segments mapped at their
+///      p_vaddr, a fresh user stack at ROOT_USER_STACK_TOP, and a
+///      read-only view of the cap table at ROOT_USER_TABLE_BASE.
+///   5. allocExecutionContext for the initial EC; patch its iret frame
+///      so RDI = ROOT_USER_TABLE_BASE (per spec — the entry point's
+///      first arg is a pointer to the read-only cap-table view).
+///   6. For each entry in passed_handles[0..], derive into child slot
+///      3+ via mintHandle. `move = 1` releases the source handle.
+///   7. Mint the IDC handle into the caller's domain pointing at the
+///      new child; return its slot in vreg 1 / via i64.
+///   8. Enqueue the initial EC for dispatch.
+///
+/// Spec validation tests 01-18 are NOT exhaustively enforced yet —
+/// reserved-bit and ceiling-subset checks are coarse. The runner exercises
+/// the success path; the per-test E_INVAL/E_PERM coverage lands once the
+/// boot loop demonstrably runs assertions.
 pub fn createCapabilityDomain(
     caller: *ExecutionContext,
     caps: u64,
@@ -191,13 +224,179 @@ pub fn createCapabilityDomain(
     elf_pf: u64,
     passed_handles: []const u64,
 ) i64 {
-    _ = caller;
-    _ = caps;
-    _ = ceilings_inner;
-    _ = ceilings_outer;
-    _ = elf_pf;
-    _ = passed_handles;
-    return -1;
+    if (elf_pf & ~@as(u64, 0xFFF) != 0) return errors.E_INVAL;
+
+    const caller_dom = caller.domain.ptr;
+
+    // Resolve the ELF page frame in the caller's table. Spec §[14].
+    const pf_slot: u12 = @truncate(elf_pf & 0xFFF);
+    const pf_kh = zag.caps.capability.resolveHandleOnDomain(
+        caller_dom,
+        pf_slot,
+        .page_frame,
+    ) orelse return errors.E_BADCAP;
+    const pf: *PageFrame = @ptrCast(@alignCast(pf_kh.ref.ptr.?));
+
+    // Read the ELF bytes through the kernel physmap mapping of the page
+    // frame's backing pages. The page frame's contents are contiguous in
+    // physical memory (allocBlock returned a power-of-two block) so a
+    // single physmap-VA pointer covers it.
+    const pf_bytes_total: u64 = @as(u64, pf.page_count) * pageFrameSizeBytes(pf.sz);
+    const pf_kernel_va = VAddr.fromPAddr(pf.phys_base, null).addr;
+    const elf_bytes = @as([*]u8, @ptrFromInt(pf_kernel_va))[0..pf_bytes_total];
+
+    var parsed: ParsedElf = undefined;
+    elf_util.parseElf(&parsed, elf_bytes) catch return errors.E_INVAL;
+
+    // Allocate the child capability domain. Self caps come from caps[0..15];
+    // ceilings flow through verbatim (callers are trusted to pass valid
+    // ceilings — spec validation deferred to per-test pass).
+    const self_caps: u16 = @truncate(caps & 0xFFFF);
+    const child_cd = allocCapabilityDomain(
+        self_caps,
+        ceilings_inner,
+        ceilings_outer,
+        parsed.entry,
+    ) catch return errors.E_NOMEM;
+
+    // Re-mirror kernel-half PML4 entries into the child's PML4 (per
+    // boot's userspace_init — fresh L3/L2 paging structures the kernel
+    // installs for its own data only land in the kernel root; without
+    // this re-mirror the child's iret epilogue's stack pop faults on
+    // the kernel stack VA).
+    const child_root_virt = VAddr.fromPAddr(child_cd.addr_space_root, null);
+    zag.arch.x64.paging.copyKernelMappings(child_root_virt);
+
+    // Load ELF segments into the child's address space.
+    userspace_init.loadElfSegments(child_cd, elf_bytes, &parsed) catch
+        return errors.E_NOMEM;
+    userspace_init.mapUserStack(child_cd) catch return errors.E_NOMEM;
+    userspace_init.mapUserTableView(child_cd) catch return errors.E_NOMEM;
+
+    // Allocate the initial EC bound to the child domain. Entry =
+    // parsed.entry; affinity = 0 (any core); priority = normal.
+    const child_ec = execution_context_mod.allocExecutionContext(
+        child_cd,
+        parsed.entry,
+        16, // user stack pages — same as boot's root stack reservation
+        0,
+        .normal,
+        null,
+        null,
+    ) catch return errors.E_NOMEM;
+
+    // Patch the initial EC's iret frame for user-mode dispatch:
+    // CS/SS = user selectors, RSP = ROOT_USER_STACK_TOP (matches the
+    // mapUserStack call above), RDI = ROOT_USER_TABLE_BASE (spec —
+    // entry point's first arg is the cap-table view pointer).
+    patchInitialIretFrame(child_ec.ctx);
+
+    // Mint slot-1 EC handle in the child for the initial EC. Caps =
+    // ec_inner_ceiling from ceilings_inner bits 0-7 per spec §[20].
+    const ec_inner: u16 = @truncate(ceilings_inner & 0xFF);
+    child_cd.user_table[1].word0 = Word0.pack(1, .execution_context, ec_inner);
+    child_cd.user_table[1].field0 = 0;
+    child_cd.user_table[1].field1 = 0;
+    child_cd.kernel_table[1].ref = .{
+        .ptr = child_ec,
+        .gen = @intCast(child_ec._gen_lock.currentGen()),
+    };
+    child_cd.kernel_table[1].parent = .{};
+    child_cd.kernel_table[1].first_child = .{};
+    child_cd.kernel_table[1].next_sibling = .{};
+
+    // Process passed_handles into child slots 3+.
+    //
+    // SPEC AMBIGUITY: spec §[create_capability_domain] declares
+    // `[5+] passed_handles` but does not encode a count anywhere
+    // (no syscall-word count subfield, no terminator). The kernel
+    // dispatcher hands us the full vreg-5..13 slice unconditionally.
+    // Convention adopted here: an all-zero entry terminates the list.
+    // The runner always passes a non-zero packed-entry (caps != 0 or
+    // move != 0) for live entries, so this is unambiguous in practice.
+    var pass_idx: usize = 0;
+    while (pass_idx < passed_handles.len) {
+        const entry = passed_handles[pass_idx];
+        if (entry == 0) break;
+        const src_slot: u12 = @truncate(entry & 0xFFF);
+        const new_caps: u16 = @truncate((entry >> 16) & 0xFFFF);
+        const move = ((entry >> 32) & 0x1) != 0;
+
+        const src_kh = zag.caps.capability.resolveHandleOnDomain(
+            caller_dom,
+            src_slot,
+            null,
+        ) orelse return errors.E_BADCAP;
+
+        const src_user = caller_dom.user_table[src_slot];
+        const src_type = Word0.typeTag(src_user.word0);
+
+        _ = mintHandle(
+            child_cd,
+            src_kh.ref,
+            src_type,
+            new_caps,
+            src_user.field0,
+            src_user.field1,
+        ) catch return errors.E_FULL;
+
+        if (move) {
+            // move=1: remove the source handle from the caller's table.
+            // For now do a coarse slot clear; full delete-with-derivation
+            // belongs in the proper derivation path. The runner uses
+            // move=0 for the port handoff so this branch is unexercised
+            // on the success path.
+            caller_dom.user_table[src_slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
+            caller_dom.kernel_table[src_slot].ref = .{};
+        }
+
+        pass_idx += 1;
+    }
+
+    // Mint the IDC handle in the CALLER's table that references the new
+    // child domain. Per spec §[19]: caps = caller's cridc_ceiling.
+    const caller_cridc: u16 = @truncate((readSelfField0(caller_dom) >> 24) & 0xFF);
+    const idc_slot = mintHandle(
+        caller_dom,
+        .{
+            .ptr = child_cd,
+            .gen = @intCast(child_cd._gen_lock.currentGen()),
+        },
+        .capability_domain,
+        caller_cridc,
+        0,
+        0,
+    ) catch return errors.E_FULL;
+
+    // Enqueue the initial EC on the calling core; SMP can pull it.
+    scheduler.enqueueOnCore(@intCast(arch.smp.coreID()), child_ec);
+
+    return @intCast(idc_slot);
+}
+
+inline fn pageFrameSizeBytes(sz: zag.capdom.var_range.PageSize) u64 {
+    return switch (sz) {
+        .sz_4k => 0x1000,
+        .sz_2m => 0x200000,
+        .sz_1g => 0x40000000,
+        ._reserved => unreachable,
+    };
+}
+
+/// Patch a fresh EC's iret frame for the initial user-mode dispatch.
+/// The arch-side `prepareEcContext` (called by `allocExecutionContext`
+/// for ECs without a pre-allocated user stack) leaves the frame in
+/// kernel-mode shape; this writes the user selectors, the user RSP,
+/// and the entry-point arg expected by the spec.
+fn patchInitialIretFrame(ctx: *zag.arch.dispatch.cpu.ArchCpuContext) void {
+    const ring_3 = 3;
+    const USER_CODE_SEL: u64 = 0x23; // (USER_CODE >> 3) | 3 — matches gdt
+    const USER_DATA_SEL: u64 = 0x1b;
+    ctx.cs = USER_CODE_SEL;
+    ctx.ss = USER_DATA_SEL;
+    _ = ring_3;
+    ctx.rsp = userspace_init.ROOT_USER_STACK_TOP;
+    ctx.regs.rdi = userspace_init.ROOT_USER_TABLE_BASE;
 }
 
 /// `acquire_ecs` syscall handler.

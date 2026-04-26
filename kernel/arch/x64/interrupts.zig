@@ -237,6 +237,17 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     const caller = scheduler.currentEc() orelse @panic("syscall with no current EC");
     const ret = zag.syscall.dispatch.dispatch(caller, syscall_word, args[0..]);
     r.rax = @bitCast(ret);
+
+    // If the dispatch suspended the calling EC (recv/suspend/futex
+    // wait), `current_ec` was cleared on this core and `caller.state`
+    // was retargeted to `.suspended_on_port` / `.futex_wait`. The asm
+    // epilogue would otherwise iretq back to the parked user mode and
+    // run the suspended EC. Switch to whatever's next (or idle); the
+    // saved register restore in the asm trampoline never executes
+    // because switchTo's `loadEcContextAndReturn` is `noreturn`.
+    if (scheduler.core_states[apic.coreID()].current_ec == null) {
+        scheduler.run();
+    }
 }
 
 /// SYSCALL entry point. Builds an iret-compatible cpu.Context frame so

@@ -58,22 +58,23 @@ const ROOT_EC_CAPS = EcCaps{
     .unbind = true,
 };
 
-/// User stack size for the root EC. 64 KiB (16 pages) — comfortable
-/// headroom for the runner's recv loop and embedded test ELF list.
-const ROOT_USER_STACK_BYTES: u64 = 16 * paging_consts.PAGE4K;
-
 /// User stack top VA in the root domain. Placed near the top of the
 /// 31-bit user range so it does not collide with the ELF segments
 /// (which are linked at origin 0 and extend into the low ~2 MiB).
-const ROOT_USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
+pub const ROOT_USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
+
+/// Pages reserved for the per-EC user stack created by
+/// create_capability_domain.
+pub const USER_STACK_PAGES: u64 = 16;
+pub const USER_STACK_BYTES: u64 = USER_STACK_PAGES * paging_consts.PAGE4K;
 
 /// User VA where the user_table view is mapped read-only. Spec
 /// §[create_capability_domain]: "The pointer to the new domain's
 /// read-only view of its capability table is passed as the first
 /// argument to the initial EC's entry point." 96 KiB (24 pages) at
 /// MAX_HANDLES_PER_DOMAIN * sizeof(Capability) = 4096 * 24 = 96 KiB.
-const ROOT_USER_TABLE_BASE: u64 = 0x0000_0000_4000_0000;
-const ROOT_USER_TABLE_BYTES: u64 = 96 * 1024;
+pub const ROOT_USER_TABLE_BASE: u64 = 0x0000_0000_4000_0000;
+pub const ROOT_USER_TABLE_BYTES: u64 = 96 * 1024;
 
 pub fn init(root_service_elf: []const u8) !void {
     var parsed: ParsedElf = undefined;
@@ -144,7 +145,7 @@ pub fn init(root_service_elf: []const u8) !void {
 ///      and leave the original PTE perms intact (the most permissive
 ///      perms — text/exec — must not be stripped by a subsequent
 ///      rodata mapping).
-fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed: *const ParsedElf) !void {
+pub fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed: *const ParsedElf) !void {
     _ = parsed;
     const hdr_sz = @sizeOf(std.elf.Elf64_Ehdr);
     var rd = std.Io.Reader.fixed(elf_bytes[0..hdr_sz]);
@@ -213,10 +214,10 @@ fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed: *c
 /// Allocate ROOT_USER_STACK_BYTES of user pages and map them ending at
 /// ROOT_USER_STACK_TOP. The EC's iret frame uses ROOT_USER_STACK_TOP as
 /// the initial RSP.
-fn mapUserStack(root_cd: *CapabilityDomain) !void {
-    const base: u64 = ROOT_USER_STACK_TOP - ROOT_USER_STACK_BYTES;
+pub fn mapUserStack(root_cd: *CapabilityDomain) !void {
+    const base: u64 = ROOT_USER_STACK_TOP - USER_STACK_BYTES;
     var off: u64 = 0;
-    while (off < ROOT_USER_STACK_BYTES) {
+    while (off < USER_STACK_BYTES) {
         const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
         const page = try pmm_mgr.create(paging_consts.PageMem(.page4k));
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
@@ -235,7 +236,7 @@ fn mapUserStack(root_cd: *CapabilityDomain) !void {
 /// user half at ROOT_USER_TABLE_BASE. The kernel writes to the table
 /// via its own kernel-half pointer (root_cd.user_table); user code
 /// reads through this view.
-fn mapUserTableView(root_cd: *CapabilityDomain) !void {
+pub fn mapUserTableView(root_cd: *CapabilityDomain) !void {
     const ut_kernel_va: u64 = @intFromPtr(root_cd.user_table);
     var off: u64 = 0;
     while (off < ROOT_USER_TABLE_BYTES) {
