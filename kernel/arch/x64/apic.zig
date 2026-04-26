@@ -224,6 +224,13 @@ pub fn armTscDeadline(deadline_tsc: u64) void {
     cpu.wrmsr(tsc_deadline_msr, deadline_tsc);
 }
 
+/// Arm the LAPIC TSC-deadline timer to fire at absolute monotonic-clock
+/// time `deadline_ns`. Spec §[timer].
+pub fn armDeadline(deadline_ns: u64) void {
+    _ = deadline_ns;
+    @panic("not implemented");
+}
+
 /// Signal end-of-interrupt by writing 0 to the EOI register. For level-triggered
 /// interrupts, this also causes an EOI message to be broadcast to I/O APICs.
 /// Intel SDM Vol 3A, Section 13.8.5 "Signaling Interrupt Servicing Completion", Figure 13-21.

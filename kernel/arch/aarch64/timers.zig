@@ -207,3 +207,10 @@ pub inline fn getMonotonicClock() Timer {
         .vtable = &monotonic_vtable,
     };
 }
+
+/// Arm CNTV_CVAL_EL0 to fire at absolute monotonic-clock time
+/// `deadline_ns`. Spec §[timer].
+pub fn armDeadline(deadline_ns: u64) void {
+    _ = deadline_ns;
+    @panic("not implemented");
+}

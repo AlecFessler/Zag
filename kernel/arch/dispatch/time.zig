@@ -60,22 +60,20 @@ pub inline fn initMonotonicClock() void {
 /// Write the platform RTC to `unix_ns` since the Unix epoch. Returns 0
 /// on success or a negative spec error code. Spec §[time].time_setwall.
 pub fn writeRtc(unix_ns: u64) i64 {
-    _ = unix_ns;
-    switch (builtin.cpu.arch) {
-        .x86_64 => return -1,
-        .aarch64 => return -1,
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.rtc.writeRtc(unix_ns),
+        .aarch64 => aarch64.rtc.writeRtc(unix_ns),
         else => unreachable,
-    }
+    };
 }
 
 /// Arm the platform's per-core deadline timer to fire at absolute
 /// monotonic-clock time `deadline_ns`. Used by the timer wheel to
 /// schedule the next wake. Spec §[timer].
 pub fn armWheelDeadline(deadline_ns: u64) void {
-    _ = deadline_ns;
     switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => {},
+        .x86_64 => x64.apic.armDeadline(deadline_ns),
+        .aarch64 => aarch64.timers.armDeadline(deadline_ns),
         else => unreachable,
     }
 }
@@ -84,9 +82,6 @@ pub fn armWheelDeadline(deadline_ns: u64) void {
 /// `getMonotonicClock` for callers that only want the scalar value.
 /// Spec §[time].time_monotonic.
 pub fn currentMonotonicNs() u64 {
-    switch (builtin.cpu.arch) {
-        .x86_64 => return 0,
-        .aarch64 => return 0,
-        else => unreachable,
-    }
+    const clock = getMonotonicClock();
+    return clock.now();
 }

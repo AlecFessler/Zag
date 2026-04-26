@@ -82,6 +82,13 @@ pub fn readRtc() u64 {
     return total_secs * 1_000_000_000;
 }
 
+/// Write the CMOS RTC to `unix_ns` since the Unix epoch. Returns 0 on
+/// success or a negative spec error code. Spec §[time].time_setwall.
+pub fn writeRtc(unix_ns: u64) i64 {
+    _ = unix_ns;
+    @panic("not implemented");
+}
+
 fn readCmosReg(reg: u8) u8 {
     cpu.outb(reg, 0x70);
     return cpu.inb(0x71);
