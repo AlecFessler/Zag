@@ -912,25 +912,54 @@ fn handleDiffFiles(
     query: []const u8,
     state: *const ServerState,
 ) !void {
+    // Same dual shape as handleDiffHunks. Parent mode passes
+    // sha_a (older) + sha_b (newer); head mode passes a single sha.
     var sha: []const u8 = "";
+    var sha_a: []const u8 = "";
+    var sha_b: []const u8 = "";
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
         const key = pair[0..eq];
         const val = pair[eq + 1 ..];
         if (std.mem.eql(u8, key, "sha")) sha = val;
+        if (std.mem.eql(u8, key, "sha_a")) sha_a = val;
+        if (std.mem.eql(u8, key, "sha_b")) sha_b = val;
     }
-    if (!isValidShaOrRef(sha)) return respondBytes(
+    const have_pair = sha_a.len > 0 and sha_b.len > 0;
+    if (!have_pair and !isValidShaOrRef(sha)) return respondBytes(
         request,
         .bad_request,
         "text/plain; charset=utf-8",
-        "missing or invalid ?sha=\n",
+        "missing or invalid ?sha= (or sha_a + sha_b)\n",
     );
+    if (have_pair and (!isValidShaOrRef(sha_a) or !isValidShaOrRef(sha_b))) {
+        return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "invalid sha_a or sha_b\n",
+        );
+    }
 
-    const argv = [_][]const u8{ "git", "diff", "--name-only", sha };
+    var argv_buf: [5][]const u8 = undefined;
+    const argv: []const []const u8 = if (have_pair) blk: {
+        argv_buf[0] = "git";
+        argv_buf[1] = "diff";
+        argv_buf[2] = "--name-only";
+        argv_buf[3] = sha_a;
+        argv_buf[4] = sha_b;
+        break :blk argv_buf[0..5];
+    } else blk: {
+        argv_buf[0] = "git";
+        argv_buf[1] = "diff";
+        argv_buf[2] = "--name-only";
+        argv_buf[3] = sha;
+        break :blk argv_buf[0..4];
+    };
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &argv,
+        .argv = argv,
         .cwd = state.git_root,
         .max_output_bytes = 4 * 1024 * 1024,
     }) catch |err| {
@@ -979,25 +1008,60 @@ fn handleDiffHunks(
     query: []const u8,
     state: *const ServerState,
 ) !void {
+    // Two call shapes are supported:
+    //   ?sha=X            — head mode: diff between working tree and X
+    //   ?sha_a=X^&sha_b=X — parent mode: diff between two specific commits
+    // Parent mode is the right shape for the review tracker because the
+    // reviewable hunks should match the *commits the user is comparing*,
+    // not whatever transient state the working tree happens to have.
     var sha: []const u8 = "";
+    var sha_a: []const u8 = "";
+    var sha_b: []const u8 = "";
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
         const key = pair[0..eq];
         const val = pair[eq + 1 ..];
         if (std.mem.eql(u8, key, "sha")) sha = val;
+        if (std.mem.eql(u8, key, "sha_a")) sha_a = val;
+        if (std.mem.eql(u8, key, "sha_b")) sha_b = val;
     }
-    if (!isValidShaOrRef(sha)) return respondBytes(
+    const have_pair = sha_a.len > 0 and sha_b.len > 0;
+    if (!have_pair and !isValidShaOrRef(sha)) return respondBytes(
         request,
         .bad_request,
         "text/plain; charset=utf-8",
-        "missing or invalid ?sha=\n",
+        "missing or invalid ?sha= (or sha_a + sha_b)\n",
     );
+    if (have_pair and (!isValidShaOrRef(sha_a) or !isValidShaOrRef(sha_b))) {
+        return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "invalid sha_a or sha_b\n",
+        );
+    }
 
-    const argv = [_][]const u8{ "git", "diff", "--unified=0", "--no-color", sha };
+    var argv_buf: [6][]const u8 = undefined;
+    const argv: []const []const u8 = if (have_pair) blk: {
+        argv_buf[0] = "git";
+        argv_buf[1] = "diff";
+        argv_buf[2] = "--unified=0";
+        argv_buf[3] = "--no-color";
+        argv_buf[4] = sha_a;
+        argv_buf[5] = sha_b;
+        break :blk argv_buf[0..6];
+    } else blk: {
+        argv_buf[0] = "git";
+        argv_buf[1] = "diff";
+        argv_buf[2] = "--unified=0";
+        argv_buf[3] = "--no-color";
+        argv_buf[4] = sha;
+        break :blk argv_buf[0..5];
+    };
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &argv,
+        .argv = argv,
         .cwd = state.git_root,
         .max_output_bytes = 64 * 1024 * 1024,
     }) catch |err| {

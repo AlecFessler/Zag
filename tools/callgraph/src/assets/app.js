@@ -2480,9 +2480,23 @@
     const sec = secondarySha();
     if (!sec) { clear(); return; }
 
+    // In parent mode the user wants the diff between two specific
+    // commits (X^..X) — not whatever the working tree happens to look
+    // like. Pass both shas to the server so it runs `git diff X^ X`
+    // instead of `git diff X^` (which would pull in every uncommitted
+    // edit). Falls back to the head-mode shape (single sha = secondary
+    // vs working tree) when no primary sha is set.
+    let hunksUrl;
+    const pair = reviewPair();
+    if (pair) {
+      hunksUrl = "/api/diff_hunks?sha_a=" + encodeURIComponent(pair.sha_a) +
+        "&sha_b=" + encodeURIComponent(pair.sha_b);
+    } else {
+      hunksUrl = "/api/diff_hunks?sha=" + encodeURIComponent(sec);
+    }
     let hunksByFile;
     try {
-      const r = await fetch("/api/diff_hunks?sha=" + encodeURIComponent(sec));
+      const r = await fetch(hunksUrl);
       if (!r.ok) throw new Error("HTTP " + r.status);
       const j = await r.json();
       hunksByFile = new Map();
