@@ -307,18 +307,27 @@ pub fn mapMmio(caller: *ExecutionContext, var_handle: u64, device_region: u64) i
 
     const sz_bytes = pageSizeBytes(v.sz);
     const var_size = @as(u64, v.page_count) * sz_bytes;
-    if (dr.size != var_size) return errors.E_INVAL;
+    // Spec §[var].map_mmio test 05: device_region size must equal VAR size.
+    // Mmio devices carry byte size in `access.mmio.size`; port_io devices'
+    // size is `port_count` bytes — the port-io fault decoder maps VAR
+    // offsets 1:1 onto port offsets (Spec §[port_io_virtualization]).
+    const dr_size: u64 = switch (dr.device_type) {
+        .mmio => dr.access.mmio.size,
+        .port_io => dr.access.port_io.port_count,
+    };
+    if (dr_size != var_size) return errors.E_INVAL;
 
     // Port-IO regions install with no PTEs — every CPU access faults
     // and is decoded by the port-io fault handler. Plain MMIO installs
     // PTEs covering [base_vaddr, base_vaddr + var_size).
     // Spec §[port_io_virtualization].
-    if (dr.dev_type == .mmio) {
+    if (dr.device_type == .mmio) {
+        const phys_base = dr.access.mmio.phys_base;
         var off: u64 = 0;
         while (off < var_size) {
             dispatch.paging.mapPageSized(
                 domain.addr_space_root,
-                .fromInt(dr.phys_base.addr + off),
+                .fromInt(phys_base.addr + off),
                 .fromInt(v.base_vaddr.addr + off),
                 v.sz,
                 v.cch,
@@ -748,7 +757,7 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             // here are spurious (real PTEs were installed at map time)
             // and route to the EC's memory_fault event.
             const dev = v.device orelse return errors.E_BADADDR;
-            if (dev.dev_type == .port_io) {
+            if (dev.device_type == .port_io) {
                 return decodePortIoFault(domain, fault_vaddr, v, dev);
             }
             return errors.E_PERM;

@@ -519,9 +519,20 @@ fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) v
             const ref = typedRef(DeviceRegion, entry.*) orelse return;
             const dr = ref.lock(@src()) catch return;
             defer ref.unlock();
-            // field1 = irq_count (kernel-mutable). field0 holds
-            // immutable region descriptor (dev_type/phys_base/size).
-            user_entry.field1 = dr.irq_count;
+            // Spec §[device_region] handle ABI: field0 packs immutable
+            // dev_type (bits 0-3) and, for port_io, base_port (bits 4-19)
+            // and port_count (bits 20-35). field1 = irq_count, owned by
+            // the IRQ handler — it propagates increments directly to each
+            // copy's `field1` paddr via `propagateIrqAndWake`. Refresh
+            // must NOT clobber it (would race with concurrent IRQs and
+            // erase coalesced counts not yet ack'd by userspace).
+            var field0: u64 = @intFromEnum(dr.device_type);
+            if (dr.device_type == .port_io) {
+                const pio = dr.access.port_io;
+                field0 |= (@as(u64, pio.base_port) << 4) |
+                    (@as(u64, pio.port_count) << 20);
+            }
+            user_entry.field0 = field0;
         },
         .timer => {
             const ref = typedRef(Timer, entry.*) orelse return;
