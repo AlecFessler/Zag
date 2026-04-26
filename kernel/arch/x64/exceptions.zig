@@ -12,15 +12,16 @@ const paging_mod = zag.arch.x64.paging;
 const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const serial = zag.arch.x64.serial;
+const var_range = zag.capdom.var_range;
 
 const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const DeviceRegion = zag.devices.device_region.DeviceRegion;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.x64.interrupts.PageFaultContext;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
+const VAR = zag.capdom.var_range.VAR;
 const VAddr = zag.memory.address.VAddr;
-const VmNode = zag.memory.vmm.VmNode;
 
 /// thread_fault sub-codes for exception-derived faults (spec §[event_type]
 /// row 2). Values are local to this file; the spec leaves sub-code
@@ -268,21 +269,25 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
 
-    // Intercept virtual_bar faults from userspace before the generic handler.
-    // These intentionally have no PTEs — the kernel decodes the faulting
-    // instruction and performs the port I/O on behalf of the EC.
+    // Intercept port-IO virtual_bar faults from userspace before the
+    // generic handler. A VAR mapped via `map_mmio` to a port-IO
+    // device_region intentionally has no PTEs — every CPU access faults
+    // and the kernel decodes the MOV, performs the port I/O on behalf
+    // of the EC, and advances RIP. Spec §[port_io_virtualization].
     if (from_user and !pf_err.present) {
         const ec = scheduler.currentEc() orelse
             @panic("user page fault with no current EC");
         // self-alive: currentEc() runs on this core; its bound
         // capability domain is alive across this PF handler.
         const domain = ec.domain.ptr;
-        if (domain.vmm.findNode(VAddr.fromInt(faulting_addr))) |node_ref| {
-            const node = node_ref.lock(@src()) catch return;
-            const is_virtual_bar = node.kind == .virtual_bar;
-            node_ref.unlock();
-            if (is_virtual_bar) {
-                emulateVirtualBar(ctx, ec, node_ref, faulting_addr, domain);
+        if (var_range.findVarCovering(domain, VAddr.fromInt(faulting_addr))) |v| {
+            v._gen_lock.lock(@src());
+            const is_port_io = v.map == .mmio and
+                v.device != null and
+                v.device.?.device_type == .port_io;
+            v._gen_lock.unlock();
+            if (is_port_io) {
+                emulateVirtualBar(ctx, ec, v, faulting_addr, domain);
                 return;
             }
         }
@@ -299,32 +304,33 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     zag.memory.fault.handlePageFault(&pf_ctx);
 }
 
-/// Emulate a port I/O access through a virtual BAR mapping.
+/// Emulate a port I/O access through a port-IO VAR.
 /// Decodes the faulting instruction, performs the port I/O, writes back
 /// the result (for reads), and advances RIP past the instruction.
 ///
-/// Spec §[virtual_bar]: unsupported instruction forms (8-byte MOV, LOCK
-/// prefixes, IN/OUT/INS/OUTS, undecodable bytes) deliver `thread_fault`
-/// with the protection sub-code. Out-of-bounds offsets and other access
-/// failures deliver `memory_fault` with read/write sub-codes.
+/// Spec §[port_io_virtualization]: unsupported instruction forms (8-byte
+/// MOV, LOCK prefixes, IN/OUT/INS/OUTS, undecodable bytes) deliver
+/// `thread_fault` with the protection sub-code. Out-of-bounds offsets
+/// and other access failures deliver `memory_fault` with read/write
+/// sub-codes.
 fn emulateVirtualBar(
     ctx: *cpu.Context,
     ec: *ExecutionContext,
-    node_ref: SlabRef(VmNode),
+    v: *VAR,
     faulting_addr: u64,
     domain: *CapabilityDomain,
 ) void {
     // Snapshot under the lock then release before any path that may
     // suspend or terminate `ec`: the fault-routing handlers may unwind
-    // through the scheduler and never return here, so holding the
-    // VmNode lock across them would strand the gen and deadlock any
-    // future walk of the domain's VMM. The DeviceRegion pointer is
-    // stable for the kernel's lifetime and `start` is immutable for a
-    // virtual_bar node, so the snapshot is safe to use unlocked.
-    const node = node_ref.lock(@src()) catch return;
-    const device = node.deviceRegion().?;
-    const node_start_addr = node.start.addr;
-    node_ref.unlock();
+    // through the scheduler and never return here, so holding the VAR
+    // lock across them would strand the gen and deadlock any future
+    // walk of the domain's vars[]. The DeviceRegion pointer is stable
+    // for the kernel's lifetime once bound and `base_vaddr` is
+    // immutable on the VAR, so the snapshot is safe to use unlocked.
+    v._gen_lock.lock(@src());
+    const device: *DeviceRegion = v.device.?;
+    const var_base_addr = v.base_vaddr.addr;
+    v._gen_lock.unlock();
 
     // Fetch instruction bytes from user RIP via the domain's page tables.
     const rip = ctx.rip;
@@ -338,7 +344,7 @@ fn emulateVirtualBar(
     const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse {
         port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
         cpu.enableInterrupts();
-        scheduler.yield();
+        scheduler.yieldTo(null);
         unreachable;
     };
 
@@ -351,12 +357,12 @@ fn emulateVirtualBar(
     const op = mmio_decode.decodeBytes(buf[0..max_bytes]) catch {
         port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
         cpu.enableInterrupts();
-        scheduler.yield();
+        scheduler.yieldTo(null);
         unreachable;
     };
 
     // Compute the port offset and validate bounds
-    const port_offset = faulting_addr - node_start_addr;
+    const port_offset = faulting_addr - var_base_addr;
     if (port_offset + op.size > device.access.port_io.port_count) {
         const subcode: u8 = if (op.is_write)
             MemoryFaultSubcode.invalid_write
@@ -364,7 +370,7 @@ fn emulateVirtualBar(
             MemoryFaultSubcode.invalid_read;
         port.fireMemoryFault(ec, subcode, faulting_addr);
         cpu.enableInterrupts();
-        scheduler.yield();
+        scheduler.yieldTo(null);
         return;
     }
 
@@ -383,7 +389,7 @@ fn emulateVirtualBar(
             else => {
                 port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
                 cpu.enableInterrupts();
-                scheduler.yield();
+                scheduler.yieldTo(null);
                 return;
             },
         }
@@ -395,7 +401,7 @@ fn emulateVirtualBar(
             else => {
                 port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
                 cpu.enableInterrupts();
-                scheduler.yield();
+                scheduler.yieldTo(null);
                 unreachable;
             },
         };
