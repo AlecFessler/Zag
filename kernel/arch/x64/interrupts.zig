@@ -580,7 +580,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         // (EC.prev), tails[N] update, and waiter_kind=.none on empty are
         // all unimplemented. See specv3.md Phase 5 priority-queue pop.
         \\movq %%r11, %%gs:80                 // publish *receiver_EC → fast_temp[4]
-        \\movq %[ec_next](%%r11), %%r11       // r11 = (*EC).next.ptr (treat ?SlabRef payload@0)
+    ++ std.fmt.comptimePrint("        movq {d}(%%r11), %%r11      // r11 = (*EC).next.ptr (treat ?SlabRef payload@0)\n", .{Offsets.ec_next}) ++
         \\movq %%r11, 0(%%rcx)                // heads[N] = next
         // TODO: also walk EC.prev for doubly-linked + tails update +
         // waiter_kind = .none if queue now empty.
@@ -811,7 +811,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         // layout is whatever Zig's auto-reorder produces; the
         // displacement is supplied as an `"i"` operand resolved at
         // comptime from `Offsets.ec_domain_ptr`.
-        \\movq %[ec_domain](%%r11), %%rcx
+    ++ std.fmt.comptimePrint("        movq {d}(%%r11), %%rcx\n", .{Offsets.ec_domain_ptr}) ++
         \\movq %%rcx, %%gs:40                 // current_domain = receiver.domain.ptr
 
         // (c) Lazy-FPU policy. per_core_ptr is at scratch[112].
@@ -937,9 +937,6 @@ pub export fn syscallEntry() callconv(.naked) void {
         // sees the same state the user invoked with. We've added a
         // few gs scratch writes (negligible).
         \\jmp .L_slow
-        :
-        : [ec_domain] "i" (Offsets.ec_domain_ptr),
-          [ec_next] "i" (Offsets.ec_next),
     );
 }
 
