@@ -795,7 +795,7 @@ fn incMapCntShim(pf: *PageFrame) void {
 /// Linear scan for any VAR whose [base, base + page_count*sz) covers
 /// `fault_vaddr`. The flat per-domain `vars[]` makes this O(N) which
 /// is fine because a domain holds at most MAX_VARS_PER_DOMAIN (512).
-fn findVarCovering(cd: *CapabilityDomain, fault_vaddr: VAddr) ?*VAR {
+pub fn findVarCovering(cd: *CapabilityDomain, fault_vaddr: VAddr) ?*VAR {
     var i: u16 = 0;
     while (i < cd.var_count) {
         const v = cd.vars[i] orelse {
