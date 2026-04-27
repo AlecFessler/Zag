@@ -18,7 +18,9 @@ const SLAB_RESERVATION: u64 = 16 * 1024 * 1024;
 pub const AddrSpacePartition = arch.paging.addr_space;
 
 pub const UserVA = struct {
+    pub const null_guard: Range = arch.paging.user_null_guard;
     pub const aslr: Range = arch.paging.user_aslr;
+    pub const static: Range = arch.paging.user_static;
 };
 
 pub const KernelVA = struct {

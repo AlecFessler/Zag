@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
+const dispatch = zag.arch.dispatch;
 const interrupts = zag.arch.x64.interrupts;
 const kprof = zag.kprof.trace_id;
 const paging = zag.memory.paging;
@@ -286,6 +287,11 @@ pub fn mapPage(
     const pmm_mgr = &pmm.global_pmm.?;
 
     const attrs = kindAttrs(kind);
+    if (attrs.user_accessible) {
+        // Spec §[address_space]: NULL guard `[0, 0x1000)` must always
+        // fault. No mapping path may install a leaf into the first page.
+        std.debug.assert(virt.addr >= dispatch.paging.user_null_guard.end);
+    }
     const writable = perms.write;
     const not_executable = !perms.exec;
 

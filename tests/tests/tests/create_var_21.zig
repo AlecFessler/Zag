@@ -19,15 +19,14 @@
 //   has the latitude to assign a different base and we cannot isolate
 //   test 21 from the spec ambiguity around runtime layout.
 //
-//   To keep this test robust against startup-layout drift we sweep a
-//   small list of candidates well above any plausible startup mapping
-//   (0x1000_0000, 0x2000_0000, 0x4000_0000) and stop on the first one
-//   the kernel honors. If none match we report assertion 2 — "no
-//   candidate matched", which surfaces the spec ambiguity rather than
-//   silently failing the assertion under test.
+//   Spec §[address_space] also requires preferred_base to lie wholly
+//   within the static zone (spec test 23) — a request outside it
+//   returns E_INVAL. Candidates are picked at the bottom of the
+//   x86-64 static zone (0x0000_1000_0000_0000) so they satisfy both
+//   the static-zone constraint and the page-alignment requirement.
 //
 // Action
-//   For each preferred_base in {0x1000_0000, 0x2000_0000, 0x4000_0000}:
+//   For each preferred_base in the candidate list:
 //     1. createVar(caps={r,w}, props={cur_rwx=0b011, sz=0, cch=0},
 //                  pages=1, preferred_base=<candidate>, device_region=0)
 //     2. If success, check cv.v2 == candidate. If yes, pass.
@@ -55,10 +54,13 @@ const CUR_RWX: u64 = 0b011; // r|w
 const SZ: u64 = 0; // 4 KiB
 const CCH: u64 = 0; // wb
 
+// preferred_base must lie wholly within the static zone (spec
+// §[address_space] / §[create_var] test 23). On x86-64 the static
+// zone starts at 0x0000_1000_0000_0000.
 const candidates = [_]u64{
-    0x1000_0000,
-    0x2000_0000,
-    0x4000_0000,
+    0x0000_1000_0000_0000,
+    0x0000_1000_0001_0000,
+    0x0000_1000_0010_0000,
 };
 
 pub fn main(cap_table_base: u64) void {
