@@ -350,15 +350,38 @@ pub fn createExecutionContext(
     return errors.E_BADCAP;
 }
 
-/// `self` syscall handler — returns the slot id of the caller's own
-/// EC handle in its table. Spec §[execution_context].self.
+/// `self` syscall handler — returns the packed handle word for an EC
+/// handle in the caller's domain that references the calling EC. Spec
+/// §[execution_context].self.
+///
+/// Linear walk of the caller's kernel_table: an in-use slot
+/// (`ref.ptr != null`) whose ptr equals `caller` and whose parallel
+/// user_table entry is type-tagged `execution_context` is a self-handle.
+/// By spec §[self]'s at-most-one invariant, at most one such slot
+/// exists. Returns the packed Word0 (id | type<<12 | caps<<48) so the
+/// type tag in bits 12..15 disambiguates the success word from the
+/// `1..15` error range.
 pub fn self(caller: *ExecutionContext) i64 {
-    // Walk caller.domain's user_table for an entry whose KernelHandle.ref
-    // points at `caller`. Returns E_NOENT when no such handle exists.
-    // Until handle-table walk is wired, this stub returns E_NOENT
-    // unconditionally — the slow path is correct (no handle found),
-    // just incomplete (won't find handles that actually exist).
-    _ = caller;
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    defer cd_ref.unlock();
+
+    var slot: u16 = 0;
+    while (slot < capability.MAX_HANDLES_PER_DOMAIN) {
+        const entry = &cd.kernel_table[slot];
+        if (entry.ref.ptr == @as(*anyopaque, @ptrCast(caller))) {
+            const user_word0 = cd.user_table[slot].word0;
+            if (capability.Word0.typeTag(user_word0) == .execution_context) {
+                const caps_word = capability.Word0.caps(user_word0);
+                return @intCast(capability.Word0.pack(
+                    @intCast(slot),
+                    .execution_context,
+                    caps_word,
+                ));
+            }
+        }
+        slot += 1;
+    }
     return errors.E_NOENT;
 }
 
