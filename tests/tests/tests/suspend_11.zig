@@ -229,13 +229,18 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 7: spin until W publishes its post-resume r15. A purely
-    // unbounded spin would deadlock if reply silently failed to
-    // resume W; the runner's outer scheduling will eventually
+    // Step 7: spin until W publishes its post-resume r15. The test EC
+    // is at runner priority (pri=3) and W is at pri=0, so a plain busy
+    // spin starves W under strict-priority scheduling. Yield explicitly
+    // to W's handle on each iteration — yield-to-target removes the
+    // named EC from its queue regardless of relative priority — so W
+    // gets scheduled, completes its r15 read, and stores g_observed.
+    // A purely unbounded spin would deadlock if reply silently failed
+    // to resume W; the runner's outer scheduling will eventually
     // surface that as a hung test, which is the correct user-visible
     // failure mode.
     while (@atomicLoad(u64, &g_observed, .acquire) == 0) {
-        asm volatile ("pause");
+        _ = syscall.yieldEc(w_handle);
     }
 
     // Step 8: confirm the kernel applied our modification verbatim.
