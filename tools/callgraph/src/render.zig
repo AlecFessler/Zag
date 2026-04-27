@@ -42,6 +42,13 @@ pub const CallerSite = struct {
 pub const Maps = struct {
     by_id: std.AutoHashMap(FnId, *const Function),
     by_name: std.StringHashMap(*const Function),
+    /// All Functions sharing each name — the index `by_name` only keeps
+    /// one entry per key, so generic-method monomorphizations
+    /// (`SlabRef(Port).lock`, `SlabRef(EC).lock`, …) collapse to a
+    /// single visible Function under that map. `by_name_multi` keeps
+    /// every instantiation so callers-style endpoints can aggregate
+    /// across them and report the true call-site count.
+    by_name_multi: std.StringHashMap(std.ArrayList(*const Function)),
     /// Reverse-edge index: callee FnId → all known call sites that
     /// reach it. Owned by this Maps; freed in `deinit`.
     callers: std.AutoHashMap(FnId, std.ArrayList(CallerSite)),
@@ -52,6 +59,9 @@ pub const Maps = struct {
     pub fn deinit(self: *Maps) void {
         self.by_id.deinit();
         self.by_name.deinit();
+        var mit = self.by_name_multi.valueIterator();
+        while (mit.next()) |list| list.deinit(self.callers_alloc);
+        self.by_name_multi.deinit();
         var it = self.callers.valueIterator();
         while (it.next()) |list| list.deinit(self.callers_alloc);
         self.callers.deinit();
@@ -122,6 +132,7 @@ pub fn emptyMaps(gpa: std.mem.Allocator) Maps {
     return .{
         .by_id = std.AutoHashMap(FnId, *const Function).init(gpa),
         .by_name = std.StringHashMap(*const Function).init(gpa),
+        .by_name_multi = std.StringHashMap(std.ArrayList(*const Function)).init(gpa),
         .callers = std.AutoHashMap(FnId, std.ArrayList(CallerSite)).init(gpa),
         .callers_alloc = gpa,
     };
@@ -134,12 +145,26 @@ pub fn buildLookups(gpa: std.mem.Allocator, g: *const Graph) !Maps {
     errdefer by_id.deinit();
     var by_name = std.StringHashMap(*const Function).init(gpa);
     errdefer by_name.deinit();
+    // Multi-value name index. Generic methods compile to one Function
+    // per (T,) instantiation but all share the same `name`, so a plain
+    // map silently drops all but the last. `by_name_multi` records
+    // every Function for each key so /api/callers can aggregate across
+    // instantiations.
+    var by_name_multi = std.StringHashMap(std.ArrayList(*const Function)).init(gpa);
+    errdefer {
+        var it = by_name_multi.valueIterator();
+        while (it.next()) |list| list.deinit(gpa);
+        by_name_multi.deinit();
+    }
     for (g.functions) |*f| {
         try by_id.put(f.id, f);
         try by_name.put(f.name, f);
         if (!std.mem.eql(u8, f.mangled, f.name)) {
             try by_name.put(f.mangled, f);
         }
+        const gop = try by_name_multi.getOrPut(f.name);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        try gop.value_ptr.append(gpa, f);
     }
 
     // Reverse-edge index. We walk each fn's intra Atom tree (which is the
@@ -157,6 +182,7 @@ pub fn buildLookups(gpa: std.mem.Allocator, g: *const Graph) !Maps {
     return .{
         .by_id = by_id,
         .by_name = by_name,
+        .by_name_multi = by_name_multi,
         .callers = callers,
         .callers_alloc = gpa,
     };
@@ -228,7 +254,13 @@ pub fn renderTrace(
 ///   `@`  function with no callees in its body — typically AST-only
 ///        helpers the compiler inlined away. Never expands further;
 ///        deepening the trace will not help. (payload: name)
-///   `~`  recursion-stopped fn (payload: name)
+///   `~`  body shown elsewhere — followed by a single base-36 depth
+///        char pointing at the line where the body was actually
+///        rendered, then the function name. Either an ancestor on the
+///        call path (recursion) or a fn already expanded earlier as a
+///        sibling. Either way, scan upward for a line whose leading
+///        char matches that depth and whose payload is this name.
+///        Shape: `<this_depth>~<body_depth><name>`.
 ///   `&`  indirect call (payload: expression)
 ///   `!`  unresolved call (payload: name)
 ///   `%`  folded debug call (payload: name)
@@ -241,7 +273,9 @@ pub fn renderTrace(
 ///   `T fns=N cap=N d=N[ top=<name>/<count>][ cap_top=<n1>/<c1>,<n2>/<c2>,...]`
 /// `cap_top` lists up to 3 fns reached at the depth cap, sorted by call-site
 /// count desc. Tells the caller exactly which fn(s) to deepen next instead
-/// of cranking depth blindly.
+/// of cranking depth blindly. Suppressed when every capped fn has only
+/// one call site — in that case the `^` markers in the body already
+/// locate them and `cap_top` adds no signal.
 pub fn renderTraceCompact(
     arena: std.mem.Allocator,
     out: *std.io.Writer,
@@ -254,7 +288,12 @@ pub fn renderTraceCompact(
     if (stats.top_fanout > 0) {
         try out.print(" top={s}/{d}", .{ stats.top_name, stats.top_fanout });
     }
-    if (stats.cap_top.len > 0) {
+    // Suppress cap_top entirely when every entry has just one call site —
+    // the `^` markers in the body already point at them and `/1` flags add
+    // noise without distinguishing a hot spot. Emit it only when at least
+    // one capped fn has 2+ call sites, which is the case where the field
+    // tells the caller which subtree to deepen first.
+    if (stats.cap_top.len > 0 and stats.cap_top[0].count > 1) {
         try out.writeAll(" cap_top=");
         for (stats.cap_top, 0..) |e, i| {
             if (i > 0) try out.writeByte(',');
@@ -263,20 +302,23 @@ pub fn renderTraceCompact(
     }
     try out.writeAll("\n");
 
-    // Two distinct fn-id sets:
+    // Two distinct fn-id maps. Values are the depth at which the fn's
+    // body was rendered — emitted after `~` so a reader can scan to that
+    // depth's earlier line instead of grepping the whole trace.
     //   `visited`  — ancestors on the current call path. Push on descend,
     //                pop on return. Catches recursion (same fn calling
-    //                itself transitively) and emits `~name`.
+    //                itself transitively) and emits `~<body_d>name`.
     //   `rendered` — every fn whose body we've already expanded ANYWHERE
     //                in this trace. Never pruned. Catches sibling repeats
     //                (e.g. SlabRef.unlock called 6× under the same parent)
-    //                and collapses them to `~name` instead of re-emitting
-    //                the same subtree. Both sets reuse the `~` tag — the
-    //                semantic ("look elsewhere for the body") is the same;
-    //                the agent doesn't need to distinguish ancestor cycle
-    //                from already-shown sibling.
-    var visited = std.AutoHashMap(FnId, void).init(arena);
-    var rendered = std.AutoHashMap(FnId, void).init(arena);
+    //                and collapses them to `~<body_d>name` instead of
+    //                re-emitting the same subtree. Both sets share the
+    //                `~` tag — the semantic ("look elsewhere for the
+    //                body") is the same; the agent doesn't need to
+    //                distinguish ancestor cycle from already-shown
+    //                sibling.
+    var visited = std.AutoHashMap(FnId, u32).init(arena);
+    var rendered = std.AutoHashMap(FnId, u32).init(arena);
     try compactFn(out, ctx, root, 0, max_depth, &visited, &rendered);
 }
 
@@ -294,8 +336,8 @@ fn compactFn(
     f: *const Function,
     depth: u32,
     max_depth: u32,
-    visited: *std.AutoHashMap(FnId, void),
-    rendered: *std.AutoHashMap(FnId, void),
+    visited: *std.AutoHashMap(FnId, u32),
+    rendered: *std.AutoHashMap(FnId, u32),
 ) RenderError!void {
     try compactDepth(out, depth);
     try out.writeAll(f.name);
@@ -304,8 +346,10 @@ fn compactFn(
     // call back into f collapse via the rendered-set check (in addition to
     // the visited-set ancestor check, which would also fire). Putting the
     // mark here — instead of in compactCall before the recursion — also
-    // covers the root, which compactCall never sees.
-    try rendered.put(f.id, {});
+    // covers the root, which compactCall never sees. Storing `depth` lets
+    // sibling-repeat `~` lines emit a forward reference back to the line
+    // where this body lives.
+    try rendered.put(f.id, depth);
     for (f.intra) |atom| {
         try compactAtom(out, ctx, atom, depth + 1, max_depth, visited, rendered);
     }
@@ -317,8 +361,8 @@ fn compactAtom(
     atom: Atom,
     depth: u32,
     max_depth: u32,
-    visited: *std.AutoHashMap(FnId, void),
-    rendered: *std.AutoHashMap(FnId, void),
+    visited: *std.AutoHashMap(FnId, u32),
+    rendered: *std.AutoHashMap(FnId, u32),
 ) RenderError!void {
     switch (atom) {
         .call => |c| try compactCall(out, ctx, c, depth, max_depth, visited, rendered),
@@ -334,14 +378,24 @@ fn compactTagLine(out: *std.io.Writer, depth: u32, tag: u8, payload: []const u8)
     try out.writeAll("\n");
 }
 
+/// `~` line with a forward reference to the depth where the body
+/// actually rendered. Format: `<this_depth>~<body_depth><name>`.
+fn compactBodyRef(out: *std.io.Writer, depth: u32, body_depth: u32, name: []const u8) !void {
+    try compactDepth(out, depth);
+    try out.writeByte('~');
+    try compactDepth(out, body_depth);
+    try out.writeAll(name);
+    try out.writeAll("\n");
+}
+
 fn compactCall(
     out: *std.io.Writer,
     ctx: Ctx,
     c: Callee,
     depth: u32,
     max_depth: u32,
-    visited: *std.AutoHashMap(FnId, void),
-    rendered: *std.AutoHashMap(FnId, void),
+    visited: *std.AutoHashMap(FnId, u32),
+    rendered: *std.AutoHashMap(FnId, u32),
 ) RenderError!void {
     if (ctx.hide_assertions and isAssertionName(c.name)) {
         return;
@@ -366,17 +420,18 @@ fn compactCall(
     if (ctx.hide_library and isLibrary(f.name)) {
         return compactTagLine(out, depth, '=', f.name);
     }
-    if (visited.contains(f.id)) {
-        return compactTagLine(out, depth, '~', f.name);
+    if (visited.get(f.id)) |body_depth| {
+        return compactBodyRef(out, depth, body_depth, f.name);
     }
     // Sibling-repeat collapse: if we've already rendered this fn's body
-    // somewhere earlier in the trace, emit `~name` instead of re-expanding
-    // the same subtree. Most kernel paths show this with hot helpers like
-    // SlabRef.unlock or mintReply being called several times under one
-    // parent; pre-dedup, the trace re-emitted the identical 3–4 line
-    // subtree per occurrence.
-    if (rendered.contains(f.id)) {
-        return compactTagLine(out, depth, '~', f.name);
+    // somewhere earlier in the trace, emit `~<body_d>name` instead of
+    // re-expanding the same subtree. Most kernel paths show this with
+    // hot helpers like SlabRef.unlock or mintReply being called several
+    // times under one parent; pre-dedup, the trace re-emitted the
+    // identical 3–4 line subtree per occurrence. The body_depth points
+    // at the line that holds the original expansion.
+    if (rendered.get(f.id)) |body_depth| {
+        return compactBodyRef(out, depth, body_depth, f.name);
     }
     if (f.intra.len == 0) {
         return compactTagLine(out, depth, '@', f.name);
@@ -384,7 +439,7 @@ fn compactCall(
     if (depth + 1 >= max_depth) {
         return compactTagLine(out, depth, '^', f.name);
     }
-    try visited.put(f.id, {});
+    try visited.put(f.id, depth);
     defer _ = visited.remove(f.id);
     try compactFn(out, ctx, f, depth, max_depth, visited, rendered);
 }
@@ -395,8 +450,8 @@ fn compactBranch(
     b: BranchAtom,
     depth: u32,
     max_depth: u32,
-    visited: *std.AutoHashMap(FnId, void),
-    rendered: *std.AutoHashMap(FnId, void),
+    visited: *std.AutoHashMap(FnId, u32),
+    rendered: *std.AutoHashMap(FnId, u32),
 ) RenderError!void {
     const kind: []const u8 = switch (b.kind) {
         .if_else => "if_else",
@@ -415,8 +470,8 @@ fn compactLoop(
     l: LoopAtom,
     depth: u32,
     max_depth: u32,
-    visited: *std.AutoHashMap(FnId, void),
-    rendered: *std.AutoHashMap(FnId, void),
+    visited: *std.AutoHashMap(FnId, u32),
+    rendered: *std.AutoHashMap(FnId, u32),
 ) RenderError!void {
     try compactTagLine(out, depth, '*', "");
     for (l.body) |a| try compactAtom(out, ctx, a, depth + 1, max_depth, visited, rendered);
@@ -462,8 +517,8 @@ pub fn statsTrace(
     // Mirror the rendering walk's two sets so the header summary matches
     // what the rendered tree actually contains. `rendered` persists across
     // siblings so a fn called many times under one parent counts once.
-    var visited = std.AutoHashMap(FnId, void).init(arena);
-    var rendered = std.AutoHashMap(FnId, void).init(arena);
+    var visited = std.AutoHashMap(FnId, u32).init(arena);
+    var rendered = std.AutoHashMap(FnId, u32).init(arena);
     var stats: TraceStats = .{};
     var cap_counts = std.StringHashMap(u32).init(arena);
     try statsFn(ctx, root, 0, max_depth, &visited, &rendered, &stats, &cap_counts);
@@ -500,13 +555,13 @@ fn statsFn(
     f: *const Function,
     depth: u32,
     max_depth: u32,
-    visited: *std.AutoHashMap(FnId, void),
-    rendered: *std.AutoHashMap(FnId, void),
+    visited: *std.AutoHashMap(FnId, u32),
+    rendered: *std.AutoHashMap(FnId, u32),
     stats: *TraceStats,
     cap_counts: *std.StringHashMap(u32),
 ) std.mem.Allocator.Error!void {
     stats.fns_visited += 1;
-    try rendered.put(f.id, {});
+    try rendered.put(f.id, depth);
     // Fanout = number of *visible* call atoms in this function's body, after
     // pruning rules. Counts calls inside branches and loops too. This is the
     // metric that matches what the trace would actually render — IR
@@ -550,8 +605,8 @@ fn statsAtom(
     atom: Atom,
     depth: u32,
     max_depth: u32,
-    visited: *std.AutoHashMap(FnId, void),
-    rendered: *std.AutoHashMap(FnId, void),
+    visited: *std.AutoHashMap(FnId, u32),
+    rendered: *std.AutoHashMap(FnId, u32),
     stats: *TraceStats,
     cap_counts: *std.StringHashMap(u32),
 ) std.mem.Allocator.Error!void {
@@ -573,8 +628,8 @@ fn statsCall(
     c: Callee,
     depth: u32,
     max_depth: u32,
-    visited: *std.AutoHashMap(FnId, void),
-    rendered: *std.AutoHashMap(FnId, void),
+    visited: *std.AutoHashMap(FnId, u32),
+    rendered: *std.AutoHashMap(FnId, u32),
     stats: *TraceStats,
     cap_counts: *std.StringHashMap(u32),
 ) std.mem.Allocator.Error!void {
@@ -598,7 +653,7 @@ fn statsCall(
         // tree as `@name`) but never as `at_cap`, since deepening will
         // not expand it.
         stats.fns_visited += 1;
-        try rendered.put(f.id, {});
+        try rendered.put(f.id, depth);
         return;
     }
     if (depth + 1 >= max_depth) {
@@ -608,7 +663,7 @@ fn statsCall(
         gop.value_ptr.* += 1;
         return;
     }
-    try visited.put(f.id, {});
+    try visited.put(f.id, depth);
     defer _ = visited.remove(f.id);
     try statsFn(ctx, f, depth, max_depth, visited, rendered, stats, cap_counts);
 }

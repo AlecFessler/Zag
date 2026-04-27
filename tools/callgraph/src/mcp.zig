@@ -136,7 +136,8 @@ const INSTRUCTIONS =
     "Header (always first line):\n" ++
     "  `T fns=N cap=N d=N [top=<name>/<count>] [cap_top=<n1>/<c1>,...]`\n" ++
     "  `cap` is the count of nodes that hit the depth limit; `cap_top` lists up to 3 of them " ++
-    "by call-site count. Use `cap_top` to deepen surgically instead of cranking `depth` blindly.\n\n" ++
+    "by call-site count. Use `cap_top` to deepen surgically instead of cranking `depth` blindly. " ++
+    "Suppressed when every capped fn has only one call site (the `^` markers locate them and `/1` adds noise).\n\n" ++
     "Body line shapes:\n" ++
     "  `<depth><name>`         — descended function (the default; `name` starts with a letter or `_`)\n" ++
     "  `<depth><tag><payload>` — tagged node (`tag` is one of the symbols below)\n\n" ++
@@ -144,7 +145,7 @@ const INSTRUCTIONS =
     "Tags:\n" ++
     "  `^` capped — fn HAS callees but hit `depth` (deepen to expand)\n" ++
     "  `@` no-body leaf — typically a compiler-inlined helper. Deepening will NOT expand it.\n" ++
-    "  `~` body shown elsewhere — either an ancestor on the call path (recursion) OR a fn whose body was already rendered earlier in this trace (sibling-repeat collapse). Look upward in the trace for the body.\n" ++
+    "  `~` body shown elsewhere — followed by ANOTHER base-36 depth char then the name. Shape: `<this_depth>~<body_depth><name>`. The body was rendered earlier in the trace at line depth `<body_depth>` — either an ancestor on the call path (recursion) or a sibling-repeat. Scan upward for a line whose leading char matches `<body_depth>` and whose payload is the same name.\n" ++
     "  `&` indirect call — fn pointer / vtable / unresolved ref\n" ++
     "  `!` unresolved direct call — name has no body in this graph\n" ++
     "  `%` folded `debug.*` call\n" ++

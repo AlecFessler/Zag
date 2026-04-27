@@ -1055,9 +1055,9 @@ fn handleType(
     while (chain_len < max_follow) {
         const cur = chain_buf[chain_len - 1];
         if (cur.kind != .constant) break;
-        const tail_name = readConstantAliasTail(allocator, cur, &alias_payload_buf) catch null;
-        const target_name = tail_name orelse break;
-        const target = findDefinitionByName(live.graph.definitions, target_name) orelse break;
+        const rhs_opt = readConstantAliasRhs(allocator, cur, &alias_payload_buf) catch null;
+        const rhs = rhs_opt orelse break;
+        const target = resolveAliasTarget(live.graph.definitions, rhs, cur) orelse break;
         if (target == cur) break;
         // Loop / repeat guard.
         var seen = false;
@@ -1138,12 +1138,69 @@ fn findDefinitionByName(defs: []const types.Definition, name: []const u8) ?*cons
     return null;
 }
 
+/// Resolve `rhs` (a dotted identifier chain like `port.Port` from an
+/// alias's RHS) to a concrete Definition, excluding `from` so an alias
+/// never resolves to itself.
+///
+/// The RHS is in the alias author's import-table namespace, not in the
+/// global qname namespace, so a literal `qname == rhs` lookup almost
+/// never hits — we don't have the import table here. Two heuristics
+/// instead, in priority order:
+///   1. Exact qualified_name match.
+///   2. Suffix match: any qname ending in `.<rhs>` (covers re-exports
+///      via short module aliases — e.g. RHS `port.Port` matches
+///      `sched.port.Port`).
+///   3. Bare-name fallback: a single non-`from` Definition whose
+///      simple `name` equals the last segment of RHS.
+fn resolveAliasTarget(
+    defs: []const types.Definition,
+    rhs: []const u8,
+    from: *const types.Definition,
+) ?*const types.Definition {
+    // 1) Exact qualified_name match.
+    for (defs) |*d| {
+        if (d == from) continue;
+        if (std.mem.eql(u8, d.qualified_name, rhs)) return d;
+    }
+    // 2) Suffix match — `<anything>.rhs`. Reject the bare-prefix case
+    //    (just `rhs`) since 1) already handled it.
+    var suffix_unique: ?*const types.Definition = null;
+    var suffix_count: usize = 0;
+    for (defs) |*d| {
+        if (d == from) continue;
+        const q = d.qualified_name;
+        if (q.len <= rhs.len + 1) continue;
+        if (q[q.len - rhs.len - 1] != '.') continue;
+        if (!std.mem.eql(u8, q[q.len - rhs.len ..], rhs)) continue;
+        suffix_count += 1;
+        suffix_unique = d;
+        if (suffix_count > 1) break;
+    }
+    if (suffix_count == 1) return suffix_unique;
+    // 3) Bare-name fallback — pick when exactly one non-`from` def has
+    //    `name` == rhs's last segment. Multiple matches mean ambiguous;
+    //    bail rather than guess.
+    const dot = std.mem.lastIndexOfScalar(u8, rhs, '.');
+    const tail = if (dot) |d| rhs[d + 1 ..] else rhs;
+    var bare_unique: ?*const types.Definition = null;
+    var bare_count: usize = 0;
+    for (defs) |*d| {
+        if (d == from) continue;
+        if (!std.mem.eql(u8, d.name, tail)) continue;
+        bare_count += 1;
+        bare_unique = d;
+        if (bare_count > 1) break;
+    }
+    if (bare_count == 1) return bare_unique;
+    return null;
+}
+
 /// Read just the source slice for a single-line `const X = ...;` definition
-/// and, if its RHS is a dotted identifier chain, return the trailing component.
+/// and return the dotted-identifier RHS if it's a trivial alias.
 /// The returned slice points into `scratch`; caller must not free it.
 /// Returns null when the body isn't a trivial alias (multi-line, has braces,
 /// numeric literal, function call, etc.).
-fn readConstantAliasTail(
+fn readConstantAliasRhs(
     allocator: std.mem.Allocator,
     def: *const types.Definition,
     scratch: []u8,
@@ -1190,11 +1247,9 @@ fn readConstantAliasTail(
     // Must lead with an alphabetic / underscore (otherwise it's a number).
     if (!((rhs[0] >= 'a' and rhs[0] <= 'z') or (rhs[0] >= 'A' and rhs[0] <= 'Z') or rhs[0] == '_')) return null;
 
-    const dot = std.mem.lastIndexOfScalar(u8, rhs, '.');
-    const tail = if (dot) |d| rhs[d + 1 ..] else rhs;
-    if (tail.len == 0 or tail.len > scratch.len) return null;
-    @memcpy(scratch[0..tail.len], tail);
-    return scratch[0..tail.len];
+    if (rhs.len > scratch.len) return null;
+    @memcpy(scratch[0..rhs.len], rhs);
+    return scratch[0..rhs.len];
 }
 
 fn handleReaches(
@@ -1560,21 +1615,42 @@ fn handleCallers(
         "function not found\n",
     );
 
+    // Aggregate across every Function sharing this name. For generic
+    // methods Zig emits one IR fn per `(T,)` instantiation, all with
+    // the same `name` — listing only `by_name`'s last-wins entry would
+    // under-report callers for the most common shape (`SlabRef.lock`,
+    // etc.). `by_name_multi` keeps every instantiation; we walk all of
+    // them and merge their reverse-edge lists.
+    const inst_list_opt = live.maps.by_name_multi.get(fp.name);
+    const inst_count: usize = if (inst_list_opt) |l| l.items.len else 1;
+    var merged = std.ArrayList(render.CallerSite){};
+    defer merged.deinit(allocator);
+    if (inst_list_opt) |list| {
+        for (list.items) |inst| {
+            if (live.maps.callers.get(inst.id)) |sites_list| {
+                try merged.appendSlice(allocator, sites_list.items);
+            }
+        }
+    } else if (live.maps.callers.get(fp.id)) |sites_list| {
+        try merged.appendSlice(allocator, sites_list.items);
+    }
+
     var aw = std.io.Writer.Allocating.init(allocator);
     defer aw.deinit();
-    const sites_opt = live.maps.callers.get(fp.id);
-    const sites: []const render.CallerSite = if (sites_opt) |list| list.items else &.{};
-    if (sites.len == 0) {
+    if (merged.items.len == 0) {
         try aw.writer.writeAll("(no callers found in graph — may be unreachable, indirect-only, or an entry point)\n");
         return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
     }
 
     // Sort by caller name then site line so output is deterministic and
     // groupable by caller.
-    const sorted = try allocator.dupe(render.CallerSite, sites);
+    const sorted = try allocator.dupe(render.CallerSite, merged.items);
     defer allocator.free(sorted);
     std.mem.sort(render.CallerSite, sorted, {}, callerSiteLessThan);
 
+    if (inst_count > 1) {
+        try aw.writer.print("({d} instantiations share this name; counts aggregated)\n", .{inst_count});
+    }
     try aw.writer.print("{d} call sites for {s}:\n", .{ sorted.len, fp.name });
     var kind_buf: [64]u8 = undefined;
     var prev_from_id: ?types.FnId = null;
