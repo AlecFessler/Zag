@@ -4,47 +4,50 @@
 //  not a subset of self's `ec_inner_ceiling`."
 //
 // Strategy
-//   The EC handle's caps argument is `[1].caps` (bits 0-15 of the
-//   caps word). When `target = 0`, the kernel mints the new EC
-//   handle into the caller's own domain, bounded by the caller's
-//   self-handle `ec_inner_ceiling` (an 8-bit field carrying
-//   EcCap bits 0-7: move/copy/saff/spri/term/susp/read/write).
+//   ec_inner_ceiling lives in self-handle field0 bits 0-7 (an 8-bit
+//   field — see §[capability_domain]). The kernel's create_ec inner
+//   subset check reads those 8 bits and compares against caps[0..7];
+//   EcCap bits 8-9 (`restart_policy`) are governed by
+//   restart_policy_ceiling, and bits 10-12 (`bind`/`rebind`/`unbind`)
+//   carry their own runtime gates in bind_event_route — none of them
+//   is constrained by ec_inner_ceiling at create_ec time. Exercising
+//   the test 03 reject path therefore requires a domain whose
+//   ec_inner_ceiling drops at least one of bits 0-7.
 //
-//   The runner spawns each test domain with `ec_inner_ceiling =
-//   0xFF` (all eight low bits, exactly the bits that fit the
-//   ceiling field). Bits >= 8 of EcCap — `restart_policy` (8-9),
-//   `bind` (10), `rebind` (11), `unbind` (12) — are unconditionally
-//   outside the ceiling.
+//   The runner spawns every test capability domain with
+//   `ec_inner_ceiling = 0xFF`, so a child running directly under the
+//   runner can never trigger the bits-0..7 reject. We work around
+//   that by spawning a sub-domain inheriting the same test ELF with
+//   `ec_inner_ceiling = 0x7F` (bit 7 = `write` cleared) and let the
+//   sub-domain's initial EC perform the actual create_ec call. The
+//   parent and the sub-domain share this ELF; the entry distinguishes
+//   the two by reading the caller's own `ec_inner_ceiling` out of
+//   `cap_table_base[SLOT_SELF].field0`:
 //
-//   Set `caps.bind = true` (bit 10). The new EC's caps word now has
-//   a bit set that the caller's `ec_inner_ceiling` cannot grant; the
-//   subset rule must reject with E_PERM.
+//     - field0 bit 7 set  → parent  → spawn the sub-domain
+//     - field0 bit 7 clear → child  → call create_execution_context
+//                                     with caps.write = true and assert
+//                                     the return is E_PERM
 //
-//   Choices that keep the call off the other reject paths:
-//     - target = 0 (self) — exercises the inner-ceiling path (test 03)
-//       rather than the outer-ceiling path (test 04).
-//     - The caller's self-handle has `crec` (granted by the runner),
-//       so test 01 does not fire.
-//     - priority = 0 — within the runner's `pri = 3` ceiling; test 06
-//       cannot fire.
-//     - stack_pages = 1 — nonzero (test 08).
-//     - affinity = 0 — "any core"; no out-of-range bits (test 09).
-//     - restart_policy = 0 — within ec_restart_max; the
-//       restart_policy_ceiling check is independent of test 03 either
-//       way.
-//     - No reserved bits set in [1] (test 10).
+//   Only the actor doing the actual test reports a result. The parent
+//   halts after spawning so the runner records exactly one outcome
+//   per spawned manifest entry (the spec test tag is per-build, so
+//   parent and child carry the same tag).
 //
-//   The new EC is never actually created — the syscall fails before
-//   any side effect — so no `dummyEntry` halt or post-call cleanup is
-//   needed.
-//
-// Action
-//   1. create_execution_context(caps={bind, rp=0}, entry=&dummyEntry,
-//                               stack_pages=1, target=0, affinity=0)
-//      — must return E_PERM.
+//   To spawn the sub-domain the parent needs a page_frame containing
+//   the test ELF. The runner already passed that handle to the test
+//   domain via `passed_handles[1]` (slot 4) for exactly this case;
+//   passed_handles[0] (slot 3) remains the shared result port. The
+//   sub-domain receives both as passed handles in the same slot
+//   layout so its child path can `report` and (if the sub-domain
+//   itself needs to spawn further tests) propagate the ELF handle.
 //
 // Assertions
-//   1: create_execution_context returned something other than E_PERM.
+//   parent path:
+//     1: createCapabilityDomain returned an error word (failed to
+//        spawn the restricted child)
+//   child path:
+//     2: create_execution_context returned something other than E_PERM
 
 const lib = @import("lib");
 
@@ -53,32 +56,109 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+const SLOT_RESULT_PORT: caps.HandleId = caps.SLOT_FIRST_PASSED; // 3
+const SLOT_TEST_ELF_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 1; // 4
+
 pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
+    const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);
+    const ec_inner_ceiling: u8 = @truncate(self_cap.field0 & 0xFF);
 
-    // bind (bit 10) is outside ec_inner_ceiling = 0xFF. Every other
-    // EcCap field is left zero so the only ceiling violation is the
-    // bind bit.
-    const ec_caps = caps.EcCap{ .bind = true };
+    // bit 7 of ec_inner_ceiling distinguishes the parent (runner-
+    // spawned, ceiling = 0xFF) from the child (parent-spawned,
+    // ceiling = 0x7F). A child path must exercise the spec reject.
+    if ((ec_inner_ceiling & 0x80) == 0) {
+        // ── Child path ────────────────────────────────────────────
+        // caps.write (bit 7) is outside the child's ec_inner_ceiling
+        // (0x7F). Every other field is zero so no other §[create_ec]
+        // reject path can fire ahead of the inner-ceiling check.
+        const ec_caps = caps.EcCap{ .write = true };
+        const caps_word: u64 = @as(u64, ec_caps.toU16());
+        const entry: u64 = @intFromPtr(&testing.dummyEntry);
 
-    // §[create_execution_context] caps word: caps in bits 0-15,
-    // target_caps in 16-31 (ignored when target = self), priority in
-    // 32-33. priority = 0 stays within the runner's pri = 3 ceiling.
-    const caps_word: u64 = @as(u64, ec_caps.toU16());
-    const entry: u64 = @intFromPtr(&testing.dummyEntry);
+        const result = syscall.createExecutionContext(
+            caps_word,
+            entry,
+            1, // stack_pages — nonzero (test 08)
+            0, // target = self — selects the test 03 path
+            0, // affinity = 0 — any core (test 09)
+        );
 
-    const result = syscall.createExecutionContext(
-        caps_word,
-        entry,
-        1, // stack_pages — nonzero so test 08 (E_INVAL) does not fire
-        0, // target = self — selects the test 03 (inner_ceiling) path
-        0, // affinity = 0 — any core; no out-of-range bits (test 09)
+        if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {
+            testing.fail(2);
+            return;
+        }
+
+        testing.pass();
+        return;
+    }
+
+    // ── Parent path ───────────────────────────────────────────────
+    // Spawn a child domain that re-enters this same ELF with
+    // ec_inner_ceiling = 0x7F. The child then takes the branch above.
+    const child_self = caps.SelfCap{
+        .crec = true,
+        .pri = 3,
+    };
+
+    // ec_inner_ceiling = 0x7F (bit 7 cleared) in field0. Other
+    // ceilings are loose — they are not load-bearing for this test.
+    const ceilings_inner: u64 =
+        @as(u64, 0x7F) |
+        (@as(u64, 0x01FF) << 8) |
+        (@as(u64, 0x3F) << 24) |
+        (@as(u64, 0xFF) << 32) |
+        (@as(u64, 0x1F) << 40) |
+        (@as(u64, 0x01) << 48) |
+        (@as(u64, 0x1C) << 56);
+
+    const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
+
+    // Pass both runner-supplied handles through to the child so the
+    // child can report on the shared port. The ELF pf is forwarded
+    // to keep symmetry with the parent layout (the child does not
+    // need to spawn further sub-domains, but uniform slot layout
+    // simplifies cap_table_base offsets).
+    const port_caps_struct = caps.PortCap{
+        .move = false,
+        .copy = false,
+        .xfer = true,
+        .bind = true,
+    };
+    const port_caps_word = port_caps_struct.toU16();
+    const pf_caps_struct = caps.PfCap{
+        .move = false,
+        .r = true,
+        .w = false,
+    };
+    const pf_caps_word = pf_caps_struct.toU16();
+    const passed: [2]u64 = .{
+        (caps.PassedHandle{
+            .id = SLOT_RESULT_PORT,
+            .caps = port_caps_word,
+            .move = false,
+        }).toU64(),
+        (caps.PassedHandle{
+            .id = SLOT_TEST_ELF_PF,
+            .caps = pf_caps_word,
+            .move = false,
+        }).toU64(),
+    };
+
+    const r = syscall.createCapabilityDomain(
+        @as(u64, child_self.toU16()),
+        ceilings_inner,
+        ceilings_outer,
+        SLOT_TEST_ELF_PF,
+        0,
+        passed[0..],
     );
-
-    if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {
+    if (testing.isHandleError(r.v1)) {
         testing.fail(1);
         return;
     }
 
-    testing.pass();
+    // Parent halts forever. The child is the sole reporter; the
+    // runner indexes results by build-time test tag so a single
+    // report from the child satisfies this test's slot.
+    while (true) asm volatile ("hlt");
 }

@@ -169,17 +169,32 @@ pub fn main(cap_table_base: u64) void {
 fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
     const pf_handle = stageElfIntoPageFrame(entry.bytes);
 
-    // Grant the child the result port with bind+xfer.
+    // Grant the child the result port with bind+xfer, plus a
+    // read-only handle to its own ELF page_frame. Tests that need to
+    // re-spawn themselves into a sub-domain (e.g. to vary
+    // ec_inner_ceiling — see create_execution_context_03) reach for
+    // the pf handle at SLOT_FIRST_PASSED + 1; tests that don't simply
+    // ignore that slot.
     const child_port_caps = caps.PortCap{
         .move = false,
         .copy = false,
         .xfer = true,
         .bind = true,
     };
-    const passed: [1]u64 = .{
+    const child_pf_caps = caps.PfCap{
+        .move = false,
+        .r = true,
+        .w = false,
+    };
+    const passed: [2]u64 = .{
         (caps.PassedHandle{
             .id = port_handle,
             .caps = child_port_caps.toU16(),
+            .move = false,
+        }).toU64(),
+        (caps.PassedHandle{
+            .id = pf_handle,
+            .caps = child_pf_caps.toU16(),
             .move = false,
         }).toU64(),
     };
