@@ -25,7 +25,7 @@ const REG_ARB: u8 = 0x02; // IOAPICARB -- RO, arbitration ID
 const REG_REDTBL_BASE: u8 = 0x10; // IOREDTBL[0] lo, 0x11 = IOREDTBL[0] hi, etc.
 
 /// Number of redirection table entries (24 IRQ pins).
-const NUM_REDIR_ENTRIES: u5 = 24;
+pub const NUM_REDIR_ENTRIES: u5 = 24;
 
 pub const Ioapic = struct {
     /// IOREGSEL: currently selected register index.

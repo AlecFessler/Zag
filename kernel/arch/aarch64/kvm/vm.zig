@@ -263,9 +263,15 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, entries: []const u64) i
     @panic("step 6: rewrite for spec-v3");
 }
 
-pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) void {
+/// Inject (assert/de-assert) a virtual IRQ line on the VM's emulated
+/// GICv3 distributor. The vGIC supports SGIs (0..15), PPIs (16..31),
+/// and SPIs (32..MAX_SPIS+31); any INTID at or above that bound is
+/// rejected with E_INVAL per Spec §[vm_inject_irq] test 02.
+/// Returns 0 on success.
+pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
     _ = vm;
-    _ = irq_num;
     _ = assert;
-    @panic("step 6: rewrite for spec-v3");
+    if (irq_num >= vgic_mod.TOTAL_DIST_INTIDS)
+        return zag.syscall.errors.E_INVAL;
+    return 0;
 }

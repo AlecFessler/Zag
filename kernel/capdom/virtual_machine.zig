@@ -338,10 +338,14 @@ pub fn vmInjectIrq(
     const slot: u12 = @truncate(vm_handle);
     const vm = lookupVirtualMachine(domain, slot) orelse return errors.E_BADCAP;
 
+    // §[vm_inject_irq] [2] is a u64 line number; reject anything that
+    // can't fit in u32 up front (no plausible emulated controller has
+    // billions of lines). Per-arch dispatch then enforces the actual
+    // upper bound for the VM's emulated controller.
+    if (irq_num > std.math.maxInt(u32)) return errors.E_INVAL;
     const irq32: u32 = @truncate(irq_num);
     const assert_bit: bool = (assert & 0x1) != 0;
-    vm_dispatch.vmInjectIrq(vm, irq32, assert_bit);
-    return 0;
+    return vm_dispatch.vmInjectIrq(vm, irq32, assert_bit);
 }
 
 /// `vm_set_policy` syscall handler. Spec §[virtual_machine].vm_set_policy.

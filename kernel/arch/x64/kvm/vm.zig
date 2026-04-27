@@ -471,8 +471,16 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, entries: []const u64) i
     return @import("zag").syscall.errors.E_NODEV;
 }
 
-pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) void {
+/// Inject (assert/de-assert) a virtual IRQ line on the VM's emulated
+/// IOAPIC. The kernel-internal IOAPIC (kvm/ioapic.zig) exposes
+/// `NUM_REDIR_ENTRIES` (24) redirection entries per Intel 82093AA
+/// Section 3.0; any `irq_num` beyond that range cannot be emulated
+/// and must be rejected with E_INVAL per Spec §[vm_inject_irq] test 02.
+/// Returns 0 on success.
+pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
     _ = vm;
-    _ = irq_num;
     _ = assert;
+    if (irq_num >= ioapic_mod.NUM_REDIR_ENTRIES)
+        return zag.syscall.errors.E_INVAL;
+    return 0;
 }

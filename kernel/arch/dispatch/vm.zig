@@ -262,13 +262,15 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, entries: []const u64) i
 }
 
 /// Inject (or de-assert) a virtual interrupt into the VM's emulated
-/// interrupt controller. Spec §[virtual_machine].vm_inject_irq.
-pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) void {
-    switch (builtin.cpu.arch) {
+/// interrupt controller. Returns 0 on success or E_INVAL if `irq_num`
+/// exceeds the maximum line supported by the per-arch emulated
+/// controller. Spec §[virtual_machine].vm_inject_irq tests 02/04/05.
+pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
+    return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.vmInjectIrq(vm, irq_num, assert),
         .aarch64 => aarch64.kvm.vm.vmInjectIrq(vm, irq_num, assert),
         else => unreachable,
-    }
+    };
 }
 
 /// Arm an emulated guest timer that fires `deadline_ns` (monotonic).
