@@ -142,8 +142,10 @@ pub fn main(cap_table_base: u64) void {
 
     // Zero the policy buffer so num_cpuid_responses = 0 and
     // num_cr_policies = 0 fall out, satisfying the size and bound
-    // checks performed by create_virtual_machine.
-    const policy_dst: [*]u8 = @ptrFromInt(policy_base);
+    // checks performed by create_virtual_machine. Volatile keeps
+    // ReleaseSmall from folding the store against the kernel's read
+    // of the policy page during create_virtual_machine.
+    const policy_dst: [*]volatile u8 = @ptrFromInt(policy_base);
     var i: usize = 0;
     while (i < VM_POLICY_BYTES) {
         policy_dst[i] = 0;

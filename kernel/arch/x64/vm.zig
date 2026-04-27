@@ -276,10 +276,15 @@ pub fn vmAllocStructures() ?PAddr {
 }
 
 /// Free arch-specific per-VM structures.
+///
+/// Spec-v3 split: this frees only the per-VM control state (VMCS on
+/// Intel, VMCB+IOPM+MSRPM on AMD). The stage-2 root is freed separately
+/// via `freeStage2RootPage`, so callers walking the spec-v3 dispatch
+/// path don't double-free the EPT/NPT root.
 pub fn vmFreeStructures(paddr: PAddr) void {
     switch (active_backend) {
         .intel_vmx => vmx.freeVmStructures(paddr),
-        .amd_svm => svm.freeVmStructures(paddr),
+        .amd_svm => svm.freeVmcbOnly(paddr),
         .none => {},
     }
 }
@@ -311,9 +316,7 @@ pub fn freeStage2RootPage(paddr: PAddr) void {
 pub fn allocVmCtrlState(stage2_root: PAddr) ?PAddr {
     return switch (active_backend) {
         .intel_vmx => vmx.allocVmcsWithEpt(stage2_root),
-        // TODO: split AMD `allocVmStructures` into NPT-root vs VMCB
-        //       so create_virtual_machine can mint a VM on SVM hosts.
-        .amd_svm => null,
+        .amd_svm => svm.allocVmcbWithNpt(stage2_root),
         .none => null,
     };
 }

@@ -380,9 +380,9 @@ pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque 
     if (!vm_hw.vmSupported()) return error.NoDevice;
 
     // EPT/NPT root has been allocated by allocStage2Root above and
-    // stored in `vm.guest_pt_root`. The Intel path patches that root
-    // into the VMCS via initVmcs; the AMD path is not yet split out
-    // and surfaces NoDevice (see arch.x64.vm.allocVmCtrlState).
+    // stored in `vm.guest_pt_root`. Both Intel (`vmx.allocVmcsWithEpt`)
+    // and AMD (`svm.allocVmcbWithNpt`) wire the externally-allocated
+    // stage-2 root into the per-VM control state.
     const ctrl_phys = vm_hw.allocVmCtrlState(vm.guest_pt_root) orelse
         return error.NoDevice;
 

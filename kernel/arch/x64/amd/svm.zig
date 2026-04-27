@@ -234,6 +234,132 @@ pub fn freeNptRoot(paddr: PAddr) void {
     pmm_mgr.destroy(page);
 }
 
+/// Allocate a VMCB + IOPM + MSRPM and wire it to an externally-allocated
+/// NPT root. Mirrors `vmx.allocVmcsWithEpt` so the spec-v3 split (one
+/// dispatch slot for the stage-2 root, another for per-VM control state)
+/// can mint AMD VMs as well.
+///
+/// AMD APM Vol 2, Section 15.5.1: VMCB is a 4KB-aligned page.
+/// Returns physical address of the VMCB page. The caller's pre-allocated
+/// NPT PML4 physical address is patched into the VMCB at offset N_CR3
+/// (0x0B0). The NPT root is NOT freed by `freeVmcbOnly` — its lifetime
+/// is governed by the spec-v3 `freeStage2Root` dispatch.
+pub fn allocVmcbWithNpt(npt_root_phys: PAddr) ?PAddr {
+    const pmm_mgr = &pmm.global_pmm.?;
+
+    // Allocate VMCB page — returns zeroed.
+    const vmcb_page = pmm_mgr.create(paging.PageMem(.page4k)) catch return null;
+    const vmcb_vaddr = @intFromPtr(vmcb_page);
+    const vmcb_phys = PAddr.fromVAddr(VAddr.fromInt(vmcb_vaddr), null);
+
+    // Allocate IOPM (3 contiguous pages = 12KB, 4KB-aligned).
+    // AMD APM Vol 2, Section 15.10.1: I/O permission map is 12KB.
+    // Must be physically contiguous. Allocate 4 pages (order-2) from the
+    // buddy allocator to guarantee contiguity, then use the first 3.
+    const iopm_ptr = pmm_mgr.allocBlock(4 * paging.PAGE4K) orelse {
+        pmm_mgr.destroy(vmcb_page);
+        return null;
+    };
+    @memset(iopm_ptr[0 .. 3 * paging.PAGE4K], 0xFF);
+    const iopm_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(iopm_ptr)), null);
+
+    // Allocate MSRPM (2 contiguous pages = 8KB, 4KB-aligned).
+    // AMD APM Vol 2, Section 15.10.2: MSR permission map is 8KB.
+    const msrpm_ptr = pmm_mgr.allocBlock(2 * paging.PAGE4K) orelse {
+        pmm_mgr.freeBlock(iopm_ptr[0 .. 4 * paging.PAGE4K]);
+        pmm_mgr.destroy(vmcb_page);
+        return null;
+    };
+    @memset(msrpm_ptr[0 .. 2 * paging.PAGE4K], 0xFF);
+
+    // Allow passthrough for MSRs that are saved/restored by VMSAVE/VMLOAD.
+    clearMsrpmBits(msrpm_ptr, 0x10); // TSC
+    clearMsrpmBits(msrpm_ptr, 0x174); // SYSENTER_CS
+    clearMsrpmBits(msrpm_ptr, 0x175); // SYSENTER_ESP
+    clearMsrpmBits(msrpm_ptr, 0x176); // SYSENTER_EIP
+    clearMsrpmBits(msrpm_ptr, 0xC0000080); // EFER
+    clearMsrpmBits(msrpm_ptr, 0xC0000081); // STAR
+    clearMsrpmBits(msrpm_ptr, 0xC0000082); // LSTAR
+    clearMsrpmBits(msrpm_ptr, 0xC0000083); // CSTAR
+    clearMsrpmBits(msrpm_ptr, 0xC0000084); // SFMASK
+    clearMsrpmBits(msrpm_ptr, 0xC0000100); // FS_BASE
+    clearMsrpmBits(msrpm_ptr, 0xC0000101); // GS_BASE
+    clearMsrpmBits(msrpm_ptr, 0xC0000102); // KERNEL_GS_BASE
+
+    const msrpm_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(msrpm_ptr)), null);
+
+    // MINIMAL VMCB SETUP — bare minimum to test if VMRUN returns at all.
+    // AMD APM Vol 2, Appendix B, Table B-1.
+    const vmcb: [*]u8 = @ptrFromInt(vmcb_vaddr);
+
+    // Intercept HLT and VMRUN only. VMRUN intercept is mandatory (AMD APM
+    // Vol 2, Section 15.5.1).
+    const ctrl1: u32 = CTRL1_INTERCEPT_INTR | CTRL1_INTERCEPT_NMI |
+        CTRL1_INTERCEPT_VINTR |
+        CTRL1_INTERCEPT_HLT | CTRL1_INTERCEPT_SHUTDOWN |
+        CTRL1_INTERCEPT_CPUID | CTRL1_INTERCEPT_MSR |
+        CTRL1_INTERCEPT_IOIO;
+    writeVmcb32(vmcb, Vmcb.INTERCEPT_CTRL1, ctrl1);
+    writeVmcb32(vmcb, Vmcb.INTERCEPT_CTRL2, CTRL2_INTERCEPT_VMRUN);
+
+    // Intercept only exceptions the hypervisor needs.
+    // #DB (1)  — debug
+    // #MC (18) — machine check, must always be intercepted
+    writeVmcb32(vmcb, Vmcb.INTERCEPT_EXCP, (1 << 1) | (1 << 18));
+
+    writeVmcb64(vmcb, Vmcb.IOPM_BASE_PA, iopm_phys.addr);
+    writeVmcb64(vmcb, Vmcb.MSRPM_BASE_PA, msrpm_phys.addr);
+
+    // Guest ASID must be non-zero (ASID 0 is reserved for the host).
+    var asid = next_asid.fetchAdd(1, .monotonic);
+    var tlb_control: u32 = 0;
+    if (asid > max_asid) {
+        next_asid.store(2, .monotonic);
+        asid = 1;
+        tlb_control = 1;
+    }
+    const asid_field: u64 = @as(u64, asid) | (@as(u64, tlb_control) << 32);
+    writeVmcb64(vmcb, Vmcb.GUEST_ASID, asid_field);
+
+    // Enable virtual interrupt masking.
+    writeVmcb64(vmcb, Vmcb.V_INTR, @as(u64, 1) << 24);
+
+    // Enable nested paging.
+    writeVmcb64(vmcb, Vmcb.NP_ENABLE, 1);
+
+    // Patch the externally-allocated NPT PML4 into the VMCB.
+    // AMD APM Vol 2, Section 15.24.3: offset 0x0B0.
+    writeVmcb64(vmcb, Vmcb.N_CR3, npt_root_phys.addr);
+
+    return vmcb_phys;
+}
+
+/// Free a VMCB allocated by `allocVmcbWithNpt`. Frees IOPM, MSRPM, and
+/// the VMCB page; leaves the NPT root alone (its lifetime is owned by
+/// the spec-v3 `freeStage2Root` dispatch).
+pub fn freeVmcbOnly(vmcb_phys: PAddr) void {
+    const pmm_mgr = &pmm.global_pmm.?;
+    const vmcb_vaddr = VAddr.fromPAddr(vmcb_phys, null).addr;
+    const vmcb: [*]u8 = @ptrFromInt(vmcb_vaddr);
+
+    const iopm_phys_addr = readVmcb64(vmcb, Vmcb.IOPM_BASE_PA);
+    if (iopm_phys_addr != 0) {
+        const iopm_vaddr = VAddr.fromPAddr(PAddr.fromInt(iopm_phys_addr), null).addr;
+        const iopm_slice: [*]u8 = @ptrFromInt(iopm_vaddr);
+        pmm_mgr.freeBlock(iopm_slice[0 .. 4 * paging.PAGE4K]);
+    }
+
+    const msrpm_phys_addr = readVmcb64(vmcb, Vmcb.MSRPM_BASE_PA);
+    if (msrpm_phys_addr != 0) {
+        const msrpm_vaddr = VAddr.fromPAddr(PAddr.fromInt(msrpm_phys_addr), null).addr;
+        const msrpm_slice: [*]u8 = @ptrFromInt(msrpm_vaddr);
+        pmm_mgr.freeBlock(msrpm_slice[0 .. 2 * paging.PAGE4K]);
+    }
+
+    const vmcb_page: *paging.PageMem(.page4k) = @ptrFromInt(vmcb_vaddr);
+    pmm_mgr.destroy(vmcb_page);
+}
+
 /// Allocate VMCB + NPT PML4 for a new VM.
 /// AMD APM Vol 2, Section 15.5.1: VMCB is a 4KB-aligned page.
 /// Returns physical address of the VMCB page. The NPT PML4 physical
