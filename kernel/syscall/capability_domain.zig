@@ -24,7 +24,7 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// frame. The caller receives back an IDC handle to the new domain.
 ///
 /// ```
-/// create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5+] passed_handles)
+/// create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_ec_affinity, [6+] passed_handles)
 ///   -> [1] idc_handle
 ///   syscall_num = 4
 ///
@@ -76,7 +76,11 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///
 ///   [4] elf_page_frame: page frame handle containing the ELF image from offset 0
 ///
-///   [5+] passed_handles: each entry is a u64 packed as
+///   [5] initial_ec_affinity: u64 core mask for the new domain's initial EC.
+///       Same encoding as `create_execution_context` `[6] affinity`.
+///       0 = any core (kernel chooses).
+///
+///   [6+] passed_handles: each entry is a u64 packed as
 ///     bits  0-11: handle id (12-bit handle in the caller's table)
 ///     bits 12-15: _reserved
 ///     bits 16-31: caps to install on the handle inserted into the new domain
@@ -116,7 +120,7 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// [test 15] returns E_INVAL if the ELF header is malformed.
 /// [test 16] returns E_INVAL if `elf_page_frame` is smaller than the declared ELF image size.
 /// [test 17] returns E_INVAL if any reserved bits are set in [1], [2], or a passed handle entry.
-/// [test 18] returns E_INVAL if any two entries in [4+] reference the same source handle.
+/// [test 18] returns E_INVAL if any two entries in [6+] reference the same source handle.
 /// [test 19] on success, the caller receives an IDC handle to the new domain with caps = the caller's `cridc_ceiling`.
 /// [test 20] on success, the new domain's handle table contains the self-handle at slot 0 with caps = `self_caps`.
 /// [test 21] on success, the new domain's handle table contains the initial EC at slot 1 with caps = the `ec_inner_ceiling` supplied in [2].
@@ -128,12 +132,15 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// [test 27] on success, the new domain's `ec_outer_ceiling` and `var_outer_ceiling` in field1 are set to the values supplied in [3].
 /// [test 28] on success, the new domain's `idc_rx` in field0 is set to the value supplied in [1].
 /// [test 29] the initial EC begins executing at the entry point declared in the ELF header.
+/// [test 31] on success, the new domain's initial EC has affinity equal to `[5]`.
+/// [test 32] returns E_INVAL if `[5]` has bits set outside the system's core count.
 pub fn createCapabilityDomain(
     caller: *anyopaque,
     caps: u64,
     ceilings_inner: u64,
     ceilings_outer: u64,
     elf_pf_slot: u64,
+    initial_ec_affinity: u64,
     passed_handles: []const u64,
 ) i64 {
     if (caps & ~CREATE_CAPS_MASK != 0) return errors.E_INVAL;
@@ -170,6 +177,7 @@ pub fn createCapabilityDomain(
         ceilings_inner,
         ceilings_outer,
         elf_pf_slot,
+        initial_ec_affinity,
         passed_handles,
     );
 }

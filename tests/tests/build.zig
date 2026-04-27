@@ -87,6 +87,8 @@ const test_entries = [_]TestEntry{
     .{ .name = "create_capability_domain_29", .path = "tests/create_capability_domain_29.zig" },
     .{ .name = "create_capability_domain_16a", .path = "tests/create_capability_domain_16a.zig" },
     .{ .name = "create_capability_domain_30", .path = "tests/create_capability_domain_30.zig" },
+    .{ .name = "create_capability_domain_31", .path = "tests/create_capability_domain_31.zig" },
+    .{ .name = "create_capability_domain_32", .path = "tests/create_capability_domain_32.zig" },
     .{ .name = "create_execution_context_01", .path = "tests/create_execution_context_01.zig" },
     .{ .name = "create_execution_context_02", .path = "tests/create_execution_context_02.zig" },
     .{ .name = "create_execution_context_03", .path = "tests/create_execution_context_03.zig" },
@@ -489,10 +491,37 @@ const test_entries = [_]TestEntry{
 fn buildTestElf(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    lib_mod: *std.Build.Module,
+    tag_wf: *std.Build.Step.WriteFile,
     name: []const u8,
     src_path: []const u8,
+    tag: u16,
 ) std.Build.LazyPath {
+    // Per-test tag module. Each test ELF embeds its own immutable
+    // u16 tag at build time. The runner uses this tag to attribute
+    // suspend-event results back to a specific manifest entry without
+    // relying on completion order.
+    const tag_src = b.fmt("pub const TAG: u16 = {d};\n", .{tag});
+    const tag_path = tag_wf.add(b.fmt("test_tag_{s}.zig", .{name}), tag_src);
+    const tag_mod = b.createModule(.{
+        .root_source_file = tag_path,
+        .target = target,
+        .optimize = .ReleaseSmall,
+    });
+
+    // Per-test libz clone. Cloning is required so libz/testing.zig's
+    // `@import("test_tag")` resolves to the test-specific tag module
+    // rather than a single shared one. The clone keeps the same source
+    // files but wires its own test_tag import.
+    const test_lib_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = "libz/lib.zig" },
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    test_lib_mod.addImport("lib", test_lib_mod);
+    test_lib_mod.addImport("test_tag", tag_mod);
+
     const app_mod = b.createModule(.{
         .root_source_file = b.path(src_path),
         .target = target,
@@ -500,7 +529,7 @@ fn buildTestElf(
         .pic = true,
         .omit_frame_pointer = true,
     });
-    app_mod.addImport("lib", lib_mod);
+    app_mod.addImport("lib", test_lib_mod);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/start.zig" },
@@ -509,7 +538,7 @@ fn buildTestElf(
         .pic = true,
         .omit_frame_pointer = true,
     });
-    start_mod.addImport("lib", lib_mod);
+    start_mod.addImport("lib", test_lib_mod);
     start_mod.addImport("app", app_mod);
 
     const exe = b.addExecutable(.{
@@ -615,6 +644,21 @@ pub fn build(b: *std.Build) void {
     }
     const selected_entries = selected.items;
 
+    // Sentinel `test_tag` module for non-test consumers of libz (the
+    // primary runner). The runner never calls `lib.testing.report`, but
+    // libz/testing.zig statically `@import`s `test_tag`, so something
+    // must satisfy the import. Sentinel TAG = 0xFFFF is reserved.
+    const sentinel_tag_wf = b.addWriteFiles();
+    const sentinel_tag_path = sentinel_tag_wf.add(
+        "test_tag_sentinel.zig",
+        "pub const TAG: u16 = 0xFFFF;\n",
+    );
+    const sentinel_tag_mod = b.createModule(.{
+        .root_source_file = sentinel_tag_path,
+        .target = target,
+        .optimize = .ReleaseSmall,
+    });
+
     const lib_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/lib.zig" },
         .target = target,
@@ -624,32 +668,43 @@ pub fn build(b: *std.Build) void {
     });
     // self-reference so libz files can `@import("lib")`
     lib_mod.addImport("lib", lib_mod);
+    lib_mod.addImport("test_tag", sentinel_tag_mod);
 
     const embedded_wf = b.addWriteFiles();
+    const tag_wf = b.addWriteFiles();
     const test_elfs = b.allocator.alloc(std.Build.LazyPath, selected_entries.len) catch
         @panic("OOM allocating test_elfs");
     for (selected_entries, 0..) |t, i| {
-        test_elfs[i] = buildTestElf(b, target, lib_mod, t.name, t.path);
+        const tag: u16 = @intCast(i);
+        test_elfs[i] = buildTestElf(b, target, tag_wf, t.name, t.path, tag);
         _ = embedded_wf.addCopyFile(test_elfs[i], b.fmt("{s}.elf", .{t.name}));
     }
 
     // Generate a manifest module surfacing the embedded ELFs as a
-    // slice the primary iterates. Manifest order = spawn order.
+    // slice the primary iterates. Manifest order = spawn order = tag
+    // index. Each entry's `tag` matches the value baked into that
+    // ELF's libz/test_tag at build time, so the runner can decode the
+    // suspend-event vreg into a manifest index in O(1).
     var manifest = std.array_list.Managed(u8).init(b.allocator);
     defer manifest.deinit();
+    manifest.writer().print(
+        "pub const TOTAL_TEST_COUNT: u16 = {d};\n\n",
+        .{selected_entries.len},
+    ) catch unreachable;
     manifest.appendSlice(
         \\pub const Entry = struct {
         \\    name: []const u8,
         \\    bytes: []const u8,
+        \\    tag: u16,
         \\};
         \\
         \\pub const manifest = [_]Entry{
         \\
     ) catch unreachable;
-    for (selected_entries) |t| {
+    for (selected_entries, 0..) |t, i| {
         manifest.writer().print(
-            "    .{{ .name = \"{s}\", .bytes = @embedFile(\"{s}.elf\") }},\n",
-            .{ t.name, t.name },
+            "    .{{ .name = \"{s}\", .bytes = @embedFile(\"{s}.elf\"), .tag = {d} }},\n",
+            .{ t.name, t.name, i },
         ) catch unreachable;
     }
     manifest.appendSlice("};\n") catch unreachable;

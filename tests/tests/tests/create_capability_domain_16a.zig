@@ -125,10 +125,10 @@ pub fn main(cap_table_base: u64) void {
     const ehdr_ptr: *Elf64Ehdr = @ptrFromInt(var_base);
     ehdr_ptr.* = .{
         .e_ident = .{
-            0x7F, 'E',          'L',           'F',
-            ELFCLASS64,         ELFDATA2LSB,   EV_CURRENT, ELFOSABI_SYSV,
-            0, 0, 0, 0,
-            0, 0, 0, 0,
+            0x7F,       'E',         'L',        'F',
+            ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_SYSV,
+            0,          0,           0,          0,
+            0,          0,           0,          0,
         },
         .e_type = ET_EXEC, // not PIE — the trigger for test 16a
         .e_machine = EM_X86_64,
@@ -159,13 +159,8 @@ pub fn main(cap_table_base: u64) void {
 
     _ = syscall.delete(var_handle);
 
-    const result = syscall.createCapabilityDomain(
-        0,
-        0,
-        0,
-        pf_handle,
-        &.{},
-    );
+    const result = syscall.createCapabilityDomain(0, 0, 0, pf_handle, 0, // initial_ec_affinity
+        &.{});
 
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(4);

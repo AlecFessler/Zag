@@ -173,10 +173,10 @@ pub fn main(cap_table_base: u64) void {
     const ehdr_ptr: *Elf64Ehdr = @ptrFromInt(var_base);
     ehdr_ptr.* = .{
         .e_ident = .{
-            0x7F, 'E',          'L',           'F',
-            ELFCLASS64,         ELFDATA2LSB,   EV_CURRENT, ELFOSABI_SYSV,
-            0, 0, 0, 0,
-            0, 0, 0, 0,
+            0x7F,       'E',         'L',        'F',
+            ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_SYSV,
+            0,          0,           0,          0,
+            0,          0,           0,          0,
         },
         .e_type = ET_DYN,
         .e_machine = EM_X86_64,
@@ -223,7 +223,8 @@ pub fn main(cap_table_base: u64) void {
         0, // [2] ceilings_inner: all subset of any caller value
         0, // [3] ceilings_outer: all subset of any caller value
         pf_handle, // [4] elf_page_frame
-        &.{}, // [5+] passed_handles: none
+        0, // [5] initial_ec_affinity: any-core
+        &.{}, // [6+] passed_handles: none
     );
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(5);

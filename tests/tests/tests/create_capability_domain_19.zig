@@ -280,13 +280,8 @@ pub fn main(cap_table_base: u64) void {
     //    checks irrelevant to test 19's post-condition.
     const passed: [0]u64 = .{};
 
-    const result = syscall.createCapabilityDomain(
-        caps_word,
-        ceilings_inner,
-        ceilings_outer,
-        pf_handle,
-        passed[0..],
-    );
+    const result = syscall.createCapabilityDomain(caps_word, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
+        passed[0..]);
     if (testing.isHandleError(result.v1)) {
         testing.fail(5);
         return;

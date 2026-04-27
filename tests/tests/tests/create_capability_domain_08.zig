@@ -98,13 +98,8 @@ pub fn main(cap_table_base: u64) void {
     // fut_wait_max ceiling check happens before that step in any sane
     // ordering of permission vs argument validation, but for this
     // degraded variant we only require that the result is NOT E_PERM.
-    const result = syscall.createCapabilityDomain(
-        caps_word,
-        ceilings_inner,
-        ceilings_outer,
-        0,
-        &.{},
-    );
+    const result = syscall.createCapabilityDomain(caps_word, ceilings_inner, ceilings_outer, 0, 0, // initial_ec_affinity
+        &.{});
 
     if (result.v1 == @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(1);

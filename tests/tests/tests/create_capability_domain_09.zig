@@ -99,6 +99,7 @@ pub fn main(cap_table_base: u64) void {
             ceilings_inner,
             ceilings_outer,
             0, // elf_page_frame: bogus on purpose — irrelevant if E_PERM fires first.
+            0, // initial_ec_affinity
             &.{},
         );
         if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {
@@ -122,6 +123,7 @@ pub fn main(cap_table_base: u64) void {
         ceilings_inner,
         ceilings_outer,
         0, // elf_page_frame: bogus on purpose; expect E_BADCAP, not E_PERM.
+        0, // initial_ec_affinity
         &.{},
     );
     if (result.v1 == @intFromEnum(errors.Error.E_PERM)) {

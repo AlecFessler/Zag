@@ -111,13 +111,8 @@ pub fn main(cap_table_base: u64) void {
     // through to a child here — we never construct the child.
     const passed_handles: [0]u64 = .{};
 
-    const result = syscall.createCapabilityDomain(
-        v1_caps,
-        ceilings_inner,
-        ceilings_outer,
-        pf_handle,
-        passed_handles[0..],
-    );
+    const result = syscall.createCapabilityDomain(v1_caps, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
+        passed_handles[0..]);
 
     if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(1);

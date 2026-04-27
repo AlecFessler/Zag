@@ -129,13 +129,8 @@ pub fn main(cap_table_base: u64) void {
     // ignored: the move = 0 contract is independent of whether the
     // call succeeds or fails. See the doc comment above for the
     // degraded-shape rationale.
-    _ = syscall.createCapabilityDomain(
-        self_caps_word,
-        ceilings_inner,
-        ceilings_outer,
-        pf_handle,
-        passed[0..],
-    );
+    _ = syscall.createCapabilityDomain(self_caps_word, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
+        passed[0..]);
 
     // Step 4: probe the original slot. If the move = 0 entry was
     // vacated, restrict returns E_BADCAP. Any other return value —

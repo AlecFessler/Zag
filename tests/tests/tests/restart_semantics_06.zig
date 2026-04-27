@@ -149,13 +149,8 @@ pub fn main(cap_table_base: u64) void {
     // succeeds (v3 not implemented yet) or surfaces a non-test-06
     // error code; under a future strict-ceiling runner it returns
     // E_PERM and the test would gate on that.
-    _ = syscall.createCapabilityDomain(
-        sub_self_caps_word,
-        sub_ceilings_inner,
-        sub_ceilings_outer,
-        pf_handle,
-        passed[0..],
-    );
+    _ = syscall.createCapabilityDomain(sub_self_caps_word, sub_ceilings_inner, sub_ceilings_outer, pf_handle, 0, // initial_ec_affinity
+        passed[0..]);
 
     testing.pass();
 }

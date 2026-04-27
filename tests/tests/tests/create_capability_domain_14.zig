@@ -95,6 +95,7 @@ pub fn main(cap_table_base: u64) void {
         0, // [2] ceilings_inner: all fields 0
         0, // [3] ceilings_outer: all fields 0 (incl. restart_policy_ceiling, fut_wait_max)
         elf_pf_handle,
+        0, // [5] initial_ec_affinity: any-core
         passed[0..],
     );
 

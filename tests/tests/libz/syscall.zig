@@ -349,28 +349,29 @@ pub fn createCapabilityDomain(
     ceilings_inner: u64,
     ceilings_outer: u64,
     elf_pf: u12,
+    initial_ec_affinity: u64,
     passed_handles: []const u64,
 ) Regs {
-    // [5+] passed_handles overflow into stack vregs once more than 9
-    // are passed. Up to 9 fit in vregs 5..13; beyond that we'd need
-    // issueStack. The mock runner passes at most 1 (the result port).
+    // Spec §[create_capability_domain]: [5] is the initial EC affinity
+    // mask, passed handles start at [6+]. Up to 8 passed handles fit
+    // in register vregs 6..13; beyond that issueStack handles spill.
     var in = Regs{
         .v1 = caps,
         .v2 = ceilings_inner,
         .v3 = ceilings_outer,
         .v4 = elf_pf,
+        .v5 = initial_ec_affinity,
     };
-    if (passed_handles.len >= 1) in.v5 = passed_handles[0];
-    if (passed_handles.len >= 2) in.v6 = passed_handles[1];
-    if (passed_handles.len >= 3) in.v7 = passed_handles[2];
-    if (passed_handles.len >= 4) in.v8 = passed_handles[3];
-    if (passed_handles.len >= 5) in.v9 = passed_handles[4];
-    if (passed_handles.len >= 6) in.v10 = passed_handles[5];
-    if (passed_handles.len >= 7) in.v11 = passed_handles[6];
-    if (passed_handles.len >= 8) in.v12 = passed_handles[7];
-    if (passed_handles.len >= 9) in.v13 = passed_handles[8];
-    if (passed_handles.len > 9) {
-        return issueStack(.create_capability_domain, 0, in, passed_handles[9..]);
+    if (passed_handles.len >= 1) in.v6 = passed_handles[0];
+    if (passed_handles.len >= 2) in.v7 = passed_handles[1];
+    if (passed_handles.len >= 3) in.v8 = passed_handles[2];
+    if (passed_handles.len >= 4) in.v9 = passed_handles[3];
+    if (passed_handles.len >= 5) in.v10 = passed_handles[4];
+    if (passed_handles.len >= 6) in.v11 = passed_handles[5];
+    if (passed_handles.len >= 7) in.v12 = passed_handles[6];
+    if (passed_handles.len >= 8) in.v13 = passed_handles[7];
+    if (passed_handles.len > 8) {
+        return issueStack(.create_capability_domain, 0, in, passed_handles[8..]);
     }
     return issueReg(.create_capability_domain, 0, in);
 }

@@ -237,13 +237,8 @@ pub fn main(cap_table_base: u64) void {
         }).toU64(),
     };
 
-    const result = syscall.createCapabilityDomain(
-        self_caps_word,
-        VALID_CEILINGS_INNER,
-        VALID_CEILINGS_OUTER,
-        pf_handle,
-        passed[0..],
-    );
+    const result = syscall.createCapabilityDomain(self_caps_word, VALID_CEILINGS_INNER, VALID_CEILINGS_OUTER, pf_handle, 0, // initial_ec_affinity
+        passed[0..]);
 
     // Smoke check: any error code in the §[error_codes] range (1..15)
     // means the success path didn't take. The post-condition test 22

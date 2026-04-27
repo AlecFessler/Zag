@@ -151,13 +151,8 @@ pub fn main(cap_table_base: u64) void {
     };
     const passed: [1]u64 = .{passed_entry.toU64()};
 
-    const ccd = syscall.createCapabilityDomain(
-        self_caps_word,
-        ceilings_inner,
-        ceilings_outer,
-        elf_pf,
-        passed[0..],
-    );
+    const ccd = syscall.createCapabilityDomain(self_caps_word, ceilings_inner, ceilings_outer, elf_pf, 0, // initial_ec_affinity
+        passed[0..]);
 
     // On a working kernel with a valid ELF body this is OK. On the
     // v0 stub kernel with no ELF body it is E_INVAL (test 15).

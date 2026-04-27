@@ -52,6 +52,7 @@ pub fn main(cap_table_base: u64) void {
         0, // ceilings_inner: every field zeroed
         0, // ceilings_outer: every field zeroed
         empty_slot, // elf_page_frame: invalid handle id
+        0, // initial_ec_affinity
         &.{}, // passed_handles: empty
     );
 
