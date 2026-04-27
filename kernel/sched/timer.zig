@@ -407,10 +407,20 @@ pub fn decHandleRef(t: *Timer) void {
 /// TODO: cross-core arm — send IPI to target core to rearm its LAPIC.
 fn wheelInsert(t: *Timer, deadline_ns: u64) void {
     const core_id: u8 = @intCast(arch.smp.coreID() & 0xFF);
-    const irq = wheel_locks[core_id].lockIrqSave(@src());
-    defer wheel_locks[core_id].unlockIrqRestore(irq);
+    // `&wheels[core_id]` / `&wheel_locks[core_id]` (pointer) rather than
+    // the direct `wheels[core_id].field` form. Debug-mode Zig codegens
+    // the indexed form as a memcpy of the entire `wheels` /
+    // `wheel_locks` array onto the caller's stack — `wheels` is
+    // `[MAX_CORES]TimerHeap` ≈ 256 KiB at MAX_CORES=64. Three such
+    // snapshots in a single function blow the kernel stack on faulting
+    // paths. Mirrors the fix in `sched.scheduler.currentEc` for
+    // `core_states[]`.
+    const lock = &wheel_locks[core_id];
+    const heap = &wheels[core_id];
+    const irq = lock.lockIrqSave(@src());
+    defer lock.unlockIrqRestore(irq);
 
-    if (wheels[core_id].insert(t, deadline_ns)) |_| {
+    if (heap.insert(t, deadline_ns)) |_| {
         t.wheel_core = core_id;
     } else {
         // Heap full. With MAX_TIMERS_PER_CORE = 256 matching the
@@ -424,7 +434,7 @@ fn wheelInsert(t: *Timer, deadline_ns: u64) void {
     // changed — reprogram the LAPIC, but only when our new deadline
     // is sooner than the running preempt slice. Otherwise we would
     // push out the next preempt tick.
-    if (wheels[core_id].peekMin()) |top| {
+    if (heap.peekMin()) |top| {
         if (top.timer == t) {
             const now_ns = currentNs();
             const preempt_deadline = now_ns +| scheduler.TIMESLICE_NS;
@@ -446,15 +456,18 @@ fn wheelRemove(t: *Timer) void {
     if (core_id == WHEEL_NO_CORE) return;
     if (core_id >= scheduler.MAX_CORES) return;
 
-    const irq = wheel_locks[core_id].lockIrqSave(@src());
-    defer wheel_locks[core_id].unlockIrqRestore(irq);
+    // `&wheels[core_id]` / `&wheel_locks[core_id]`: see `wheelInsert`.
+    const lock = &wheel_locks[core_id];
+    const heap = &wheels[core_id];
+    const irq = lock.lockIrqSave(@src());
+    defer lock.unlockIrqRestore(irq);
 
     // Re-check under lock — a concurrent expire on the owning core
     // may have already popped this entry.
     if (t.wheel_core != core_id) return;
     const idx = t.wheel_idx;
     if (idx == WHEEL_NOT_QUEUED) return;
-    wheels[core_id].removeAt(idx);
+    heap.removeAt(idx);
 }
 
 /// Drain every timer on this core's wheel whose `deadline_ns <=
@@ -469,6 +482,9 @@ fn wheelRemove(t: *Timer) void {
 pub fn wheelExpireDue() void {
     const now_ns = currentNs();
     const core_id: u8 = @intCast(arch.smp.coreID() & 0xFF);
+    // `&wheels[core_id]` / `&wheel_locks[core_id]`: see `wheelInsert`.
+    const lock = &wheel_locks[core_id];
+    const heap = &wheels[core_id];
 
     while (true) {
         // Snapshot expired entry under lock, fire outside lock — fire
@@ -477,11 +493,11 @@ pub fn wheelExpireDue() void {
         // which would deadlock if we held wheel_locks[core_id] across.
         var fire_target: ?*Timer = null;
         {
-            const irq = wheel_locks[core_id].lockIrqSave(@src());
-            defer wheel_locks[core_id].unlockIrqRestore(irq);
-            const top = wheels[core_id].peekMin() orelse break;
+            const irq = lock.lockIrqSave(@src());
+            defer lock.unlockIrqRestore(irq);
+            const top = heap.peekMin() orelse break;
             if (top.deadline_ns > now_ns) break;
-            const popped = wheels[core_id].popMin().?;
+            const popped = heap.popMin().?;
             fire_target = popped.timer;
         }
         onFire(fire_target.?);
@@ -492,9 +508,9 @@ pub fn wheelExpireDue() void {
     // `schedTimerHandler` already armed for `TIMESLICE_NS` from now
     // — otherwise leave the LAPIC alone so we don't push the next
     // preempt out past the time slice.
-    const irq = wheel_locks[core_id].lockIrqSave(@src());
-    defer wheel_locks[core_id].unlockIrqRestore(irq);
-    const top = wheels[core_id].peekMin() orelse return;
+    const irq = lock.lockIrqSave(@src());
+    defer lock.unlockIrqRestore(irq);
+    const top = heap.peekMin() orelse return;
     const post_drain_now = currentNs();
     const preempt_deadline = post_drain_now +| scheduler.TIMESLICE_NS;
     if (top.deadline_ns < preempt_deadline) {
