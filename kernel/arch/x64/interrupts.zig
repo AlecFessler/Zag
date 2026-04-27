@@ -224,17 +224,48 @@ pub fn updateScratchKernelRsp(core_id: u64, kernel_rsp: u64) void {
 ///     14..127 are not collected here — handlers that need them read
 ///     them from `[ctx.rsp + (N-13)*8]` directly.
 ///   - return: i64 → ctx.regs.rax (vreg 1).
+///
+/// L4 IPC fast path (Phase 2 + 3): when the syscall word names
+/// `suspend` we attempt `port.suspendFast` BEFORE building the args
+/// slice or routing through the dispatch switch. The fast path handles
+/// the dominant test-runner pattern (self-suspend with a receiver
+/// already queued on the destination port). Predicate misses return
+/// `null` and we fall straight through to the slow-path dispatch — the
+/// observable behavior is identical because the slow path mints the
+/// same state via `suspendEc` → `suspendOnPort`.
 export fn syscallDispatch(ctx: *cpu.Context) void {
     const r = &ctx.regs;
-    var args: [13]u64 = .{
-        r.rax, r.rbx, r.rdx, r.rbp, r.rsi, r.rdi,
-        r.r8,  r.r9,  r.r10, r.r12, r.r13, r.r14, r.r15,
-    };
     var syscall_word: u64 = undefined;
     cpu.stac();
     syscall_word = @as(*const u64, @ptrFromInt(ctx.rsp)).*;
     cpu.clac();
     const caller = scheduler.currentEc() orelse @panic("syscall with no current EC");
+
+    // Phase 2: cheap classifier on the syscall number. Only `suspend`
+    // unlocks the fast rendezvous below — every other syscall takes
+    // the args[0..13] slice path.
+    const SyscallNum = zag.syscall.dispatch.SyscallNum;
+    if ((syscall_word & 0xFFF) == @intFromEnum(SyscallNum.@"suspend")) {
+        // vreg 1 = rax = target EC handle; vreg 2 = rbx = port handle.
+        if (zag.sched.port.suspendFast(caller, r.rax, r.rbx)) |fast_ret| {
+            r.rax = @bitCast(fast_ret);
+            // The fast path may have suspended `caller` (rendezvous
+            // success): in that case `current_ec` was cleared and the
+            // syscall epilogue would otherwise iretq back to the now-
+            // parked user EC. Drive the scheduler to pick the next
+            // ready EC (typically the just-readied receiver).
+            if (scheduler.core_states[apic.coreID()].current_ec == null) {
+                scheduler.run();
+            }
+            return;
+        }
+        // Predicate miss — fall through to the slow path below.
+    }
+
+    var args: [13]u64 = .{
+        r.rax, r.rbx, r.rdx, r.rbp, r.rsi, r.rdi,
+        r.r8,  r.r9,  r.r10, r.r12, r.r13, r.r14, r.r15,
+    };
     const ret = zag.syscall.dispatch.dispatch(caller, syscall_word, args[0..]);
     r.rax = @bitCast(ret);
 
@@ -275,22 +306,26 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
 /// the eventual L4-style IPC fast path is intended to preserve in
 /// registers.
 ///
-/// L4 IPC fast path — design intent (NOT YET WIRED): a future
-/// implementation can short-circuit suspend/reply pairs that satisfy
-/// the hot-path predicate (handle lookup hits, target waiter queued,
-/// no attachments / no cap mismatches) by handling the rendezvous
-/// inline in this naked stub, without touching vregs 1-13. The Phase
-/// 1 prologue below already stashes user RSP/RIP/RFLAGS to per-CPU
-/// scratch and peeks the syscall word from vreg 0; downstream phases
-/// (handle resolve, port lock, PQ pop, CR3 + GS switch, lazy-FPU
-/// policy, sysretq) require offsets pinned against the consuming
-/// structs (CapabilityDomain handle tables, Port._gen_lock + waiters,
-/// ExecutionContext.ctx + domain SlabRef) and a derivation-tree-aware
-/// reply minting helper. Until those land the prologue falls straight
-/// through to the slow path so suspend/reply executes via
-/// `kernel/sched/port.zig` (`suspendEc`, `recv`, `reply`,
+/// L4 IPC fast path — Phases 2 + 3 wired in `syscallDispatch` (Zig).
+/// The asm prologue below still does the full Context save unchanged;
+/// the short-circuit is taken inside `syscallDispatch` after a cheap
+/// classifier on the syscall word: when the call is `suspend` and the
+/// predicate matches (self-suspend + receiver queued + caps OK),
+/// `port.suspendFast` performs the rendezvous inline without traversing
+/// the args[0..13] copy or the dispatch switch. The receiver is made
+/// ready and the caller is transitioned to `.suspended_on_port` with
+/// `current_ec` cleared on this core so the post-dispatch hook drives
+/// the scheduler at the bottom of `syscallDispatch`. Predicate misses
+/// fall straight through to the slow path so suspend/reply still
+/// executes via `kernel/sched/port.zig` (`suspendEc`, `recv`, `reply`,
 /// `replyTransfer`) — observable state matches what the fast path is
 /// specified to produce per spec §[port], §[reply], §[event_state].
+///
+/// Phase 4 (CR3 + GS swap + sysretq inline in this naked stub) is not
+/// yet wired: the Zig fast path still returns through the asm Context
+/// restore + iretq epilogue, just bypassing the slow dispatch above.
+/// Moving the receiver dispatch into the naked stub itself remains the
+/// future work this scratch layout was provisioned for.
 pub export fn syscallEntry() callconv(.naked) void {
     // Slow-path Context layout:
     //   [RSP+0..112]   r15..rax (15 GPRs, 120 bytes)

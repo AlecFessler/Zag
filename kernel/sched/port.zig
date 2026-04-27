@@ -101,6 +101,20 @@ pub const Port = struct {
     waiter_kind: WaiterKind = .none,
 };
 
+// Layout asserts for the L4 IPC fast path. The current Zig
+// `suspendFast` reaches `Port` through normal field access, so these
+// guard against drift that would silently break a future Phase 4 asm
+// rendezvous (which references `_gen_lock`, `waiters`, and
+// `waiter_kind` as immediate displacements off `*Port`).
+comptime {
+    if (@offsetOf(Port, "waiter_kind") <= @offsetOf(Port, "waiters")) {
+        @compileError("Port.waiter_kind must follow Port.waiters (asm fast path)");
+    }
+    if (@offsetOf(Port, "_gen_lock") >= @offsetOf(Port, "waiters")) {
+        @compileError("Port._gen_lock must precede Port.waiters (asm fast path)");
+    }
+}
+
 pub const Allocator = SecureSlab(Port, 256);
 pub var slab_instance: Allocator = undefined;
 
@@ -159,6 +173,110 @@ pub fn createPort(caller: *ExecutionContext, caps: u64) i64 {
     // returned value carries the type tag in bits 12..15 and never
     // collides with the small-positive error range 1..15.
     return @intCast(Word0.pack(slot, .port, port_caps_word));
+}
+
+/// L4 IPC fast path (Phase 2 + 3 in Zig). Resolves `target` and `port`
+/// handles inline against `caller.domain`, validates `susp` and `bind`
+/// caps, and — if a receiver is queued on the port — performs the
+/// rendezvous via `suspendOnPort` without going back through the slow
+/// path's argument-slice + dispatch-switch.
+///
+/// Returns `null` to signal predicate miss; caller must fall through to
+/// the slow path (which performs identical state mutations on success
+/// and surfaces the appropriate error code on validation failures, so
+/// the fall-through is observably equivalent to running the fast path
+/// to completion).
+///
+/// Predicate (must ALL hold; returns null otherwise):
+///   - `target` and `port` resolve cleanly in the caller's `user_table`
+///     to the expected types (`execution_context`, `port`).
+///   - The target EC is the caller itself — self-suspend, the dominant
+///     test pattern. Cross-EC suspend stays on the slow path because it
+///     needs an extra EC `_gen_lock` round trip and a separate state
+///     check that would dilute the fast path's branch budget.
+///   - The target handle has the `susp` cap and the port handle has the
+///     `bind` cap.
+///   - The caller is not a vCPU.
+///   - The port has at least one queued receiver
+///     (`waiter_kind == .receivers`).
+///
+/// On predicate match the result is identical to what `suspendEc` would
+/// have produced via `suspendOnPort` → `rendezvousWithReceiver`: caller
+/// transitions to `.suspended_on_port`, the highest-priority receiver
+/// is dequeued and made `.ready` with the §[event_state] vregs filled,
+/// and `current_ec` is cleared on this core so the syscall epilogue
+/// dispatches the next ready EC.
+///
+/// Lock order: CD → Port (canonical, matches §[delete] release path).
+/// CD is dropped before Port is taken, so `suspendOnPort` →
+/// `rendezvousWithReceiver` can acquire the receiver's CD without
+/// inverting the order.
+pub fn suspendFast(caller: *ExecutionContext, target: u64, port: u64) ?i64 {
+    if (target & ~capability.HANDLE_ARG_MASK != 0) return null;
+    if (port & ~capability.HANDLE_ARG_MASK != 0) return null;
+    if (caller.vm != null) return null;
+
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return null;
+
+    const target_slot: u12 = @truncate(target);
+    const port_slot: u12 = @truncate(port);
+
+    const target_entry = capability.resolveHandleOnDomain(cd, target_slot, .execution_context) orelse {
+        cd_ref.unlock();
+        return null;
+    };
+    const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse {
+        cd_ref.unlock();
+        return null;
+    };
+
+    // Self-suspend predicate: target EC must be the caller itself. The
+    // typed ref's ptr is the underlying object pointer; when it points
+    // back at `caller` we can skip the cross-EC lock dance entirely.
+    const target_ref = capability.typedRef(ExecutionContext, target_entry.*) orelse {
+        cd_ref.unlock();
+        return null;
+    };
+    if (target_ref.ptr != caller) {
+        cd_ref.unlock();
+        return null;
+    }
+
+    const ec_caps: EcCaps = @bitCast(Word0.caps(cd.user_table[target_slot].word0));
+    if (!ec_caps.susp) {
+        cd_ref.unlock();
+        return null;
+    }
+    const port_caps: PortCaps = @bitCast(Word0.caps(cd.user_table[port_slot].word0));
+    if (!port_caps.bind) {
+        cd_ref.unlock();
+        return null;
+    }
+
+    const port_ref = capability.typedRef(Port, port_entry.*) orelse {
+        cd_ref.unlock();
+        return null;
+    };
+    cd_ref.unlock();
+
+    const p = port_ref.lock(@src()) catch return null;
+
+    // Only commit to the fast path when there's a receiver to hand off
+    // to. The no-receiver branch (sender parks on the port) requires
+    // the same state mutations but produces no observable speedup over
+    // the slow path, so let the slow path own it — keeps this function
+    // a single tight predicate→rendezvous path.
+    if (p.waiter_kind != .receivers) {
+        port_ref.unlock();
+        return null;
+    }
+
+    // `suspendOnPort` requires the port lock held on entry; it releases
+    // the lock either directly (no-receiver path) or transitively via
+    // `rendezvousWithReceiver` (success path, drops port before locking
+    // receiver's CD to honor CD → Port).
+    return execution_context.suspendOnPort(caller, p, .suspension, 0, 0, ec_caps.write);
 }
 
 /// `suspend` syscall handler. Spec §[port].suspend.
