@@ -467,7 +467,18 @@ pub fn prepareThreadContext(
     if (ustack_top != null) {
         ctx.cs = gdt.USER_CODE_OFFSET | ring_3;
         ctx.ss = gdt.USER_DATA_OFFSET | ring_3;
-        ctx.rsp = ustack_top.?.addr;
+        // SysV AMD64 ABI §3.4.1: at a function's first instruction
+        // `rsp % 16 == 8` (the implicit CALL pushed an 8-byte return
+        // address onto a 16-byte-aligned stack). `ustack_top` is page-
+        // aligned (and therefore 16-byte aligned), so subtract 8 to
+        // mimic the post-CALL skew the compiler relies on. Without
+        // this skew, any 16-byte-aligned access the compiler emits
+        // against `rsp+offset` (e.g. movaps/movdqa for XMM spills,
+        // 16-byte struct copies) traps with #GP at the first
+        // instruction. Mirrors the same fix applied to the initial
+        // EC of a freshly-spawned capability domain in
+        // `capdom.capability_domain.patchInitialIretFrame`.
+        ctx.rsp = ustack_top.?.addr - 8;
     } else {
         ctx.cs = gdt.KERNEL_CODE_OFFSET;
         ctx.ss = gdt.KERNEL_DATA_OFFSET;

@@ -1162,8 +1162,20 @@ fn consumeReply(holder: *KernelHandle, receiver: *ExecutionContext, sender: *Exe
 }
 
 /// Resume the suspended sender with `E_ABANDONED` — the path invoked
-/// when `delete` consumes a reply handle without resuming.
-fn resumeWithAbandoned(sender: *ExecutionContext) void {
+/// when `delete` consumes a reply handle without resuming. Spec
+/// §[capabilities] line 176: deleting a reply handle whose suspended
+/// sender is still waiting resolves them with E_ABANDONED.
+///
+/// Caller has already verified the sender slab is live (via SlabRef
+/// gen-lock) and holds `sender._gen_lock`. State must be
+/// `.suspended_on_port` — a sender on the queue side or already woken
+/// is not eligible.
+pub fn resumeWithAbandoned(sender: *ExecutionContext) void {
+    // Sender may have been pulled off the port by an earlier wake path
+    // (e.g. a concurrent E_CLOSED propagation). resumeFromReply asserts
+    // .suspended_on_port — gate to avoid asserting in those races.
+    if (sender.state != .suspended_on_port) return;
+
     if (sender.iret_frame) |frame| {
         arch.syscall.setSyscallReturn(frame, @bitCast(errors.E_ABANDONED));
     } else {

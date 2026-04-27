@@ -479,11 +479,13 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
             // sender EC; the entry's ref.ptr is that EC. Resume them
             // with E_ABANDONED if still parked. The reply is not a
             // separate slab object — clearing the slot below severs
-            // the back-pointer.
+            // the back-pointer. Spec §[capabilities] line 176: "If
+            // the suspended sender is still waiting, resume them
+            // with E_ABANDONED. Release handle."
             const ref = typedRef(ExecutionContext, entry.*) orelse return;
             const sender = ref.lock(@src()) catch return;
             defer ref.unlock();
-            execution_context.abandonPendingReply(sender);
+            port.resumeWithAbandoned(sender);
         },
         .virtual_machine => {
             const ref = typedRef(VirtualMachine, entry.*) orelse return;

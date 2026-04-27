@@ -568,16 +568,38 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
 }
 
 /// `yield` syscall handler. Spec §[execution_context].yield.
+///
+/// Per spec: when `target` is non-zero and names a runnable EC handle
+/// in the caller's table, the scheduler dispatches that EC next on
+/// this core; otherwise (target == 0 or resolution fails) the call
+/// still yields and the scheduler picks whatever's next.
+///
+/// Target-aware dispatch matters when caller's priority outranks the
+/// target's: a plain `yieldTo(null)` re-dispatches the caller from
+/// its own priority queue, starving the lower-pri target. Surfaces
+/// in recv_14 (parent pri=3 yields to worker pri=0; worker must
+/// self-suspend before the parent's blocking recv can complete).
 pub fn yieldEc(caller: *ExecutionContext, target: u64) i64 {
-    _ = caller;
-    if (target == 0) {
-        scheduler.yieldTo(null);
-        return 0;
-    }
-    // Resolve target as EC handle; if runnable yield to it, else fall
-    // back to scheduler choice. Awaits handle table.
-    scheduler.yieldTo(null);
+    const target_ec = resolveYieldTarget(caller, target);
+    scheduler.yieldTo(target_ec);
     return 0;
+}
+
+/// Resolve `target` to a `*ExecutionContext` for `yieldEc`. Returns
+/// `null` for target == 0 and for any resolution failure (bad handle,
+/// wrong type, freed slab) — in those cases the caller still yields
+/// and the scheduler picks whatever runs next.
+fn resolveYieldTarget(caller: *ExecutionContext, target: u64) ?*ExecutionContext {
+    if (target == 0) return null;
+
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return null;
+    defer cd_ref.unlock();
+
+    const slot: u12 = @truncate(target);
+    const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse return null;
+    const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse return null;
+    return target_ref.ptr;
 }
 
 /// `priority` syscall handler. Spec §[execution_context].priority.
