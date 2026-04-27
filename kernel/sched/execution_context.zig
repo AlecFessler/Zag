@@ -251,18 +251,15 @@ pub const ExecutionContext = struct {
     event_addr: u64 = 0,
 
     /// Spec §[event_state] vregs 1..13 = the suspending EC's GPRs at
-    /// suspend time. Snapshotted in `suspendOnPort` and rewritten into
-    /// the receiver's matching GPR slots in `port.deliverEvent` so the
-    /// sender's payload (e.g. test runner's result_code/assertion_id in
-    /// vreg 3/4/5) is observable on recv. Currently vregs 3 (rdx / x2),
-    /// 4 (rbp / x3), and 5 (rsi / x4) are propagated — the vregs the
-    /// userspace test ABI uses for
-    /// `report(result_code, assertion_id, tag)`. Other GPR-backed
-    /// vregs land in the receiver as zero until a fuller snapshot is
-    /// wired (no test asserts them today).
-    event_vreg3: u64 = 0,
-    event_vreg4: u64 = 0,
-    event_vreg5: u64 = 0,
+    /// suspend time. Snapshotted in `suspendOnPort` from the EC's
+    /// iret frame in canonical vreg order via
+    /// `arch.syscall.getEventStateGprs`, and rewritten into the
+    /// receiver's matching GPR slots in `port.deliverEvent` (gated by
+    /// `originating_read_cap`) so the sender's payload is observable
+    /// on recv per Spec §[suspend] test 10.
+    /// x86-64 ordering: rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10,
+    /// r12, r13, r14, r15. aarch64 ordering: x0..x12.
+    event_state_gprs: [13]u64 = [_]u64{0} ** 13,
 
     /// Spec §[event_state] vreg 14 (x86-64 `[rsp+8]`) / vreg 32
     /// (aarch64 `[sp+8]`) — the suspending EC's saved instruction
@@ -364,6 +361,14 @@ pub const ExecutionContext = struct {
     /// sender's saved state iff the originating handle had `write`.
     /// Spec §[reply] tests 05/06.
     originating_write_cap: bool = false,
+
+    /// Read-cap snapshot from the originating EC handle. Mirrors
+    /// `originating_write_cap` but gates the recv-side projection of
+    /// the suspended EC's §[event_state] vregs 1..13 onto the
+    /// receiver's frame in `port.deliverEvent`: when set, the
+    /// snapshotted GPRs are exposed; when clear, all 13 vregs land in
+    /// the receiver as zero. Spec §[suspend] test 10.
+    originating_read_cap: bool = false,
 
     /// Kernel-held event route bindings, one slot per registerable event
     /// type. Index follows `EventType` ordering minus the unregisterable
@@ -985,6 +990,7 @@ pub fn suspendOnPort(
     subcode: u8,
     addr: u64,
     originating_write_cap: bool,
+    originating_read_cap: bool,
 ) i64 {
     if (ec.vm != null and event != .vm_exit) {
         port._gen_lock.unlock();
@@ -1000,18 +1006,17 @@ pub fn suspendOnPort(
     ec.event_subcode = subcode;
     ec.event_addr = addr;
     // §[event_state] vregs 1..13 carry the suspending EC's GPRs to the
-    // receiver. We snapshot vreg 3 / vreg 4 here from the EC's user
-    // iret frame (where the syscall-entry GPRs were saved) so they
-    // survive across the recv and ride into the receiver's matching
-    // GPR slots in `port.deliverEvent`. `iret_frame` is the canonical
-    // user-state pointer set on syscall/exception entry; fall back to
-    // `ctx` for ECs that suspend outside an in-flight syscall (e.g.
-    // event-route fault paths that suspend a not-currently-executing
-    // EC; ctx still references the most recent saved frame).
+    // receiver. Snapshot them all in canonical vreg order from the
+    // EC's user iret frame (where the syscall-entry GPRs were saved)
+    // so they survive across the recv and ride into the receiver's
+    // matching GPR slots in `port.deliverEvent`. `iret_frame` is the
+    // canonical user-state pointer set on syscall/exception entry;
+    // fall back to `ctx` for ECs that suspend outside an in-flight
+    // syscall (e.g. event-route fault paths that suspend a
+    // not-currently-executing EC; ctx still references the most
+    // recent saved frame).
     const sender_ctx = ec.iret_frame orelse ec.ctx;
-    ec.event_vreg3 = arch.syscall.getEventVreg3(sender_ctx);
-    ec.event_vreg4 = arch.syscall.getEventVreg4(sender_ctx);
-    ec.event_vreg5 = arch.syscall.getEventVreg5(sender_ctx);
+    ec.event_state_gprs = arch.syscall.getEventStateGprs(sender_ctx);
     ec.event_rip = arch.syscall.getEventRip(sender_ctx);
     ec.suspend_port = SlabRef(Port).init(port, port._gen_lock.currentGen());
     ec.state = .suspended_on_port;
@@ -1019,6 +1024,7 @@ pub fn suspendOnPort(
     ec.pending_reply_domain = null;
     ec.pending_reply_slot = 0;
     ec.originating_write_cap = originating_write_cap;
+    ec.originating_read_cap = originating_read_cap;
     ec.on_cpu.store(false, .release);
 
     // Rendezvous with a waiting receiver if one is parked. Spec
@@ -1073,6 +1079,7 @@ pub fn resumeFromReply(ec: *ExecutionContext, apply_writes: bool) void {
     ec.pending_reply_slot = 0;
     ec.originating_write_cap = false;
     ec.pending_pair_count = 0;
+    ec.originating_read_cap = false;
     ec.state = .ready;
     scheduler.markReady(ec);
 }
@@ -1137,6 +1144,7 @@ pub fn restartEntry(ec: *ExecutionContext) void {
     ec.pending_reply_slot = 0;
     ec.originating_write_cap = false;
     ec.pending_pair_count = 0;
+    ec.originating_read_cap = false;
     ec.iret_frame = null;
     ec.futex_wait_nodes = null;
     ec.futex_wait_vaddrs = null;
@@ -1279,6 +1287,7 @@ pub fn allocExecutionContext(
     ec.pending_reply_slot = 0;
     ec.originating_write_cap = false;
     ec.pending_pair_count = 0;
+    ec.originating_read_cap = false;
     ec.event_routes = .{ null, null, null, null };
     ec.entry_point = entry;
     ec.vm = if (vm) |v| SlabRef(VirtualMachine).init(v, v._gen_lock.currentGen()) else null;

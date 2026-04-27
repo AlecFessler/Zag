@@ -208,6 +208,34 @@ pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void
     }
 }
 
+/// Read the §[event_state] GPR-backed vregs 1..13 from a suspending EC
+/// in canonical vreg order. Snapshotted in `suspendOnPort` and
+/// re-applied on the receiver in `port.deliverEvent` when the
+/// originating EC handle carries the `read` cap (Spec §[suspend] test
+/// 10). x86-64 ordering matches the vreg → GPR table:
+/// rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15.
+/// aarch64 ordering: x0..x12 (vregs 1..13).
+pub fn getEventStateGprs(ctx: *const ArchCpuContext) [13]u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.getEventStateGprs(ctx),
+        .aarch64 => aarch64.interrupts.getEventStateGprs(ctx),
+        else => unreachable,
+    };
+}
+
+/// Write the §[event_state] GPR-backed vregs 1..13 onto a receiving
+/// EC's frame in canonical vreg order. Companion to
+/// `getEventStateGprs`; used by `port.deliverEvent` to project the
+/// suspended sender's snapshotted GPR set onto the recv-side vregs
+/// when the originating handle carries the `read` cap.
+pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.setEventStateGprs(ctx, gprs),
+        .aarch64 => aarch64.interrupts.setEventStateGprs(ctx, gprs),
+        else => unreachable,
+    }
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.interrupts.getIpcHandle(ctx),

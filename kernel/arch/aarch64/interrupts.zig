@@ -470,6 +470,45 @@ pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void
     dst.regs = src.regs;
 }
 
+/// Snapshot the suspending EC's GPR-backed vregs 1..13 in canonical
+/// vreg order. Spec §[event_state] aarch64 maps vregs 1..13 onto
+/// x0..x12.
+pub fn getEventStateGprs(ctx: *const ArchCpuContext) [13]u64 {
+    return .{
+        ctx.regs.x0,
+        ctx.regs.x1,
+        ctx.regs.x2,
+        ctx.regs.x3,
+        ctx.regs.x4,
+        ctx.regs.x5,
+        ctx.regs.x6,
+        ctx.regs.x7,
+        ctx.regs.x8,
+        ctx.regs.x9,
+        ctx.regs.x10,
+        ctx.regs.x11,
+        ctx.regs.x12,
+    };
+}
+
+/// Project a vreg 1..13 GPR snapshot onto a receiving EC's frame in
+/// canonical vreg order. Companion to `getEventStateGprs`.
+pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
+    ctx.regs.x0 = gprs[0];
+    ctx.regs.x1 = gprs[1];
+    ctx.regs.x2 = gprs[2];
+    ctx.regs.x3 = gprs[3];
+    ctx.regs.x4 = gprs[4];
+    ctx.regs.x5 = gprs[5];
+    ctx.regs.x6 = gprs[6];
+    ctx.regs.x7 = gprs[7];
+    ctx.regs.x8 = gprs[8];
+    ctx.regs.x9 = gprs[9];
+    ctx.regs.x10 = gprs[10];
+    ctx.regs.x11 = gprs[11];
+    ctx.regs.x12 = gprs[12];
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.x5;
 }

@@ -813,6 +813,50 @@ pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void
     dst.regs.r15 = src.regs.r15;
 }
 
+/// Snapshot the suspending EC's GPR-backed vregs 1..13 in canonical
+/// vreg order. Spec §[event_state] x86-64:
+///   vreg 1 → rax, vreg 2 → rbx, vreg 3 → rdx, vreg 4 → rbp,
+///   vreg 5 → rsi, vreg 6 → rdi, vreg 7 → r8,  vreg 8 → r9,
+///   vreg 9 → r10, vreg 10 → r12, vreg 11 → r13, vreg 12 → r14,
+///   vreg 13 → r15.
+/// rcx / r11 are reserved by the SYSCALL ABI (user RIP/RFLAGS) and are
+/// intentionally excluded.
+pub fn getEventStateGprs(ctx: *const ArchCpuContext) [13]u64 {
+    return .{
+        ctx.regs.rax,
+        ctx.regs.rbx,
+        ctx.regs.rdx,
+        ctx.regs.rbp,
+        ctx.regs.rsi,
+        ctx.regs.rdi,
+        ctx.regs.r8,
+        ctx.regs.r9,
+        ctx.regs.r10,
+        ctx.regs.r12,
+        ctx.regs.r13,
+        ctx.regs.r14,
+        ctx.regs.r15,
+    };
+}
+
+/// Project a vreg 1..13 GPR snapshot onto a receiving EC's frame in
+/// canonical vreg order. Companion to `getEventStateGprs`.
+pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
+    ctx.regs.rax = gprs[0];
+    ctx.regs.rbx = gprs[1];
+    ctx.regs.rdx = gprs[2];
+    ctx.regs.rbp = gprs[3];
+    ctx.regs.rsi = gprs[4];
+    ctx.regs.rdi = gprs[5];
+    ctx.regs.r8 = gprs[6];
+    ctx.regs.r9 = gprs[7];
+    ctx.regs.r10 = gprs[8];
+    ctx.regs.r12 = gprs[9];
+    ctx.regs.r13 = gprs[10];
+    ctx.regs.r14 = gprs[11];
+    ctx.regs.r15 = gprs[12];
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.r13;
 }

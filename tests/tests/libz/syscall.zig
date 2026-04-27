@@ -295,6 +295,12 @@ fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     var ov12: u64 = undefined;
     var ov13: u64 = undefined;
     var oword: u64 = undefined;
+    // Allocate 24 bytes so the kernel's writes to [rsp+0] (syscall
+    // word, vreg 0) and [rsp+8] (vreg 14, suspended EC's RIP per
+    // §[event_state]) both land in the alloc instead of stomping
+    // caller-frame locals that may live in the red zone. The userspace
+    // only reads [rsp+0]; [rsp+8] is consumed by the kernel and
+    // discarded on return.
     asm volatile (
         \\ subq $144, %%rsp
         \\ movq %%rcx, (%%rsp)

@@ -384,7 +384,7 @@ pub fn suspendFast(caller: *ExecutionContext, target: u64, port: u64) ?i64 {
     // the lock either directly (no-receiver path) or transitively via
     // `rendezvousWithReceiver` (success path, drops port before locking
     // receiver's CD to honor CD → Port).
-    return execution_context.suspendOnPort(caller, p, .suspension, 0, 0, ec_caps.write);
+    return execution_context.suspendOnPort(caller, p, .suspension, 0, 0, ec_caps.write, ec_caps.read);
 }
 
 /// `suspend` syscall handler. Spec §[port].suspend.
@@ -459,11 +459,12 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
     // on the no-receiver path, transitively via `rendezvousWithReceiver`
     // on the success path) so we MUST NOT add `defer port_ref.unlock()`.
 
-    // Snapshot the originating EC handle's `write` cap so reply-time
-    // can decide whether receiver mutations apply (Spec §[reply] tests
-    // 05/06). The caps were captured into `ec_caps` above under the
-    // domain lock.
-    return execution_context.suspendOnPort(target_ec, p, .suspension, 0, 0, ec_caps.write);
+    // Snapshot the originating EC handle's `write` and `read` caps so
+    // reply-time can decide whether receiver mutations apply (Spec
+    // §[reply] tests 05/06) and so recv-time gates the suspended EC's
+    // §[event_state] vregs 1..13 exposure (Spec §[suspend] test 10).
+    // The caps were captured into `ec_caps` above under the domain lock.
+    return execution_context.suspendOnPort(target_ec, p, .suspension, 0, 0, ec_caps.write, ec_caps.read);
 }
 
 /// `recv` syscall handler. Spec §[port].recv.
@@ -715,8 +716,12 @@ fn fireRouted(
     // write-cap snapshot is not yet plumbed through to this path; until
     // event_route bookkeeping records that snapshot at bind time the
     // safe default is to discard receiver mutations on reply (§[reply]
-    // test 06's no-write-cap branch).
-    _ = execution_context.suspendOnPort(ec, port_ptr, event, subcode, addr, false);
+    // test 06's no-write-cap branch). The fault-firing site has read
+    // access to the EC's full saved frame so default `read=true` —
+    // §[suspend] test 10 only zeroes the payload when the originating
+    // handle explicitly lacks `read`, which the bind_event_route path
+    // would record once plumbed through.
+    _ = execution_context.suspendOnPort(ec, port_ptr, event, subcode, addr, false, true);
     return true;
 }
 
@@ -786,8 +791,10 @@ pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
     // receiver mutations. The lookup that captures that bit per-vCPU
     // is part of the VMM-owned exit pipeline; until it lands, default
     // to allowing applies (the common case for VMM resume) so the
-    // exit→reply→resume cycle remains observable end-to-end.
-    _ = execution_context.suspendOnPort(ec, port_ptr, .vm_exit, subcode, payload[0], true);
+    // exit→reply→resume cycle remains observable end-to-end. `read`
+    // defaults to true so §[event_state] vregs 1..13 carry the vCPU's
+    // GPRs to the VMM at recv time (the dominant exit-pipeline case).
+    _ = execution_context.suspendOnPort(ec, port_ptr, .vm_exit, subcode, payload[0], true, true);
 }
 
 // ── Internal API ─────────────────────────────────────────────────────
@@ -1028,20 +1035,16 @@ fn deliverEvent(
         (@as(u64, reply_slot) << REPLY_HANDLE_SHIFT) |
         (@as(u64, @intFromEnum(event_type)) << EVENT_TYPE_SHIFT);
 
-    // §[event_state] vreg 2 = sub-code (sender-suspend metadata),
-    // vregs 3 and 4 = sender's GPR-backed vregs snapshotted at suspend
-    // time (Spec §[event_state] vregs 1..13 are the suspending EC's
-    // GPRs). For suspension events triggered by `suspend(target, port)`
-    // both `subcode` and `event_addr` are 0; the sender's `event_vreg3`
-    // / `event_vreg4` carry the userspace payload. For fault / vm_exit
-    // events the firing site supplies `subcode` and `event_addr` for
-    // vreg 2 / vreg 3, and per-spec vreg 3 must reflect the suspended
-    // EC's rdx (x2) — the firing-site `event_addr` and the EC's vreg 3
-    // are different concepts that today share the same physical
-    // register because we have not yet relocated event_addr to a higher
-    // vreg slot. The sender snapshot wins per spec §[event_state] —
-    // event-specific u64 payloads must move to vreg 19+ (x86-64) /
-    // vreg 36+ (aarch64) when those tests come online.
+    // §[event_state] vregs 1..13 = the suspending EC's GPRs snapshotted
+    // at `suspendOnPort` time, projected onto the receiver's matching
+    // vregs here when the originating handle carried `read` (Spec
+    // §[suspend] test 10). When `read` is clear the entire 13-vreg
+    // window is delivered as zero. vreg 2 then carries the
+    // event-type-specific sub-code on top of the GPR projection
+    // (overlapping the snapshot's vreg 2 slot — the firing site's
+    // sub-code wins for fault/vm_exit events; for `suspend(target,port)`
+    // the spec leaves `subcode` 0 anyway, so the projection's sender
+    // rbx/x1 surfaces unchanged).
     // Spec §[syscall_abi]: vreg 0 (`[rsp+0]`) carries the recv-success
     // syscall return word; vreg 1 (rax) holds an error code on failure
     // and is 0 on success. Stage `ret_word` in `pending_event_word` so
@@ -1052,21 +1055,22 @@ fn deliverEvent(
     const target_ctx = receiver.iret_frame orelse receiver.ctx;
     receiver.pending_event_word = ret_word;
     receiver.pending_event_word_valid = true;
-    // Spec §[event_state] vreg 14 (x86-64 `[rsp+8]`) / vreg 32
-    // (aarch64 `[sp+8]`) = the suspending EC's RIP/PC. Like the
-    // syscall word at vreg 0 the user-page write must run with the
-    // receiver's CR3/TTBR0 active, so stage it here and flush from
-    // the per-arch resume path. `event_rip` was snapshotted in
-    // `suspendOnPort`; for ECs that never executed it is the entry
-    // point set by `prepareEcContext`.
     receiver.pending_event_rip = sender.event_rip;
     receiver.pending_event_rip_valid = true;
-    arch.syscall.setSyscallReturn(target_ctx, @as(u64, @bitCast(errors.OK)));
-    arch.syscall.setEventSubcode(target_ctx, subcode);
     _ = event_addr;
-    arch.syscall.setEventAddr(target_ctx, sender.event_vreg3);
-    arch.syscall.setEventVreg4(target_ctx, sender.event_vreg4);
-    arch.syscall.setEventVreg5(target_ctx, sender.event_vreg5);
+    if (sender.originating_read_cap) {
+        arch.syscall.setEventStateGprs(target_ctx, sender.event_state_gprs);
+    } else {
+        // §[suspend] test 10 / §[recv] tests 11/12: the snapshot is
+        // delivered iff the originating EC handle had the `read` cap;
+        // otherwise the GPR-backed event-state vregs are zeroed.
+        arch.syscall.setEventStateGprs(target_ctx, [_]u64{0} ** 13);
+        // Surface `subcode` in vreg 2 for events that rely on it
+        // (memory_fault read/write/execute, etc.). When `read` is set
+        // the sender's rbx (vreg 2) wins — see the read-cap branch
+        // above which already overwrote rbx with the snapshot.
+        arch.syscall.setEventSubcode(target_ctx, subcode);
+    }
 
     // i64 return == OK on success. The composed `ret_word` is delivered
     // out-of-band via `pending_event_word` rather than through
