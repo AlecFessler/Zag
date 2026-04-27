@@ -443,6 +443,24 @@ pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x4 = value;
 }
 
+/// Spec §[event_state] vreg 32 read — the suspending EC's saved PC.
+/// `elr_el1` carries the entry point set in `prepareEcContext` for
+/// freshly created ECs and the saved exception-return address for
+/// ones suspended mid-execution.
+pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
+    return ctx.elr_el1;
+}
+
+/// Spec §[event_state] vreg 32 write — writes the suspended EC's PC
+/// into the receiver's user stack at `[ctx.sp_el0 + 8]`. Caller MUST
+/// ensure TTBR0 already references the receiver's address space (the
+/// stack page only exists there). Mirrors the x86-64
+/// `writeUserVreg14` contract; aarch64 has no SMAP equivalent so the
+/// store is direct.
+pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
+    @as(*u64, @ptrFromInt(ctx.sp_el0 + 8)).* = value;
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.x5;
 }

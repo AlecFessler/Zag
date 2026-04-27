@@ -165,6 +165,34 @@ pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
+/// Read the saved instruction pointer from a suspending EC — used to
+/// snapshot the sender's RIP/PC at suspend time for delivery as Spec
+/// §[event_state] vreg 14 (x86-64 `[rsp+8]`) / vreg 32 (aarch64
+/// `[sp+8]`) at recv time. For an EC that has never executed this
+/// returns the entry point set up by `prepareEcContext`; for one
+/// suspended mid-execution it returns the saved iret-frame RIP/PC.
+pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.getEventRip(ctx),
+        .aarch64 => aarch64.interrupts.getEventRip(ctx),
+        else => unreachable,
+    };
+}
+
+/// Write the event-state vreg 14 (x86-64 `[user_rsp + 8]`) / vreg 32
+/// (aarch64 `[user_sp + 8]`) slot on a receiving EC — the suspended
+/// EC's RIP/PC per Spec §[event_state]. MUST be called with the
+/// receiver's address space active in CR3/TTBR0 (the user-stack write
+/// touches a userspace page that is only mapped in the receiver's
+/// domain). Mirrors `writeUserSyscallWord`'s contract.
+pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.writeUserVreg14(ctx, value),
+        .aarch64 => aarch64.interrupts.writeUserVreg14(ctx, value),
+        else => unreachable,
+    }
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.interrupts.getIpcHandle(ctx),

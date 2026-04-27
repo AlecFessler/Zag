@@ -242,6 +242,14 @@ pub const ExecutionContext = struct {
     event_vreg4: u64 = 0,
     event_vreg5: u64 = 0,
 
+    /// Spec §[event_state] vreg 14 (x86-64 `[rsp+8]`) / vreg 32
+    /// (aarch64 `[sp+8]`) — the suspending EC's saved instruction
+    /// pointer. Snapshotted in `suspendOnPort` from the EC's saved
+    /// context (entry point for ECs that never executed; saved RIP/PC
+    /// for ones suspended mid-execution) and flushed onto the
+    /// receiver's user stack at recv resume time.
+    event_rip: u64 = 0,
+
     /// Port we joined the wait queue on. Lets cleanup find us if the
     /// port closes while we are queued. `null` outside a suspension.
     suspend_port: ?SlabRef(Port) = null,
@@ -262,6 +270,19 @@ pub const ExecutionContext = struct {
     /// from "pending write of value 0" since 0 is a legal return word.
     pending_event_word: u64 = 0,
     pending_event_word_valid: bool = false,
+
+    /// Spec §[event_state] vreg 14 (x86-64 `[rsp+8]`) / vreg 32
+    /// (aarch64 `[sp+8]`) — the suspending EC's RIP / PC, staged here
+    /// in `deliverEvent` and flushed onto this EC's user stack at recv
+    /// resume time. Like `pending_event_word`, the user-page write is
+    /// only safe when running in this EC's address space, so the flush
+    /// is deferred to the syscall epilogue (synchronous recv with a
+    /// queued sender) or the rendezvous resume path (parked receiver
+    /// woken by an arriving suspend). 0 is a legal value on freshly
+    /// created ECs whose entry was zeroed, hence the explicit `_valid`
+    /// flag.
+    pending_event_rip: u64 = 0,
+    pending_event_rip_valid: bool = false,
 
     /// Back-pointer to the receiver-side handle table entry that holds
     /// the outstanding reply against this EC. Set when we are dequeued
@@ -920,6 +941,7 @@ pub fn suspendOnPort(
     ec.event_vreg3 = arch.syscall.getEventVreg3(sender_ctx);
     ec.event_vreg4 = arch.syscall.getEventVreg4(sender_ctx);
     ec.event_vreg5 = arch.syscall.getEventVreg5(sender_ctx);
+    ec.event_rip = arch.syscall.getEventRip(sender_ctx);
     ec.suspend_port = SlabRef(Port).init(port, port._gen_lock.currentGen());
     ec.state = .suspended_on_port;
     ec.pending_reply_holder = null;

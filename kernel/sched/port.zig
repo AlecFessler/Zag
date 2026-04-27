@@ -964,6 +964,15 @@ fn deliverEvent(
     const target_ctx = receiver.iret_frame orelse receiver.ctx;
     receiver.pending_event_word = ret_word;
     receiver.pending_event_word_valid = true;
+    // Spec §[event_state] vreg 14 (x86-64 `[rsp+8]`) / vreg 32
+    // (aarch64 `[sp+8]`) = the suspending EC's RIP/PC. Like the
+    // syscall word at vreg 0 the user-page write must run with the
+    // receiver's CR3/TTBR0 active, so stage it here and flush from
+    // the per-arch resume path. `event_rip` was snapshotted in
+    // `suspendOnPort`; for ECs that never executed it is the entry
+    // point set by `prepareEcContext`.
+    receiver.pending_event_rip = sender.event_rip;
+    receiver.pending_event_rip_valid = true;
     arch.syscall.setSyscallReturn(target_ctx, @as(u64, @bitCast(errors.OK)));
     arch.syscall.setEventSubcode(target_ctx, subcode);
     _ = event_addr;

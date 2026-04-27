@@ -287,6 +287,19 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
         writeUserSyscallWord(ctx, caller.pending_event_word);
         caller.pending_event_word = 0;
         caller.pending_event_word_valid = false;
+
+        // Spec §[event_state] vreg 14 — RIP at `[user_rsp + 8]`.
+        // Staged alongside the syscall word in `port.deliverEvent`;
+        // flush here while we are guaranteed to be in the receiver's
+        // CR3 (the synchronous path through dispatch ran in the
+        // caller's address space throughout). Tied to
+        // `pending_event_word_valid` because both flags are set
+        // together in `deliverEvent`.
+        if (caller.pending_event_rip_valid) {
+            writeUserVreg14(ctx, caller.pending_event_rip);
+            caller.pending_event_rip = 0;
+            caller.pending_event_rip_valid = false;
+        }
     }
 
     // If the dispatch suspended the calling EC (recv/suspend/futex
@@ -525,6 +538,16 @@ pub fn switchTo(ec: *ExecutionContext) void {
         writeUserSyscallWord(ec.ctx, ec.pending_event_word);
         ec.pending_event_word = 0;
         ec.pending_event_word_valid = false;
+
+        // Spec §[event_state] vreg 14 — RIP at `[user_rsp + 8]`.
+        // Staged in `port.deliverEvent` and flushed here on the
+        // rendezvous wake path now that CR3 references the
+        // receiver's address space.
+        if (ec.pending_event_rip_valid) {
+            writeUserVreg14(ec.ctx, ec.pending_event_rip);
+            ec.pending_event_rip = 0;
+            ec.pending_event_rip_valid = false;
+        }
     }
 
     // lockdep: this asm `jmp interruptStubEpilogue` abandons the call stack
@@ -733,6 +756,26 @@ pub fn getEventVreg5(ctx: *const ArchCpuContext) u64 {
 
 pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rsi = value;
+}
+
+/// Spec §[event_state] vreg 14 read — the suspending EC's saved RIP.
+/// For freshly created ECs `ctx.rip` carries the entry point set in
+/// `prepareEcContext`; for ones suspended mid-execution it carries
+/// the iret-frame RIP saved on syscall/exception entry.
+pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
+    return ctx.rip;
+}
+
+/// Spec §[event_state] vreg 14 write — writes the suspended EC's RIP
+/// into the receiver's user stack at `[ctx.rsp + 8]`. STAC/CLAC
+/// bracket the write under SMAP; caller MUST ensure CR3 already
+/// references the receiver's address space (the stack page only
+/// exists there). `vreg 0` lives at `[ctx.rsp + 0]` and is written by
+/// `writeUserSyscallWord`; this is the next slot up.
+pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
+    cpu.stac();
+    @as(*u64, @ptrFromInt(ctx.rsp + 8)).* = value;
+    cpu.clac();
 }
 
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
