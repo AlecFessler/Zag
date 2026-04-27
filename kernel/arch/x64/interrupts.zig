@@ -244,8 +244,14 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // Phase 2: cheap classifier on the syscall number. Only `suspend`
     // unlocks the fast rendezvous below — every other syscall takes
     // the args[0..13] slice path.
+    //
+    // The fast path skips the §[handle_attachments] entry-validation
+    // step, so when pair_count > 0 (syscall word bits 12-19) we MUST
+    // fall through to the slow path so the per-entry checks (E_BADCAP
+    // on invalid source ids, etc.) actually run.
     const SyscallNum = zag.syscall.dispatch.SyscallNum;
-    if ((syscall_word & 0xFFF) == @intFromEnum(SyscallNum.@"suspend")) {
+    const pair_count_bits: u8 = @truncate((syscall_word >> 12) & 0xFF);
+    if ((syscall_word & 0xFFF) == @intFromEnum(SyscallNum.@"suspend") and pair_count_bits == 0) {
         // vreg 1 = rax = target EC handle; vreg 2 = rbx = port handle.
         if (zag.sched.port.suspendFast(caller, r.rax, r.rbx)) |fast_ret| {
             r.rax = @bitCast(fast_ret);

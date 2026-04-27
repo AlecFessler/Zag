@@ -44,12 +44,16 @@ const testing = lib.testing;
 
 const SUSPEND_NUM: u64 = @intFromEnum(syscall.SyscallNum.@"suspend");
 
-// Reserve 115 stack slots above the syscall word so vreg 127 reaches
-// `[rsp + 912]`. The pad covers vregs 14..127 (114 slots) plus the
-// syscall word at rsp+0 (1 slot), totalling 920 bytes — the smallest
-// 16-byte-aligned frame that satisfies the v3 vreg layout.
-const STACK_PAD_BYTES: u64 = 920;
-const VREG127_OFFSET: u64 = (127 - 13) * 8; // = 912
+// Reserve 114 stack slots for vregs 14..127 (912 bytes). The syscall
+// word slot at rsp+0 is added by the trailing `pushq %rcx`, so the
+// pre-push frame covers exactly the 114 high-vreg slots and the
+// post-push frame matches the v3 vreg layout (syscall word at
+// `[rsp + 0]`, vreg 127 at `[rsp + 912]` per §[syscall_abi]).
+const STACK_PAD_BYTES: u64 = 912;
+// Pre-push offset of vreg 127 within the 912-byte pad: the topmost
+// quadword slot at offset (127 - 14) * 8 = 904. After `pushq %rcx`
+// shifts everything by 8, the slot lands at `[rsp + 912]`.
+const VREG127_PRE_PUSH_OFFSET: u64 = (127 - 14) * 8; // = 904
 
 fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
     // Syscall word: bits 0-11 = syscall_num, bits 12-19 = pair_count = 1.
@@ -70,7 +74,7 @@ fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
     var ov13: u64 = undefined;
     asm volatile (
         \\ subq %[pad], %%rsp
-        \\ movq %[entry], 912(%%rsp)
+        \\ movq %[entry], 904(%%rsp)
         \\ pushq %%rcx
         \\ syscall
         \\ addq $8, %%rsp

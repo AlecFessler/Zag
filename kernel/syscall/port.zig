@@ -1,15 +1,33 @@
 const zag = @import("zag");
 
+const cpu = zag.arch.dispatch.cpu;
 const capability = zag.caps.capability;
 const errors = zag.syscall.errors;
 const port_obj = zag.sched.port;
 
+const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
 const CapabilityDomainCaps = zag.capdom.capability_domain.CapabilityDomainCaps;
 const CapabilityType = capability.CapabilityType;
 const EcCaps = zag.sched.execution_context.EcCaps;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PortCaps = port_obj.PortCaps;
 const Word0 = capability.Word0;
+
+/// §[handle_attachments] pair entry layout — bits 0-11 source handle id,
+/// bits 16-31 caps, bit 32 move flag. All other bits must be zero.
+const PAIR_SOURCE_MASK: u64 = 0xFFF;
+const PAIR_CAPS_MASK: u64 = @as(u64, 0xFFFF) << 16;
+const PAIR_MOVE_BIT: u64 = @as(u64, 1) << 32;
+const PAIR_VALID_MASK: u64 = PAIR_SOURCE_MASK | PAIR_CAPS_MASK | PAIR_MOVE_BIT;
+
+/// Maximum pair_count per §[handle_attachments]. The syscall word's
+/// pair_count field is 8 bits (0..255), but only 0..63 are valid; 64..255
+/// are reserved.
+const MAX_PAIR_COUNT: usize = 63;
+
+/// Maximum entries we read from the user stack at once. Stack-allocated
+/// upper bound matching MAX_PAIR_COUNT.
+const PAIR_BUF_LEN: usize = MAX_PAIR_COUNT;
 
 /// Mask of the bits the caller is allowed to set in `create_port`'s
 /// caps argument. Spec §[port].create_port packs caps into bits 0-15;
@@ -92,6 +110,12 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
     if (target & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (port & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
+    // Spec §[handle_attachments]: pair_count occupies the syscall
+    // word's bits 12-19 (0..255), but only 1..63 are valid attachment
+    // counts. Any value above 63 (or 0 with attached entries) is a
+    // structural violation of the attachment ABI.
+    if (pair_count > MAX_PAIR_COUNT) return errors.E_INVAL;
+
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
     const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
@@ -127,7 +151,110 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
     // rather than a §[suspend] cap miss.
     if (pair_count > 0 and !port_caps.xfer) return errors.E_PERM;
 
+    if (pair_count > 0) {
+        if (validatePairEntries(ec, pair_count)) |err| return err;
+    }
+
     return port_obj.suspendEc(ec, target, port);
+}
+
+/// Reads `pair_count` pair entries from the suspending EC's user
+/// stack at vregs `[128-N..127]` per §[syscall_abi] / §[handle_attachments]
+/// and runs the per-entry validation gates: reserved-bit check
+/// (test 06), intra-batch source-id duplicate check (test 07),
+/// per-entry source-id resolution (test 02), per-entry caps subset
+/// (test 03), and per-entry move/copy cap (tests 04/05). Returns
+/// `null` when every entry passes; otherwise the error code that fires.
+fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
+    var entries: [PAIR_BUF_LEN]u64 = undefined;
+    const n: usize = pair_count;
+
+    // Spec §[syscall_abi]: vreg N for 14 ≤ N ≤ 127 lives at
+    // `[rsp + (N-13)*8]` when the syscall executes. With pair_count
+    // = N entries occupy vregs [128-N..127] — i.e. offsets
+    // (128-N-13)*8 .. (127-13)*8 from the user RSP captured on syscall
+    // entry. SMAP gates the load.
+    const user_rsp = ec.ctx.rsp;
+    const first_vreg: u64 = 128 - @as(u64, n);
+    const first_off: u64 = (first_vreg - 13) * 8;
+
+    cpu.userAccessBegin();
+    var i: usize = 0;
+    while (i < n) {
+        const off = first_off + i * 8;
+        const ptr: *const u64 = @ptrFromInt(user_rsp + off);
+        entries[i] = ptr.*;
+        i += 1;
+    }
+    cpu.userAccessEnd();
+
+    // Test 06: any reserved bit set in any entry → E_INVAL.
+    i = 0;
+    while (i < n) {
+        if (entries[i] & ~PAIR_VALID_MASK != 0) return errors.E_INVAL;
+        i += 1;
+    }
+
+    // Test 07: two entries naming the same source handle → E_INVAL.
+    // O(N²) scan — N ≤ 63 so the alternative (sort or bitmap) would
+    // dwarf the win.
+    i = 0;
+    while (i < n) {
+        const a: u12 = @truncate(entries[i] & PAIR_SOURCE_MASK);
+        var j: usize = i + 1;
+        while (j < n) {
+            const b: u12 = @truncate(entries[j] & PAIR_SOURCE_MASK);
+            if (a == b) return errors.E_INVAL;
+            j += 1;
+        }
+        i += 1;
+    }
+
+    // Tests 02, 03, 04, 05: per-entry source-handle resolution under
+    // the suspending EC's domain lock. Each entry is checked in turn
+    // and the first failure short-circuits — spec does not pin
+    // intra-list ordering, only that 02 fires on any invalid id, 03
+    // on any cap-subset violation, etc.
+    const cd_ref = ec.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    defer cd_ref.unlock();
+
+    i = 0;
+    while (i < n) {
+        const slot: u12 = @truncate(entries[i] & PAIR_SOURCE_MASK);
+        const entry_caps: u16 = @truncate((entries[i] >> 16) & 0xFFFF);
+        const move_flag: bool = (entries[i] & PAIR_MOVE_BIT) != 0;
+
+        const handle = capability.resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
+        _ = handle;
+
+        const src_caps: u16 = @truncate(Word0.caps(cd.user_table[slot].word0));
+
+        // Test 03: requested caps must be a subset of the source
+        // handle's current caps. Bitwise subset suffices for every
+        // cap type that ships through pair entries today (port,
+        // execution_context, page_frame, var, device_region, timer,
+        // capability_domain IDC) — none of them carry the 2-bit
+        // restart_policy enum that `restrict` special-cases.
+        if (entry_caps & ~src_caps != 0) return errors.E_PERM;
+
+        // Tests 04/05: move/copy authority. Bit 0 = `move`, bit 1 =
+        // `copy` in the cap layout shared by transferable handle
+        // types. EC handles place those bits at the same indices, so
+        // this check is type-agnostic for the handle types that can
+        // ride a pair entry.
+        const has_move = (src_caps & 0x1) != 0;
+        const has_copy = (src_caps & 0x2) != 0;
+        if (move_flag) {
+            if (!has_move) return errors.E_PERM;
+        } else {
+            if (!has_copy) return errors.E_PERM;
+        }
+
+        i += 1;
+    }
+
+    return null;
 }
 
 /// Blocks waiting for an event on a port. On return, the kernel has
