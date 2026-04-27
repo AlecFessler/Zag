@@ -469,6 +469,15 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     const p = port_ref.lock(@src()) catch return errors.E_BADCAP;
 
     if (p.waiter_kind == .senders) {
+        // Spec §[port].recv test 06: if our handle table cannot
+        // accommodate the reply handle (and any pair_count attached
+        // handles), return E_FULL before disturbing the sender queue.
+        // Pair attachments are not yet plumbed through this path; the
+        // current minimum is 1 free slot for the reply handle alone.
+        if (cd.free_count == 0) {
+            port_ref.unlock();
+            return errors.E_FULL;
+        }
         const sender = popHighestPrioritySender(p) orelse {
             port_ref.unlock();
             return errors.E_CLOSED;
@@ -489,6 +498,16 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     if (p.send_refcount == 0 and p.event_route_count == 0) {
         port_ref.unlock();
         return errors.E_CLOSED;
+    }
+
+    // Spec §[port].recv test 06: a recv whose handle table is already
+    // full cannot mint the reply handle the eventual sender will need,
+    // so block-then-fail is observably equivalent to fail-now. Surface
+    // E_FULL up front rather than parking and discovering the failure
+    // at rendezvous time (which would silently lose the wakeup).
+    if (cd.free_count == 0) {
+        port_ref.unlock();
+        return errors.E_FULL;
     }
 
     enqueueReceiver(p, caller);
