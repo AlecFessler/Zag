@@ -175,7 +175,19 @@ pub fn switchTo(ec: *ExecutionContext) void {
         // rax — turning vreg 1 (= "OK on success") into a stale
         // handle id and tripping `errors.isError`.
         @memset(std.mem.asBytes(&current.ctx.regs), 0);
+        // lockdep IRQ-mode mix: `scheduler.run` re-enters this branch
+        // after `arch.cpu.idle()` returns with IF=1 (sti+hlt's iretq
+        // restored the pre-hlt IF). `fireVmExit` then takes the exit
+        // port's `_gen_lock` — the same SecureSlab(Port) class that
+        // the timer IRQ's `expireTimedRecvWaiters` takes from async-IRQ
+        // context. A class taken in both async-IRQ context (state 1)
+        // and process-with-IRQs-enabled context (state 3) is the
+        // textbook same-core deadlock vector. Disable IRQs across the
+        // synthetic-exit dispatch so the lock acquisition classifies
+        // as state 2 (process + IRQs disabled).
+        const irq = arch.cpu.saveAndDisableInterrupts();
         port_mod.fireVmExit(current, 0, [3]u64{ 0, 0, 0 });
+        arch.cpu.restoreInterrupts(irq);
 
         // The synthetic-exit path above may have rendezvoused with a
         // parked VMM receiver, putting it in this core's run queue.
