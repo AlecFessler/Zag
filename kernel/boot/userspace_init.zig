@@ -517,7 +517,12 @@ fn resolveOrSpawnRootEc(
     const ring_3: u64 = 3;
     ctx.cs = gdt.USER_CODE_OFFSET | ring_3;
     ctx.ss = gdt.USER_DATA_OFFSET | ring_3;
-    ctx.rsp = layout.stack_top;
+    // SysV AMD64 ABI: `_start`'s first instruction must see `rsp % 16 == 8`
+    // (matching the post-`call` skew compilers assume when emitting 16-byte
+    // aligned moves like `movaps`). `layout.stack_top` is page-aligned;
+    // subtract 8 so user code does not #GP on `movaps [rsp+k]` patterns.
+    // Mirrors the same adjustment in `capdom.capability_domain.patchInitialIretFrame`.
+    ctx.rsp = layout.stack_top - 8;
     ctx.rip = entry.addr;
     ctx.regs.rdi = layout.table_base;
 

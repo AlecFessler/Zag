@@ -427,7 +427,17 @@ fn patchInitialIretFrame(
     ctx.cs = USER_CODE_SEL;
     ctx.ss = USER_DATA_SEL;
     ctx.rip = entry.addr;
-    ctx.rsp = layout.stack_top;
+    // SysV AMD64 ABI: at a function's first instruction, the stack pointer
+    // satisfies `rsp % 16 == 8` (the prior `call` instruction pushed a
+    // return address onto a 16-byte-aligned stack). Compilers emit
+    // `movaps`/`movdqa` against `rsp+offset` slots assuming this offset
+    // holds; if `_start` is entered with `rsp % 16 == 0` instead, those
+    // 16-byte aligned moves trap with #GP. `layout.stack_top` is page-
+    // aligned (and therefore 16-byte aligned), so subtract 8 to mimic
+    // the post-`call` skew the compiler relied on. The first 8 bytes
+    // below `stack_top` are unused — `_start` has no return address to
+    // pop — so this costs only the offset.
+    ctx.rsp = layout.stack_top - 8;
     ctx.regs.rdi = layout.table_base;
 }
 
