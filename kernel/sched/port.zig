@@ -930,15 +930,34 @@ fn fireRouted(
 /// Fire a memory_fault event for `ec`. Looks up `ec.event_routes[0]`;
 /// if bound, suspends `ec` on the port; else applies the no-route
 /// fallback. Spec §[event_route] specifies restart-domain or release-
-/// self semantics here; until those are wired we fall back to
-/// terminating the faulting EC (mirrors `fireThreadFault`'s no-route
-/// path). Without this, a single faulting child anywhere in the system
-/// brings down the kernel before the runner can even drain results
-/// from the result port — a stub-vs-spec mismatch that turns every
-/// userland bug into an unrecoverable kernel panic.
+/// self semantics here; until those are wired we park the faulting EC
+/// (mirrors `fireThreadFault`'s no-route path). Without this, a single
+/// faulting child anywhere in the system brings down the kernel before
+/// the runner can even drain results from the result port — a stub-vs-
+/// spec mismatch that turns every userland bug into an unrecoverable
+/// kernel panic.
+///
+/// Park (not terminate) for two reasons that mirror `fireThreadFault`'s
+/// fallback rationale:
+///
+///   1. Recursive CD lock. The user-mode page-fault path (and any
+///      syscall that page-faults while holding the caller's CD lock —
+///      e.g. `readSelfFutWaitMax` accessing the user-table view) reaches
+///      this fallback with the EC's CD `_gen_lock` already held.
+///      `terminate(ec, 0)` would re-acquire the same lock and lockdep
+///      flags it as a recursive acquire.
+///   2. Wrong slot resolution. `terminate(caller, target)` resolves
+///      `target` in the caller's table; slot 0 is the SELF
+///      capability_domain handle, so `terminate(ec, 0)` would always
+///      have surfaced E_BADCAP and iretq'd back onto the faulting RIP.
+///
+/// `parkSelfFaulted` clears the local core's `current_ec` and marks the
+/// state `.exited` so the scheduler stops re-enqueueing. The slab and
+/// kernel stack we're running on stay pinned until the owning domain is
+/// torn down.
 pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void {
     if (fireRouted(ec, .memory_fault, subcode, fault_addr)) return;
-    _ = execution_context.terminate(ec, 0);
+    execution_context.parkSelfFaulted(ec);
 }
 
 /// Fire a thread_fault event. Fallback on no route: park the EC so the
