@@ -69,6 +69,17 @@ var buckets: [BUCKET_COUNT]Bucket = [_]Bucket{.{}} ** BUCKET_COUNT;
 var timed_lock: SpinLock = .{ .class = "futex.timed_lock" };
 var timed_waiters: [MAX_TIMED_WAITERS]?*ExecutionContext = [_]?*ExecutionContext{null} ** MAX_TIMED_WAITERS;
 
+/// `timed_lock` ordered_group. The wait paths take a bucket.lock first
+/// then call `addTimedWaiter` (which acquires `timed_lock`); the timer
+/// IRQ path takes `timed_lock` then per-EC bucket.locks. Tagging the
+/// timed_lock acquisition with a non-zero ordered_group opts out of
+/// pair-edge cycle detection on the (bucket.lock, timed_lock) pair so
+/// the two acquisition orders don't seed a phantom AB-BA cycle. Caller
+/// discipline: timed_lock is always released before any bucket.lock is
+/// re-acquired (phase split in `expireTimedWaiters`; release-then-undo
+/// in `addTimedWaiter` failure path).
+const FUTEX_TIMED_GROUP: u32 = 2;
+
 /// Returned by `wakeFromIrq`: count of woken ECs plus the mask of cores
 /// that need an explicit wake IPI follow-up. The IRQ path can't ride
 /// `enqueueOnCore`'s normal IPI emission because the caller wants to
@@ -83,7 +94,7 @@ fn bucketIdx(paddr: PAddr) usize {
 }
 
 fn addTimedWaiter(ec: *ExecutionContext) bool {
-    const irq = timed_lock.lockIrqSave(@src());
+    const irq = timed_lock.lockIrqSaveOrdered(@src(), FUTEX_TIMED_GROUP);
     defer timed_lock.unlockIrqRestore(irq);
     for (&timed_waiters) |*slot| {
         if (slot.* == null) {
@@ -95,7 +106,7 @@ fn addTimedWaiter(ec: *ExecutionContext) bool {
 }
 
 fn removeTimedWaiter(ec: *ExecutionContext) void {
-    const irq = timed_lock.lockIrqSave(@src());
+    const irq = timed_lock.lockIrqSaveOrdered(@src(), FUTEX_TIMED_GROUP);
     defer timed_lock.unlockIrqRestore(irq);
     for (&timed_waiters) |*slot| {
         if (slot.* == ec) {
@@ -625,7 +636,7 @@ pub fn expireTimedWaiters() void {
     var expired: [MAX_TIMED_WAITERS]Snapshot = undefined;
     var expired_count: usize = 0;
     {
-        const irq = timed_lock.lockIrqSave(@src());
+        const irq = timed_lock.lockIrqSaveOrdered(@src(), FUTEX_TIMED_GROUP);
         defer timed_lock.unlockIrqRestore(irq);
         for (&timed_waiters) |*slot| {
             const ec = slot.* orelse continue;
