@@ -222,6 +222,7 @@ pub fn createCapabilityDomain(
     ceilings_inner: u64,
     ceilings_outer: u64,
     elf_pf: u64,
+    initial_ec_affinity: u64,
     passed_handles: []const u64,
 ) i64 {
     if (elf_pf & ~@as(u64, 0xFFF) != 0) return errors.E_INVAL;
@@ -286,12 +287,13 @@ pub fn createCapabilityDomain(
     userspace_init.mapUserTableView(child_cd, layout.table_base) catch return errors.E_NOMEM;
 
     // Allocate the initial EC bound to the child domain. Entry =
-    // slid_entry; affinity = 0 (any core); priority = normal.
+    // slid_entry; affinity from spec §[create_capability_domain] [5];
+    // priority = normal.
     const child_ec = execution_context_mod.allocExecutionContext(
         child_cd,
         slid_entry,
         16, // user stack pages — same as boot's root stack reservation
-        0,
+        initial_ec_affinity,
         .normal,
         null,
         null,
@@ -377,8 +379,20 @@ pub fn createCapabilityDomain(
         0,
     ) catch return errors.E_FULL;
 
-    // Enqueue the initial EC on the calling core; SMP can pull it.
-    scheduler.enqueueOnCore(@intCast(arch.smp.coreID()), child_ec);
+    // Enqueue the initial EC on a core that satisfies its affinity
+    // mask. With affinity = 0 (any core) or a mask containing the
+    // calling core, prefer the calling core; otherwise use the lowest
+    // bit set in the mask. The scheduler's pull path can still migrate
+    // it later. Spec §[create_capability_domain] [5].
+    const calling_core: u64 = arch.smp.coreID();
+    const enqueue_core: u64 = blk: {
+        if (initial_ec_affinity == 0) break :blk calling_core;
+        if ((initial_ec_affinity >> @intCast(calling_core)) & 1 != 0) {
+            break :blk calling_core;
+        }
+        break :blk @ctz(initial_ec_affinity);
+    };
+    scheduler.enqueueOnCore(@intCast(enqueue_core), child_ec);
 
     // Spec §[error_codes] / §[capabilities]: success returns the
     // packed Word0 (id | type<<12 | caps<<48) so the type tag in bits

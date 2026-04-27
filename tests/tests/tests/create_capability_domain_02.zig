@@ -93,6 +93,7 @@ pub fn main(cap_table_base: u64) void {
         0, // ceilings_outer — same
         0, // elf_page_frame — handle id 0 (self); kernel will reject
         // on the type tag, but only after the self_caps subset check
+        0, // initial_ec_affinity
         &.{}, // passed_handles — empty
     );
 

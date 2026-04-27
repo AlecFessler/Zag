@@ -111,13 +111,8 @@ pub fn main(cap_table_base: u64) void {
         (template_outer & ~(@as(u64, 0xFF) << 8)) |
         (@as(u64, new_var_outer) << 8);
 
-    const result = syscall.createCapabilityDomain(
-        caps_word,
-        ceilings_inner,
-        ceilings_outer,
-        pf_handle,
-        &[_]u64{},
-    );
+    const result = syscall.createCapabilityDomain(caps_word, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
+        &[_]u64{});
 
     if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(2);

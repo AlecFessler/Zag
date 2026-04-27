@@ -220,13 +220,8 @@ pub fn main(cap_table_base: u64) void {
     // not depend on the [5+] vector.
     const passed: [0]u64 = .{};
 
-    const r = syscall.createCapabilityDomain(
-        caps_word,
-        ceilings_inner,
-        ceilings_outer,
-        pf_handle,
-        passed[0..],
-    );
+    const r = syscall.createCapabilityDomain(caps_word, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
+        passed[0..]);
 
     // Smoke check: vreg 1 must not be a v3 error code (1..15). On a
     // working kernel it is the caller's IDC handle to the new domain.

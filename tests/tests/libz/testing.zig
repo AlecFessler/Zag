@@ -4,13 +4,15 @@
 // with the result port at `SLOT_FIRST_PASSED`. A test reports its
 // outcome by calling `pass()` or `fail(id)`, which suspends the
 // initial EC on the port with the result encoding loaded into vregs
-// 3 (result_code) and 4 (assertion_id). The kernel snapshots the
-// suspended EC's GPRs as part of §[event_state]; the primary recv's,
-// reads vregs 3-4, records, and replies. Control returns to the test
-// and main returns out to start.zig which deletes the self-handle.
+// 3 (result_code), 4 (assertion_id), and 5 (test tag — build-time
+// stable identity used by the runner to attribute the result to a
+// specific manifest entry). The kernel snapshots the suspended EC's
+// GPRs as part of §[event_state]; the primary recv's, reads vregs
+// 3-5, records into a tag-indexed table, and replies.
 
 const caps = @import("caps.zig");
 const syscall = @import("syscall.zig");
+const test_tag = @import("test_tag");
 
 pub const PASS_CODE: u64 = 1;
 pub const FAIL_CODE: u64 = 0;
@@ -21,6 +23,7 @@ pub fn report(result_code: u64, assertion_id: u64) void {
         .v2 = caps.SLOT_FIRST_PASSED,
         .v3 = result_code,
         .v4 = assertion_id,
+        .v5 = test_tag.TAG,
     });
 }
 
