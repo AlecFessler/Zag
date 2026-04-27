@@ -394,18 +394,22 @@ pub fn self(caller: *ExecutionContext) i64 {
 ///
 ///   1. Re-resolve the slot under the cd lock to recover the worker
 ///      EC's typed slab ref (pointer + gen).
-///   2. Clear the caller's slot while the cd lock is still held — once
-///      we drop the lock another EC could see and observe the entry,
-///      so the slot must be retired before any teardown side effect.
-///   3. Drop the cd lock, then fire `destroyExecutionContext`. The
+///   2. Drop the cd lock, then fire `destroyExecutionContext`. The
 ///      destroy path locks the worker's domain itself to read the
 ///      addr-space root for kstack unmap, so it must run with the cd
 ///      lock released (worker.domain == caller.domain in the
 ///      target=self construction the spec tests use).
 ///
-/// Other capability domains' stale handles to the destroyed EC are
-/// caught lazily by the gen mismatch on their next syscall (spec test
-/// 05) — no eager fan-out is needed here.
+/// The caller's slot is intentionally NOT cleared here. Per spec
+/// §[execution_context].terminate test 05, "syscalls invoked with any
+/// handle to the terminated EC return E_TERM and remove that handle
+/// from the caller's table on the same call." The kernel-table entry
+/// is left pointing at the now-destroyed EC slab; the gen bump in
+/// `destroyExecutionContext` flips its parity to "freed", so the next
+/// syscall using this handle catches the gen mismatch via
+/// `SlabRef.lock`, surfaces `E_TERM`, and lazily evicts the slot. The
+/// same lazy eviction applies to stale handles in other capability
+/// domains.
 pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     const cd_ref = caller.domain;
     const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
@@ -421,12 +425,16 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
         return errors.E_BADCAP;
     };
 
-    // Detach + free the caller's slot while the cd lock is held. The
-    // EC slab itself is still alive at this point (gen unchanged); the
-    // worker may still be running on another core. Stale handles in
-    // other domains will hit E_TERM via the gen-bump that
-    // destroyExecutionContext performs below.
-    capability.clearAndFreeSlot(cd, slot, entry);
+    // Verify the slot still references a live EC. If the gen lock
+    // refuses (slot's referenced EC was already destroyed), evict
+    // the stale entry and surface E_TERM (spec test 05/06).
+    _ = worker_ref.lock(@src()) catch {
+        capability.clearAndFreeSlot(cd, slot, entry);
+        cd_ref.unlock();
+        return errors.E_TERM;
+    };
+    worker_ref.unlock();
+
     cd_ref.unlock();
 
     destroyExecutionContext(worker_ref.ptr);
@@ -454,6 +462,13 @@ pub fn yieldEc(caller: *ExecutionContext, target: u64) i64 {
 /// priority and refreshes the handle's field0 snapshot (spec
 /// §[execution_context] field0 bits 0-1 = pri).
 ///
+/// If the target EC has been terminated, the slot still references the
+/// destroyed slab but its gen has flipped to "freed". `lockWithGen`
+/// catches the parity mismatch and we surface `E_TERM` while evicting
+/// the slot from the caller's table — the spec line "syscalls invoked
+/// with any handle to the terminated EC return E_TERM and remove that
+/// handle from the caller's table on the same call" (test 05).
+///
 /// Re-bucketing the target if it is currently parked in a futex/port
 /// wait queue (spec test 07) is not yet implemented; the priority
 /// field is updated unconditionally so the next enqueue picks it up.
@@ -474,8 +489,17 @@ pub fn setPriority(caller: *ExecutionContext, target: u64, new_priority: u64) i6
         return errors.E_BADCAP;
     };
 
+    const target_ec = target_ref.lock(@src()) catch {
+        // Stale handle — target EC was terminated. Evict the slot from
+        // the caller's table and surface E_TERM (spec test 05).
+        capability.clearAndFreeSlot(cd, slot, entry);
+        cd_ref.unlock();
+        return errors.E_TERM;
+    };
+
     const new_pri: Priority = @enumFromInt(@as(u2, @intCast(new_priority)));
-    target_ref.ptr.priority = new_pri;
+    target_ec.priority = new_pri;
+    target_ref.unlock();
 
     // Refresh the handle's field0 snapshot (priority is bits 0-1).
     cd.user_table[slot].field0 = (cd.user_table[slot].field0 & ~@as(u64, 0x3)) | @intFromEnum(new_pri);
