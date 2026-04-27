@@ -293,6 +293,13 @@ pub fn mapPf(caller: *ExecutionContext, var_handle: u64, pairs: []const u64) i64
     const sz_bytes = pageSizeBytes(v.sz);
     const var_size = @as(u64, v.page_count) * sz_bytes;
 
+    // Pass 1: validate every pair and reject before any install. Spec
+    // §[var].map_pf tests 02, 05, 06, 07, 08, 09 are all non-mutating
+    // gates — a partial install on a later-rejected batch would leave
+    // the VAR with side-effects from the earlier pairs, contradicting
+    // the all-or-nothing contract. The checks below mirror the order
+    // of the spec gates so the first failing pair surfaces the
+    // strictest error consistent with the spec text.
     var i: usize = 0;
     while (i < pairs.len) {
         const offset = pairs[i];
@@ -311,6 +318,53 @@ pub fn mapPf(caller: *ExecutionContext, var_handle: u64, pairs: []const u64) i64
         const pf_sz_bytes = pageSizeBytes(pf.sz);
         const pair_bytes = @as(u64, pf.page_count) * pf_sz_bytes;
         if (offset >= var_size or offset + pair_bytes > var_size) return errors.E_INVAL;
+
+        // Spec §[var].map_pf test 08: no two pairs in the same call
+        // may have overlapping ranges. Compare against all earlier
+        // pairs in this batch.
+        var j: usize = 0;
+        while (j < i) {
+            const other_offset = pairs[j];
+            const other_pf_slot: u12 = @truncate(pairs[j + 1] & 0xFFF);
+            const other_kh = lookupHandle(domain, other_pf_slot, .page_frame) orelse
+                return errors.E_BADCAP;
+            const other_pf: *PageFrame = @ptrCast(@alignCast(other_kh.ref.ptr.?));
+            const other_pair_bytes = @as(u64, other_pf.page_count) * pageSizeBytes(other_pf.sz);
+            const a_start = offset;
+            const a_end = offset + pair_bytes;
+            const b_start = other_offset;
+            const b_end = other_offset + other_pair_bytes;
+            if (a_start < b_end and b_start < a_end) return errors.E_INVAL;
+            j += 2;
+        }
+
+        // Spec §[var].map_pf test 09: pair must not overlap any
+        // mapping already installed in the VAR. For non-DMA VARs the
+        // owning domain's page tables are the authoritative record;
+        // probe each page-sized slot in the pair's range.
+        if (!var_caps.dma) {
+            var off_in: u64 = 0;
+            while (off_in < pair_bytes) {
+                const va = v.base_vaddr.addr + offset + off_in;
+                if (dispatch.paging.resolveVaddr(domain.addr_space_root, .fromInt(va)) != null) {
+                    return errors.E_INVAL;
+                }
+                off_in += sz_bytes;
+            }
+        }
+
+        i += 2;
+    }
+
+    // Pass 2: install. All pairs are now known to be well-formed and
+    // non-overlapping with each other and with prior installations.
+    i = 0;
+    while (i < pairs.len) {
+        const offset = pairs[i];
+        const pf_slot: u12 = @truncate(pairs[i + 1] & 0xFFF);
+        const pf_kh = lookupHandle(domain, pf_slot, .page_frame) orelse
+            return errors.E_BADCAP;
+        const pf: *PageFrame = @ptrCast(@alignCast(pf_kh.ref.ptr.?));
 
         const rc = mappingInstall(v, offset, pf);
         if (rc != 0) return rc;
