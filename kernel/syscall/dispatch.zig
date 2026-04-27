@@ -234,11 +234,24 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .clear_event_route => event_route.clearEventRoute(caller, arg(args, 0), arg(args, 1)),
 
         .reply => reply.reply(caller, arg(args, 0)),
-        .reply_transfer => reply.replyTransfer(
-            caller,
-            arg(args, 0),
-            if (args.len > 1) args[1..] else &.{},
-        ),
+        .reply_transfer => blk: {
+            // Spec §[reply].reply_transfer: syscall word bits 12-19 carry
+            // `pair_count` `N`. Spec §[handle_attachments] places the N
+            // pair entries at vregs [128-N..127], but the v0 runner only
+            // sources register vregs (1..13); for the register-only path
+            // we map the entries into args[1..1+N]. Without this slice
+            // the handler sees uninitialized vregs above the user's
+            // payload as junk pair entries and trips the
+            // pair-entry-reserved-bits gate (test 04) before the
+            // handle-resolve gate (test 01) can fire.
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const end_idx: usize = @min(1 + @as(usize, @intCast(n)), args.len);
+            break :blk reply.replyTransfer(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
 
         .timer_arm => timer.timerArm(
             caller,
