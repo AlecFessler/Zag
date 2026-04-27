@@ -282,7 +282,12 @@
       border-radius: 0 0 4px 4px;
       padding: 0;
       margin: 0;
-      overflow: auto;
+      /* Intentionally NOT a scroll container — the surrounding
+         `.source_block` already scrolls in both axes. Making `pre`
+         scroll too would create a nested H-bar at the bottom of the
+         pre's content (far below the visible area) while the outer
+         block's H-bar would have nothing to scroll. */
+      overflow: visible;
       font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
       font-size: 12px;
       line-height: 1.4;
@@ -887,6 +892,98 @@
       display: flex;
       align-items: center;
       gap: 8px;
+    }
+
+    /* Per-pane minimize/maximize button. Lives in a header row at the
+       top of each pane (always present, even outside compare mode where
+       the label content is empty). Click toggles a `.collapsed` class
+       on the pane wrapper; state persists in localStorage. */
+    .pane_header_row {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: stretch;
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border);
+      min-height: 28px;
+    }
+    .pane_header_row > .trace_pane_label,
+    .pane_header_row > .source_pane_label {
+      flex: 1 1 auto;
+      min-width: 0;
+      background: transparent;
+      border-bottom: none;
+      border-radius: 0;
+      /* Truncate long subjects so they don't push the button off-screen. */
+      overflow: hidden;
+    }
+    .pane_header_row > .trace_pane_label .pane_subj,
+    .pane_header_row > .source_pane_label .pane_subj {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .pane_collapse_btn {
+      flex: 0 0 auto;
+      width: 28px;
+      padding: 0;
+      background: transparent;
+      border: none;
+      border-left: 1px solid var(--border);
+      color: var(--fg-dim);
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1;
+      font-family: inherit;
+    }
+    .pane_collapse_btn:hover {
+      color: var(--fg-bright);
+      background: var(--bg-elev-2);
+    }
+    /* Vertical-strip name shown only when the pane is collapsed. */
+    .pane_collapsed_label {
+      display: none;
+      writing-mode: vertical-rl;
+      transform: rotate(180deg);
+      color: var(--fg-dim);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 12px 0 6px 0;
+      text-align: center;
+      flex: 1 1 auto;
+      user-select: none;
+    }
+    /* Collapsed-pane styling: shrink to a thin strip, hide everything
+       except the header row (which holds the button) and the rotated
+       name. Other panes in the flex row redistribute automatically. */
+    .trace_pane_col.collapsed,
+    .review_tracker_col.collapsed,
+    .source_pane.collapsed {
+      flex: 0 0 28px;
+      min-width: 28px;
+      max-width: 28px;
+      overflow: hidden;
+    }
+    .trace_pane_col.collapsed > *:not(.pane_header_row):not(.pane_collapsed_label),
+    .review_tracker_col.collapsed > *:not(.pane_header_row):not(.pane_collapsed_label),
+    .source_pane.collapsed > *:not(.pane_header_row):not(.pane_collapsed_label) {
+      display: none !important;
+    }
+    /* Inside the collapsed strip, the header row holds just the button —
+       the label content (LIVE tag, sha, subject) is hidden. */
+    .collapsed > .pane_header_row > .trace_pane_label,
+    .collapsed > .pane_header_row > .source_pane_label {
+      display: none !important;
+    }
+    .collapsed > .pane_header_row > .pane_collapse_btn {
+      border-left: none;
+      width: 100%;
+    }
+    .trace_pane_col.collapsed > .pane_collapsed_label,
+    .review_tracker_col.collapsed > .pane_collapsed_label,
+    .source_pane.collapsed > .pane_collapsed_label {
+      display: block;
     }
 
     /* Diff change list — sticky panel at the top of the primary trace
@@ -1526,7 +1623,11 @@
 
       <div id="trace_view_wrap" class="trace_view_wrap" style="display: none;">
         <div class="trace_pane_col review_tracker_col" id="review_tracker_col" style="display: none;">
-          <div class="trace_pane_label review_tracker_label" id="review_tracker_label">REVIEW TRACKER</div>
+          <div class="pane_header_row">
+            <div class="trace_pane_label review_tracker_label" id="review_tracker_label">REVIEW TRACKER</div>
+            <button class="pane_collapse_btn" data-pane="review_tracker_col" type="button" title="Collapse pane">&minus;</button>
+          </div>
+          <div class="pane_collapsed_label" data-pane-label-for="review_tracker_col">REVIEW</div>
           <div class="diff_changes_panel" id="diff_changes_panel">
             <div class="diff_changes_header">
               <span class="diff_changes_count" id="diff_changes_count"></span>
@@ -1538,11 +1639,19 @@
           </div>
         </div>
         <div class="trace_pane_col" id="trace_pane_col_a">
-          <div class="trace_pane_label" id="trace_label_a" style="display: none;"></div>
+          <div class="pane_header_row">
+            <div class="trace_pane_label" id="trace_label_a" style="display: none;"></div>
+            <button class="pane_collapse_btn" data-pane="trace_pane_col_a" type="button" title="Collapse pane">&minus;</button>
+          </div>
+          <div class="pane_collapsed_label" data-pane-label-for="trace_pane_col_a">LIVE</div>
           <div id="trace_view" class="trace_view_pane"></div>
         </div>
         <div class="trace_pane_col" id="trace_pane_col_b" style="display: none;">
-          <div class="trace_pane_label" id="trace_label_b"></div>
+          <div class="pane_header_row">
+            <div class="trace_pane_label" id="trace_label_b" style="display: none;"></div>
+            <button class="pane_collapse_btn" data-pane="trace_pane_col_b" type="button" title="Collapse pane">&minus;</button>
+          </div>
+          <div class="pane_collapsed_label" data-pane-label-for="trace_pane_col_b">OLDER</div>
           <div id="trace_view_b" class="trace_view_pane trace_view_pane_b"></div>
         </div>
       </div>
@@ -1558,11 +1667,19 @@
           <dt style="color: var(--fg-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px;">Source</dt>
           <div class="source_split" id="info_source_split">
             <div class="source_pane" id="info_source_pane_a">
-              <div class="source_pane_label" id="info_source_label_a" style="display: none;"></div>
+              <div class="pane_header_row">
+                <div class="source_pane_label" id="info_source_label_a" style="display: none;"></div>
+                <button class="pane_collapse_btn" data-pane="info_source_pane_a" type="button" title="Collapse pane">&minus;</button>
+              </div>
+              <div class="pane_collapsed_label" data-pane-label-for="info_source_pane_a">LIVE</div>
               <div class="source_block" id="info_source"></div>
             </div>
             <div class="source_pane" id="info_source_pane_b" style="display: none;">
-              <div class="source_pane_label" id="info_source_label_b"></div>
+              <div class="pane_header_row">
+                <div class="source_pane_label" id="info_source_label_b" style="display: none;"></div>
+                <button class="pane_collapse_btn" data-pane="info_source_pane_b" type="button" title="Collapse pane">&minus;</button>
+              </div>
+              <div class="pane_collapsed_label" data-pane-label-for="info_source_pane_b">OLDER</div>
               <div class="source_block source_block_b" id="info_source_b"></div>
             </div>
           </div>

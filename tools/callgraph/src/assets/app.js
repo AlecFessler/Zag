@@ -865,10 +865,9 @@
   function clearSource() {
     sourceFetchToken += 1;
     els.infoSource.innerHTML = "";
-    if (els.infoSourceB) {
-      els.infoSourceB.innerHTML = "";
-      els.infoSourceB.style.display = "none";
-    }
+    if (els.infoSourceB) els.infoSourceB.innerHTML = "";
+    if (els.infoSourcePaneB) els.infoSourcePaneB.style.display = "none";
+    if (els.infoSourceLabelB) els.infoSourceLabelB.style.display = "none";
     if (els.infoSourceSplit) els.infoSourceSplit.classList.remove("compare_active");
     els.infoSourceWrap.style.display = "none";
     els.infoSourceError.style.display = "none";
@@ -3951,6 +3950,35 @@
     }
   }
 
+  /** Per-pane minimize/maximize. Each `.pane_collapse_btn` has a
+   *  `data-pane="<id>"` attribute pointing at its wrapper; click toggles
+   *  the `.collapsed` class. State is stored in localStorage so reload
+   *  preserves layout. */
+  function wirePaneCollapse() {
+    const btns = document.querySelectorAll(".pane_collapse_btn");
+    btns.forEach(function (btn) {
+      const id = btn.getAttribute("data-pane");
+      if (!id) return;
+      const pane = document.getElementById(id);
+      if (!pane) return;
+      const key = "paneCollapsed:" + id;
+      let initialCollapsed = false;
+      try { initialCollapsed = localStorage.getItem(key) === "1"; } catch (_e) {}
+      const apply = function (collapsed) {
+        pane.classList.toggle("collapsed", collapsed);
+        btn.innerHTML = collapsed ? "&plus;" : "&minus;";
+        btn.title = collapsed ? "Expand pane" : "Collapse pane";
+      };
+      apply(initialCollapsed);
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        const next = !pane.classList.contains("collapsed");
+        apply(next);
+        try { localStorage.setItem(key, next ? "1" : "0"); } catch (_e) {}
+      });
+    });
+  }
+
   ready(function () {
     if (typeof cytoscape === "undefined") {
       setStatus("cytoscape.min.js failed to load", true);
@@ -3959,6 +3987,7 @@
     }
     wireEvents();
     wireCompareEvents();
+    wirePaneCollapse();
     loadGraph();
   });
 })();

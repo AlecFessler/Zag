@@ -212,7 +212,7 @@ fn handleRequest(
         return handleGraph(request, query, state);
     }
     if (std.mem.eql(u8, path, "/api/source")) {
-        return handleSource(allocator, request, query);
+        return handleSource(allocator, request, query, state);
     }
     if (std.mem.eql(u8, path, "/api/trace")) {
         return handleTrace(allocator, request, query, state);
@@ -468,6 +468,7 @@ fn handleSource(
     allocator: std.mem.Allocator,
     request: *std.http.Server.Request,
     query: []const u8,
+    state: *const ServerState,
 ) !void {
     var path_param: ?[]const u8 = null;
     var start_line: ?u32 = null;
@@ -515,7 +516,18 @@ fn handleSource(
     const decoded_path = try percentDecodeAlloc(allocator, file_path);
     defer allocator.free(decoded_path);
 
-    const file = std.fs.cwd().openFile(decoded_path, .{}) catch |err| switch (err) {
+    // Resolve repo-relative paths (e.g. `kernel/sched/scheduler.zig` from
+    // the review tracker's hunk rows) against the configured git_root so
+    // behavior doesn't depend on the daemon's CWD. Absolute paths pass
+    // through unchanged — those come from def_loc.file (own checkout) and
+    // worktree-mounted secondary commits.
+    const resolved_path = if (std.fs.path.isAbsolute(decoded_path))
+        try allocator.dupe(u8, decoded_path)
+    else
+        try std.fs.path.join(allocator, &.{ state.git_root, decoded_path });
+    defer allocator.free(resolved_path);
+
+    const file = std.fs.openFileAbsolute(resolved_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return respondBytes(
             request,
             .not_found,
