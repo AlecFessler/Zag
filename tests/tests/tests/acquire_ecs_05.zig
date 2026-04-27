@@ -31,13 +31,12 @@
 //   3. assert count == 1
 //
 // Assertions
-//   1: acquire_ecs returned a non-OK error word
+//   1: acquire_ecs returned an error in vreg 1
 //   2: the returned syscall word's count field is not 1
 
 const lib = @import("lib");
 
 const caps = lib.caps;
-const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
@@ -48,7 +47,9 @@ pub fn main(cap_table_base: u64) void {
 
     const result = syscall.acquireEcs(self_idc);
 
-    if (result.regs.v1 != @intFromEnum(errors.Error.OK)) {
+    // On success, v1 is either OK (count == 0) or a packed handle
+    // word; only error codes 1..15 indicate failure per §[error_codes].
+    if (testing.isHandleError(result.regs.v1)) {
         testing.fail(1);
         return;
     }
