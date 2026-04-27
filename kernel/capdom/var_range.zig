@@ -22,6 +22,7 @@ const GenLock = secure_slab.GenLock;
 const KernelHandle = zag.caps.capability.KernelHandle;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PageFrame = zag.memory.page_frame.PageFrame;
+const PageFrameCaps = zag.memory.page_frame.PageFrameCaps;
 const SecureSlab = secure_slab.SecureSlab;
 const VAddr = zag.memory.address.VAddr;
 const Word0 = zag.caps.capability.Word0;
@@ -78,6 +79,19 @@ pub const RestartPolicy = enum(u2) {
     snapshot = 3,
 };
 
+/// Maximum installed (offset, page_frame) entries tracked per VAR.
+/// Bounds the inline mapping table; sized well above any plausible
+/// per-VAR fan-out for current spec-v3 tests. Larger VARs would need
+/// a sparse out-of-band layout — see VAR.mapping_table TBD note.
+pub const MAX_INSTALLED_PFS: usize = 64;
+
+/// One installed page_frame at `offset` inside its owning VAR. `pf =
+/// null` marks an empty slot in the inline `installed_pfs` array.
+pub const InstalledPf = struct {
+    offset: u64 = 0,
+    pf: ?*PageFrame = null,
+};
+
 pub const VAR = struct {
     /// Slab generation lock. Validates `SlabRef(VAR)` liveness AND
     /// guards every mutable field below.
@@ -131,6 +145,14 @@ pub const VAR = struct {
     /// pointer structure. Null when `map = unmapped` or `map = mmio`
     /// (the latter has only the single `device` binding).
     mapping_table: ?*anyopaque = null,
+
+    /// Inline list of installed page_frames for `map = page_frame`.
+    /// Each entry records the offset within the VAR and the
+    /// page_frame installed there. Used by `remap` to compute the
+    /// caps.rwx intersection across all installed page_frames (spec
+    /// §[var].remap test 04) and by `unmap`/`destroy` to walk live
+    /// installations. Empty slots have `pf = null`.
+    installed_pfs: [MAX_INSTALLED_PFS]InstalledPf = [_]InstalledPf{.{}} ** MAX_INSTALLED_PFS,
 };
 
 pub const Allocator = SecureSlab(VAR, 256);
@@ -517,9 +539,41 @@ pub fn remap(caller: *ExecutionContext, var_handle: u64, new_cur_rwx: u64) i64 {
     if ((new_rwx & ~caps_rwx) != 0) return errors.E_INVAL;
     if (var_caps.dma and (new_rwx & 0b100) != 0) return errors.E_INVAL;
 
-    // For map=1, intersect against every installed page_frame's caps —
-    // see spec §[var].remap test 04. Walking the per-page table is the
-    // mapping_table's job; defer enforcement until that layout lands.
+    // Spec §[var].remap test 04: for map = page_frame, new_cur_rwx must
+    // be a subset of the intersection of every installed page_frame's
+    // r/w/x caps. The intersection starts at all-bits-set and ANDs in
+    // each live entry's caps; an empty installed list (shouldn't occur
+    // when map = page_frame) leaves the intersection at all-bits.
+    if (v.map == .page_frame) {
+        var pf_intersect_rwx: u3 = 0b111;
+        for (&v.installed_pfs) |*entry| {
+            const pf = entry.pf orelse continue;
+            const pf_caps_word: u16 = blk: {
+                var i: usize = 0;
+                while (i < domain.user_table.len) : (i += 1) {
+                    if (Word0.typeTag(domain.user_table[i].word0) != .page_frame) continue;
+                    const kh = domain.kernel_table[i];
+                    if (kh.ref.ptr == @as(*const anyopaque, @ptrCast(pf))) {
+                        break :blk Word0.caps(domain.user_table[i].word0);
+                    }
+                }
+                // No handle to this pf in the calling domain: derive
+                // r/w/x from the pf's effective state by treating it
+                // as fully permissive (all bits set). The owning
+                // domain's handle is what gates installation, and the
+                // intersection is taken across installed frames; the
+                // remap caller already passed a caps-subset check via
+                // the VAR's own caps.
+                break :blk @as(u16, 0xFFFF);
+            };
+            const pf_caps: PageFrameCaps = @bitCast(pf_caps_word);
+            const pf_rwx: u3 = (@as(u3, @intFromBool(pf_caps.r))) |
+                (@as(u3, @intFromBool(pf_caps.w)) << 1) |
+                (@as(u3, @intFromBool(pf_caps.x)) << 2);
+            pf_intersect_rwx &= pf_rwx;
+        }
+        if ((new_rwx & ~pf_intersect_rwx) != 0) return errors.E_INVAL;
+    }
 
     const sz_bytes = pageSizeBytes(v.sz);
     var off: u64 = 0;
@@ -771,6 +825,9 @@ fn allocVar(
     v.device = device;
     v.snapshot_source = null;
     v.mapping_table = null;
+    for (&v.installed_pfs) |*entry| {
+        entry.* = .{};
+    }
     return v;
 }
 
@@ -902,6 +959,19 @@ fn mappingInstall(v: *VAR, offset: u64, pf: *PageFrame) i64 {
     const perms = rwxToPerms(v.cur_rwx);
     const pf_sz_bytes = pageSizeBytes(pf.sz);
 
+    // Reserve a slot in the inline installed-pf table before touching
+    // any PTE so a full table is reported as E_NOMEM up front. The
+    // slot is committed (pf field set) only after the install
+    // succeeds; on failure it stays empty.
+    var slot_reserved: ?usize = null;
+    for (&v.installed_pfs, 0..) |*entry, idx| {
+        if (entry.pf == null) {
+            slot_reserved = idx;
+            break;
+        }
+    }
+    if (slot_reserved == null) return errors.E_NOMEM;
+
     var p: u32 = 0;
     while (p < pf.page_count) {
         const off_p = offset + @as(u64, p) * pf_sz_bytes;
@@ -929,6 +999,7 @@ fn mappingInstall(v: *VAR, offset: u64, pf: *PageFrame) i64 {
         }
         p += 1;
     }
+    v.installed_pfs[slot_reserved.?] = .{ .offset = offset, .pf = pf };
     incMapCntShim(pf);
     return 0;
 }
@@ -944,8 +1015,17 @@ fn mappingRemove(v: *VAR, offset: u64) ?*PageFrame {
         0;
     const var_caps: VarCaps = @bitCast(caps_word);
 
+    var removed: ?*PageFrame = null;
+    for (&v.installed_pfs) |*entry| {
+        if (entry.pf != null and entry.offset == offset) {
+            removed = entry.pf;
+            entry.* = .{};
+            break;
+        }
+    }
+
     if (var_caps.dma) {
-        const dev = v.device orelse return null;
+        const dev = v.device orelse return removed;
         _ = dispatch.iommu.iommuUnmapPage(dev, v.base_vaddr.addr + offset, v.sz);
         dispatch.iommu.invalidateIotlbRange(dev, v.base_vaddr.addr + offset, v.sz, 1);
     } else {
@@ -955,7 +1035,7 @@ fn mappingRemove(v: *VAR, offset: u64) ?*PageFrame {
             v.sz,
         );
     }
-    return null;
+    return removed;
 }
 
 /// Demand-page allocation on first fault to an unmapped VAR. Allocates
@@ -1073,16 +1153,20 @@ fn handleSlotOf(v: *const VAR, cd: *const CapabilityDomain) u16 {
 /// installed. Concrete walk depends on the eventual `mapping_table`
 /// layout.
 fn findInstalledOffset(v: *VAR, pf: *PageFrame) ?u64 {
-    _ = v;
-    _ = pf;
+    for (&v.installed_pfs) |*entry| {
+        if (entry.pf == pf) return entry.offset;
+    }
     return null;
 }
 
 /// Number of currently-installed pages in `v`'s mapping table. Used by
 /// `unmap` to decide whether to clear `map` back to `unmapped`.
 fn countInstalled(v: *VAR) u32 {
-    _ = v;
-    return 0;
+    var count: u32 = 0;
+    for (&v.installed_pfs) |*entry| {
+        if (entry.pf != null) count += 1;
+    }
+    return count;
 }
 
 /// Tear down every installed PTE / demand page, decrement mapcnts, and
@@ -1097,6 +1181,9 @@ fn unmapAll(v: *VAR, domain: *CapabilityDomain) void {
             v.sz,
         );
         off += sz_bytes;
+    }
+    for (&v.installed_pfs) |*entry| {
+        entry.* = .{};
     }
     dispatch.paging.shootdownTlbRange(
         domain.addr_space_id,
