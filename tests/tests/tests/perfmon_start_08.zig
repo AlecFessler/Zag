@@ -50,18 +50,21 @@
 //   perfmon_read on the calling EC: spec test 04 of §[perfmon_read]
 //   says E_BUSY if [1] is not the calling EC and not currently
 //   suspended, so calling EC == self is the explicitly-blessed path.
-//   With num_configs = 1 the perfmon_read return layout per
-//   §[perfmon_read] is:
-//     vreg 1 = counter_0 (the configured counter's current value)
-//     vreg 2 = timestamp (since num_counters + 1 = 2)
-//   Test 08's assertion: both vregs `[1..2]` are nonzero. Counter_0
-//   nonzero implies the kernel actually attached and incremented the
-//   counter; timestamp nonzero implies the kernel populated the
-//   trailing timestamp word. A counter_0 value of zero would also
-//   collide with the spec's §[error_codes] OK encoding (vreg 1 == 0)
-//   and with any error code in the 1..15 range — so the nonzero check
-//   simultaneously establishes that perfmon_read did not return an
-//   error AND that the counter advanced.
+//   The perfmon_read return layout per §[perfmon_read] is:
+//     vregs [1..num_counters] = counter values
+//     vreg num_counters + 1   = timestamp
+//   where `num_counters` is the system-wide hardware count from
+//   `perfmon_info` (caps_word bits 0-7). Counters that aren't
+//   currently configured by perfmon_start read as zero.
+//
+//   Test 08's assertion is "nonzero values in vregs `[1..2]`". The
+//   spec phrasing pins this on (counter_0, timestamp) — the value of
+//   the configured counter and the trailing kernel timestamp — and we
+//   probe both unambiguously by writing counter_0 at vreg 1 and the
+//   timestamp at vreg `num_counters + 1`. Counter_0 nonzero implies
+//   the kernel actually attached and incremented the counter;
+//   timestamp nonzero implies the kernel populated the trailing
+//   timestamp word.
 //
 // Degraded smoke
 //   - If perfmon_info returns an error code in vreg 1 (PMU absent /
@@ -110,6 +113,29 @@ fn lowestSetBit(mask: u64) u8 {
     return 64;
 }
 
+// Pull the counter value at vreg index `idx` (1-based) out of a Regs.
+// `idx` must be in [1..13]; callers gate before calling. The
+// register-backed vreg window stops at 13 on x86-64 (vregs 14+ live on
+// the user stack and aren't observable through libz's syscall.Regs).
+fn vregAt(regs: syscall.Regs, idx: u64) u64 {
+    return switch (idx) {
+        1 => regs.v1,
+        2 => regs.v2,
+        3 => regs.v3,
+        4 => regs.v4,
+        5 => regs.v5,
+        6 => regs.v6,
+        7 => regs.v7,
+        8 => regs.v8,
+        9 => regs.v9,
+        10 => regs.v10,
+        11 => regs.v11,
+        12 => regs.v12,
+        13 => regs.v13,
+        else => 0,
+    };
+}
+
 // Side-effect-laden busy loop. The volatile asm prevents the optimizer
 // from eliding the work; the loop body is cheap and runs many times so
 // the host CPU executes plenty of cycles and instructions before we
@@ -145,6 +171,15 @@ pub fn main(cap_table_base: u64) void {
     const supported_events: u64 = info.v2;
     if (num_counters == 0 or supported_events == 0) {
         // Nothing legal to configure — assertion is unobservable.
+        testing.pass();
+        return;
+    }
+    // perfmon_read places the timestamp at vreg `num_counters + 1`.
+    // If that exceeds the register-backed window (vregs 1..13 on
+    // x86-64), the timestamp spills to the user stack and is not
+    // observable through libz's syscall.Regs — degraded smoke.
+    const ts_idx: u64 = num_counters + 1;
+    if (ts_idx > 13) {
         testing.pass();
         return;
     }
@@ -195,16 +230,16 @@ pub fn main(cap_table_base: u64) void {
 
     const read_result = syscall.perfmonRead(@as(u12, @intCast(caps.SLOT_INITIAL_EC)));
 
-    // §[perfmon_read] return layout with num_counters used = 1:
-    //   vreg 1 = counter_0
-    //   vreg 2 = timestamp (num_counters + 1)
-    // Spec test 08: both must be nonzero on success after the target
-    // EC has executed enough work to register the configured event.
+    // §[perfmon_read] return layout: vregs [1..num_counters] hold the
+    // counter values, vreg num_counters + 1 holds the timestamp. Spec
+    // test 08: vreg 1 (counter_0) and the timestamp slot must both be
+    // nonzero on success after the target EC has executed enough work
+    // to register the configured event.
     if (read_result.v1 == 0) {
         testing.fail(2);
         return;
     }
-    if (read_result.v2 == 0) {
+    if (vregAt(read_result, ts_idx) == 0) {
         testing.fail(3);
         return;
     }

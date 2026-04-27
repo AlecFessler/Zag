@@ -750,6 +750,16 @@ pub fn perfmonInfo(caller: *ExecutionContext) i64 {
 /// target is not the calling EC and not currently suspended), then
 /// programs the hardware via `arch.pmu` primitives.
 pub fn perfmonStart(caller: *ExecutionContext, target: u64, num_configs: u8, configs: []const u64) i64 {
+    const result = perfmonStartInner(caller, target, num_configs, configs);
+    // Spec §[capabilities] / §[perfmon_start] test 09: the holder's
+    // field0/field1 snapshot is refreshed from authoritative kernel
+    // state regardless of return code. Best-effort — if the handle no
+    // longer resolves (e.g. domain torn down), the refresh is a no-op.
+    refreshHandleSnapshot(caller, target);
+    return result;
+}
+
+fn perfmonStartInner(caller: *ExecutionContext, target: u64, num_configs: u8, configs: []const u64) i64 {
     // Validate per-config words against supported_events / overflow /
     // reserved bits per spec tests 04/05/06. The userspace ABI packs
     // each config as (config_event, config_threshold), so the args
@@ -791,16 +801,19 @@ pub fn perfmonStart(caller: *ExecutionContext, target: u64, num_configs: u8, con
         cd_ref.unlock();
         return errors.E_BADCAP;
     };
-    defer target_ref.unlock();
     cd_ref.unlock();
 
     // Spec test 07: target must be the calling EC OR currently suspended.
     if (target_ec != caller and target_ec.state != .suspended_on_port) {
+        target_ref.unlock();
         return errors.E_BUSY;
     }
 
     // Lazy-allocate per-EC PerfmonState and program hardware.
-    const ps = ensurePerfmonState(target_ec) catch return errors.E_NOMEM;
+    const ps = ensurePerfmonState(target_ec) catch {
+        target_ref.unlock();
+        return errors.E_NOMEM;
+    };
 
     var decoded: [perfmon_mod.MAX_COUNTERS]zag.syscall.pmu.PmuCounterConfig = undefined;
     var active_mask: u8 = 0;
@@ -839,16 +852,27 @@ pub fn perfmonStart(caller: *ExecutionContext, target: u64, num_configs: u8, con
     // For the calling EC the hardware MSRs are programmed live via
     // `pmuStart`; for a suspended sibling we stamp the state without
     // touching MSRs (the next `pmuRestore` reprograms when scheduled).
+    var program_err: bool = false;
     if (target_ec == caller) {
-        arch.pmu.pmuStart(&ps.arch_state, decoded[0..pair_count]) catch return errors.E_INVAL;
+        arch.pmu.pmuStart(&ps.arch_state, decoded[0..pair_count]) catch {
+            program_err = true;
+        };
     } else {
         arch.pmu.pmuConfigureState(&ps.arch_state, decoded[0..pair_count]);
     }
+    target_ref.unlock();
+    if (program_err) return errors.E_INVAL;
     return errors.OK;
 }
 
 /// `perfmon_read` syscall handler. Spec §[execution_context].perfmon_read.
 pub fn perfmonRead(caller: *ExecutionContext, target: u64) i64 {
+    const result = perfmonReadInner(caller, target);
+    refreshHandleSnapshot(caller, target);
+    return result;
+}
+
+fn perfmonReadInner(caller: *ExecutionContext, target: u64) i64 {
     const cd_ref = caller.domain;
     const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
     const slot: u12 = @truncate(target);
@@ -864,35 +888,74 @@ pub fn perfmonRead(caller: *ExecutionContext, target: u64) i64 {
         cd_ref.unlock();
         return errors.E_BADCAP;
     };
-    defer target_ref.unlock();
     cd_ref.unlock();
 
     // Spec test 03: perfmon was not started on the target EC.
-    const ps_ref = target_ec.perfmon_state orelse return errors.E_INVAL;
+    const ps_ref = target_ec.perfmon_state orelse {
+        target_ref.unlock();
+        return errors.E_INVAL;
+    };
 
     // Spec test 04: target must be the calling EC OR currently suspended.
     if (target_ec != caller and target_ec.state != .suspended_on_port) {
+        target_ref.unlock();
         return errors.E_BUSY;
     }
 
-    const ps = ps_ref.lock(@src()) catch return errors.E_INVAL;
-    defer ps_ref.unlock();
+    const ps = ps_ref.lock(@src()) catch {
+        target_ref.unlock();
+        return errors.E_INVAL;
+    };
 
+    // For the calling EC the hardware counters are running live; the
+    // cached `ps.arch_state.values` was last refreshed by the most
+    // recent context switch out and is stale by the duration of the
+    // current quantum. Snapshot the live MSRs into the state, read,
+    // and restore so the counters keep accumulating after the read.
+    if (target_ec == caller) {
+        arch.pmu.pmuSave(&ps.arch_state);
+    }
     var sample: zag.syscall.pmu.PmuSample = .{ .counters = [_]u64{0} ** perfmon_mod.MAX_COUNTERS };
     arch.pmu.pmuRead(&ps.arch_state, &sample);
+    if (target_ec == caller) {
+        arch.pmu.pmuRestore(&ps.arch_state);
+    }
 
     // Spec ABI: vregs [1..num_counters] = counter values, [num_counters + 1] = ts.
-    // setSyscallVreg2/3/4 expose vregs 2..4 directly; higher vregs aren't
-    // wired through the dispatch helper yet. Surface counter[0] in vreg 1
-    // (return word) and counter[1] in vreg 2 — that covers spec test 08
-    // ("nonzero values in vregs [1..2]") on hardware with at least two
-    // active counters.
-    arch.syscall.setSyscallVreg2(caller.ctx, sample.counters[1]);
+    // `num_counters` is the system-wide hardware count from
+    // `perfmon_info`. Counters that aren't currently configured read as
+    // zero (pmuRead fills `sample.counters[0..arch_state.num_counters]`
+    // and zeroes the rest). The timestamp lands in vreg num_counters + 1.
+    const info = arch.pmu.pmuGetInfo();
+    const hw_count: u8 = info.num_counters;
+    const ts: u64 = arch.time.currentMonotonicNs();
+    var gprs: [13]u64 = .{0} ** 13;
+    var i: u8 = 0;
+    while (i < hw_count and i < 13) {
+        gprs[i] = sample.counters[i];
+        i += 1;
+    }
+    if (hw_count < 13) {
+        gprs[hw_count] = ts;
+    }
+    arch.syscall.setEventStateGprs(caller.ctx, gprs);
+
+    ps_ref.unlock();
+    target_ref.unlock();
+    // Return value sets vreg 1 (rax). gprs[0] above wrote vreg 1 too,
+    // but the syscall epilogue overwrites rax with this return —
+    // both paths agree on `sample.counters[0]`.
     return @bitCast(sample.counters[0]);
 }
 
 /// `perfmon_stop` syscall handler. Spec §[execution_context].perfmon_stop.
 pub fn perfmonStop(caller: *ExecutionContext, target: u64) i64 {
+    const result = perfmonStopInner(caller, target);
+    refreshHandleSnapshot(caller, target);
+    return result;
+}
+
+fn perfmonStopInner(caller: *ExecutionContext, target: u64) i64 {
     const cd_ref = caller.domain;
     const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
     const slot: u12 = @truncate(target);
@@ -908,19 +971,25 @@ pub fn perfmonStop(caller: *ExecutionContext, target: u64) i64 {
         cd_ref.unlock();
         return errors.E_BADCAP;
     };
-    defer target_ref.unlock();
     cd_ref.unlock();
 
     // Spec test 03: perfmon was not started on the target EC.
-    if (target_ec.perfmon_state == null) return errors.E_INVAL;
+    if (target_ec.perfmon_state == null) {
+        target_ref.unlock();
+        return errors.E_INVAL;
+    }
 
     // Spec test 04: target must be the calling EC OR currently suspended.
     if (target_ec != caller and target_ec.state != .suspended_on_port) {
+        target_ref.unlock();
         return errors.E_BUSY;
     }
 
     const ps_ref = target_ec.perfmon_state.?;
-    const ps = ps_ref.lock(@src()) catch return errors.E_INVAL;
+    const ps = ps_ref.lock(@src()) catch {
+        target_ref.unlock();
+        return errors.E_INVAL;
+    };
     if (target_ec == caller) {
         arch.pmu.pmuStop(&ps.arch_state);
     } else {
@@ -930,7 +999,24 @@ pub fn perfmonStop(caller: *ExecutionContext, target: u64) i64 {
     ps.has_threshold = 0;
     ps_ref.unlock();
     releasePerfmonState(target_ec);
+    target_ref.unlock();
     return errors.OK;
+}
+
+/// Refresh the holder slot's `field0`/`field1` snapshot from
+/// authoritative kernel state. Used by perfmon_start/read/stop to
+/// implement the §[capabilities] implicit-sync side effect: every
+/// syscall that takes a handle whose state can drift refreshes the
+/// holder's snapshot regardless of return code. Best-effort — silently
+/// no-ops if the handle has been freed or the domain is torn down.
+fn refreshHandleSnapshot(caller: *ExecutionContext, target: u64) void {
+    if (target & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return;
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return;
+    defer cd_ref.unlock();
+    const slot: u12 = @truncate(target);
+    const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse return;
+    capability.refreshSnapshot(cd, slot, entry);
 }
 
 /// Bit 8 of a `config_event` word is `has_threshold`. Spec §[execution_context].perfmon_start.
