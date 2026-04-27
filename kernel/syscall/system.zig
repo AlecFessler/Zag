@@ -295,10 +295,10 @@ pub fn powerSetFreq(caller: *anyopaque, core_id: u64, hz: u64) i64 {
 /// [test 14] returns E_NODEV if the queried core does not support idle states (per `info_cores` flag bit 1).
 /// [test 15] returns E_INVAL if [2] is greater than 2.
 pub fn powerSetIdle(caller: *anyopaque, core_id: u64, policy: u64) i64 {
-    const self_caps = readSelfCaps(caller) orelse return errors.E_BADCAP;
-    if (!self_caps.power) return errors.E_PERM;
     if (core_id >= smp.coreCount()) return errors.E_INVAL;
     if (policy > 2) return errors.E_INVAL;
+    const self_caps = readSelfCaps(caller) orelse return errors.E_BADCAP;
+    if (!self_caps.power) return errors.E_PERM;
     // TODO: per-core idle-state capability probe (spec test 14) is not
     // yet exposed by the arch dispatch. The current backend ignores
     // core_id and operates on the local core only.
