@@ -122,16 +122,6 @@ pub fn isAvailable() bool {
     return active_type != .none;
 }
 
-pub fn createIommuDomain(device: *SpecDeviceRegion) !*anyopaque {
-    _ = device;
-    @panic("not implemented");
-}
-
-pub fn destroyIommuDomain(device: *SpecDeviceRegion) void {
-    _ = device;
-    @panic("not implemented");
-}
-
 pub fn iommuMapPage(
     device: *SpecDeviceRegion,
     iova: u64,

@@ -435,17 +435,6 @@ pub fn prepareEcContext(
     @panic("aarch64 prepareEcContext not implemented");
 }
 
-/// Write TPIDR_EL0 (the ARMv8 user-mode TLS base). Spec §[execution_context].
-pub fn writeTpidrEl0(value: u64) void {
-    _ = value;
-    @panic("not implemented");
-}
-
-/// Read TPIDR_EL0 (the ARMv8 user-mode TLS base). Spec §[execution_context].
-pub fn readTpidrEl0() u64 {
-    @panic("not implemented");
-}
-
 /// Halt the local core with DAIF.{I,F} clear until the next IRQ (WFI).
 /// Spec §[execution_context] idle EC.
 pub fn idle() void {

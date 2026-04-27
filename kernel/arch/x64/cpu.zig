@@ -881,30 +881,6 @@ pub fn prepareEcContext(
     );
 }
 
-/// Write IA32_FS_BASE (MSR C000_0100h). Spec §[execution_context].
-pub fn writeFsBase(value: u64) void {
-    _ = value;
-    @panic("not implemented");
-}
-
-/// Write IA32_KERNEL_GS_BASE (MSR C000_0102h) — the user GS.base value
-/// loaded by the next SWAPGS into the userspace GS.base. Spec
-/// §[execution_context].
-pub fn writeGsBaseUser(value: u64) void {
-    _ = value;
-    @panic("not implemented");
-}
-
-/// Read IA32_FS_BASE (MSR C000_0100h). Spec §[execution_context].
-pub fn readFsBase() u64 {
-    @panic("not implemented");
-}
-
-/// Read IA32_KERNEL_GS_BASE (MSR C000_0102h). Spec §[execution_context].
-pub fn readGsBaseUser() u64 {
-    @panic("not implemented");
-}
-
 /// Halt the local core with interrupts enabled until the next IRQ.
 /// Spec §[execution_context] idle EC.
 pub fn idle() void {

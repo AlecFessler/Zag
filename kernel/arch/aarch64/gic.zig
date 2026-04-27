@@ -1166,24 +1166,3 @@ pub fn maskIrq(intid: u32) void {
     @panic("not implemented");
 }
 
-/// Bind a hardware IRQ source (GIC INTID) to a DeviceRegion so device IRQs
-/// route into its `irq_count` and futex-wake every domain-local copy.
-/// Spec §[device_irq].
-pub fn registerDeviceIrq(device: *zag.devices.device_region.DeviceRegion, irq_source: u32) !void {
-    _ = device;
-    _ = irq_source;
-    @panic("not implemented");
-}
-
-/// Tear down the binding installed by `registerDeviceIrq`. Spec §[device_irq].
-pub fn unregisterDeviceIrq(device: *zag.devices.device_region.DeviceRegion) void {
-    _ = device;
-    @panic("not implemented");
-}
-
-/// Generic IRQ dispatch entry point — called from the per-arch ISR with
-/// the source identifier. Spec §[device_irq].
-pub fn deviceIrqDispatch(irq_source: u32) void {
-    _ = irq_source;
-    @panic("not implemented");
-}

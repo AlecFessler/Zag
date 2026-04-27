@@ -526,61 +526,6 @@ pub fn prepareEcContext(
     };
 }
 
-/// Write the user FS base (x86-64). aarch64 has no equivalent — TLS
-/// uses TPIDR_EL0 (see `writeTpidrEl0`).
-pub fn writeFsBase(value: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.writeFsBase(value),
-        .aarch64 => @compileError("FS base is x86-only; use writeTpidrEl0"),
-        else => unreachable,
-    }
-}
-
-/// Write the user GS base (x86-64). aarch64 has no equivalent — TLS
-/// uses TPIDR_EL0 (see `writeTpidrEl0`).
-pub fn writeGsBaseUser(value: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.writeGsBaseUser(value),
-        .aarch64 => @compileError("GS base is x86-only; use writeTpidrEl0"),
-        else => unreachable,
-    }
-}
-
-/// Read the user FS base (x86-64).
-pub fn readFsBase() u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.readFsBase(),
-        .aarch64 => @compileError("FS base is x86-only; use readTpidrEl0"),
-        else => unreachable,
-    };
-}
-
-/// Read the user GS base (x86-64).
-pub fn readGsBaseUser() u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.readGsBaseUser(),
-        .aarch64 => @compileError("GS base is x86-only; use readTpidrEl0"),
-        else => unreachable,
-    };
-}
-
-/// Write TPIDR_EL0 (aarch64 user TLS base). x86-64 uses FS/GS instead.
-pub fn writeTpidrEl0(value: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => @compileError("TPIDR_EL0 is aarch64-only; use writeFsBase/writeGsBaseUser"),
-        .aarch64 => aarch64.cpu.writeTpidrEl0(value),
-        else => unreachable,
-    }
-}
-
-/// Read TPIDR_EL0 (aarch64 user TLS base).
-pub fn readTpidrEl0() u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => @compileError("TPIDR_EL0 is aarch64-only; use readFsBase/readGsBaseUser"),
-        .aarch64 => aarch64.cpu.readTpidrEl0(),
-        else => unreachable,
-    };
-}
 
 /// Halt the local core in an interrupts-enabled state until the next
 /// interrupt (HLT with IF=1 on x86-64, WFI with DAIF cleared on

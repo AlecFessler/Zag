@@ -243,20 +243,6 @@ pub fn unmaskIrq(irq_line: u8) void {
     ioapic_lock.unlockIrqRestore(irq_state);
 }
 
-/// Bind a hardware IRQ source to a DeviceRegion so device IRQs route into
-/// its `irq_count` and futex-wake every domain-local copy. Spec §[device_irq].
-pub fn registerDeviceIrq(device: *DeviceRegion, irq_source: u32) !void {
-    _ = device;
-    _ = irq_source;
-    @panic("not implemented");
-}
-
-/// Tear down the binding installed by `registerDeviceIrq`. Spec §[device_irq].
-pub fn unregisterDeviceIrq(device: *DeviceRegion) void {
-    _ = device;
-    @panic("not implemented");
-}
-
 /// Read a 32-bit register from the I/O APIC via the indirect MMIO interface.
 /// 82093AA I/O APIC Datasheet, §3.1 "I/O APIC Registers" — IOREGSEL at
 /// base+0x00 selects the register index; IOWIN at base+0x10 is the data window.

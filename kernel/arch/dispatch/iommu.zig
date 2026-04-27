@@ -25,28 +25,6 @@ pub fn enableDmaRemapping() void {
     }
 }
 
-/// Allocate an IOMMU domain (Intel VT-d context entry / AMD-Vi DTE /
-/// SMMU stream table entry) for `device` and return an opaque per-arch
-/// handle stored in the kernel's DeviceRegion for later map/unmap.
-/// Spec §[var].map_pf (caps.dma=1).
-pub fn createIommuDomain(device: *DeviceRegion) !*anyopaque {
-    switch (builtin.cpu.arch) {
-        .x86_64 => return x64.iommu.createIommuDomain(device),
-        .aarch64 => return aarch64.iommu.createIommuDomain(device),
-        else => unreachable,
-    }
-}
-
-/// Tear down the IOMMU domain previously installed by
-/// `createIommuDomain`. Quiesces in-flight DMA and invalidates IOTLB.
-pub fn destroyIommuDomain(device: *DeviceRegion) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.iommu.destroyIommuDomain(device),
-        .aarch64 => aarch64.iommu.destroyIommuDomain(device),
-        else => unreachable,
-    }
-}
-
 /// Map a single page-sized IOVA in `device`'s domain to `phys` with
 /// `perms`. Spec §[var].map_pf (caps.dma=1).
 pub fn iommuMapPage(

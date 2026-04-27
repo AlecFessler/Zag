@@ -75,16 +75,6 @@ pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void 
 
 pub fn enableTranslation() void {}
 
-pub fn createIommuDomain(device: *SpecDeviceRegion) !*anyopaque {
-    _ = device;
-    @panic("not implemented");
-}
-
-pub fn destroyIommuDomain(device: *SpecDeviceRegion) void {
-    _ = device;
-    @panic("not implemented");
-}
-
 pub fn iommuMapPage(
     device: *SpecDeviceRegion,
     iova: u64,
