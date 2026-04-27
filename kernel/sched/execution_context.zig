@@ -235,6 +235,40 @@ pub const ExecutionContext = struct {
     /// vreg-1 contract. `null` outside `.futex_wait`.
     futex_wait_vaddrs: ?[*]const u64 = null,
 
+    // ── Syscall-side scratch for futex_wait_val / futex_wait_change ───
+    //
+    // The syscall layer (`syscall.futex.futexWaitVal` /
+    // `futexWaitChange`) decodes up to MAX_FUTEX_ADDRS_PER_EC pairs from
+    // the user `pairs[]` slice into three parallel arrays before
+    // handing them to `futex.waitVal/waitChange`. At 63 entries each
+    // (3 × 504 B = ~1.5 KiB) those arrays do not fit safely on the
+    // syscall kernel stack — combined with the rest of the syscall
+    // chain they overran adjacent frames' saved-RIP slots and
+    // manifested as `GPF at arch.x64.cpu.idle` on stress runs.
+    //
+    // Only the syscall-issuing EC ever reads/writes these. The
+    // `futex.waitVal/waitChange` impl copies anything it needs to
+    // outlive the syscall return into `futex_wait_nodes_storage` /
+    // `futex_wait_vaddrs_storage`, so these scratch slots are dead
+    // once the syscall returns and may be reused by the next syscall
+    // on the same EC.
+
+    /// Resolved page-aligned PAddr for each user vaddr in the call's
+    /// pairs[] list. Built in `futexWait{Val,Change}`; consumed by
+    /// `futex.waitVal/waitChange` for bucket selection and live-value
+    /// loads.
+    futex_syscall_addrs_storage: [MAX_FUTEX_ADDRS_PER_EC]PAddr = undefined,
+
+    /// User-domain vaddrs from the call's pairs[] list, paired with
+    /// `futex_syscall_addrs_storage`. Passed through to the futex impl
+    /// which copies into `futex_wait_vaddrs_storage` for the wait.
+    futex_syscall_vaddrs_storage: [MAX_FUTEX_ADDRS_PER_EC]u64 = undefined,
+
+    /// `expected` (waitVal) or `target` (waitChange) values from the
+    /// call's pairs[] list. Read-only in the futex impl; not retained
+    /// across the wait.
+    futex_syscall_values_storage: [MAX_FUTEX_ADDRS_PER_EC]u64 = undefined,
+
     // ── Event metadata — meaningful iff state == .suspended_on_port ───
 
     /// Type of event that triggered the suspension. `none` when the EC

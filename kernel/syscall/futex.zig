@@ -10,7 +10,10 @@ const PAddr = zag.memory.address.PAddr;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
 
-const MAX_PAIRS: usize = 63;
+/// Per-call address ceiling. Mirrors
+/// `execution_context.MAX_FUTEX_ADDRS_PER_EC` so the per-EC scratch
+/// storage that backs decoded pairs can never be overrun.
+const MAX_PAIRS: usize = zag.sched.execution_context.MAX_FUTEX_ADDRS_PER_EC;
 
 /// Resolve `vaddr` in `caller`'s capability domain to a physical address.
 /// Returns null when the address is unmapped. Holds the domain `_gen_lock`
@@ -91,9 +94,14 @@ pub fn futexWaitVal(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) i64
     if (fut_wait_max == 0) return errors.E_PERM;
     if (n > fut_wait_max) return errors.E_INVAL;
 
-    var addrs: [MAX_PAIRS]PAddr = undefined;
-    var vaddrs: [MAX_PAIRS]u64 = undefined;
-    var expected: [MAX_PAIRS]u64 = undefined;
+    // The 3 parallel arrays below total ~1.5 KiB. Stored on the EC
+    // rather than the syscall stack — only the syscall-issuing EC
+    // ever uses them, and they are dead once `futex.waitVal` returns
+    // (the futex impl copies anything that must outlive the syscall
+    // into its own EC-resident storage).
+    const addrs = &ec.futex_syscall_addrs_storage;
+    const vaddrs = &ec.futex_syscall_vaddrs_storage;
+    const expected = &ec.futex_syscall_values_storage;
     var i: usize = 0;
     while (i < n) {
         const va = pairs[i * 2];
@@ -147,9 +155,10 @@ pub fn futexWaitChange(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) 
     if (fut_wait_max == 0) return errors.E_PERM;
     if (n > fut_wait_max) return errors.E_INVAL;
 
-    var addrs: [MAX_PAIRS]PAddr = undefined;
-    var vaddrs: [MAX_PAIRS]u64 = undefined;
-    var targets: [MAX_PAIRS]u64 = undefined;
+    // Same EC-resident-scratch discipline as `futexWaitVal`.
+    const addrs = &ec.futex_syscall_addrs_storage;
+    const vaddrs = &ec.futex_syscall_vaddrs_storage;
+    const targets = &ec.futex_syscall_values_storage;
     var i: usize = 0;
     while (i < n) {
         const va = pairs[i * 2];
