@@ -88,6 +88,13 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
         }
     }
 
+    // Section headers are optional per the ELF spec — a runtime image
+    // with no debug info / no symbol table can legitimately have
+    // e_shnum=0 and e_shoff=0. The DWARF walk below only adds debug
+    // info, never anything load-bearing for execution, so a section-
+    // table-less ELF is fine; bail out before touching the table.
+    if (elf_hdr.shnum == 0) return;
+
     var shdr_itr = elf_hdr.iterateSectionHeadersBuffer(bytes);
 
     // Bounds-check the section header table before slicing. A truncated

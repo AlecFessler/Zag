@@ -94,12 +94,43 @@ const testing = lib.testing;
 const VALID_CEILINGS_INNER: u64 = 0x001C_011F_3F01_FFFF;
 const VALID_CEILINGS_OUTER: u64 = 0x0000_003F_03FE_FFFF;
 
-// Minimum-viable x86-64 ELF64 header. Layout per System V ABI / ELF-64
+// Minimum-viable x86-64 ELF64 image. Layout per System V ABI / ELF-64
 // gABI: 16-byte e_ident, 2-byte e_type, 2-byte e_machine, 4-byte
 // e_version, 8-byte e_entry, 8-byte e_phoff, 8-byte e_shoff, 4-byte
 // e_flags, 2-byte e_ehsize, 2-byte e_phentsize, 2-byte e_phnum,
-// 2-byte e_shentsize, 2-byte e_shnum, 2-byte e_shstrndx.
+// 2-byte e_shentsize, 2-byte e_shnum, 2-byte e_shstrndx. Followed by
+// one PT_LOAD program header so the kernel's elfImageSpan / loader
+// have at least one loadable segment to work with.
+const SIZEOF_EHDR64: usize = 64;
+const SIZEOF_PHDR64: usize = 56;
+const PAGE_SIZE: usize = 4096;
+
+fn writeU16(dst: [*]volatile u8, off: usize, v: u16) void {
+    dst[off + 0] = @truncate(v & 0xFF);
+    dst[off + 1] = @truncate((v >> 8) & 0xFF);
+}
+
+fn writeU32(dst: [*]volatile u8, off: usize, v: u32) void {
+    dst[off + 0] = @truncate(v & 0xFF);
+    dst[off + 1] = @truncate((v >> 8) & 0xFF);
+    dst[off + 2] = @truncate((v >> 16) & 0xFF);
+    dst[off + 3] = @truncate((v >> 24) & 0xFF);
+}
+
+fn writeU64(dst: [*]volatile u8, off: usize, v: u64) void {
+    var i: usize = 0;
+    while (i < 8) {
+        dst[off + i] = @truncate((v >> @as(u6, @intCast(i * 8))) & 0xFF);
+        i += 1;
+    }
+}
+
 fn writeMinimalElf64(dst: [*]volatile u8) void {
+    var i: usize = 0;
+    while (i < PAGE_SIZE) {
+        dst[i] = 0;
+        i += 1;
+    }
     // e_ident
     dst[0] = 0x7F; // EI_MAG0
     dst[1] = 'E'; // EI_MAG1
@@ -109,64 +140,36 @@ fn writeMinimalElf64(dst: [*]volatile u8) void {
     dst[5] = 1; // EI_DATA  = ELFDATA2LSB (little-endian)
     dst[6] = 1; // EI_VERSION = EV_CURRENT
     dst[7] = 0; // EI_OSABI = ELFOSABI_NONE
-    dst[8] = 0; // EI_ABIVERSION
-    var i: usize = 9;
-    while (i < 16) {
-        dst[i] = 0; // EI_PAD
-        i += 1;
-    }
-    // e_type = ET_DYN (3) — kernel rejects non-PIE per §[create_capability_domain] test 16a
-    dst[16] = 3;
-    dst[17] = 0;
-    // e_machine = EM_X86_64 (62)
-    dst[18] = 62;
-    dst[19] = 0;
-    // e_version = 1
-    dst[20] = 1;
-    dst[21] = 0;
-    dst[22] = 0;
-    dst[23] = 0;
-    // e_entry = 0 (no entry; if the kernel schedules the child it
-    // will fault immediately, but test 22's assertion is about the
-    // slot-2 cap entry which is set at create time, not entry time).
-    i = 24;
-    while (i < 32) {
-        dst[i] = 0;
-        i += 1;
-    }
-    // e_phoff = 0 (no program headers in this minimal stub)
-    while (i < 40) {
-        dst[i] = 0;
-        i += 1;
-    }
-    // e_shoff = 0
-    while (i < 48) {
-        dst[i] = 0;
-        i += 1;
-    }
-    // e_flags = 0
-    dst[48] = 0;
-    dst[49] = 0;
-    dst[50] = 0;
-    dst[51] = 0;
-    // e_ehsize = 64
-    dst[52] = 64;
-    dst[53] = 0;
-    // e_phentsize = 56 (Elf64_Phdr size)
-    dst[54] = 56;
-    dst[55] = 0;
-    // e_phnum = 0
-    dst[56] = 0;
-    dst[57] = 0;
-    // e_shentsize = 64 (Elf64_Shdr size)
-    dst[58] = 64;
-    dst[59] = 0;
-    // e_shnum = 0
-    dst[60] = 0;
-    dst[61] = 0;
-    // e_shstrndx = 0
-    dst[62] = 0;
-    dst[63] = 0;
+
+    const entry_off: u64 = SIZEOF_EHDR64 + SIZEOF_PHDR64;
+
+    writeU16(dst, 0x10, 3); // e_type = ET_DYN
+    writeU16(dst, 0x12, 62); // e_machine = EM_X86_64
+    writeU32(dst, 0x14, 1); // e_version
+    writeU64(dst, 0x18, entry_off); // e_entry
+    writeU64(dst, 0x20, SIZEOF_EHDR64); // e_phoff
+    writeU64(dst, 0x28, 0); // e_shoff
+    writeU32(dst, 0x30, 0); // e_flags
+    writeU16(dst, 0x34, SIZEOF_EHDR64); // e_ehsize
+    writeU16(dst, 0x36, SIZEOF_PHDR64); // e_phentsize
+    writeU16(dst, 0x38, 1); // e_phnum
+    writeU16(dst, 0x3A, 0); // e_shentsize
+    writeU16(dst, 0x3C, 0); // e_shnum
+    writeU16(dst, 0x3E, 0); // e_shstrndx
+
+    // Program header at offset 64 (one PT_LOAD covering the page).
+    const ph: usize = SIZEOF_EHDR64;
+    writeU32(dst, ph + 0x00, 1); // PT_LOAD
+    writeU32(dst, ph + 0x04, 4 | 1); // p_flags = PF_R | PF_X
+    writeU64(dst, ph + 0x08, 0); // p_offset
+    writeU64(dst, ph + 0x10, 0); // p_vaddr
+    writeU64(dst, ph + 0x18, 0); // p_paddr
+    writeU64(dst, ph + 0x20, PAGE_SIZE); // p_filesz
+    writeU64(dst, ph + 0x28, PAGE_SIZE); // p_memsz
+    writeU64(dst, ph + 0x30, PAGE_SIZE); // p_align
+
+    // Single hlt instruction at e_entry so a scheduled child halts cleanly.
+    dst[entry_off] = 0xF4;
 }
 
 pub fn main(cap_table_base: u64) void {

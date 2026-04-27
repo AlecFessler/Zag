@@ -76,17 +76,41 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Minimal x86-64 ELF64 header — enough for the kernel's parser to
-// accept the image as well-formed (test 15 negation). 0x40 bytes
-// covers the Elf64_Ehdr; the rest of the page frame is zero. There
-// are no program headers because test 26 only requires successful
-// construction of the new domain's data structures up through the
-// point where the kernel writes its slot-0 self-handle field0; if a
-// future kernel implementation requires a runnable image to clear
-// test 26's success condition, we extend this with PT_LOAD entries.
-const ELF_HEADER_SIZE: usize = 0x40;
+// Minimal x86-64 ELF64 image — enough for the kernel's parser /
+// loader to accept the image as well-formed and find at least one
+// PT_LOAD segment (test 15 negation; elfImageSpan rejects images
+// with zero loadable segments). 0x40 covers Elf64_Ehdr; the next
+// 0x38 covers one Elf64_Phdr.
+const SIZEOF_EHDR64: usize = 64;
+const SIZEOF_PHDR64: usize = 56;
+const PAGE_SIZE: usize = 4096;
+
+fn writeU16(dst: [*]volatile u8, off: usize, v: u16) void {
+    dst[off + 0] = @truncate(v & 0xFF);
+    dst[off + 1] = @truncate((v >> 8) & 0xFF);
+}
+
+fn writeU32(dst: [*]volatile u8, off: usize, v: u32) void {
+    dst[off + 0] = @truncate(v & 0xFF);
+    dst[off + 1] = @truncate((v >> 8) & 0xFF);
+    dst[off + 2] = @truncate((v >> 16) & 0xFF);
+    dst[off + 3] = @truncate((v >> 24) & 0xFF);
+}
+
+fn writeU64(dst: [*]volatile u8, off: usize, v: u64) void {
+    var i: usize = 0;
+    while (i < 8) {
+        dst[off + i] = @truncate((v >> @as(u6, @intCast(i * 8))) & 0xFF);
+        i += 1;
+    }
+}
 
 fn writeElfHeader(dst: [*]volatile u8) void {
+    var i: usize = 0;
+    while (i < PAGE_SIZE) {
+        dst[i] = 0;
+        i += 1;
+    }
     // e_ident: magic + class=ELF64 + data=little + version=1 + osabi=sysv
     dst[0] = 0x7F;
     dst[1] = 'E';
@@ -96,30 +120,36 @@ fn writeElfHeader(dst: [*]volatile u8) void {
     dst[5] = 1; // EI_DATA  = ELFDATA2LSB
     dst[6] = 1; // EI_VERSION = EV_CURRENT
     dst[7] = 0; // EI_OSABI = SYSV
-    var i: usize = 8;
-    while (i < 16) {
-        dst[i] = 0;
-        i += 1;
-    }
-    // e_type = ET_DYN (3) — kernel rejects non-PIE per §[create_capability_domain] test 16a
-    dst[16] = 3;
-    dst[17] = 0;
-    // e_machine = EM_X86_64 (62) at offset 18
-    dst[18] = 62;
-    dst[19] = 0;
-    // e_version = 1 at offset 20
-    dst[20] = 1;
-    dst[21] = 0;
-    dst[22] = 0;
-    dst[23] = 0;
-    // e_entry through e_shstrndx are zeroed; the kernel may reject a
-    // 0 entry on test 29 (initial EC begins at the entry point), but
-    // test 26 verifies field0 layout, not control-flow handoff.
-    i = 24;
-    while (i < ELF_HEADER_SIZE) {
-        dst[i] = 0;
-        i += 1;
-    }
+
+    const entry_off: u64 = SIZEOF_EHDR64 + SIZEOF_PHDR64;
+
+    writeU16(dst, 0x10, 3); // e_type = ET_DYN
+    writeU16(dst, 0x12, 62); // e_machine = EM_X86_64
+    writeU32(dst, 0x14, 1); // e_version
+    writeU64(dst, 0x18, entry_off); // e_entry
+    writeU64(dst, 0x20, SIZEOF_EHDR64); // e_phoff
+    writeU64(dst, 0x28, 0); // e_shoff
+    writeU32(dst, 0x30, 0); // e_flags
+    writeU16(dst, 0x34, SIZEOF_EHDR64); // e_ehsize
+    writeU16(dst, 0x36, SIZEOF_PHDR64); // e_phentsize
+    writeU16(dst, 0x38, 1); // e_phnum
+    writeU16(dst, 0x3A, 0); // e_shentsize
+    writeU16(dst, 0x3C, 0); // e_shnum
+    writeU16(dst, 0x3E, 0); // e_shstrndx
+
+    // Program header at offset 64 (one PT_LOAD covering the page).
+    const ph: usize = SIZEOF_EHDR64;
+    writeU32(dst, ph + 0x00, 1); // PT_LOAD
+    writeU32(dst, ph + 0x04, 4 | 1); // p_flags = PF_R | PF_X
+    writeU64(dst, ph + 0x08, 0); // p_offset
+    writeU64(dst, ph + 0x10, 0); // p_vaddr
+    writeU64(dst, ph + 0x18, 0); // p_paddr
+    writeU64(dst, ph + 0x20, PAGE_SIZE); // p_filesz
+    writeU64(dst, ph + 0x28, PAGE_SIZE); // p_memsz
+    writeU64(dst, ph + 0x30, PAGE_SIZE); // p_align
+
+    // Single hlt instruction at e_entry so a scheduled child halts cleanly.
+    dst[entry_off] = 0xF4;
 }
 
 pub fn main(cap_table_base: u64) void {

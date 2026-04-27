@@ -84,6 +84,74 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+const SIZEOF_EHDR64: usize = 64;
+const SIZEOF_PHDR64: usize = 56;
+const PAGE_SIZE: usize = 4096;
+
+fn writeU16(dst: [*]volatile u8, off: usize, v: u16) void {
+    dst[off + 0] = @truncate(v & 0xFF);
+    dst[off + 1] = @truncate((v >> 8) & 0xFF);
+}
+
+fn writeU32(dst: [*]volatile u8, off: usize, v: u32) void {
+    dst[off + 0] = @truncate(v & 0xFF);
+    dst[off + 1] = @truncate((v >> 8) & 0xFF);
+    dst[off + 2] = @truncate((v >> 16) & 0xFF);
+    dst[off + 3] = @truncate((v >> 24) & 0xFF);
+}
+
+fn writeU64(dst: [*]volatile u8, off: usize, v: u64) void {
+    var i: usize = 0;
+    while (i < 8) {
+        dst[off + i] = @truncate((v >> @as(u6, @intCast(i * 8))) & 0xFF);
+        i += 1;
+    }
+}
+
+fn writeMinimalElf(dst: [*]volatile u8) void {
+    var i: usize = 0;
+    while (i < PAGE_SIZE) {
+        dst[i] = 0;
+        i += 1;
+    }
+    dst[0] = 0x7F;
+    dst[1] = 'E';
+    dst[2] = 'L';
+    dst[3] = 'F';
+    dst[4] = 2; // ELFCLASS64
+    dst[5] = 1; // ELFDATA2LSB
+    dst[6] = 1; // EV_CURRENT
+    dst[7] = 0;
+
+    const entry_off: u64 = SIZEOF_EHDR64 + SIZEOF_PHDR64;
+
+    writeU16(dst, 0x10, 3); // ET_DYN
+    writeU16(dst, 0x12, 62); // EM_X86_64
+    writeU32(dst, 0x14, 1);
+    writeU64(dst, 0x18, entry_off);
+    writeU64(dst, 0x20, SIZEOF_EHDR64); // e_phoff
+    writeU64(dst, 0x28, 0);
+    writeU32(dst, 0x30, 0);
+    writeU16(dst, 0x34, SIZEOF_EHDR64);
+    writeU16(dst, 0x36, SIZEOF_PHDR64);
+    writeU16(dst, 0x38, 1); // e_phnum
+    writeU16(dst, 0x3A, 0);
+    writeU16(dst, 0x3C, 0);
+    writeU16(dst, 0x3E, 0);
+
+    const ph: usize = SIZEOF_EHDR64;
+    writeU32(dst, ph + 0x00, 1); // PT_LOAD
+    writeU32(dst, ph + 0x04, 4 | 1); // PF_R | PF_X
+    writeU64(dst, ph + 0x08, 0);
+    writeU64(dst, ph + 0x10, 0);
+    writeU64(dst, ph + 0x18, 0);
+    writeU64(dst, ph + 0x20, PAGE_SIZE);
+    writeU64(dst, ph + 0x28, PAGE_SIZE);
+    writeU64(dst, ph + 0x30, PAGE_SIZE);
+
+    dst[entry_off] = 0xF4; // hlt
+}
+
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
@@ -101,21 +169,44 @@ pub fn main(cap_table_base: u64) void {
     }
     const donor: caps.HandleId = @truncate(cp.v1 & 0xFFF);
 
-    // Step 2 — page frame to act as elf_page_frame. Two 4 KiB pages
-    // is plenty of room for an ELF header + minimal program-header /
-    // load segment, so the size-mismatch error (test 16) cannot fire
-    // ahead of the malformed-header error (test 15).
-    const pf_caps = caps.PfCap{ .move = true, .r = true, .w = true };
+    // Step 2 — page frame to act as elf_page_frame. One 4 KiB page is
+    // sufficient for a minimal valid ELF (Ehdr + one Phdr + entry).
+    const pf_caps = caps.PfCap{ .move = true, .copy = true, .r = true, .w = true, .x = true };
     const cpf = syscall.createPageFrame(
         @as(u64, pf_caps.toU16()),
         0, // props.sz = 0 (4 KiB)
-        2,
+        1,
     );
     if (testing.isHandleError(cpf.v1)) {
         testing.fail(2);
         return;
     }
     const elf_pf: caps.HandleId = @truncate(cpf.v1 & 0xFFF);
+
+    // Stage the ELF into a writable VAR mapping of the page frame
+    // (the kernel reads the page frame contents through physmap).
+    const stage_var_caps = caps.VarCap{ .r = true, .w = true };
+    const cvar = syscall.createVar(
+        @as(u64, stage_var_caps.toU16()),
+        0b011,
+        1,
+        0,
+        0,
+    );
+    if (testing.isHandleError(cvar.v1)) {
+        testing.fail(2);
+        return;
+    }
+    const stage_var: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const stage_base: u64 = cvar.v2;
+    const map = syscall.mapPf(stage_var, &.{ 0, elf_pf });
+    if (map.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(2);
+        return;
+    }
+    const dst: [*]volatile u8 = @ptrFromInt(stage_base);
+    writeMinimalElf(dst);
+    _ = syscall.delete(stage_var);
 
     // Step 3 — child self caps. Subset of what the runner grants this
     // test domain (see runner/primary.zig spawnOne).

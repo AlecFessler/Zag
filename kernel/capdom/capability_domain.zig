@@ -257,8 +257,15 @@ pub fn createCapabilityDomain(
     // Spec §[address_space]: pick randomized non-overlapping bases
     // for the ELF image, the user stack, and the read-only cap-table
     // view. Each lives inside the ASLR zone.
-    const layout = userspace_init.resolveDomainLayout(elf_bytes) catch
-        return errors.E_NOMEM;
+    //   - ElfPhdrFileSizeExceeds → spec §[create_capability_domain]
+    //     [test 16]: a PT_LOAD declares more file bytes than the
+    //     staged page frame supplies. Surfaces as E_INVAL.
+    //   - ElfHasNoLoadableSegments / parse errors are also INVAL inputs.
+    //   - OutOfMemory (no slot in ASLR zone) is the only NOMEM here.
+    const layout = userspace_init.resolveDomainLayout(elf_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return errors.E_NOMEM,
+        else => return errors.E_INVAL,
+    };
     const slid_entry = VAddr.fromInt(parsed.entry.addr + layout.elf_slide);
 
     // Allocate the child capability domain. Self caps come from caps[0..15];

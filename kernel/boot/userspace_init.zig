@@ -90,6 +90,14 @@ fn elfImageSpan(elf_bytes: []const u8) !u64 {
     var phdr_itr = hdr.iterateProgramHeadersBuffer(@constCast(elf_bytes));
     while (try phdr_itr.next()) |phdr| {
         if (phdr.p_type != std.elf.PT_LOAD) continue;
+        // Spec §[create_capability_domain] [test 16]: any PT_LOAD that
+        // declares more file bytes than the staged page frame can
+        // supply (`p_offset + p_filesz > elf_bytes.len`) is an INVAL —
+        // userspace lied about the staged image. Surface this here so
+        // the syscall short-circuits with E_INVAL instead of trying to
+        // copy past the end of the staged buffer in `loadElfSegments`.
+        if (phdr.p_offset > elf_bytes.len) return error.ElfPhdrFileSizeExceeds;
+        if (phdr.p_filesz > elf_bytes.len - phdr.p_offset) return error.ElfPhdrFileSizeExceeds;
         const end = std.mem.alignForward(u64, phdr.p_vaddr + phdr.p_memsz, paging_consts.PAGE4K);
         if (end > max_end) max_end = end;
     }
