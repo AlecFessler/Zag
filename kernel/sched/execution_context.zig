@@ -424,13 +424,41 @@ pub fn yieldEc(caller: *ExecutionContext, target: u64) i64 {
 }
 
 /// `priority` syscall handler. Spec §[execution_context].priority.
+///
+/// The syscall layer has already validated reserved bits, resolved the
+/// handle as an EC, and verified `spri` + `new_priority <= caller's
+/// pri ceiling`. This handler updates the target EC's authoritative
+/// priority and refreshes the handle's field0 snapshot (spec
+/// §[execution_context] field0 bits 0-1 = pri).
+///
+/// Re-bucketing the target if it is currently parked in a futex/port
+/// wait queue (spec test 07) is not yet implemented; the priority
+/// field is updated unconditionally so the next enqueue picks it up.
 pub fn setPriority(caller: *ExecutionContext, target: u64, new_priority: u64) i64 {
-    _ = caller;
-    _ = target;
     if (new_priority > 3) return errors.E_INVAL;
-    // Awaits handle resolution; once the target *EC is in hand, the
-    // queue-aware logic below applies it.
-    return errors.E_BADCAP;
+
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+
+    const slot: u12 = @truncate(target);
+    const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+
+    const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+
+    const new_pri: Priority = @enumFromInt(@as(u2, @intCast(new_priority)));
+    target_ref.ptr.priority = new_pri;
+
+    // Refresh the handle's field0 snapshot (priority is bits 0-1).
+    cd.user_table[slot].field0 = (cd.user_table[slot].field0 & ~@as(u64, 0x3)) | @intFromEnum(new_pri);
+
+    cd_ref.unlock();
+    return errors.OK;
 }
 
 /// `affinity` syscall handler. Spec §[execution_context].affinity.
