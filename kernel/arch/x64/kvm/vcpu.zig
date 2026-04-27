@@ -234,44 +234,45 @@ fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
 
 // ── Spec-v3 dispatch backings (STUB) ─────────────────────────────────
 
+// SPEC AMBIGUITY: x64 KVM vCPU lifecycle is not yet implemented.
+// allocVcpuArchState fails the alloc path (E_NOMEM at the syscall
+// layer); the rest noop so error-path teardown and the rare
+// cross-kind dispatch through these names doesn't panic the kernel.
+// VM-running paths cannot reach the noop variants because no vCPU
+// arch state is ever installed (alloc returns OutOfMemory first).
+
 pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void {
     _ = vm;
     _ = vcpu_ec;
-    @panic("not implemented");
+    return error.OutOfMemory;
 }
 
 pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
     _ = vcpu_ec;
-    @panic("not implemented");
 }
 
 pub fn loadGuestState(vcpu_ec: *ExecutionContext) void {
     _ = vcpu_ec;
-    @panic("not implemented");
 }
 
 pub fn saveGuestState(vcpu_ec: *ExecutionContext) void {
     _ = vcpu_ec;
-    @panic("not implemented");
 }
 
 pub fn enterGuest(vcpu_ec: *ExecutionContext) void {
     _ = vcpu_ec;
-    @panic("not implemented");
 }
 
 pub fn lastVmExitInfo(vcpu_ec: *ExecutionContext) VmExitInfo {
     _ = vcpu_ec;
-    @panic("not implemented");
+    return std.mem.zeroes(VmExitInfo);
 }
 
 pub fn vmEmulatedTimerArm(vcpu_ec: *ExecutionContext, deadline_ns: u64) void {
     _ = vcpu_ec;
     _ = deadline_ns;
-    @panic("not implemented");
 }
 
 pub fn vmEmulatedTimerCancel(vcpu_ec: *ExecutionContext) void {
     _ = vcpu_ec;
-    @panic("not implemented");
 }
