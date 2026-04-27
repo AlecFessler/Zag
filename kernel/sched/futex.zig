@@ -489,8 +489,8 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
     // EC will never observe.
     ec.on_cpu.store(false, .release);
     const core_id = arch.smp.coreID();
-    if (sched.core_states[core_id].current_ec == ec) {
-        sched.core_states[core_id].current_ec = null;
+    if ((&sched.core_states[core_id]).current_ec == ec) {
+        (&sched.core_states[core_id]).current_ec = null;
     }
     return 0;
 }
@@ -577,8 +577,8 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
     // Park the EC: see `waitVal` for the full rationale.
     ec.on_cpu.store(false, .release);
     const core_id = arch.smp.coreID();
-    if (sched.core_states[core_id].current_ec == ec) {
-        sched.core_states[core_id].current_ec = null;
+    if ((&sched.core_states[core_id]).current_ec == ec) {
+        (&sched.core_states[core_id]).current_ec = null;
     }
     return 0;
 }

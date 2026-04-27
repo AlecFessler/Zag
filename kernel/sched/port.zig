@@ -593,8 +593,8 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     port_ref.unlock();
 
     const core_id = arch.smp.coreID();
-    if (scheduler.core_states[core_id].current_ec == caller) {
-        scheduler.core_states[core_id].current_ec = null;
+    if ((&scheduler.core_states[core_id]).current_ec == caller) {
+        (&scheduler.core_states[core_id]).current_ec = null;
     }
     return 0;
 }

@@ -260,7 +260,14 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
             // syscall epilogue would otherwise iretq back to the now-
             // parked user EC. Drive the scheduler to pick the next
             // ready EC (typically the just-readied receiver).
-            if (scheduler.core_states[apic.coreID()].current_ec == null) {
+            // `&core_states[i]` (pointer) rather than the
+            // `core_states[i].field` form: see the matching note in
+            // `sched.scheduler.currentEc`. Debug-mode Zig codegens the
+            // direct-array index as a 6 KiB memcpy of the entire
+            // `core_states` array onto the syscall path's stack frame
+            // — three such snapshots in this function consume ~18 KiB
+            // and overflow the 48 KiB kernel stack on faulting paths.
+            if ((&scheduler.core_states[apic.coreID()]).current_ec == null) {
                 scheduler.run();
             }
             return;
@@ -282,7 +289,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // core when dispatch returned without suspending us, and we are
     // still in the caller's CR3, so the user-page write is safe here.
     if (caller.pending_event_word_valid and
-        scheduler.core_states[apic.coreID()].current_ec == caller)
+        (&scheduler.core_states[apic.coreID()]).current_ec == caller)
     {
         writeUserSyscallWord(ctx, caller.pending_event_word);
         caller.pending_event_word = 0;
@@ -309,7 +316,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // run the suspended EC. Switch to whatever's next (or idle); the
     // saved register restore in the asm trampoline never executes
     // because switchTo's `loadEcContextAndReturn` is `noreturn`.
-    if (scheduler.core_states[apic.coreID()].current_ec == null) {
+    if ((&scheduler.core_states[apic.coreID()]).current_ec == null) {
         scheduler.run();
     }
 }
@@ -510,7 +517,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
     }
 
     const cid: u8 = @truncate(core_id);
-    scheduler.core_states[cid].current_ec = ec;
+    (&scheduler.core_states[cid]).current_ec = ec;
     per_cpu_scratch[cid].current_ec = @intFromPtr(ec);
     per_cpu_scratch[cid].current_domain = @intFromPtr(dom);
 
@@ -528,10 +535,10 @@ pub fn switchTo(ec: *ExecutionContext) void {
     // never armed, so no migration flush is needed either.
     if (comptime fpu.lazy_enabled) {
         scheduler.migrateFlush(ec);
-        const desired_armed = (scheduler.core_states[cid].last_fpu_owner != ec);
-        if (desired_armed != scheduler.core_states[cid].fpu_trap_armed) {
+        const desired_armed = ((&scheduler.core_states[cid]).last_fpu_owner != ec);
+        if (desired_armed != (&scheduler.core_states[cid]).fpu_trap_armed) {
             if (desired_armed) cpu.fpuArmTrap() else cpu.fpuClearTrap();
-            scheduler.core_states[cid].fpu_trap_armed = desired_armed;
+            (&scheduler.core_states[cid]).fpu_trap_armed = desired_armed;
         }
     }
 

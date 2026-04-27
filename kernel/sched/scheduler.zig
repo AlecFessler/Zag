@@ -122,7 +122,7 @@ pub fn dequeue() ?*ExecutionContext {
     const core: u8 = @truncate(arch.smp.coreID());
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-    const ec = core_states[core].run_queue.dequeue();
+    const ec = (&core_states[core]).run_queue.dequeue();
     lock.unlockIrqRestore(irq);
     return ec;
 }
@@ -162,7 +162,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
     var current = ec;
     while (current.vm != null) {
         const core: u8 = @truncate(arch.smp.coreID());
-        core_states[core].current_ec = null;
+        (&core_states[core]).current_ec = null;
         // Spec §[vm_exit_state]: vregs 1..13 carry the guest GPR state
         // at exit time. With real VMX/SVM guest re-entry still TODO,
         // no actual guest code runs between reply and the next exit;
@@ -203,7 +203,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
     }
 
     const core: u8 = @truncate(arch.smp.coreID());
-    core_states[core].current_ec = current;
+    (&core_states[core]).current_ec = current;
     current.state = .running;
     arch.cpu.loadEcContextAndReturn(current);
 }
@@ -240,7 +240,7 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     // bit. Halting *here* would leave the timer IRQ never EOI'd —
     // any subsequent same-priority LAPIC tick would be blocked,
     // wedging the scheduler tick on this core.
-    core_states[core].current_ec = null;
+    (&core_states[core]).current_ec = null;
 }
 
 /// Preemption tick — invoked from the per-core timer interrupt when
@@ -311,12 +311,12 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
 
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-    core_states[core].run_queue.enqueue(ec);
+    (&core_states[core]).run_queue.enqueue(ec);
     // Snapshot the target's current EC before deciding whether to
     // wake / preempt. Reading the remote core's `current_ec` is a racy
     // hint — the worst case if it changes after we decide is a spurious
     // wake or a missed preempt that the next preempt tick covers.
-    const target_current = core_states[core].current_ec;
+    const target_current = (&core_states[core]).current_ec;
     lock.unlockIrqRestore(irq);
 
     const self_core: u8 = @truncate(arch.smp.coreID());
@@ -356,7 +356,7 @@ pub fn removeFromQueue(ec: *ExecutionContext) void {
     while (i < MAX_CORES) {
         const lock = &core_locks[i];
         const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-        const removed = core_states[i].run_queue.remove(ec);
+        const removed = (&core_states[i]).run_queue.remove(ec);
         lock.unlockIrqRestore(irq);
         if (removed) return;
         i += 1;
@@ -364,8 +364,22 @@ pub fn removeFromQueue(ec: *ExecutionContext) void {
 }
 
 /// Currently dispatched EC on this core (the calling core).
+///
+/// IMPORTANT: indexes via `&core_states[i]` rather than the direct
+/// `(&core_states[i]).field` form. In Debug builds Zig codegens the
+/// latter as a `memcpy` of the entire `[MAX_CORES]PerCore` array onto
+/// the caller's stack (≈ 6 KiB) followed by an index-of-the-copy
+/// load — see `__zig_probe_stack` + `memcpy($0x1800, ...)` in the
+/// disassembly. `currentEc` is on every page-fault, syscall, and
+/// dispatch path, so unbounded 6 KiB-per-call stack blowups quickly
+/// overflow the 48 KiB kernel stack and corrupt return addresses,
+/// surfacing as `cpu.idle` returning to a `.bss` byte (#GP) or as
+/// `pageFaultHandler` re-entering with `currentEc() == null` because
+/// the stack-frame for the saved EC pointer was clobbered. Pointer
+/// indexing avoids the per-call array snapshot.
 pub fn currentEc() ?*ExecutionContext {
-    return core_states[arch.smp.coreID()].current_ec;
+    const core: u8 = @truncate(arch.smp.coreID());
+    return (&core_states[core]).current_ec;
 }
 
 /// Find which core (if any) is currently running `ec`. Returns null
@@ -374,7 +388,7 @@ pub fn coreRunning(ec: *ExecutionContext) ?u8 {
     const count = arch.smp.coreCount();
     var i: u8 = 0;
     while (i < count) {
-        if (core_states[i].current_ec == ec) return i;
+        if ((&core_states[i]).current_ec == ec) return i;
         i += 1;
     }
     return null;
