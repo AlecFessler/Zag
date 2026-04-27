@@ -69,6 +69,7 @@ const expected_self = caps.SelfCap{
     .crvm = true,
     .crpt = true,
     .pmu = true,
+    .setwall = true,
     .fut_wake = true,
     .timer = true,
     .pri = 3,

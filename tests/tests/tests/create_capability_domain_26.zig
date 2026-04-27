@@ -86,7 +86,7 @@ const testing = lib.testing;
 // test 26's success condition, we extend this with PT_LOAD entries.
 const ELF_HEADER_SIZE: usize = 0x40;
 
-fn writeElfHeader(dst: [*]u8) void {
+fn writeElfHeader(dst: [*]volatile u8) void {
     // e_ident: magic + class=ELF64 + data=little + version=1 + osabi=sysv
     dst[0] = 0x7F;
     dst[1] = 'E';
@@ -101,8 +101,8 @@ fn writeElfHeader(dst: [*]u8) void {
         dst[i] = 0;
         i += 1;
     }
-    // e_type = ET_EXEC (2) at offset 16
-    dst[16] = 2;
+    // e_type = ET_DYN (3) — kernel rejects non-PIE per §[create_capability_domain] test 16a
+    dst[16] = 3;
     dst[17] = 0;
     // e_machine = EM_X86_64 (62) at offset 18
     dst[18] = 62;
@@ -161,7 +161,9 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    const dst: [*]u8 = @ptrFromInt(var_base);
+    // volatile so ReleaseSmall doesn't optimize away the writes (the
+    // kernel reads through a different VA after we delete the staging VAR).
+    const dst: [*]volatile u8 = @ptrFromInt(var_base);
     writeElfHeader(dst);
 
     // ----------------------------------------------------------------

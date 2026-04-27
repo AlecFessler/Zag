@@ -26,10 +26,10 @@ const CREATE_VCPU_CAPS_MASK: u64 = 0x0000_0003_0000_FFFF;
 const INJECT_IRQ_ASSERT_MASK: u64 = 0x1;
 
 /// Bit position of `vm_ceiling` within self-handle `field0`.
-/// Per §[create_capability_domain] [2] ceilings_inner — which "matches
-/// self-handle field0" per the syscall doc — vm_ceiling occupies bits
-/// 40-47 with `policy` at bit 40.
-const VM_CEILING_FIELD0_SHIFT: u6 = 40;
+/// Per §[capability_domain] Self handle layout — field0 has idc_rx at
+/// bits 32-39, so vm_ceiling occupies bits 48-55 with `policy` at bit
+/// 48 (shifted up by 8 from the [2] ceilings_inner layout).
+const VM_CEILING_FIELD0_SHIFT: u6 = 48;
 const VM_CEILING_MASK: u64 = 0xFF;
 
 /// Allocates a VM with its own guest physical address space and

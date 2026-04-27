@@ -114,12 +114,13 @@ pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64
     if (!self_caps_struct.crvm) return errors.E_PERM;
 
     // Spec §[virtual_machine] VmCap layout: bit 0 = `policy`, bit 1 =
-    // `restart_policy`. `vm_ceiling` (self-handle field0 bits 40-47 per
-    // §[create_capability_domain] [2] ceilings_inner layout) gates only
-    // `policy`; `restart_policy` is gated separately by
-    // `restart_policy_ceiling.vm_restart_max` per §[restart_semantics]
+    // `restart_policy`. `vm_ceiling` (self-handle field0 bits 48-55 per
+    // §[capability_domain] Self handle layout — shifted up by 8 from
+    // the [2] ceilings_inner layout to make room for idc_rx at bits
+    // 32-39) gates only `policy`; `restart_policy` is gated separately
+    // by `restart_policy_ceiling.vm_restart_max` per §[restart_semantics]
     // and is enforced below.
-    const vm_ceiling: u8 = @truncate(readSelfField0(domain) >> 40);
+    const vm_ceiling: u8 = @truncate(readSelfField0(domain) >> 48);
     const requested_policy: u16 = requested_caps & 0x1;
     const ceiling_policy: u16 = vm_ceiling & 0x1;
     if ((requested_policy & ~ceiling_policy) != 0) return errors.E_PERM;

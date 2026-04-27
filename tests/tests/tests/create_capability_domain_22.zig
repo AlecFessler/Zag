@@ -99,7 +99,7 @@ const VALID_CEILINGS_OUTER: u64 = 0x0000_003F_03FE_FFFF;
 // e_version, 8-byte e_entry, 8-byte e_phoff, 8-byte e_shoff, 4-byte
 // e_flags, 2-byte e_ehsize, 2-byte e_phentsize, 2-byte e_phnum,
 // 2-byte e_shentsize, 2-byte e_shnum, 2-byte e_shstrndx.
-fn writeMinimalElf64(dst: [*]u8) void {
+fn writeMinimalElf64(dst: [*]volatile u8) void {
     // e_ident
     dst[0] = 0x7F; // EI_MAG0
     dst[1] = 'E'; // EI_MAG1
@@ -115,8 +115,8 @@ fn writeMinimalElf64(dst: [*]u8) void {
         dst[i] = 0; // EI_PAD
         i += 1;
     }
-    // e_type = ET_EXEC (2)
-    dst[16] = 2;
+    // e_type = ET_DYN (3) — kernel rejects non-PIE per §[create_capability_domain] test 16a
+    dst[16] = 3;
     dst[17] = 0;
     // e_machine = EM_X86_64 (62)
     dst[18] = 62;
@@ -209,7 +209,9 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Write the minimal valid ELF64 header into the staged page frame.
-    const dst: [*]u8 = @ptrFromInt(var_base);
+    // volatile so ReleaseSmall doesn't optimize away the writes (the
+    // kernel reads through a different VA after we delete the staging VAR).
+    const dst: [*]volatile u8 = @ptrFromInt(var_base);
     writeMinimalElf64(dst);
 
     // Reclaim the staging VAR (mirrors runner/primary.zig's pattern).

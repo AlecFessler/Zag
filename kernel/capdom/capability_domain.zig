@@ -262,12 +262,20 @@ pub fn createCapabilityDomain(
     const slid_entry = VAddr.fromInt(parsed.entry.addr + layout.elf_slide);
 
     // Allocate the child capability domain. Self caps come from caps[0..15];
-    // ceilings flow through verbatim (callers are trusted to pass valid
-    // ceilings — spec validation deferred to per-test pass).
+    // self-handle field0 layout differs from the [2] ceilings_inner shape —
+    // §[capability_domain] Self handle puts idc_rx at field0 bits 32-39,
+    // sourced from [1] caps bits 16-23, with pf/vm/port ceilings shifted
+    // up by 8 bits relative to ceilings_inner. See spec
+    // §[create_capability_domain] doc for the [2] layout vs §[capability_domain]
+    // for the field0 layout.
     const self_caps: u16 = @truncate(caps & 0xFFFF);
+    const idc_rx: u64 = (caps >> 16) & 0xFF;
+    const ec_var_cridc: u64 = ceilings_inner & 0x0000_0000_FFFF_FFFF;
+    const pf_vm_port: u64 = (ceilings_inner >> 32) & 0x0000_0000_00FF_FFFF;
+    const self_field0: u64 = ec_var_cridc | (idc_rx << 32) | (pf_vm_port << 40);
     const child_cd = allocCapabilityDomain(
         self_caps,
-        ceilings_inner,
+        self_field0,
         ceilings_outer,
         slid_entry,
     ) catch return errors.E_NOMEM;

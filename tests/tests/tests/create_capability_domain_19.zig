@@ -98,7 +98,7 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const EV_CURRENT: u8 = 1;
 const ELFOSABI_NONE: u8 = 0;
-const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
@@ -116,7 +116,13 @@ const PAGE_SIZE: usize = 4096;
 // is whatever sits at offset SIZEOF_EHDR64 + SIZEOF_PHDR64 in the
 // page. We write a single 0xF4 (`hlt`) byte there so a domain that
 // successfully launches will halt rather than fault on undefined ops.
-fn writeMinimalElf(dst: [*]u8) usize {
+//
+// `dst` is `volatile` because the kernel re-reads the page frame
+// through a different VA (physmap) after the staging VAR is dropped;
+// without volatile, ReleaseSmall optimizes away the stores (see
+// project memory `project_zig_shm_readtable_bug.md` — same class of
+// bug as the runner's stageElfIntoPageFrame which also uses volatile).
+fn writeMinimalElf(dst: [*]volatile u8) usize {
     var i: usize = 0;
     while (i < PAGE_SIZE) {
         dst[i] = 0;
@@ -136,7 +142,7 @@ fn writeMinimalElf(dst: [*]u8) usize {
 
     const entry_off: u64 = SIZEOF_EHDR64 + SIZEOF_PHDR64;
 
-    writeU16(dst, 0x10, ET_EXEC); // e_type
+    writeU16(dst, 0x10, ET_DYN); // e_type — kernel requires PIE (ET_DYN)
     writeU16(dst, 0x12, EM_X86_64); // e_machine
     writeU32(dst, 0x14, EV_CURRENT); // e_version
     writeU64(dst, 0x18, entry_off); // e_entry — vaddr of first insn
@@ -167,19 +173,19 @@ fn writeMinimalElf(dst: [*]u8) usize {
     return PAGE_SIZE;
 }
 
-fn writeU16(dst: [*]u8, off: usize, v: u16) void {
+fn writeU16(dst: [*]volatile u8, off: usize, v: u16) void {
     dst[off + 0] = @truncate(v & 0xFF);
     dst[off + 1] = @truncate((v >> 8) & 0xFF);
 }
 
-fn writeU32(dst: [*]u8, off: usize, v: u32) void {
+fn writeU32(dst: [*]volatile u8, off: usize, v: u32) void {
     dst[off + 0] = @truncate(v & 0xFF);
     dst[off + 1] = @truncate((v >> 8) & 0xFF);
     dst[off + 2] = @truncate((v >> 16) & 0xFF);
     dst[off + 3] = @truncate((v >> 24) & 0xFF);
 }
 
-fn writeU64(dst: [*]u8, off: usize, v: u64) void {
+fn writeU64(dst: [*]volatile u8, off: usize, v: u64) void {
     var i: usize = 0;
     while (i < 8) {
         dst[off + i] = @truncate((v >> @as(u6, @intCast(i * 8))) & 0xFF);
@@ -239,7 +245,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // 4. Stage a minimal valid ELF into the page frame.
-    const dst: [*]u8 = @ptrFromInt(var_base);
+    const dst: [*]volatile u8 = @ptrFromInt(var_base);
     _ = writeMinimalElf(dst);
 
     // 5. Drop the staging VAR. The kernel re-reads the page frame
@@ -264,11 +270,14 @@ pub fn main(cap_table_base: u64) void {
     const idc_rx_byte: u64 = (self_cap.field0 >> 32) & 0xFF;
     const caps_word: u64 = @as(u64, new_self.toU16()) | (idc_rx_byte << 16);
 
-    // ceilings_inner: pull ec_inner / var_inner / cridc / pf / vm /
-    // port from the caller's field0 verbatim. Reserved bits are all
-    // zero in the caller's field0 by construction, so this is a clean
-    // self-subset.
-    const ceilings_inner: u64 = self_cap.field0;
+    // ceilings_inner ([2] arg layout): build from the caller's field0
+    // (which uses §[capability_domain] Self handle layout — idc_rx at
+    // bits 32-39 between cridc and pf). Copy bits 0-31 verbatim
+    // (ec/var/cridc) and shift bits 40-63 (pf/vm/port) down by 8 to
+    // place them at [2]-layout bits 32-55.
+    const field0_low: u64 = self_cap.field0 & 0x0000_0000_FFFF_FFFF;
+    const field0_pf_vm_port: u64 = (self_cap.field0 >> 40) & 0x0000_0000_00FF_FFFF;
+    const ceilings_inner: u64 = field0_low | (field0_pf_vm_port << 32);
 
     // ceilings_outer: ec_outer in bits 0-7, var_outer in bits 8-15,
     // restart_policy_ceiling in 16-31, fut_wait_max in 32-37 — all
