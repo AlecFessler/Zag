@@ -278,6 +278,14 @@ pub const ExecutionContext = struct {
     /// reply ops comes from this EC's own `_gen_lock`.
     pending_reply_holder: ?*KernelHandle = null,
 
+    /// Receiver-side domain + slot for the outstanding reply handle —
+    /// paired with `pending_reply_holder`. Stored separately so the
+    /// `terminate` path can mark the user_table caps with the
+    /// `abandoned` bit (the kernel_table entry alone has no caps
+    /// field). Both are set/cleared together with `pending_reply_holder`.
+    pending_reply_domain: ?*CapabilityDomain = null,
+    pending_reply_slot: u12 = 0,
+
     /// Write-cap snapshot from the originating EC handle taken at the
     /// moment this EC was suspended (the suspending EC handle for
     /// explicit suspend, the EC handle used at `bind_event_route` for
@@ -915,6 +923,8 @@ pub fn suspendOnPort(
     ec.suspend_port = SlabRef(Port).init(port, port._gen_lock.currentGen());
     ec.state = .suspended_on_port;
     ec.pending_reply_holder = null;
+    ec.pending_reply_domain = null;
+    ec.pending_reply_slot = 0;
     ec.originating_write_cap = originating_write_cap;
     ec.on_cpu.store(false, .release);
 
@@ -966,23 +976,40 @@ pub fn resumeFromReply(ec: *ExecutionContext, apply_writes: bool) void {
     ec.event_addr = 0;
     ec.suspend_port = null;
     ec.pending_reply_holder = null;
+    ec.pending_reply_domain = null;
+    ec.pending_reply_slot = 0;
     ec.originating_write_cap = false;
     ec.state = .ready;
     scheduler.markReady(ec);
 }
 
 /// Mark a pending reply against `ec` as abandoned — invoked when
-/// `terminate` destroys a sender that's parked awaiting reply. The
-/// receiver's reply handle resolves to E_ABANDONED on its next op via
-/// `ec`'s gen-bump on slab destroy; this hook gives the reply slot a
-/// chance to record the cause for debug output before the gen flips.
+/// `terminate` destroys a sender that's parked awaiting reply. Sets the
+/// `abandoned` bit in the receiver-side reply handle's caps so a
+/// subsequent `reply` / `reply_transfer` / `delete` on that slot returns
+/// E_ABANDONED per spec §[terminate] test 07. The kernel_table entry
+/// itself stays valid until the receiver consumes the slot — the gen
+/// bump on `ec` would already make `reply` fail with E_TERM, but the
+/// spec wants E_ABANDONED for the post-terminate window. Marking the
+/// caps lets reply distinguish "abandoned via terminate" from "sender
+/// died for other reasons".
 pub fn abandonPendingReply(ec: *ExecutionContext) void {
-    const holder = ec.pending_reply_holder orelse return;
-    // Real impl marks `holder` as abandoned so the receiver gets
-    // E_ABANDONED rather than E_TERM on its next op. Hook is here;
-    // the abandoned-state encoding is still TBD on the reply handle.
-    _ = holder;
+    _ = ec.pending_reply_holder orelse return;
+    if (ec.pending_reply_domain) |dom| {
+        const slot = ec.pending_reply_slot;
+        const word0 = dom.user_table[slot].word0;
+        const tag = zag.caps.capability.Word0.typeTag(word0);
+        if (tag == .reply) {
+            const caps_u16 = zag.caps.capability.Word0.caps(word0);
+            var rc: zag.sched.port.ReplyCaps = @bitCast(caps_u16);
+            rc.abandoned = true;
+            const new_caps: u16 = @bitCast(rc);
+            dom.user_table[slot].word0 = zag.caps.capability.Word0.pack(slot, .reply, new_caps);
+        }
+    }
     ec.pending_reply_holder = null;
+    ec.pending_reply_domain = null;
+    ec.pending_reply_slot = 0;
 }
 
 /// Re-launch `ec` at its `entry_point` with a fresh user stack —
@@ -1012,6 +1039,8 @@ pub fn restartEntry(ec: *ExecutionContext) void {
     ec.event_subcode = 0;
     ec.event_addr = 0;
     ec.pending_reply_holder = null;
+    ec.pending_reply_domain = null;
+    ec.pending_reply_slot = 0;
     ec.originating_write_cap = false;
     ec.iret_frame = null;
     ec.futex_wait_nodes = null;
@@ -1151,6 +1180,8 @@ pub fn allocExecutionContext(
     ec.event_addr = 0;
     ec.suspend_port = null;
     ec.pending_reply_holder = null;
+    ec.pending_reply_domain = null;
+    ec.pending_reply_slot = 0;
     ec.originating_write_cap = false;
     ec.event_routes = .{ null, null, null, null };
     ec.entry_point = entry;

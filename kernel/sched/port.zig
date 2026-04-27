@@ -153,7 +153,14 @@ pub const ReplyCaps = packed struct(u16) {
     move: bool = false,
     copy: bool = false,
     xfer: bool = false,
-    _reserved: u13 = 0,
+    /// Internal marker (not a user-visible cap): set by `terminate` on
+    /// reply handles whose suspended sender was destroyed. Subsequent
+    /// `reply` operations on the marked handle return `E_ABANDONED`
+    /// per spec §[terminate] test 07. Lives in the caps bitfield so
+    /// the existing user_table.word0 carries it without extending the
+    /// kernel-side handle struct.
+    abandoned: bool = false,
+    _reserved: u12 = 0,
 };
 
 /// Names which side currently owns `Port.waiters`. A port can never
@@ -515,6 +522,8 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     caller.suspend_port = SlabRef(Port).init(p, p._gen_lock.currentGen());
     caller.state = .suspended_on_port;
     caller.pending_reply_holder = null;
+    caller.pending_reply_domain = null;
+    caller.pending_reply_slot = 0;
     caller.on_cpu.store(false, .release);
 
     // Timed recv — register before dropping the port lock so the wakeup
@@ -553,11 +562,15 @@ pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
     // Snapshot the caps on the reply handle and clear the slot under
     // the domain lock so a concurrent delete cannot race the resume.
     const reply_caps: ReplyCaps = @bitCast(Word0.caps(cd.user_table[slot].word0));
-    _ = reply_caps;
 
     capability.clearAndFreeSlot(cd, slot, entry);
 
     cd_ref.unlock();
+
+    // Spec §[terminate] test 07: when terminate destroys the suspended
+    // sender, it marks the reply handle's `abandoned` bit. Subsequent
+    // reply ops on that slot return E_ABANDONED rather than E_TERM.
+    if (reply_caps.abandoned) return errors.E_ABANDONED;
 
     const sender = sender_ref.lock(@src()) catch return errors.E_TERM;
     defer sender_ref.unlock();
@@ -905,7 +918,18 @@ fn deliverEvent(
     pair_count: u8,
 ) i64 {
     const xfer_allowed = pair_count > 0;
-    const reply_slot = mintReply(dom, sender, xfer_allowed) catch return errors.E_FULL;
+    const reply_slot = mintReply(dom, sender, xfer_allowed) catch {
+        // Receiver's table is full — surface E_FULL into the receiver's
+        // iret frame so the rendezvous wake path delivers it correctly.
+        // The synchronous recv path (where caller == receiver) overwrites
+        // rax via the syscall epilogue from the i64 return below; the
+        // rendezvous path (sender resumes a parked receiver) has no such
+        // epilogue and would otherwise leave rax = 0 from recv's pre-
+        // suspend return. Spec §[recv] test 06.
+        const target_ctx = receiver.iret_frame orelse receiver.ctx;
+        arch.syscall.setSyscallReturn(target_ctx, @bitCast(errors.E_FULL));
+        return errors.E_FULL;
+    };
 
     // Compose §[event_state] syscall return word: pair_count, tstart,
     // reply_handle_id, event_type. tstart only meaningful when pair_count
@@ -1036,6 +1060,8 @@ fn mintReply(receiver_domain: *CapabilityDomain, sender: *ExecutionContext, xfer
     );
 
     sender.pending_reply_holder = &receiver_domain.kernel_table[slot];
+    sender.pending_reply_domain = receiver_domain;
+    sender.pending_reply_slot = slot;
     return slot;
 }
 
