@@ -100,16 +100,25 @@ pub fn main(cap_table_base: u64) void {
         .pri = 3,
     };
 
-    // ec_inner_ceiling = 0x7F (bit 7 cleared) in field0. Other
-    // ceilings are loose — they are not load-bearing for this test.
+    // ec_inner_ceiling = 0x7F (bit 7 cleared) in [2] bits 0-7. Other
+    // sub-fields mirror the runner's installed ceilings exactly so the
+    // syscall's subset checks (test 12 port_ceiling in particular)
+    // accept the spawn — only the ec_inner_ceiling restriction is
+    // load-bearing for this test. Layout matches §[create_capability_domain]
+    // [2] ceilings_inner:
+    //   bits  0-7   ec_inner_ceiling   = 0x7F (bit 7 cleared)
+    //   bits  8-23  var_inner_ceiling  = 0x01FF (matches runner)
+    //   bits 24-31  cridc_ceiling      = 0x3F  (matches runner)
+    //   bits 32-39  pf_ceiling         = 0x1F  (matches runner)
+    //   bits 40-47  vm_ceiling         = 0x01  (matches runner)
+    //   bits 48-55  port_ceiling       = 0x1C  (matches runner)
     const ceilings_inner: u64 =
         @as(u64, 0x7F) |
         (@as(u64, 0x01FF) << 8) |
         (@as(u64, 0x3F) << 24) |
-        (@as(u64, 0xFF) << 32) |
-        (@as(u64, 0x1F) << 40) |
-        (@as(u64, 0x01) << 48) |
-        (@as(u64, 0x1C) << 56);
+        (@as(u64, 0x1F) << 32) |
+        (@as(u64, 0x01) << 40) |
+        (@as(u64, 0x1C) << 48);
 
     const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
 
