@@ -26,8 +26,10 @@ const CREATE_VCPU_CAPS_MASK: u64 = 0x0000_0003_0000_FFFF;
 const INJECT_IRQ_ASSERT_MASK: u64 = 0x1;
 
 /// Bit position of `vm_ceiling` within self-handle `field0`.
-/// Spec §[capability_domain] field0 layout: vm_ceiling is bits 48-55.
-const VM_CEILING_FIELD0_SHIFT: u6 = 48;
+/// Per §[create_capability_domain] [2] ceilings_inner — which "matches
+/// self-handle field0" per the syscall doc — vm_ceiling occupies bits
+/// 40-47 with `policy` at bit 40.
+const VM_CEILING_FIELD0_SHIFT: u6 = 40;
 const VM_CEILING_MASK: u64 = 0xFF;
 
 /// Allocates a VM with its own guest physical address space and
@@ -85,11 +87,12 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 
     if (!self_caps.crvm) return errors.E_PERM;
 
-    // vm_ceiling occupies bits 48-55 of self field0; the requested caps
-    // word is the 16-bit cap layout from §[virtual_machine]. The ceiling
-    // gates `policy` (bit 0); `restart_policy` is gated separately by
-    // restart_policy_ceiling per §[restart_semantics] and is enforced
-    // inside the capdom layer.
+    // vm_ceiling occupies bits 40-47 of self field0 (per the
+    // §[create_capability_domain] [2] ceilings_inner layout); the
+    // requested caps word is the 16-bit cap layout from §[virtual_machine].
+    // The ceiling gates `policy` (bit 0); `restart_policy` is gated
+    // separately by restart_policy_ceiling per §[restart_semantics] and
+    // is enforced inside the capdom layer.
     const requested: u16 = @truncate(caps);
     const requested_policy = requested & 0x1;
     const ceiling_policy = vm_ceiling & 0x1;

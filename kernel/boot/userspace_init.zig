@@ -191,22 +191,24 @@ pub fn init(root_service_elf: []const u8) !void {
     // createPageFrame / createVar / createCapabilityDomain calls fail
     // E_PERM against zero ceilings before the first test ever runs.
     //
-    // ceilings_inner (field0):
+    // Field0 layout follows the §[create_capability_domain] [2]
+    // ceilings_inner spec; the kernel writes the [2] word verbatim into
+    // self-handle field0 (no idc_rx slot — idc_rx rides in [1] caps and
+    // is propagated separately):
     //   bits  0-7   ec_inner_ceiling          = 0xFF
     //   bits  8-23  var_inner_ceiling         = 0xFFFF
     //   bits 24-31  cridc_ceiling             = 0xFF
-    //   bits 32-39  idc_rx                    = 0xFF
-    //   bits 40-47  pf_ceiling                = 0x1F  (max_rwx=7, max_sz=3)
-    //   bits 48-55  vm_ceiling                = 0xFF
-    //   bits 56-63  port_ceiling              = 0xFF
+    //   bits 32-39  pf_ceiling                = 0x1F  (max_rwx=7, max_sz=3)
+    //   bits 40-47  vm_ceiling                = 0x01  (policy=1)
+    //   bits 48-55  port_ceiling              = 0x1C  (xfer|recv|bind)
+    //   bits 56-63  _reserved                 = 0
     const root_field0_ceilings: u64 =
         @as(u64, 0xFF) |
         (@as(u64, 0xFFFF) << 8) |
         (@as(u64, 0xFF) << 24) |
-        (@as(u64, 0xFF) << 32) |
-        (@as(u64, 0x1F) << 40) |
-        (@as(u64, 0xFF) << 48) |
-        (@as(u64, 0xFF) << 56);
+        (@as(u64, 0x1F) << 32) |
+        (@as(u64, 0x01) << 40) |
+        (@as(u64, 0x1C) << 48);
     // ceilings_outer (field1):
     //   bits  0-7   ec_outer_ceiling           = 0xFF
     //   bits  8-15  var_outer_ceiling          = 0xFF

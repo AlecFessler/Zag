@@ -209,6 +209,21 @@ pub fn createCapabilityDomain(
         return errors.E_PERM;
     }
 
+    // Spec §[create_capability_domain] test 12: requested `port_ceiling`
+    // (bits 48-55 of [2]) must be a bitwise subset of the caller's own
+    // `port_ceiling` on its self-handle field0. Otherwise the new domain
+    // could mint port handles with caps the parent doesn't itself hold,
+    // breaking the monotonic-rights invariant. Reserved bit violations
+    // (sub-field bits 0-1, 5-7) belong to test 17 (E_INVAL) and are
+    // out of scope here.
+    const caller_field0 = cd.user_table[SELF_HANDLE_SLOT].field0;
+    const caller_port_ceiling: u8 = @truncate((caller_field0 >> 48) & 0xFF);
+    const requested_port_ceiling: u8 = @truncate((ceilings_inner >> 48) & 0xFF);
+    if (requested_port_ceiling & ~caller_port_ceiling != 0) {
+        cd_ref.unlock();
+        return errors.E_PERM;
+    }
+
     const elf_slot: u12 = @truncate(elf_pf_slot);
     if (capability.resolveHandleOnDomain(cd, elf_slot, .page_frame) == null) {
         cd_ref.unlock();

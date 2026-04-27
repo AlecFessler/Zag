@@ -307,14 +307,15 @@ fn selfHandleLacksCrpf(ec: *ExecutionContext) bool {
 }
 
 /// Spec §[create_page_frame] test 02: returns E_PERM if caps' r/w/x
-/// bits are not a subset of the caller's `pf_ceiling.max_rwx`. The
-/// pf_ceiling lives in the self-handle's field0 at bits 32..47, with
-/// `max_rwx` in bits 40..42 and `max_sz` in bits 43..44 per
-/// spec §[capability_domain] field0 layout.
+/// bits are not a subset of the caller's `pf_ceiling.max_rwx`. Per
+/// §[create_capability_domain] [2] ceilings_inner — pf_ceiling lives
+/// at field0 bits 32..39 with `max_rwx` at bits 32..34 and `max_sz`
+/// at bits 35..36. (Self-handle field0 layout matches the [2] arg
+/// layout verbatim per the syscall doc.)
 fn rwxIsSubsetOfCeiling(ec: *ExecutionContext, caps_bits: PageFrameCaps) bool {
     const cd = callerDomain(ec);
     const self_field0 = cd.user_table[0].field0;
-    const max_rwx: u3 = @truncate((self_field0 >> 40) & 0b111);
+    const max_rwx: u3 = @truncate((self_field0 >> 32) & 0b111);
     const requested_rwx: u3 = (@as(u3, @intFromBool(caps_bits.r))) |
         (@as(u3, @intFromBool(caps_bits.w)) << 1) |
         (@as(u3, @intFromBool(caps_bits.x)) << 2);
@@ -323,10 +324,10 @@ fn rwxIsSubsetOfCeiling(ec: *ExecutionContext, caps_bits: PageFrameCaps) bool {
 
 /// Spec §[create_page_frame] test 03: returns E_PERM if `caps.max_sz`
 /// exceeds the caller's `pf_ceiling.max_sz`. Stored in self-handle
-/// field0 bits 43..44.
+/// field0 bits 35..36 per §[create_capability_domain] [2] layout.
 fn maxSzWithinCeiling(ec: *ExecutionContext, caps_bits: PageFrameCaps) bool {
     const cd = callerDomain(ec);
     const self_field0 = cd.user_table[0].field0;
-    const ceiling_max_sz: u2 = @truncate((self_field0 >> 43) & 0b11);
+    const ceiling_max_sz: u2 = @truncate((self_field0 >> 35) & 0b11);
     return caps_bits.max_sz <= ceiling_max_sz;
 }
