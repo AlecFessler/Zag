@@ -44,12 +44,16 @@ pub const CANCELLED: u64 = std.math.maxInt(u64);
 /// cancellation sentinel.
 pub const COUNTER_CEILING: u64 = std.math.maxInt(u64) - 1;
 
-/// Spec error codes used by this module.
-const E_PERM: i64 = -12;
-const E_BADCAP: i64 = -3;
-const E_INVAL: i64 = -7;
-const E_NOMEM: i64 = -10;
-const E_FULL: i64 = -6;
+/// Spec error codes used by this module. Spec v3 §[error_codes]:
+/// errors are positive integers returned in vreg 1; sign is not a
+/// success discriminator. Mirror the values from `syscall.errors`
+/// rather than re-declaring negatives (which crossed wires with
+/// userspace expecting the spec-positive values).
+const E_PERM: i64 = zag.syscall.errors.E_PERM;
+const E_BADCAP: i64 = zag.syscall.errors.E_BADCAP;
+const E_INVAL: i64 = zag.syscall.errors.E_INVAL;
+const E_NOMEM: i64 = zag.syscall.errors.E_NOMEM;
+const E_FULL: i64 = zag.syscall.errors.E_FULL;
 
 /// Reserved-bit masks for the public ABI.
 const TIMER_CAPS_RESERVED_MASK: u64 = 0xFFFF_FFFF_FFFF_0000;
@@ -373,15 +377,28 @@ fn callerDomain(caller: *anyopaque) ?*CapabilityDomain {
     return dom;
 }
 
+/// Read the slot-0 self-handle `timer` cap bit. Spec §[capability_domain]
+/// self-handle cap layout — `timer` at bit 12 of the cap word — and
+/// §[timer_arm] "Self-handle cap required: `timer`".
 fn callerHasTimerCap(cd: *CapabilityDomain) bool {
-    _ = cd;
-    return true;
+    const caps_word: u16 = capability.Word0.caps(cd.user_table[0].word0);
+    return (caps_word & (1 << 12)) != 0;
 }
 
+/// Enforce §[restart_semantics] test 08 / §[timer_arm] test 02:
+/// when the requested timer caps include `restart_policy = 1`
+/// (TimerCaps bit 4) the calling domain's self-handle
+/// `restart_policy_ceiling.tm_restart_max` must be 1. The ceiling
+/// lives in slot-0's field1 at bit 25 (the 16-bit
+/// `restart_policy_ceiling` block occupies field1 bits 16-31, and
+/// `tm_restart_max` is bit 9 within that block — i.e., bit 25 of
+/// field1). Spec §[capability_domain] field1 layout.
 fn checkRestartPolicyCeiling(cd: *CapabilityDomain, requested: u16) bool {
-    _ = cd;
-    _ = requested;
-    return true;
+    const requested_keep: bool = (requested & (1 << 4)) != 0;
+    if (!requested_keep) return true;
+    const f1 = cd.user_table[0].field1;
+    const tm_restart_max: u1 = @truncate((f1 >> 25) & 0x1);
+    return tm_restart_max == 1;
 }
 
 fn resolveTimerHandle(cd: *CapabilityDomain, handle: u64, expected: CapabilityType) ?TimerLookup {
