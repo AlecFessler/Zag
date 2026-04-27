@@ -161,16 +161,6 @@ pub fn registerPortIo(base_port: u16, port_count: u16) !*DeviceRegion {
     return dr;
 }
 
-/// Increment the refcount of an already-live region. Caller passes
-/// `dr._gen_lock` already held; this fn releases it before returning.
-/// Used when a new KernelHandle is minted for an existing region
-/// (handle copy, transfer-in via reply).
-pub fn incHandleRef(dr: *DeviceRegion) void {
-    std.debug.assert(dr.refcount > 0);
-    dr.refcount += 1;
-    dr._gen_lock.unlock();
-}
-
 /// Public release-handle entry point invoked from the cross-cutting
 /// `caps.capability.delete` path. Acquires `dr._gen_lock` and routes
 /// through the standard `decHandleRef` which owns the teardown

@@ -204,15 +204,6 @@ fn destroyPageFrame(pf: *PageFrame) void {
     }
 }
 
-/// Handle copy/transfer: increment refcount under `_gen_lock`.
-fn incHandleRef(pf: *PageFrame) void {
-    pf._gen_lock.lock(@src());
-    defer pf._gen_lock.unlock();
-    // Saturate to keep refcount overflow from aliasing a destroy
-    // decision against a still-live holder.
-    if (pf.refcount != std.math.maxInt(u32)) pf.refcount += 1;
-}
-
 /// Handle delete: decrement refcount under `_gen_lock`; if both
 /// refcount and mapcnt are zero, calls `destroyPageFrame`.
 fn decHandleRef(pf: *PageFrame) void {

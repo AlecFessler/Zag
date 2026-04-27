@@ -821,28 +821,6 @@ fn deliverReplyTransferResume(
     execution_context.resumeFromReply(sender, sender.originating_write_cap);
 }
 
-/// `bind_event_route` syscall handler. Spec §[event_route].bind_event_route.
-///
-/// Top-level entry kept for symmetry with the syscall surface; the
-/// real per-call work happens in syscall/event_route.zig which routes
-/// into `installEventRoute` below after locking caller, target EC, and
-/// destination port.
-pub fn bindEventRoute(caller: *ExecutionContext, target: u64, event_type_raw: u64, port: u64) i64 {
-    _ = caller;
-    _ = target;
-    _ = event_type_raw;
-    _ = port;
-    return errors.E_INVAL;
-}
-
-/// `clear_event_route` syscall handler. Spec §[event_route].clear_event_route.
-pub fn clearEventRoute(caller: *ExecutionContext, target: u64, event_type_raw: u64) i64 {
-    _ = caller;
-    _ = target;
-    _ = event_type_raw;
-    return errors.E_INVAL;
-}
-
 /// Install `port` as `ec.event_routes[slot_idx]`, replacing any prior
 /// binding. Caller has already locked `ec` and `port` and validated caps.
 /// Bumps `port.event_route_count` and decrements the prior port's

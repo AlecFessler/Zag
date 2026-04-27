@@ -380,26 +380,8 @@ pub fn sync(caller: *anyopaque, handle: u64) i64 {
 /// (Capability, KernelHandle) entries, validating reserved bits, that
 /// the slot is in-use, and that the type tag matches `expected`.
 ///
-/// Caller-facing variant — extracts the calling domain from `caller`
-/// (an `*ExecutionContext`), validates the handle's encoding, and
-/// returns the kernel entry. Per-object syscall handlers use this to
-/// gate their argument before doing any work.
-pub fn resolveHandle(caller: *anyopaque, handle: u64, expected: CapabilityType) ?*KernelHandle {
-    if (handle & ~HANDLE_ARG_MASK != 0) return null;
-
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return null;
-    defer cd_ref.unlock();
-
-    const slot: u12 = @truncate(handle);
-    return resolveHandleOnDomain(cd, slot, expected);
-}
-
-/// Domain-direct variant of `resolveHandle`. The caller has already
-/// locked the domain and recovered `*CapabilityDomain`. `expected ==
-/// null` skips the type-tag check (used by `restrict`/`delete`/
-/// `revoke`/`sync` which all accept any type).
+/// `expected == null` skips the type-tag check (used by
+/// `restrict`/`delete`/`revoke`/`sync` which all accept any type).
 pub fn resolveHandleOnDomain(
     cd: *CapabilityDomain,
     slot: u12,

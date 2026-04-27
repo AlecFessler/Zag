@@ -387,13 +387,6 @@ fn destroyTimer(t: *Timer) void {
     slab_instance.destroy(t, gen) catch {};
 }
 
-/// Handle copy: increment refcount under `_gen_lock`.
-pub fn incHandleRef(t: *Timer) void {
-    t._gen_lock.lock(@src());
-    defer t._gen_lock.unlock();
-    t.refcount +|= 1;
-}
-
 /// Handle delete: decrement under `_gen_lock`; teardown at 0.
 pub fn decHandleRef(t: *Timer) void {
     t._gen_lock.lock(@src());
