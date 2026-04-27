@@ -450,6 +450,19 @@ fn attachIntra(
         _ = try alias_index.getOrPutValue(a.key, a.target);
     }
 
+    // qname → return-type-qname index. Used by `inferInitType` so a local
+    // bound to a call expression (`const port_ref = capability.typedRef(...)
+    // orelse ...;`) gets stamped with the call's return type, which the
+    // receiver resolver then walks for downstream `port_ref.method(...)`.
+    // First-write-wins; functions whose return type didn't reduce to a
+    // struct qname are simply omitted (empty value would only confuse the
+    // consumer).
+    var fn_return_type_index = branches.FnReturnTypeIndex.init(arena);
+    for (ast_fns) |af| {
+        if (af.return_type_qname.len == 0) continue;
+        _ = try fn_return_type_index.getOrPutValue(af.qualified_name, af.return_type_qname);
+    }
+
     // qname → AstFunction lookup. Used by the all-callers-agree pass to
     // (a) find AST-only inline fns with fn-pointer params (the substitution
     //     targets), and
@@ -549,6 +562,7 @@ fn attachIntra(
             af.receiver_type,
             pb_opt,
             &alias_index,
+            &fn_return_type_index,
         ) catch &.{};
     }
 }

@@ -63,11 +63,41 @@ pub const Ctx = struct {
     by_name: *const std.StringHashMap(*const Function),
     hide_debug: bool,
     hide_library: bool,
+    /// When true, drop `debug.assert`, `debug.FullPanic.*`, and
+    /// `builtin.returnError` calls entirely — no trace line at all. These
+    /// are 0-signal noise in most investigations (every fallible path has
+    /// a `returnError`; every guarded one has an `assert`); folding them
+    /// to a `%` or `=` leaf still costs a line per occurrence. Default
+    /// true. Pass false when explicitly investigating panic / failure
+    /// sites.
+    hide_assertions: bool = true,
+    /// When true, skip `&<bare_ident>` lines whose target name is a single
+    /// identifier (no dots, no parens). Such lines are usually argument
+    /// captures or struct-field references that the IR analyzer flagged as
+    /// indirect calls but that don't actually resolve to a callsite — they
+    /// dominate trace output (~25-35% of lines) without carrying signal.
+    /// Real fn-pointer / vtable indirect calls (anything with a dotted or
+    /// expression-shaped name) are still rendered.
+    hide_ref_captures: bool = true,
     /// Patterns folded as `-` leaves in the trace. Each pattern is either
     /// a literal substring or ends in `.*` to mean "anything starting with
     /// this prefix". Empty when no excludes were requested.
     excludes: []const []const u8 = &.{},
 };
+
+/// True when `name` looks like a bare identifier (`self`, `p`, `buckets`),
+/// not a real call expression (`foo.bar.baz`, `vt.fp[i]`). Such names usually
+/// come from the IR analyzer mis-classifying an argument capture as an
+/// indirect call.
+pub fn isTrivialRefCapture(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
 
 /// Check whether `name` matches any of the exclude patterns. Patterns
 /// ending in `.*` are treated as prefix matches; otherwise substring.
@@ -193,7 +223,11 @@ pub fn renderTrace(
 /// function-name payload.
 ///
 /// Tags:
-///   `^`  function at depth cap (payload: name)
+///   `^`  function at depth cap, body has callees (payload: name; trace
+///        deeper to expand)
+///   `@`  function with no callees in its body — typically AST-only
+///        helpers the compiler inlined away. Never expands further;
+///        deepening the trace will not help. (payload: name)
 ///   `~`  recursion-stopped fn (payload: name)
 ///   `&`  indirect call (payload: expression)
 ///   `!`  unresolved call (payload: name)
@@ -204,7 +238,10 @@ pub fn renderTrace(
 ///   `>`  branch arm (payload: label, truncated at 80 chars)
 ///
 /// Header line (always first):
-///   `T fns=N cap=N d=N[ top=<name>/<count>]`
+///   `T fns=N cap=N d=N[ top=<name>/<count>][ cap_top=<n1>/<c1>,<n2>/<c2>,...]`
+/// `cap_top` lists up to 3 fns reached at the depth cap, sorted by call-site
+/// count desc. Tells the caller exactly which fn(s) to deepen next instead
+/// of cranking depth blindly.
 pub fn renderTraceCompact(
     arena: std.mem.Allocator,
     out: *std.io.Writer,
@@ -217,10 +254,30 @@ pub fn renderTraceCompact(
     if (stats.top_fanout > 0) {
         try out.print(" top={s}/{d}", .{ stats.top_name, stats.top_fanout });
     }
+    if (stats.cap_top.len > 0) {
+        try out.writeAll(" cap_top=");
+        for (stats.cap_top, 0..) |e, i| {
+            if (i > 0) try out.writeByte(',');
+            try out.print("{s}/{d}", .{ e.name, e.count });
+        }
+    }
     try out.writeAll("\n");
 
+    // Two distinct fn-id sets:
+    //   `visited`  — ancestors on the current call path. Push on descend,
+    //                pop on return. Catches recursion (same fn calling
+    //                itself transitively) and emits `~name`.
+    //   `rendered` — every fn whose body we've already expanded ANYWHERE
+    //                in this trace. Never pruned. Catches sibling repeats
+    //                (e.g. SlabRef.unlock called 6× under the same parent)
+    //                and collapses them to `~name` instead of re-emitting
+    //                the same subtree. Both sets reuse the `~` tag — the
+    //                semantic ("look elsewhere for the body") is the same;
+    //                the agent doesn't need to distinguish ancestor cycle
+    //                from already-shown sibling.
     var visited = std.AutoHashMap(FnId, void).init(arena);
-    try compactFn(out, ctx, root, 0, max_depth, &visited);
+    var rendered = std.AutoHashMap(FnId, void).init(arena);
+    try compactFn(out, ctx, root, 0, max_depth, &visited, &rendered);
 }
 
 fn compactDepth(out: *std.io.Writer, depth: u32) !void {
@@ -238,12 +295,19 @@ fn compactFn(
     depth: u32,
     max_depth: u32,
     visited: *std.AutoHashMap(FnId, void),
+    rendered: *std.AutoHashMap(FnId, void),
 ) RenderError!void {
     try compactDepth(out, depth);
     try out.writeAll(f.name);
     try out.writeAll("\n");
+    // Mark this fn as rendered before walking its body so descendants that
+    // call back into f collapse via the rendered-set check (in addition to
+    // the visited-set ancestor check, which would also fire). Putting the
+    // mark here — instead of in compactCall before the recursion — also
+    // covers the root, which compactCall never sees.
+    try rendered.put(f.id, {});
     for (f.intra) |atom| {
-        try compactAtom(out, ctx, atom, depth + 1, max_depth, visited);
+        try compactAtom(out, ctx, atom, depth + 1, max_depth, visited, rendered);
     }
 }
 
@@ -254,11 +318,12 @@ fn compactAtom(
     depth: u32,
     max_depth: u32,
     visited: *std.AutoHashMap(FnId, void),
+    rendered: *std.AutoHashMap(FnId, void),
 ) RenderError!void {
     switch (atom) {
-        .call => |c| try compactCall(out, ctx, c, depth, max_depth, visited),
-        .branch => |b| try compactBranch(out, ctx, b, depth, max_depth, visited),
-        .loop => |l| try compactLoop(out, ctx, l, depth, max_depth, visited),
+        .call => |c| try compactCall(out, ctx, c, depth, max_depth, visited, rendered),
+        .branch => |b| try compactBranch(out, ctx, b, depth, max_depth, visited, rendered),
+        .loop => |l| try compactLoop(out, ctx, l, depth, max_depth, visited, rendered),
     }
 }
 
@@ -276,7 +341,11 @@ fn compactCall(
     depth: u32,
     max_depth: u32,
     visited: *std.AutoHashMap(FnId, void),
+    rendered: *std.AutoHashMap(FnId, void),
 ) RenderError!void {
+    if (ctx.hide_assertions and isAssertionName(c.name)) {
+        return;
+    }
     if (ctx.hide_debug and isDebugName(c.name)) {
         return compactTagLine(out, depth, '%', c.name);
     }
@@ -284,6 +353,9 @@ fn compactCall(
     if (c.to) |id| fp = ctx.by_id.get(id);
     if (fp == null) fp = ctx.by_name.get(c.name);
     if (fp == null) {
+        if (c.kind == .indirect and ctx.hide_ref_captures and isTrivialRefCapture(c.name)) {
+            return;
+        }
         const tag: u8 = if (c.kind == .indirect) '&' else '!';
         return compactTagLine(out, depth, tag, c.name);
     }
@@ -297,12 +369,24 @@ fn compactCall(
     if (visited.contains(f.id)) {
         return compactTagLine(out, depth, '~', f.name);
     }
+    // Sibling-repeat collapse: if we've already rendered this fn's body
+    // somewhere earlier in the trace, emit `~name` instead of re-expanding
+    // the same subtree. Most kernel paths show this with hot helpers like
+    // SlabRef.unlock or mintReply being called several times under one
+    // parent; pre-dedup, the trace re-emitted the identical 3–4 line
+    // subtree per occurrence.
+    if (rendered.contains(f.id)) {
+        return compactTagLine(out, depth, '~', f.name);
+    }
+    if (f.intra.len == 0) {
+        return compactTagLine(out, depth, '@', f.name);
+    }
     if (depth + 1 >= max_depth) {
         return compactTagLine(out, depth, '^', f.name);
     }
     try visited.put(f.id, {});
     defer _ = visited.remove(f.id);
-    try compactFn(out, ctx, f, depth, max_depth, visited);
+    try compactFn(out, ctx, f, depth, max_depth, visited, rendered);
 }
 
 fn compactBranch(
@@ -312,6 +396,7 @@ fn compactBranch(
     depth: u32,
     max_depth: u32,
     visited: *std.AutoHashMap(FnId, void),
+    rendered: *std.AutoHashMap(FnId, void),
 ) RenderError!void {
     const kind: []const u8 = switch (b.kind) {
         .if_else => "if_else",
@@ -320,7 +405,7 @@ fn compactBranch(
     try compactTagLine(out, depth, '?', kind);
     for (b.arms) |arm| {
         try compactTagLine(out, depth + 1, '>', shorten(arm.label, 80));
-        for (arm.seq) |a| try compactAtom(out, ctx, a, depth + 2, max_depth, visited);
+        for (arm.seq) |a| try compactAtom(out, ctx, a, depth + 2, max_depth, visited, rendered);
     }
 }
 
@@ -331,9 +416,10 @@ fn compactLoop(
     depth: u32,
     max_depth: u32,
     visited: *std.AutoHashMap(FnId, void),
+    rendered: *std.AutoHashMap(FnId, void),
 ) RenderError!void {
     try compactTagLine(out, depth, '*', "");
-    for (l.body) |a| try compactAtom(out, ctx, a, depth + 1, max_depth, visited);
+    for (l.body) |a| try compactAtom(out, ctx, a, depth + 1, max_depth, visited, rendered);
 }
 
 /// Quick stats from a stats-only walk over the trace tree, mirroring the
@@ -353,6 +439,15 @@ pub const TraceStats = struct {
     top_name: []const u8 = "",
     top_loc: SourceLoc = .{ .file = "", .line = 0 },
     top_fanout: u32 = 0,
+    /// Top capped fns ordered by how many call sites reach them at the
+    /// depth cap. Lets the trace header tell the caller WHERE to deepen
+    /// without scanning the body. Only populated when at_cap > 0.
+    cap_top: []const CapEntry = &.{},
+
+    pub const CapEntry = struct {
+        name: []const u8,
+        count: u32,
+    };
 };
 
 /// Walk the trace tree rooted at `root` mirroring `renderTrace`'s pruning
@@ -364,10 +459,40 @@ pub fn statsTrace(
     root: *const Function,
     max_depth: u32,
 ) !TraceStats {
+    // Mirror the rendering walk's two sets so the header summary matches
+    // what the rendered tree actually contains. `rendered` persists across
+    // siblings so a fn called many times under one parent counts once.
     var visited = std.AutoHashMap(FnId, void).init(arena);
+    var rendered = std.AutoHashMap(FnId, void).init(arena);
     var stats: TraceStats = .{};
-    try statsFn(ctx, root, 0, max_depth, &visited, &stats);
+    var cap_counts = std.StringHashMap(u32).init(arena);
+    try statsFn(ctx, root, 0, max_depth, &visited, &rendered, &stats, &cap_counts);
+    stats.cap_top = try topCapNames(arena, &cap_counts, 3);
     return stats;
+}
+
+fn topCapNames(
+    arena: std.mem.Allocator,
+    counts: *const std.StringHashMap(u32),
+    limit: usize,
+) ![]TraceStats.CapEntry {
+    if (counts.count() == 0) return &.{};
+    var all = try arena.alloc(TraceStats.CapEntry, counts.count());
+    var i: usize = 0;
+    var it = counts.iterator();
+    while (it.next()) |e| {
+        all[i] = .{ .name = e.key_ptr.*, .count = e.value_ptr.* };
+        i += 1;
+    }
+    const Sorter = struct {
+        fn lt(_: void, a: TraceStats.CapEntry, b: TraceStats.CapEntry) bool {
+            if (a.count != b.count) return a.count > b.count;
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    };
+    std.mem.sort(TraceStats.CapEntry, all, {}, Sorter.lt);
+    const n = @min(all.len, limit);
+    return all[0..n];
 }
 
 fn statsFn(
@@ -376,9 +501,12 @@ fn statsFn(
     depth: u32,
     max_depth: u32,
     visited: *std.AutoHashMap(FnId, void),
+    rendered: *std.AutoHashMap(FnId, void),
     stats: *TraceStats,
+    cap_counts: *std.StringHashMap(u32),
 ) std.mem.Allocator.Error!void {
     stats.fns_visited += 1;
+    try rendered.put(f.id, {});
     // Fanout = number of *visible* call atoms in this function's body, after
     // pruning rules. Counts calls inside branches and loops too. This is the
     // metric that matches what the trace would actually render — IR
@@ -389,7 +517,7 @@ fn statsFn(
         stats.top_name = f.name;
         stats.top_loc = f.def_loc;
     }
-    for (f.intra) |atom| try statsAtom(ctx, atom, depth + 1, max_depth, visited, stats);
+    for (f.intra) |atom| try statsAtom(ctx, atom, depth + 1, max_depth, visited, rendered, stats, cap_counts);
 }
 
 fn countVisibleCalls(ctx: Ctx, atoms: []const Atom) u32 {
@@ -397,6 +525,7 @@ fn countVisibleCalls(ctx: Ctx, atoms: []const Atom) u32 {
     for (atoms) |atom| {
         switch (atom) {
             .call => |c| {
+                if (ctx.hide_assertions and isAssertionName(c.name)) continue;
                 if (ctx.hide_debug and isDebugName(c.name)) continue;
                 var fp: ?*const Function = null;
                 if (c.to) |id| fp = ctx.by_id.get(id);
@@ -422,17 +551,19 @@ fn statsAtom(
     depth: u32,
     max_depth: u32,
     visited: *std.AutoHashMap(FnId, void),
+    rendered: *std.AutoHashMap(FnId, void),
     stats: *TraceStats,
+    cap_counts: *std.StringHashMap(u32),
 ) std.mem.Allocator.Error!void {
     switch (atom) {
-        .call => |c| try statsCall(ctx, c, depth, max_depth, visited, stats),
+        .call => |c| try statsCall(ctx, c, depth, max_depth, visited, rendered, stats, cap_counts),
         .branch => |b| {
             for (b.arms) |arm| {
-                for (arm.seq) |a| try statsAtom(ctx, a, depth, max_depth, visited, stats);
+                for (arm.seq) |a| try statsAtom(ctx, a, depth, max_depth, visited, rendered, stats, cap_counts);
             }
         },
         .loop => |l| {
-            for (l.body) |a| try statsAtom(ctx, a, depth, max_depth, visited, stats);
+            for (l.body) |a| try statsAtom(ctx, a, depth, max_depth, visited, rendered, stats, cap_counts);
         },
     }
 }
@@ -443,8 +574,11 @@ fn statsCall(
     depth: u32,
     max_depth: u32,
     visited: *std.AutoHashMap(FnId, void),
+    rendered: *std.AutoHashMap(FnId, void),
     stats: *TraceStats,
+    cap_counts: *std.StringHashMap(u32),
 ) std.mem.Allocator.Error!void {
+    if (ctx.hide_assertions and isAssertionName(c.name)) return;
     if (ctx.hide_debug and isDebugName(c.name)) return;
     var fp: ?*const Function = null;
     if (c.to) |id| fp = ctx.by_id.get(id);
@@ -454,13 +588,29 @@ fn statsCall(
     if (ctx.excludes.len > 0 and matchExclude(f.name, ctx.excludes)) return;
     if (ctx.hide_library and isLibrary(f.name)) return;
     if (visited.contains(f.id)) return;
+    // Sibling-repeat collapse: mirror compactCall's `rendered` check so
+    // the header counts (fns/at_cap/cap_top) describe what's actually in
+    // the body. A repeat sibling is rendered as `~name`, not as a fresh
+    // descent or a `^` cap leaf, so it shouldn't bump fns_visited or at_cap.
+    if (rendered.contains(f.id)) return;
+    if (f.intra.len == 0) {
+        // No-body leaf — counted as visited (it appears in the rendered
+        // tree as `@name`) but never as `at_cap`, since deepening will
+        // not expand it.
+        stats.fns_visited += 1;
+        try rendered.put(f.id, {});
+        return;
+    }
     if (depth + 1 >= max_depth) {
         stats.at_cap += 1;
+        const gop = try cap_counts.getOrPut(f.name);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
         return;
     }
     try visited.put(f.id, {});
     defer _ = visited.remove(f.id);
-    try statsFn(ctx, f, depth, max_depth, visited, stats);
+    try statsFn(ctx, f, depth, max_depth, visited, rendered, stats, cap_counts);
 }
 
 fn renderFn(
@@ -522,6 +672,9 @@ fn renderCall(
     if (c.to) |id| fp = ctx.by_id.get(id);
     if (fp == null) fp = ctx.by_name.get(c.name);
 
+    if (ctx.hide_assertions and isAssertionName(c.name)) {
+        return;
+    }
     if (ctx.hide_debug and isDebugName(c.name)) {
         try writePaddedName(out, prefixSpaces(indent), "↓ debug", c.name);
         try writeLoc(out, c.site, "@ ");
@@ -530,6 +683,9 @@ fn renderCall(
     }
 
     if (fp == null) {
+        if (c.kind == .indirect and ctx.hide_ref_captures and isTrivialRefCapture(c.name)) {
+            return;
+        }
         if (c.kind == .indirect) {
             try writePaddedName(out, prefixSpaces(indent), "? indirect", c.name);
         } else {
@@ -639,6 +795,8 @@ fn renderLoop(
 /// module) are suppressed unless `include_intra` is set — at the layering
 /// granularity people usually care about, the inter-module edges are the
 /// signal.
+pub const ModuleDirection = enum { out, in, both };
+
 pub fn renderModuleGraph(
     allocator: std.mem.Allocator,
     out: *std.io.Writer,
@@ -646,6 +804,9 @@ pub fn renderModuleGraph(
     maps: Maps,
     level: u32,
     include_intra: bool,
+    min_edges: u32,
+    exclude_external: bool,
+    direction: ModuleDirection,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -670,51 +831,147 @@ pub fn renderModuleGraph(
         try collectModuleEdgesFromAtoms(arena, &edges, &fn_module, &module_pool, &maps, src_mod, f.intra, level);
     }
 
-    const Edge = struct { src: []const u8, dst: []const u8, count: u32 };
     var edge_list = std.ArrayList(Edge){};
     defer edge_list.deinit(arena);
 
+    var hidden_edges: u32 = 0;
+    var hidden_external: u32 = 0;
     var it = edges.iterator();
     while (it.next()) |e| {
         const sep = std.mem.indexOfScalar(u8, e.key_ptr.*, 0) orelse continue;
         const src = e.key_ptr.*[0..sep];
         const dst = e.key_ptr.*[sep + 1 ..];
         if (!include_intra and std.mem.eql(u8, src, dst)) continue;
+        if (exclude_external and isExternalModule(src, dst)) {
+            hidden_external += 1;
+            continue;
+        }
+        if (e.value_ptr.* < min_edges) {
+            hidden_edges += 1;
+            continue;
+        }
         try edge_list.append(arena, .{ .src = src, .dst = dst, .count = e.value_ptr.* });
     }
 
-    std.mem.sort(Edge, edge_list.items, {}, struct {
-        fn lt(_: void, a: Edge, b: Edge) bool {
-            const c = std.mem.order(u8, a.src, b.src);
-            if (c != .eq) return c == .lt;
-            if (a.count != b.count) return a.count > b.count;
-            return std.mem.order(u8, a.dst, b.dst) == .lt;
-        }
-    }.lt);
-
     var unique_modules = std.StringHashMap(void).init(arena);
     var fm_it = fn_module.valueIterator();
-    while (fm_it.next()) |m| try unique_modules.put(m.*, {});
-
-    try out.print(
-        "module graph (level={d}{s}): {d} modules, {d} edges\n\n",
-        .{
-            level,
-            if (include_intra) "" else "; intra suppressed",
-            unique_modules.count(),
-            edge_list.items.len,
-        },
-    );
-
-    var prev_src: []const u8 = "";
-    for (edge_list.items) |e| {
-        if (!std.mem.eql(u8, e.src, prev_src)) {
-            if (prev_src.len > 0) try out.writeAll("\n");
-            try out.print("{s}\n", .{e.src});
-            prev_src = e.src;
-        }
-        try out.print("  -> {s} ({d})\n", .{ e.dst, e.count });
+    while (fm_it.next()) |m| {
+        if (exclude_external and isExternalModule(m.*, m.*)) continue;
+        try unique_modules.put(m.*, {});
     }
+
+    const total_edges = edge_list.items.len + hidden_edges + hidden_external;
+    if (hidden_edges == 0 and hidden_external == 0) {
+        try out.print(
+            "module graph (level={d}{s}{s}{s}; direction={s}): {d} modules, {d} edges",
+            .{
+                level,
+                if (include_intra) "" else "; intra suppressed",
+                if (min_edges > 1) "; min_edges>1" else "",
+                if (exclude_external) "; external excluded" else "",
+                @tagName(direction),
+                unique_modules.count(),
+                edge_list.items.len,
+            },
+        );
+    } else {
+        try out.print(
+            "module graph (level={d}{s}{s}{s}; direction={s}): {d} modules, {d} of {d} edges shown",
+            .{
+                level,
+                if (include_intra) "" else "; intra suppressed",
+                if (min_edges > 1) "; min_edges>1" else "",
+                if (exclude_external) "; external excluded" else "",
+                @tagName(direction),
+                unique_modules.count(),
+                edge_list.items.len,
+                total_edges,
+            },
+        );
+    }
+    if (hidden_edges > 0 or hidden_external > 0) {
+        try out.writeAll(" (");
+        var wrote = false;
+        if (hidden_external > 0) {
+            try out.print("{d} to/from external", .{hidden_external});
+            wrote = true;
+        }
+        if (hidden_edges > 0) {
+            if (wrote) try out.writeAll(", ");
+            try out.print("{d} below min_edges={d}", .{ hidden_edges, min_edges });
+        }
+        try out.writeAll(" hidden)");
+    }
+    try out.writeAll("\n\n");
+
+    if (direction == .out or direction == .both) {
+        if (direction == .both) try out.writeAll("# outbound (src -> dst)\n\n");
+        try renderModuleEdgeList(out, edge_list.items, .out, arena);
+    }
+    if (direction == .both) try out.writeAll("\n");
+    if (direction == .in or direction == .both) {
+        if (direction == .both) try out.writeAll("# inbound (dst <- src)\n\n");
+        try renderModuleEdgeList(out, edge_list.items, .in, arena);
+    }
+}
+
+fn renderModuleEdgeList(
+    out: *std.io.Writer,
+    edges: []const Edge,
+    direction: ModuleDirection,
+    arena: std.mem.Allocator,
+) !void {
+    // Take a private mutable copy and sort it for the direction we're about
+    // to render — `out` groups by src, `in` groups by dst.
+    const sorted = try arena.dupe(Edge, edges);
+    if (direction == .in) {
+        std.mem.sort(Edge, sorted, {}, struct {
+            fn lt(_: void, a: Edge, b: Edge) bool {
+                const c = std.mem.order(u8, a.dst, b.dst);
+                if (c != .eq) return c == .lt;
+                if (a.count != b.count) return a.count > b.count;
+                return std.mem.order(u8, a.src, b.src) == .lt;
+            }
+        }.lt);
+        var prev_dst: []const u8 = "";
+        for (sorted) |e| {
+            if (!std.mem.eql(u8, e.dst, prev_dst)) {
+                if (prev_dst.len > 0) try out.writeAll("\n");
+                try out.print("{s}\n", .{e.dst});
+                prev_dst = e.dst;
+            }
+            try out.print("  <- {s} ({d})\n", .{ e.src, e.count });
+        }
+    } else {
+        std.mem.sort(Edge, sorted, {}, struct {
+            fn lt(_: void, a: Edge, b: Edge) bool {
+                const c = std.mem.order(u8, a.src, b.src);
+                if (c != .eq) return c == .lt;
+                if (a.count != b.count) return a.count > b.count;
+                return std.mem.order(u8, a.dst, b.dst) == .lt;
+            }
+        }.lt);
+        var prev_src: []const u8 = "";
+        for (sorted) |e| {
+            if (!std.mem.eql(u8, e.src, prev_src)) {
+                if (prev_src.len > 0) try out.writeAll("\n");
+                try out.print("{s}\n", .{e.src});
+                prev_src = e.src;
+            }
+            try out.print("  -> {s} ({d})\n", .{ e.dst, e.count });
+        }
+    }
+}
+
+const Edge = struct { src: []const u8, dst: []const u8, count: u32 };
+
+/// True when either endpoint is the synthetic `std` or `external` bucket
+/// produced by `internModule` for non-kernel paths. Used to drop stdlib /
+/// non-kernel noise from the module graph when the caller asks for kernel
+/// layering only.
+fn isExternalModule(src: []const u8, dst: []const u8) bool {
+    return std.mem.eql(u8, src, "std") or std.mem.eql(u8, src, "external") or
+        std.mem.eql(u8, dst, "std") or std.mem.eql(u8, dst, "external");
 }
 
 fn collectModuleEdgesFromAtoms(
@@ -977,6 +1234,20 @@ pub fn isLibrary(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "std.") or
         std.mem.startsWith(u8, name, "builtin.") or
         std.mem.startsWith(u8, name, "compiler_rt.");
+}
+
+/// True for assertion / unrecoverable-error calls that almost never carry
+/// signal in a control-flow investigation: `debug.assert`, every
+/// `debug.FullPanic.*` variant, and `builtin.returnError`. Used by the
+/// `hide_assertions` filter to drop these calls entirely (no fold leaf
+/// either) — they otherwise dominate ~10–25% of lines in syscall traces.
+pub fn isAssertionName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "debug.assert")) return true;
+    if (std.mem.endsWith(u8, name, ".debug.assert")) return true;
+    if (std.mem.startsWith(u8, name, "debug.FullPanic.")) return true;
+    if (std.mem.indexOf(u8, name, ".debug.FullPanic.") != null) return true;
+    if (std.mem.eql(u8, name, "builtin.returnError")) return true;
+    return false;
 }
 
 pub fn kindLabel(k: EntryKind) []const u8 {

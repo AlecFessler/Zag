@@ -63,6 +63,12 @@ const ServerState = struct {
     /// Per-arch render lookup tables (by_id + by_name). Built once at
     /// startup; reused across requests. Key matches the arch tag.
     lookups: std.StringHashMap(render.Maps),
+    /// Wall-clock unix seconds when the IR was loaded into this daemon.
+    /// Used to compute an "index age" footer on MCP-targeted responses so
+    /// agents notice when the daemon is serving stale graphs (e.g. a
+    /// long-running daemon spawned before a refactor renamed several
+    /// modules). Zero disables the footer entirely.
+    index_built_unix: i64,
 };
 
 pub fn serve(
@@ -72,8 +78,9 @@ pub fn serve(
     git_root: []const u8,
     registry: *commits.Registry,
     port: u16,
+    index_built_unix: i64,
 ) !void {
-    var state = try buildState(allocator, graphs, default_arch, git_root, registry);
+    var state = try buildState(allocator, graphs, default_arch, git_root, registry, index_built_unix);
     defer freeState(allocator, &state);
 
     const addr = try std.net.Address.parseIp("127.0.0.1", port);
@@ -111,6 +118,7 @@ fn buildState(
     default_arch: []const u8,
     git_root: []const u8,
     registry: *commits.Registry,
+    index_built_unix: i64,
 ) !ServerState {
     var blobs = std.StringHashMap([]u8).init(allocator);
     errdefer {
@@ -161,6 +169,7 @@ fn buildState(
         .registry = registry,
         .graphs = graphs,
         .lookups = lookups,
+        .index_built_unix = index_built_unix,
     };
 }
 
@@ -364,6 +373,75 @@ fn respondBytes(
     });
 }
 
+/// Index-age threshold (seconds) at which we start adding a freshness footer
+/// to MCP-targeted responses. The kernel changes constantly during dev — a
+/// graph older than this is increasingly likely to disagree with the
+/// working tree (deleted modules, renamed fns, etc.).
+const FRESHNESS_FOOTER_AFTER_SECS: i64 = 60 * 60;
+
+/// Build the freshness footer string for MCP-targeted text responses, or
+/// return null when the index is fresh enough to skip it. Caller owns the
+/// returned slice when non-null.
+fn buildFreshnessFooter(allocator: std.mem.Allocator, state: *const ServerState) !?[]u8 {
+    if (state.index_built_unix == 0) return null;
+    const now = std.time.timestamp();
+    const age_s = now - state.index_built_unix;
+    if (age_s < FRESHNESS_FOOTER_AFTER_SECS) return null;
+    const hours = @divTrunc(age_s, 3600);
+    const minutes = @divTrunc(@mod(age_s, 3600), 60);
+    return try std.fmt.allocPrint(
+        allocator,
+        "\n# index age: {d}h{d:0>2}m — restart the daemon if names look stale\n",
+        .{ hours, minutes },
+    );
+}
+
+/// 400-response body for `unknown arch` errors. Always includes the list
+/// of arches the daemon actually has loaded, so the agent doesn't need a
+/// follow-up `callgraph_arches` round-trip just to recover from a typo or
+/// to discover the alternative tag.
+fn respondUnknownArch(
+    allocator: std.mem.Allocator,
+    state: *const ServerState,
+    request: *std.http.Server.Request,
+) !void {
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "unknown arch (available: ");
+    var first = true;
+    var kit = state.graphs.keyIterator();
+    while (kit.next()) |k| {
+        if (!first) try buf.appendSlice(allocator, ", ");
+        first = false;
+        try buf.appendSlice(allocator, k.*);
+    }
+    try buf.appendSlice(allocator, ")\n");
+    return respondBytes(request, .bad_request, "text/plain; charset=utf-8", buf.items);
+}
+
+/// Like `respondBytes` but for MCP-targeted `text/plain` payloads: appends
+/// the freshness footer when the index has aged past the threshold so an
+/// agent reading the output notices when it might be looking at deleted /
+/// renamed symbols.
+fn respondTextWithFreshness(
+    allocator: std.mem.Allocator,
+    state: *const ServerState,
+    request: *std.http.Server.Request,
+    status: std.http.Status,
+    body: []const u8,
+) !void {
+    const footer_opt = buildFreshnessFooter(allocator, state) catch null;
+    if (footer_opt) |footer| {
+        defer allocator.free(footer);
+        const combined = try allocator.alloc(u8, body.len + footer.len);
+        defer allocator.free(combined);
+        @memcpy(combined[0..body.len], body);
+        @memcpy(combined[body.len..], footer);
+        return respondBytes(request, status, "text/plain; charset=utf-8", combined);
+    }
+    return respondBytes(request, status, "text/plain; charset=utf-8", body);
+}
+
 // ---- Source (JSON with tokenized highlights) -----------------------------
 
 const SourceToken = struct {
@@ -497,6 +575,16 @@ const TraceQuery = struct {
     // Pass `hide_debug=0` / `hide_library=0` to opt back into full fidelity.
     hide_debug: bool = true,
     hide_library: bool = true,
+    /// Default-on: drop `debug.assert`, `debug.FullPanic.*`, and
+    /// `builtin.returnError` calls entirely (no fold leaf either) — these
+    /// are 0-signal in most control-flow investigations and can dominate
+    /// 10–25% of trace lines. Pass `hide_assertions=0` when explicitly
+    /// investigating panic / failure sites.
+    hide_assertions: bool = true,
+    /// Default-on: drop `&<bare_ident>` lines (e.g. `&self`, `&buckets`)
+    /// that are usually argument captures the IR analyzer flagged as
+    /// indirect calls. Pass `hide_ref_captures=0` to keep them.
+    hide_ref_captures: bool = true,
     /// Output format: "text" (default for HTTP, indented tree) or "compact"
     /// (the agent-optimized line format; see render.renderTraceCompact).
     format: []const u8 = "text",
@@ -504,6 +592,12 @@ const TraceQuery = struct {
     /// folded `-` leaves. Empty by default. Supports `module.*` prefix
     /// globs and bare substrings.
     excludes: []const u8 = "",
+    /// Comma-separated list of entry kinds to keep when listing entries.
+    /// Empty = no filter (return all). Recognised kinds match
+    /// `EntryKind`: `syscall`, `irq`, `trap`, `boot`, `manual`. Used by
+    /// `/api/entries` so an agent investigating one subsystem doesn't
+    /// have to post-filter ~70 entries on every orientation call.
+    kind: []const u8 = "",
 };
 
 fn parseTraceQuery(query: []const u8) TraceQuery {
@@ -519,8 +613,11 @@ fn parseTraceQuery(query: []const u8) TraceQuery {
         if (std.mem.eql(u8, k, "depth")) q.depth = std.fmt.parseInt(u32, v, 10) catch q.depth;
         if (std.mem.eql(u8, k, "hide_debug")) q.hide_debug = isTruthy(v);
         if (std.mem.eql(u8, k, "hide_library")) q.hide_library = isTruthy(v);
+        if (std.mem.eql(u8, k, "hide_assertions")) q.hide_assertions = isTruthy(v);
+        if (std.mem.eql(u8, k, "hide_ref_captures")) q.hide_ref_captures = isTruthy(v);
         if (std.mem.eql(u8, k, "format")) q.format = v;
         if (std.mem.eql(u8, k, "exclude") or std.mem.eql(u8, k, "excludes")) q.excludes = v;
+        if (std.mem.eql(u8, k, "kind") or std.mem.eql(u8, k, "kinds")) q.kind = v;
     }
     return q;
 }
@@ -571,12 +668,7 @@ fn handleTrace(
             "text/plain; charset=utf-8",
             "non-HEAD sha not supported by /api/trace yet (HEAD only)\n",
         ),
-        error.UnknownArch => return respondBytes(
-            request,
-            .bad_request,
-            "text/plain; charset=utf-8",
-            "unknown arch (try /api/arches)\n",
-        ),
+        error.UnknownArch => return respondUnknownArch(allocator, state, request),
         else => return err,
     };
 
@@ -612,6 +704,8 @@ fn handleTrace(
         .by_name = &live.maps.by_name,
         .hide_debug = q.hide_debug,
         .hide_library = q.hide_library,
+        .hide_assertions = q.hide_assertions,
+        .hide_ref_captures = q.hide_ref_captures,
         .excludes = excludes_list.items,
     };
     // Stats walk feeds either the JSON wrapper or the text header.
@@ -626,7 +720,7 @@ fn handleTrace(
                 @errorName(err),
             );
         };
-        return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+        return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
     }
 
     if (stats.top_fanout > 0) {
@@ -648,7 +742,7 @@ fn handleTrace(
             @errorName(err),
         );
     };
-    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
 }
 
 fn handleFnSource(
@@ -674,12 +768,7 @@ fn handleFnSource(
             "text/plain; charset=utf-8",
             "non-HEAD sha not supported (HEAD only)\n",
         ),
-        error.UnknownArch => return respondBytes(
-            request,
-            .bad_request,
-            "text/plain; charset=utf-8",
-            "unknown arch\n",
-        ),
+        error.UnknownArch => return respondUnknownArch(allocator, state, request),
         else => return err,
     };
 
@@ -698,7 +787,7 @@ fn handleFnSource(
         "text/plain; charset=utf-8",
         @errorName(err),
     );
-    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
 }
 
 fn handleFind(
@@ -737,25 +826,78 @@ fn handleFind(
             "text/plain; charset=utf-8",
             "non-HEAD sha not supported (HEAD only)\n",
         ),
-        error.UnknownArch => return respondBytes(
-            request,
-            .bad_request,
-            "text/plain; charset=utf-8",
-            "unknown arch\n",
-        ),
+        error.UnknownArch => return respondUnknownArch(allocator, state, request),
         else => return err,
     };
 
+    // Pre-collect matches so we can decide between flat and grouped output
+    // and bound the cost of optional signature extraction. We keep counting
+    // past the limit so the footer can say HOW MANY matches were dropped —
+    // the caller needs that to decide whether to raise `limit` or refine
+    // the query.
+    var matches_buf = std.ArrayList(*const types.Function){};
+    defer matches_buf.deinit(allocator);
+    var total_matches: usize = 0;
+    for (live.graph.functions) |*f| {
+        if (std.mem.indexOf(u8, f.name, needle) == null) continue;
+        total_matches += 1;
+        if (matches_buf.items.len < q_limit) {
+            try matches_buf.append(allocator, f);
+        }
+    }
+    const truncated = total_matches > matches_buf.items.len;
+    const dropped = total_matches - matches_buf.items.len;
+
     var aw = std.io.Writer.Allocating.init(allocator);
     defer aw.deinit();
-    var matches: u32 = 0;
+    if (matches_buf.items.len == 0) {
+        try aw.writer.writeAll("(no matches)\n");
+        return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
+    }
+
+    // Cheap signature extraction — only for small result sets. Bounded by
+    // GROUPED_THRESHOLD so wildcard searches across hundreds of fns don't
+    // open every source file. We cache file contents per-handler so multiple
+    // matches in the same file pay one read.
+    const SIG_BUDGET: usize = 50;
+    var file_cache = std.StringHashMap([]u8).init(allocator);
+    defer {
+        var ci = file_cache.iterator();
+        while (ci.next()) |e| allocator.free(e.value_ptr.*);
+        file_cache.deinit();
+    }
+    const want_sigs = matches_buf.items.len <= SIG_BUDGET;
+
+    // Group when the result set is large: scanning 30+ flat lines for the
+    // right name is much slower than scanning by file. Threshold deliberately
+    // higher than SIG_BUDGET so we never group AND skip signatures.
+    const GROUP_THRESHOLD: usize = 30;
+    const want_group = matches_buf.items.len > GROUP_THRESHOLD;
+
+    if (want_group) {
+        // Sort by (file, name). One header per file, then matches under it.
+        std.mem.sort(*const types.Function, matches_buf.items, {}, struct {
+            fn lt(_: void, a: *const types.Function, b: *const types.Function) bool {
+                const c = std.mem.order(u8, a.def_loc.file, b.def_loc.file);
+                if (c != .eq) return c == .lt;
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.lt);
+    }
+
     var aux_buf: [128]u8 = undefined;
-    for (live.graph.functions) |f| {
-        if (std.mem.indexOf(u8, f.name, needle) == null) continue;
-        // Concatenate entry tag + reach count into the aux column.
-        // `(reached by N)` makes hub functions visually distinct from
-        // local helpers — same name lookup, very different blast radius.
-        const tag = render.entryTag(f);
+    var sig_buf: [256]u8 = undefined;
+    var prev_file: []const u8 = "";
+    for (matches_buf.items) |f| {
+        if (want_group) {
+            if (!std.mem.eql(u8, f.def_loc.file, prev_file)) {
+                if (prev_file.len > 0) try aw.writer.writeAll("\n");
+                try aw.writer.print("# {s}\n", .{render.shortFile(f.def_loc.file)});
+                prev_file = f.def_loc.file;
+            }
+        }
+
+        const tag = render.entryTag(f.*);
         const aux: []const u8 = if (f.entry_reach > 0 and tag.len > 0)
             (std.fmt.bufPrint(&aux_buf, "{s} (reached by {d})", .{ tag, f.entry_reach }) catch tag)
         else if (f.entry_reach > 0)
@@ -763,16 +905,96 @@ fn handleFind(
         else
             tag;
         try render.writePaddedName(&aw.writer, "", f.name, aux);
-        try render.writeLoc(&aw.writer, f.def_loc, "");
+        if (want_group) {
+            try aw.writer.print("  :{d}", .{f.def_loc.line});
+        } else {
+            try render.writeLoc(&aw.writer, f.def_loc, "");
+        }
+        if (want_sigs) {
+            if (extractSignature(allocator, &file_cache, f, &sig_buf)) |sig| {
+                try aw.writer.print("\n  {s}", .{sig});
+            }
+        }
         try aw.writer.writeAll("\n");
-        matches += 1;
-        if (matches >= q_limit) {
-            try aw.writer.writeAll("(truncated)\n");
+    }
+    if (truncated) try aw.writer.print(
+        "(truncated; showing {d} of {d}; {d} more — raise `limit` or refine query)\n",
+        .{ matches_buf.items.len, total_matches, dropped },
+    );
+    return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
+}
+
+/// Read just the signature header (`fn foo(...) RetType` up to `{`) of a
+/// function and write a single-line summary into `scratch`. Returns null
+/// when the source is unreadable or the signature spans more than `scratch`.
+/// File contents are cached in `cache` so multiple matches in one file pay
+/// one disk read.
+fn extractSignature(
+    allocator: std.mem.Allocator,
+    cache: *std.StringHashMap([]u8),
+    f: *const types.Function,
+    scratch: []u8,
+) ?[]const u8 {
+    const contents = blk: {
+        if (cache.get(f.def_loc.file)) |c| break :blk c;
+        const file = std.fs.openFileAbsolute(f.def_loc.file, .{}) catch return null;
+        defer file.close();
+        const c = file.readToEndAlloc(allocator, 8 * 1024 * 1024) catch return null;
+        cache.put(f.def_loc.file, c) catch {
+            allocator.free(c);
+            return null;
+        };
+        break :blk c;
+    };
+
+    // Find the byte offset for line def_loc.line.
+    var line: u32 = 1;
+    var i: usize = 0;
+    var line_off: usize = 0;
+    while (i < contents.len) : (i += 1) {
+        if (line == f.def_loc.line) {
+            line_off = i;
             break;
         }
+        if (contents[i] == '\n') line += 1;
     }
-    if (matches == 0) try aw.writer.writeAll("(no matches)\n");
-    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    if (line != f.def_loc.line) return null;
+
+    // Scan from line_off to the first '{' on the same logical fn header,
+    // tracking paren depth so we don't stop at a default-value `{` inside
+    // params (rare but possible).
+    var paren_depth: i32 = 0;
+    var end: usize = line_off;
+    while (end < contents.len) : (end += 1) {
+        const c = contents[end];
+        if (c == '(') paren_depth += 1;
+        if (c == ')') paren_depth -= 1;
+        if (c == '{' and paren_depth == 0) break;
+    }
+    if (end >= contents.len) return null;
+    const raw = contents[line_off..end];
+
+    // Collapse whitespace so the one-line summary fits in scratch.
+    var out_len: usize = 0;
+    var prev_ws = true;
+    for (raw) |c| {
+        const is_ws = c == ' ' or c == '\t' or c == '\r' or c == '\n';
+        if (is_ws) {
+            if (!prev_ws and out_len < scratch.len) {
+                scratch[out_len] = ' ';
+                out_len += 1;
+            }
+            prev_ws = true;
+        } else {
+            if (out_len >= scratch.len) return null;
+            scratch[out_len] = c;
+            out_len += 1;
+            prev_ws = false;
+        }
+    }
+    while (out_len > 0 and scratch[out_len - 1] == ' ') out_len -= 1;
+    if (out_len == 0) return null;
+    return scratch[0..out_len];
 }
 
 fn handleType(
@@ -798,33 +1020,21 @@ fn handleType(
             "text/plain; charset=utf-8",
             "non-HEAD sha not supported (HEAD only)\n",
         ),
-        error.UnknownArch => return respondBytes(
-            request,
-            .bad_request,
-            "text/plain; charset=utf-8",
-            "unknown arch\n",
-        ),
+        error.UnknownArch => return respondUnknownArch(allocator, state, request),
         else => return err,
     };
 
     // Look up the Definition by qualified name. Linear scan over the
     // per-arch definitions list — small enough (~hundreds) that an
     // index isn't worth the maintenance cost yet.
-    var def_opt: ?*const types.Definition = null;
-    for (live.graph.definitions) |*d| {
-        if (std.mem.eql(u8, d.qualified_name, name) or std.mem.eql(u8, d.name, name)) {
-            def_opt = d;
-            break;
-        }
-    }
-    const def = def_opt orelse {
+    const initial = findDefinitionByName(live.graph.definitions, name) orelse {
         // Fallback: maybe the user passed a function name instead — give
         // a hint so they don't waste a second tool call.
         if (live.maps.by_name.get(name)) |fp| {
-            var aw = std.io.Writer.Allocating.init(allocator);
-            defer aw.deinit();
-            try aw.writer.print("{s} is a function, not a type — use callgraph_src or callgraph_loc.\nat {s}:{d}\n", .{ fp.name, render.shortFile(fp.def_loc.file), fp.def_loc.line });
-            return respondBytes(request, .not_found, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+            var aw_fn = std.io.Writer.Allocating.init(allocator);
+            defer aw_fn.deinit();
+            try aw_fn.writer.print("{s} is a function, not a type — use callgraph_src or callgraph_loc.\nat {s}:{d}\n", .{ fp.name, render.shortFile(fp.def_loc.file), fp.def_loc.line });
+            return respondBytes(request, .not_found, "text/plain; charset=utf-8", aw_fn.writer.buffer[0..aw_fn.writer.end]);
         }
         return respondBytes(
             request,
@@ -834,9 +1044,47 @@ fn handleType(
         );
     };
 
+    // Follow trivial alias chains (`pub const X = some.dotted.Y;`) up to
+    // a small depth so a single tool call lands on the underlying type
+    // instead of a one-line redirect that forces a second lookup.
+    const max_follow = 4;
+    var chain_buf: [max_follow]*const types.Definition = undefined;
+    chain_buf[0] = initial;
+    var chain_len: usize = 1;
+    var alias_payload_buf: [256]u8 = undefined;
+    while (chain_len < max_follow) {
+        const cur = chain_buf[chain_len - 1];
+        if (cur.kind != .constant) break;
+        const tail_name = readConstantAliasTail(allocator, cur, &alias_payload_buf) catch null;
+        const target_name = tail_name orelse break;
+        const target = findDefinitionByName(live.graph.definitions, target_name) orelse break;
+        if (target == cur) break;
+        // Loop / repeat guard.
+        var seen = false;
+        for (chain_buf[0..chain_len]) |c| if (c == target) {
+            seen = true;
+            break;
+        };
+        if (seen) break;
+        chain_buf[chain_len] = target;
+        chain_len += 1;
+        // Stop as soon as we land on a real type body — further hops would
+        // walk past the answer the caller asked for.
+        if (target.kind != .constant) break;
+    }
+    const def = chain_buf[chain_len - 1];
+
     var aw = std.io.Writer.Allocating.init(allocator);
     defer aw.deinit();
     const visibility: []const u8 = if (def.is_pub) "pub " else "";
+    if (chain_len > 1) {
+        try aw.writer.writeAll("(followed alias: ");
+        for (chain_buf[0..chain_len], 0..) |c, i| {
+            if (i > 0) try aw.writer.writeAll(" → ");
+            try aw.writer.writeAll(c.qualified_name);
+        }
+        try aw.writer.writeAll(")\n");
+    }
     try aw.writer.print(
         "{s}{s} ({s}) — {s}:{d}-{d}\n---\n",
         .{ visibility, def.qualified_name, @tagName(def.kind), render.shortFile(def.file), def.line_start, def.line_end },
@@ -847,7 +1095,7 @@ fn handleType(
     // payload growth.
     const file = std.fs.openFileAbsolute(def.file, .{}) catch |err| {
         try aw.writer.print("(open {s}: {s})\n", .{ def.file, @errorName(err) });
-        return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+        return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
     };
     defer file.close();
     const contents = try file.readToEndAlloc(allocator, 8 * 1024 * 1024);
@@ -880,7 +1128,73 @@ fn handleType(
     if (slice.len == 0 or slice[slice.len - 1] != '\n') try aw.writer.writeAll("\n");
     try aw.writer.writeAll("---\n");
 
-    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
+}
+
+fn findDefinitionByName(defs: []const types.Definition, name: []const u8) ?*const types.Definition {
+    for (defs) |*d| {
+        if (std.mem.eql(u8, d.qualified_name, name) or std.mem.eql(u8, d.name, name)) return d;
+    }
+    return null;
+}
+
+/// Read just the source slice for a single-line `const X = ...;` definition
+/// and, if its RHS is a dotted identifier chain, return the trailing component.
+/// The returned slice points into `scratch`; caller must not free it.
+/// Returns null when the body isn't a trivial alias (multi-line, has braces,
+/// numeric literal, function call, etc.).
+fn readConstantAliasTail(
+    allocator: std.mem.Allocator,
+    def: *const types.Definition,
+    scratch: []u8,
+) !?[]const u8 {
+    if (def.line_end != def.line_start) return null;
+    const file = std.fs.openFileAbsolute(def.file, .{}) catch return null;
+    defer file.close();
+    const contents = try file.readToEndAlloc(allocator, 8 * 1024 * 1024);
+    defer allocator.free(contents);
+
+    // Locate the single source line for this def.
+    var line: u32 = 1;
+    var off: usize = 0;
+    var line_start: usize = 0;
+    while (off < contents.len) : (off += 1) {
+        if (line == def.line_start) {
+            line_start = off;
+            break;
+        }
+        if (contents[off] == '\n') line += 1;
+    }
+    if (line != def.line_start) return null;
+    const line_end = std.mem.indexOfScalarPos(u8, contents, line_start, '\n') orelse contents.len;
+    const src = std.mem.trim(u8, contents[line_start..line_end], " \t\r");
+
+    // Match: `(pub )?const NAME = <rhs>;`. Anything fancier (calls, braces,
+    // operators, slices) means it's not a trivial alias and we bail.
+    var rest = src;
+    if (std.mem.startsWith(u8, rest, "pub ")) rest = rest[4..];
+    if (!std.mem.startsWith(u8, rest, "const ")) return null;
+    rest = rest[6..];
+    const eq = std.mem.indexOfScalar(u8, rest, '=') orelse return null;
+    rest = std.mem.trim(u8, rest[eq + 1 ..], " \t");
+    if (!std.mem.endsWith(u8, rest, ";")) return null;
+    var rhs = rest[0 .. rest.len - 1];
+    rhs = std.mem.trim(u8, rhs, " \t");
+    if (rhs.len == 0) return null;
+    // Reject anything with non-identifier characters between dots.
+    for (rhs) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_' or c == '.';
+        if (!ok) return null;
+    }
+    // Must lead with an alphabetic / underscore (otherwise it's a number).
+    if (!((rhs[0] >= 'a' and rhs[0] <= 'z') or (rhs[0] >= 'A' and rhs[0] <= 'Z') or rhs[0] == '_')) return null;
+
+    const dot = std.mem.lastIndexOfScalar(u8, rhs, '.');
+    const tail = if (dot) |d| rhs[d + 1 ..] else rhs;
+    if (tail.len == 0 or tail.len > scratch.len) return null;
+    @memcpy(scratch[0..tail.len], tail);
+    return scratch[0..tail.len];
 }
 
 fn handleReaches(
@@ -929,12 +1243,7 @@ fn handleReaches(
             "text/plain; charset=utf-8",
             "non-HEAD sha not supported (HEAD only)\n",
         ),
-        error.UnknownArch => return respondBytes(
-            request,
-            .bad_request,
-            "text/plain; charset=utf-8",
-            "unknown arch\n",
-        ),
+        error.UnknownArch => return respondUnknownArch(allocator, state, request),
         else => return err,
     };
 
@@ -954,7 +1263,8 @@ fn handleReaches(
     var aw = std.io.Writer.Allocating.init(allocator);
     defer aw.deinit();
 
-    const path = findShortestPath(allocator, live.graph, &live.maps, from_fp.id, to_fp.id, q_max) catch |err| switch (err) {
+    var search_stats: ReachesStats = .{ .visited = 0, .cap_hit = false };
+    const path = findShortestPath(allocator, live.graph, &live.maps, from_fp.id, to_fp.id, q_max, &search_stats) catch |err| switch (err) {
         error.OutOfMemory => return respondBytes(
             request,
             .internal_server_error,
@@ -965,8 +1275,39 @@ fn handleReaches(
     defer if (path) |p| allocator.free(p);
 
     if (path == null) {
-        try aw.writer.print("no path from {s} to {s} within {d} hops (try increasing max)\n", .{ from_fp.name, to_fp.name, q_max });
-        return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+        if (search_stats.cap_hit) {
+            try aw.writer.print(
+                "no path from {s} to {s} within {d} hops (depth limit hit; reached {d} fns; try increasing max)\n",
+                .{ from_fp.name, to_fp.name, q_max, search_stats.visited },
+            );
+        } else {
+            try aw.writer.print(
+                "no path from {s} to {s} (search exhausted; {s} transitively reaches {d} fns, {s} not among them)\n",
+                .{ from_fp.name, to_fp.name, from_fp.name, search_stats.visited, to_fp.name },
+            );
+            // Heuristic: if the source is an entry point whose direct-call
+            // closure is tiny (≤ 4 fns), it's almost certainly a trampoline
+            // that dispatches to its real targets through a runtime table
+            // (the syscall vector, the IDT, vtables, ...). Tell the agent
+            // which other tools to reach for instead of letting them stare
+            // at a confusing dead-end.
+            if (from_fp.is_entry and search_stats.visited <= 4) {
+                const kind_tag: []const u8 = if (from_fp.entry_kind) |k| @tagName(k) else "unknown";
+                const article: []const u8 = if (kind_tag.len > 0 and (kind_tag[0] == 'a' or kind_tag[0] == 'i' or kind_tag[0] == 'u')) "an" else "a";
+                try aw.writer.print(
+                    "  hint: {s} is {s} {s} entry that reaches only {d} fn(s) by direct calls — its real targets are likely reached through a runtime dispatch table (e.g. the syscall/IDT vector) which BFS does not follow. To investigate {s}, try `callgraph_callers {s}` (who calls it directly) or `callgraph_entries` to enumerate the dispatch handlers.\n",
+                    .{
+                        from_fp.name,
+                        article,
+                        kind_tag,
+                        search_stats.visited,
+                        to_fp.name,
+                        to_fp.name,
+                    },
+                );
+            }
+        }
+        return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
     }
 
     try aw.writer.print("path ({d} hops):\n", .{path.?.len - 1});
@@ -974,12 +1315,22 @@ fn handleReaches(
         const fp = live.maps.by_id.get(id) orelse continue;
         try aw.writer.print("{d} {s}\n", .{ i, fp.name });
     }
-    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
 }
+
+/// Outcome statistics for a `findShortestPath` run. `visited` is how many
+/// distinct functions BFS reached (including `from`). `cap_hit` flips to
+/// true the first time BFS would have descended past `max_hops` — i.e.,
+/// the search was depth-limited rather than fully exhausted.
+const ReachesStats = struct {
+    visited: u32,
+    cap_hit: bool,
+};
 
 /// BFS forward from `from` looking for `to`, walking the same intra-atom
 /// edges as `computeEntryReach`. Returns the shortest path as an owned
 /// slice of FnIds (caller frees), or null if no path within `max_hops`.
+/// Fills `stats` so callers can distinguish depth-limited from exhausted.
 fn findShortestPath(
     allocator: std.mem.Allocator,
     graph: *const Graph,
@@ -987,10 +1338,12 @@ fn findShortestPath(
     from: types.FnId,
     to: types.FnId,
     max_hops: u32,
+    stats: *ReachesStats,
 ) std.mem.Allocator.Error!?[]types.FnId {
     if (from == to) {
         const buf = try allocator.alloc(types.FnId, 1);
         buf[0] = from;
+        stats.visited = 1;
         return buf;
     }
     const fns = graph.functions;
@@ -1015,11 +1368,15 @@ fn findShortestPath(
     while (head < queue.items.len) {
         const cur = queue.items[head];
         head += 1;
-        if (depth[cur] >= max_hops) continue;
+        if (depth[cur] >= max_hops) {
+            stats.cap_hit = true;
+            continue;
+        }
         try walkIntraReachable(allocator, fns, &maps.by_name, cur, fns[cur].intra, &queue, parent, depth);
         if (parent[to] != null_id) break;
     }
 
+    stats.visited = @intCast(queue.items.len);
     if (parent[to] == null_id) return null;
 
     // Reconstruct path: walk parent chain from `to` back to `from`.
@@ -1091,12 +1448,7 @@ fn handleLoc(
             "text/plain; charset=utf-8",
             "non-HEAD sha not supported (HEAD only)\n",
         ),
-        error.UnknownArch => return respondBytes(
-            request,
-            .bad_request,
-            "text/plain; charset=utf-8",
-            "unknown arch\n",
-        ),
+        error.UnknownArch => return respondUnknownArch(allocator, state, request),
         else => return err,
     };
 
@@ -1115,7 +1467,7 @@ fn handleLoc(
     }
     if (fp.is_ast_only) try aw.writer.writeAll("  inlined");
     try aw.writer.writeAll("\n");
-    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
 }
 
 fn handleModules(
@@ -1128,6 +1480,9 @@ fn handleModules(
     var q_sha: ?[]const u8 = null;
     var q_level: u32 = 1;
     var q_intra: bool = false;
+    var q_min_edges: u32 = 1;
+    var q_exclude_external: bool = false;
+    var q_direction: render.ModuleDirection = .out;
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
@@ -1137,7 +1492,15 @@ fn handleModules(
         if (std.mem.eql(u8, k, "sha")) q_sha = v;
         if (std.mem.eql(u8, k, "level")) q_level = std.fmt.parseInt(u32, v, 10) catch q_level;
         if (std.mem.eql(u8, k, "intra")) q_intra = isTruthy(v);
+        if (std.mem.eql(u8, k, "min_edges")) q_min_edges = std.fmt.parseInt(u32, v, 10) catch q_min_edges;
+        if (std.mem.eql(u8, k, "exclude_external")) q_exclude_external = isTruthy(v);
+        if (std.mem.eql(u8, k, "direction")) {
+            if (std.mem.eql(u8, v, "in")) q_direction = .in;
+            if (std.mem.eql(u8, v, "out")) q_direction = .out;
+            if (std.mem.eql(u8, v, "both")) q_direction = .both;
+        }
     }
+    if (q_min_edges == 0) q_min_edges = 1;
 
     const live = resolveLiveGraph(state, q_sha, q_arch) catch |err| switch (err) {
         error.NonHeadNotSupported => return respondBytes(
@@ -1146,18 +1509,13 @@ fn handleModules(
             "text/plain; charset=utf-8",
             "non-HEAD sha not supported (HEAD only)\n",
         ),
-        error.UnknownArch => return respondBytes(
-            request,
-            .bad_request,
-            "text/plain; charset=utf-8",
-            "unknown arch\n",
-        ),
+        error.UnknownArch => return respondUnknownArch(allocator, state, request),
         else => return err,
     };
 
     var aw = std.io.Writer.Allocating.init(allocator);
     defer aw.deinit();
-    render.renderModuleGraph(allocator, &aw.writer, live.graph, live.maps, q_level, q_intra) catch |err| {
+    render.renderModuleGraph(allocator, &aw.writer, live.graph, live.maps, q_level, q_intra, q_min_edges, q_exclude_external, q_direction) catch |err| {
         return respondBytes(
             request,
             .internal_server_error,
@@ -1165,7 +1523,7 @@ fn handleModules(
             @errorName(err),
         );
     };
-    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
 }
 
 fn handleCallers(
@@ -1191,12 +1549,7 @@ fn handleCallers(
             "text/plain; charset=utf-8",
             "non-HEAD sha not supported (HEAD only)\n",
         ),
-        error.UnknownArch => return respondBytes(
-            request,
-            .bad_request,
-            "text/plain; charset=utf-8",
-            "unknown arch\n",
-        ),
+        error.UnknownArch => return respondUnknownArch(allocator, state, request),
         else => return err,
     };
 
@@ -1213,7 +1566,7 @@ fn handleCallers(
     const sites: []const render.CallerSite = if (sites_opt) |list| list.items else &.{};
     if (sites.len == 0) {
         try aw.writer.writeAll("(no callers found in graph — may be unreachable, indirect-only, or an entry point)\n");
-        return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+        return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
     }
 
     // Sort by caller name then site line so output is deterministic and
@@ -1238,7 +1591,7 @@ fn handleCallers(
         try aw.writer.writeAll("\n");
         prev_from_id = cs.from.id;
     }
-    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
 }
 
 fn callerSiteLessThan(_: void, a: render.CallerSite, b: render.CallerSite) bool {
@@ -1262,18 +1615,52 @@ fn handleEntries(
             "text/plain; charset=utf-8",
             "non-HEAD sha not supported (HEAD only)\n",
         ),
-        error.UnknownArch => return respondBytes(
+        error.UnknownArch => return respondUnknownArch(allocator, state, request),
+        else => return err,
+    };
+    // Parse the optional `kind=` filter. Empty list means "keep everything".
+    // We bit-pack the allowed kinds — fewer than 8 variants, so a u8 mask is
+    // plenty and avoids allocator churn on a hot read endpoint. Unknown kind
+    // strings 400 so the agent gets a clear error rather than silent
+    // empty-result behaviour.
+    //
+    // Decode percent-escapes first — the MCP shim percent-encodes commas
+    // (`,` → `%2C`) when forwarding multi-kind filters, and `parseKindMask`
+    // splits on a literal `,`. Without decoding, `kind=trap,irq` arrives as
+    // `trap%2Cirq` and trips the unknown-kind branch.
+    const kind_decoded = try percentDecodeAlloc(allocator, q.kind);
+    defer allocator.free(kind_decoded);
+    const kind_mask = parseKindMask(kind_decoded) catch {
+        return respondBytes(
             request,
             .bad_request,
             "text/plain; charset=utf-8",
-            "unknown arch\n",
-        ),
-        else => return err,
+            "unknown kind — accepted: syscall,irq,trap,boot,manual\n",
+        );
     };
+
+    // Sort entries by (kind, label) so the output groups orientation by
+    // subsystem instead of dumping in graph-walk order. Within a kind, the
+    // alphabetic order keeps the syscall list scannable.
+    var sorted = try std.ArrayList(types.EntryPoint).initCapacity(allocator, live.graph.entry_points.len);
+    defer sorted.deinit(allocator);
+    for (live.graph.entry_points) |ep| {
+        if (kind_mask != 0 and (kind_mask & kindBit(ep.kind)) == 0) continue;
+        sorted.appendAssumeCapacity(ep);
+    }
+    std.mem.sort(types.EntryPoint, sorted.items, {}, entryPointLessThan);
+
     var aw = std.io.Writer.Allocating.init(allocator);
     defer aw.deinit();
     var name_buf: [512]u8 = undefined;
-    for (live.graph.entry_points) |ep| {
+    var prev_kind: ?types.EntryKind = null;
+    for (sorted.items) |ep| {
+        // Blank line between kind groups so visual scanning is fast.
+        if (prev_kind) |pk| {
+            if (pk != ep.kind) try aw.writer.writeAll("\n");
+        }
+        prev_kind = ep.kind;
+
         const fp_opt = live.maps.by_id.get(ep.fn_id);
         const loc: ?types.SourceLoc = if (fp_opt) |fp| fp.def_loc else null;
         // Append `-> <qualified_name>` after the label so callers know
@@ -1287,7 +1674,46 @@ fn handleEntries(
         if (loc) |l| try render.writeLoc(&aw.writer, l, "");
         try aw.writer.writeAll("\n");
     }
-    return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
+    return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
+}
+
+/// Sort order: boot → trap → irq → syscall → manual, then alphabetic by label.
+fn entryKindOrder(k: types.EntryKind) u8 {
+    return switch (k) {
+        .boot => 0,
+        .trap => 1,
+        .irq => 2,
+        .syscall => 3,
+        .manual => 4,
+    };
+}
+
+fn entryPointLessThan(_: void, a: types.EntryPoint, b: types.EntryPoint) bool {
+    const oa = entryKindOrder(a.kind);
+    const ob = entryKindOrder(b.kind);
+    if (oa != ob) return oa < ob;
+    return std.mem.lessThan(u8, a.label, b.label);
+}
+
+fn kindBit(k: types.EntryKind) u8 {
+    return @as(u8, 1) << @intFromEnum(k);
+}
+
+/// Parse a comma-separated list of entry kinds into a bitmask. Empty input
+/// returns 0 (the caller treats 0 as "no filter"). Unknown tokens trigger
+/// an error so callers get a 400 — silently dropping them would yield an
+/// empty result and look like the entry list itself was empty.
+fn parseKindMask(s: []const u8) !u8 {
+    if (s.len == 0) return 0;
+    var mask: u8 = 0;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |raw| {
+        const tok = std.mem.trim(u8, raw, " \t");
+        if (tok.len == 0) continue;
+        const k = std.meta.stringToEnum(types.EntryKind, tok) orelse return error.UnknownKind;
+        mask |= kindBit(k);
+    }
+    return mask;
 }
 
 fn computeLineRange(contents: []const u8, start: u32, end: u32) RangeBounds {
@@ -1458,6 +1884,9 @@ fn handleCommits(
     state: *const ServerState,
 ) !void {
     var limit: u32 = 50;
+    // Default format is JSON for the web UI; the MCP shim asks for text
+    // so the callgraph tool surface is uniformly plain text.
+    var fmt: enum { json, text } = .json;
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
@@ -1465,6 +1894,10 @@ fn handleCommits(
         const val = pair[eq + 1 ..];
         if (std.mem.eql(u8, key, "limit")) {
             limit = std.fmt.parseInt(u32, val, 10) catch limit;
+        }
+        if (std.mem.eql(u8, key, "format")) {
+            if (std.mem.eql(u8, val, "text")) fmt = .text;
+            if (std.mem.eql(u8, val, "json")) fmt = .json;
         }
     }
     if (limit == 0) limit = 50;
@@ -1512,6 +1945,32 @@ fn handleCommits(
         var it_keys = compat_set.keyIterator();
         while (it_keys.next()) |k| allocator.free(k.*);
         compat_set.deinit();
+    }
+
+    if (fmt == .text) {
+        // One commit per line: `<short>  <date>  <subject>` with a trailing
+        // `  [stale]` marker on commits whose tree predates the `-Demit_ir`
+        // build option (those can't be loaded by /api/load_commit because
+        // the build would fail with `invalid option: -Demit_ir`). Every
+        // other MCP tool returns text/plain; the format=text branch keeps
+        // the MCP surface uniform without breaking the JSON-consuming
+        // web UI.
+        var aw = std.io.Writer.Allocating.init(allocator);
+        defer aw.deinit();
+        var line_it = std.mem.splitScalar(u8, result.stdout, '\n');
+        while (line_it.next()) |line| {
+            if (line.len == 0) continue;
+            var fields_it = std.mem.splitSequence(u8, line, GIT_FIELD_SEP);
+            const sha = fields_it.next() orelse continue;
+            const short = fields_it.next() orelse continue;
+            _ = fields_it.next() orelse continue; // author — not in the line format
+            const date = fields_it.next() orelse continue;
+            const subject = fields_it.next() orelse continue;
+            try aw.writer.print("{s}  {s}  {s}", .{ short, date, subject });
+            if (!compat_set.contains(sha)) try aw.writer.writeAll("  [stale]");
+            try aw.writer.writeAll("\n");
+        }
+        return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
     }
 
     var commit_list = std.ArrayList(Commit){};

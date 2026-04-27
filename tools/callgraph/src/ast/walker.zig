@@ -67,6 +67,14 @@ pub const AstFunction = struct {
     /// statically-known argument values into the AST-only inline body's
     /// intra. Empty when the proto had no params.
     params: []const ParamInfo = &.{},
+    /// Qualified name of this function's return type, with pointer/optional
+    /// decoration stripped — same shape as `receiver_type`. Used downstream
+    /// to populate the global fn-return-type index, which lets
+    /// `inferInitType` stamp `const x = someFn(...);` bindings with the
+    /// right struct qname for chained `x.method()` resolution. Empty when
+    /// the return type isn't reducible (primitives, anyerror, comptime
+    /// types, anonymous structs, generic params).
+    return_type_qname: []const u8 = "",
 };
 
 /// Per-file map: local binding name → resolved module path. Built by
@@ -880,6 +888,81 @@ fn resolveFieldTypeQname(
     return "";
 }
 
+/// Resolve a function's return-type expression to a struct qname. Mirrors
+/// `resolveFieldTypeQname` but first peels error-union sugar (`E!T` and `!T`)
+/// since those are extremely common on the success-result wrapper. Pointer/
+/// optional/const decoration is stripped further inside.
+fn resolveReturnTypeQname(
+    ctx: *WalkCtx,
+    type_node: std.zig.Ast.Node.Index,
+    container_path: []const u8,
+) ![]const u8 {
+    // `error_union` AST nodes are `LHS!RHS`; the success type lives on the
+    // RHS. Recurse there directly so the source-slice path below operates on
+    // the real type rather than the error-set decoration.
+    if (ctx.tree.nodeTag(type_node) == .error_union) {
+        const lhs_rhs = ctx.tree.nodeData(type_node).node_and_node;
+        return try resolveReturnTypeQname(ctx, lhs_rhs[1], container_path);
+    }
+
+    // Some protos write `!T` directly without a named error set on the LHS;
+    // that comes through as a different node tag depending on parse, so do a
+    // source-text fallback strip too. Cheap and robust.
+    const src = nodeSourceSlice(ctx.tree, type_node);
+    const trimmed = std.mem.trim(u8, src, &std.ascii.whitespace);
+    if (trimmed.len > 0 and trimmed[0] == '!') {
+        // The substring after `!` is the same shape resolveFieldTypeQname
+        // wants; build a synthetic span and reuse the rest of its logic by
+        // routing through the bare-form branches inline.
+        const after = std.mem.trim(u8, trimmed[1..], &std.ascii.whitespace);
+        if (after.len == 0) return "";
+        return try resolveTypeSourceQname(ctx, after, container_path);
+    }
+
+    return try resolveFieldTypeQname(ctx, type_node, container_path);
+}
+
+/// Source-only variant of `resolveFieldTypeQname`. Takes a raw type-source
+/// slice (post error-union strip) and resolves it via the same rules.
+fn resolveTypeSourceQname(
+    ctx: *WalkCtx,
+    src_in: []const u8,
+    container_path: []const u8,
+) ![]const u8 {
+    if (src_in.len == 0) return "";
+    const stripped = stripPointerOptional(src_in);
+    if (stripped.len == 0) return "";
+
+    if (std.mem.eql(u8, stripped, "@This()")) {
+        return containerQName(ctx.arena, ctx.module_path, container_path);
+    }
+    const immediate = lastSegment(container_path);
+    if (immediate.len > 0 and std.mem.eql(u8, stripped, immediate)) {
+        return containerQName(ctx.arena, ctx.module_path, container_path);
+    }
+    if (container_path.len == 0) {
+        const file_seg = lastSegment(ctx.module_path);
+        if (file_seg.len > 0 and std.mem.eql(u8, stripped, file_seg)) {
+            return ctx.arena.dupe(u8, ctx.module_path);
+        }
+    }
+    if (looksLikeDottedChain(stripped)) {
+        if (try resolveDottedChain(ctx.arena, stripped, ctx.imports)) |q| {
+            if (q.len > 0) return q;
+        }
+        return "";
+    }
+    if (isBareIdent(stripped)) {
+        if (ctx.imports.get(stripped)) |q| {
+            return ctx.arena.dupe(u8, q);
+        }
+        if (ctx.module_path.len > 0) {
+            return std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ ctx.module_path, stripped });
+        }
+    }
+    return "";
+}
+
 fn emitFn(
     ctx: *WalkCtx,
     node: std.zig.Ast.Node.Index,
@@ -909,6 +992,37 @@ fn emitFn(
 
     const params = collectParams(ctx, fn_proto) catch &.{};
 
+    // Resolve the return type to a struct qname using the same rules
+    // `resolveFieldTypeQname` applies — strips pointer/optional/error-union
+    // wrapping, walks dotted chains through the import table, falls back to
+    // same-container / same-file. Most return types reduce cleanly; ones
+    // that don't (primitives, anyerror, comptime types) leave the slot
+    // empty and downstream resolution falls back to indirect rather than
+    // mis-resolving.
+    //
+    // Special case: a `type`-returning factory like
+    //   `pub fn SlabRef(comptime T: type) type { return extern struct { ... }; }`
+    // declares no concrete struct in its proto, but the anonymous struct it
+    // returns gets walked under THIS fn's container path — its methods are
+    // emitted as `<this fn's qname>.<method>`. So pointing the return-type
+    // slot at the fn's own qname is exactly what downstream receiver
+    // resolution wants: `cd_ref: SlabRef(T)` strips to `SlabRef`, resolves
+    // to `memory.allocators.secure_slab.SlabRef`, and `cd_ref.lock(...)`
+    // hits `memory.allocators.secure_slab.SlabRef.lock` in the qname index.
+    // The kernel uses this factory pattern pervasively (SlabRef,
+    // AtomicSlabRef, fixed-size buddy pools, etc.), so this single
+    // special-case unlocks dozens of method-call resolutions per trace.
+    const return_type_qname: []const u8 = blk: {
+        const ret_node = fn_proto.ast.return_type.unwrap() orelse break :blk "";
+        const ret_src = nodeSourceSlice(ctx.tree, ret_node);
+        if (std.mem.eql(u8, std.mem.trim(u8, ret_src, &std.ascii.whitespace), "type")) {
+            // Use this fn's own qname so the anonymous struct-decl methods
+            // inside the body resolve through the receiver path.
+            break :blk qualified;
+        }
+        break :blk resolveReturnTypeQname(ctx, ret_node, container_path) catch "";
+    };
+
     try ctx.out.append(ctx.arena, .{
         .name = try ctx.arena.dupe(u8, name),
         .qualified_name = qualified,
@@ -920,6 +1034,7 @@ fn emitFn(
         .receiver_name = recv.name,
         .receiver_type = recv.type_qname,
         .params = params,
+        .return_type_qname = return_type_qname,
     });
 
     // Recurse into the body so nested struct decls and inner fns are picked up.
@@ -1110,10 +1225,18 @@ fn nodeSourceSlice(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) []con
     return tree.source[start..end];
 }
 
-/// Strip leading pointer/optional/sentinel tokens from a type source span.
-/// Repeats until no more strippable prefix is found. Returns "" for slice/
-/// array forms (`[N]T`, `[]T`, `[*]T`) since their element-method calls
-/// can't be resolved through the receiver path anyway.
+/// Strip leading pointer/optional/sentinel tokens from a type source span,
+/// then any trailing balanced generic-args group (`SlabRef(CapabilityDomain)`
+/// → `SlabRef`). Repeats prefix stripping until no more strippable prefix is
+/// found. Returns "" for slice/array forms (`[N]T`, `[]T`, `[*]T`) since
+/// their element-method calls can't be resolved through the receiver path
+/// anyway.
+///
+/// The generic-args strip is what makes `SlabRef(T)` field types resolve
+/// down to the `SlabRef` qname — the kernel's pervasive `pub fn Foo(comptime
+/// T: type) type { return struct { ... }; }` factory pattern means an
+/// enormous fraction of fields and locals carry these types, and without
+/// stripping them the receiver path can't dispatch onto the methods.
 fn stripPointerOptional(src: []const u8) []const u8 {
     var s = std.mem.trim(u8, src, &std.ascii.whitespace);
     while (s.len > 0) {
@@ -1129,6 +1252,29 @@ fn stripPointerOptional(src: []const u8) []const u8 {
         }
         if (s[0] == '[') return "";
         break;
+    }
+    return stripTrailingGenericArgs(s);
+}
+
+/// Strip a single trailing balanced-paren group. `SlabRef(CapabilityDomain)`
+/// → `SlabRef`. `Foo(A, B)` → `Foo`. Unmatched / no-paren inputs pass through
+/// unchanged. Used by type-resolution helpers so generic-factory return types
+/// (`pub fn Foo(comptime T: type) type {...}`) collapse to the factory's own
+/// qname for receiver-method resolution.
+fn stripTrailingGenericArgs(s: []const u8) []const u8 {
+    if (s.len == 0 or s[s.len - 1] != ')') return s;
+    var depth: usize = 0;
+    var i: usize = s.len;
+    while (i > 0) {
+        i -= 1;
+        switch (s[i]) {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if (depth == 0) return std.mem.trim(u8, s[0..i], &std.ascii.whitespace);
+            },
+            else => {},
+        }
     }
     return s;
 }

@@ -27,22 +27,24 @@ pub const Args = struct {
     /// from /proc/self/exe when not provided.
     self_path: ?[]const u8 = null,
     /// How long to poll for the daemon coming up after a spawn, in
-    /// milliseconds. Cold start of the daemon is ≈30s on a 900-file
-    /// kernel; default 90s gives ample headroom.
-    spawn_timeout_ms: u32 = 90_000,
+    /// milliseconds. Cold start now includes a full kernel rebuild + IR
+    /// regeneration per arch (we dropped --no-build to keep the index
+    /// honest), which can take 1–2 minutes on a 900-file kernel; default
+    /// 240s gives headroom for both arches plus the graph build pass.
+    spawn_timeout_ms: u32 = 240_000,
 };
 
 const TOOLS_JSON =
     \\[
     \\  {
     \\    "name": "callgraph_entries",
-    \\    "description": "Use this FIRST when orienting yourself in the Zag kernel codebase. Lists every entry point — boot handlers, syscalls, traps, IRQs — that the kernel exposes, with file:line locations. This is how you find which code paths exist before exploring any of them. Vastly more efficient than grepping the source tree for entry-point patterns. Output is one entry per line: `<label> (<kind>) <file>:<line>`.",
-    \\    "inputSchema": {"type":"object","properties":{"arch":{"type":"string","description":"CPU architecture tag — typically x86_64 (default) or aarch64. Use callgraph_arches to see what's loaded."}},"additionalProperties":false}
+    \\    "description": "Use this FIRST when orienting yourself in the Zag kernel codebase. Lists every entry point — boot handlers, syscalls, traps, IRQs — that the kernel exposes, with file:line locations. This is how you find which code paths exist before exploring any of them. Vastly more efficient than grepping the source tree for entry-point patterns. Output is one entry per line: `<label> (<kind>) <file>:<line>`.\n\nPass `kind=syscall` (or any comma-separated subset of `syscall,irq,trap,boot,manual`) to scope the output to one subsystem when investigating a specific code path. Default is no filter — every entry returned.",
+    \\    "inputSchema": {"type":"object","properties":{"arch":{"type":"string","description":"CPU architecture tag — typically x86_64 (default) or aarch64. Use callgraph_arches to see what's loaded."},"kind":{"type":"string","description":"Comma-separated list of entry kinds to keep: any of `syscall`, `irq`, `trap`, `boot`, `manual`. Empty/omitted = no filter. Use this to scope orientation to one subsystem (e.g. `kind=syscall` when investigating an ABI question, `kind=irq,trap` when chasing fault handling)."}},"additionalProperties":false}
     \\  },
     \\  {
     \\    "name": "callgraph_trace",
     \\    "description": "PREFER THIS over reading kernel source files when you need to understand control flow in the Zag kernel. Renders the full call hierarchy from one function as a compact indented tree, including if/else, switch, and loop control-flow blocks. One trace replaces dozens of Read calls and uses a fraction of the tokens. Use this any time the question is 'what does X do', 'what gets called when X happens', or 'how does control flow reach Y'. Drill in by re-tracing the callee whose behavior matters; expand depth gradually rather than reading source. The output mirrors the visual call-graph the user reviews in the web UI, so your understanding will line up with theirs.",
-    \\    "inputSchema": {"type":"object","properties":{"entry":{"type":"string","description":"Qualified function name to root the trace at (e.g. `main.kEntry`, `proc.process.start`). Use callgraph_find or callgraph_entries to discover names."},"arch":{"type":"string","description":"CPU architecture tag — x86_64 (default) or aarch64."},"depth":{"type":"integer","minimum":1,"maximum":36,"description":"Max traversal depth. Default 6. Increase only when the leaves you care about are still capped at the previous depth."},"hide_debug":{"type":"boolean","description":"Fold `debug.*` calls into one-line leaves. Default true. Pass false for full fidelity (e.g. when investigating panic/assert sites)."},"hide_library":{"type":"boolean","description":"Fold `std.*`/`builtin.*` calls into one-line leaves. Default true. Pass false to see stdlib internals."},"exclude":{"type":"string","description":"Comma-separated list of patterns to fold as `-` leaves in the trace. Each pattern is either a `module.*` prefix glob (matches qualified names starting with the prefix) or a bare substring. Use this to prune known-uninteresting subtrees per question (e.g. `exclude=memory.allocators.*,utils.elf.*` when investigating spawn flow but not the ELF parser internals)."},"format":{"type":"string","enum":["compact","text"],"description":"Output format. Default `compact` — pure-control-flow line format optimized for LLM token efficiency (~4–5× smaller than `text`). FORMAT SPEC for `compact`:\n  Header: `T fns=N cap=N d=N [top=<name>/<count>]` — one line, summary stats. `cap` is the number of nodes that hit the depth limit (non-zero = consider increasing `depth`).\n  Body: each line is `<depth><payload>` (descended function) or `<depth><tag><payload>` (tagged node).\n  `<depth>` is one base-36 char: `0`-`9` for 0-9, then `a`-`z` for 10-35.\n  When the second char is a letter or underscore, the rest of the line is a qualified function name we descended into.\n  When the second char is one of these tags, the rest is the tag's payload:\n    `^` function reached the depth cap (payload=name; trace deeper to expand)\n    `~` recursion stop (payload=name; we already visited it on this path)\n    `&` indirect call — fn pointer / vtable / unresolved ref (payload=expression)\n    `!` unresolved direct call — name has no body in this graph (payload=name)\n    `%` folded `debug.*` call (payload=name)\n    `=` folded `std.*` / `builtin.*` call (payload=name)\n    `?` branch (payload=`if_else` or `switch`)\n    `*` loop (no payload)\n    `>` branch arm label (payload=label, truncated at 80 chars)\n    `-` excluded by `exclude` pattern (payload=name)\n  No file:line in the trace — use `callgraph_loc <name>` to look up any node's source location, or `callgraph_src <name>` to read its body.\n  Use `format=text` for the indented human-readable tree."}},"required":["entry"],"additionalProperties":false}
+    \\    "inputSchema": {"type":"object","properties":{"entry":{"type":"string","description":"Qualified function name to root the trace at (e.g. `main.kEntry`, `proc.process.start`). Use callgraph_find or callgraph_entries to discover names."},"arch":{"type":"string","description":"CPU architecture tag — x86_64 (default) or aarch64."},"depth":{"type":"integer","minimum":1,"maximum":36,"description":"Max traversal depth. Default 6. Increase only when the leaves you care about are still capped at the previous depth."},"hide_debug":{"type":"boolean","description":"Fold `debug.*` calls into one-line leaves. Default true. Pass false for full fidelity (e.g. when investigating panic/assert sites)."},"hide_library":{"type":"boolean","description":"Fold `std.*`/`builtin.*` calls into one-line leaves. Default true. Pass false to see stdlib internals."},"hide_assertions":{"type":"boolean","description":"Drop `debug.assert` / `debug.FullPanic.*` / `builtin.returnError` lines entirely. Default true — these are 0-signal noise in most traces. Pass false to keep them (e.g. when investigating which calls can fail)."},"hide_ref_captures":{"type":"boolean","description":"Drop `&<bare_ident>` lines (e.g. `&self`, `&buckets`) that are usually argument captures the IR analyzer flagged as indirect calls. Default true. Pass false to see them all."},"exclude":{"type":"string","description":"Comma-separated list of patterns to fold as `-` leaves in the trace. Each pattern is either a `module.*` prefix glob (matches qualified names starting with the prefix) or a bare substring. Use this to prune known-uninteresting subtrees per question (e.g. `exclude=memory.allocators.*,utils.elf.*` when investigating spawn flow but not the ELF parser internals)."},"format":{"type":"string","enum":["compact","text"],"description":"Output format. Default `compact` — pure-control-flow line format optimized for LLM token efficiency (~3-5× smaller than `text`). Each line: `<depth><payload>` for a descended fn, `<depth><tag><payload>` for a tagged node. `<depth>` is one base-36 char (`0`-`9`, then `a`-`z`). The full tag legend (`^@~&!%=?>*-` plus header format) lives in the MCP server `instructions` field — read it once at session start. Use `format=text` for the indented human-readable tree."}},"required":["entry"],"additionalProperties":false}
     \\  },
     \\  {
     \\    "name": "callgraph_src",
@@ -51,13 +53,13 @@ const TOOLS_JSON =
     \\  },
     \\  {
     \\    "name": "callgraph_find",
-    \\    "description": "Use this to discover Zag kernel function names by substring search before reaching for callgraph_trace or callgraph_src. Vastly faster and more focused than grepping the source tree when all you need is a function's qualified name. Match is case-sensitive across qualified names (e.g. `kEntry`, `vmm.alloc`, `Process.start`).",
+    \\    "description": "Use this to discover Zag kernel function names by substring search before reaching for callgraph_trace or callgraph_src. Vastly faster and more focused than grepping the source tree when all you need is a function's qualified name. Match is case-sensitive across qualified names (e.g. `kEntry`, `vmm.alloc`, `Process.start`).\n\nOutput annotations:\n  • `(reached by N)` — N distinct entry points (boot/syscall/trap/irq) can transitively reach this function via direct call edges (indirect/vtable edges are NOT walked). High N = load-bearing hub reached from many syscall paths; low or absent = local helper. Use it as a hotness signal when picking which name to investigate first.\n  • `(syscall)` / `(irq)` / `(trap)` / `(boot)` — appears when the function is itself an entry point.\n\nLayout:\n  • Up to 50 matches: each result includes the inline signature (`fn name(args) Ret`) so you can pick without a follow-up `loc` / `src`.\n  • Over 30 matches: results are grouped under a `# <file>` header so a flood is easy to scan by file.",
     \\    "inputSchema": {"type":"object","properties":{"query":{"type":"string","description":"Substring to match against qualified function names."},"arch":{"type":"string","description":"CPU architecture tag. Default x86_64."},"limit":{"type":"integer","minimum":1,"maximum":1000,"description":"Cap on returned matches. Default 200."}},"required":["query"],"additionalProperties":false}
     \\  },
     \\  {
     \\    "name": "callgraph_modules",
-    \\    "description": "Returns the static module-to-module call graph aggregated from all function-level edges. PREFER THIS when you need the kernel's layering at a glance — which top-level module depends on which — before investigating any specific function path. One call replaces dozens of `callgraph_trace`s when the question is structural ('does memory call into sched?', 'what depends on caps?') rather than behavioral. Output groups outgoing edges per source module, sorted by edge count. Module identity is derived from each function's source file path; `level=1` (default) is the top-level directory (`syscall`, `capdom`, `arch`...), `level=2` keeps one more component (`arch.x64`, `arch.dispatch`), `level=0` returns the full file path so the most fine-grained layering is visible.",
-    \\    "inputSchema": {"type":"object","properties":{"arch":{"type":"string","description":"CPU architecture tag. Default x86_64."},"level":{"type":"integer","minimum":0,"maximum":8,"description":"Path-component depth for the module identifier. 1=top dir (default), 2=top dir + subdir, 0=full file path."},"intra":{"type":"boolean","description":"Include intra-module edges (src module == dst module). Default false — at the layering granularity, intra edges are noise."}},"additionalProperties":false}
+    \\    "description": "Returns the static module-to-module call graph aggregated from all function-level edges. PREFER THIS when you need the kernel's layering at a glance — which top-level module depends on which — before investigating any specific function path. One call replaces dozens of `callgraph_trace`s when the question is structural ('does memory call into sched?', 'what depends on caps?') rather than behavioral. Output groups outgoing edges per source module, sorted by edge count. Module identity is derived from each function's source file path; `level=1` (default) is the top-level directory (`syscall`, `capdom`, `arch`...), `level=2` keeps one more component (`arch.x64`, `arch.dispatch`), `level=0` returns the full file path so the most fine-grained layering is visible. At `level=2` and finer, single-edge connections dominate the output — pass `min_edges=2` (or higher) to suppress them. Pass `exclude_external=true` to drop the synthetic `std`/`external` buckets so kernel layering isn't buried under stdlib noise. Pass `direction=in` to flip the view to inbound edges (per-dst, with `<- src (count)` lines) — useful for blast-radius questions like 'who depends on caps?'. `direction=both` emits both views in one call.",
+    \\    "inputSchema": {"type":"object","properties":{"arch":{"type":"string","description":"CPU architecture tag. Default x86_64."},"level":{"type":"integer","minimum":0,"maximum":8,"description":"Path-component depth for the module identifier. 1=top dir (default), 2=top dir + subdir, 0=full file path."},"intra":{"type":"boolean","description":"Include intra-module edges (src module == dst module). Default false — at the layering granularity, intra edges are noise."},"min_edges":{"type":"integer","minimum":1,"description":"Suppress (src,dst) pairs with fewer than this many edges. Default 1 (no filter). Bump to 2-3 at level=2+ to drop trivial cross-module noise."},"exclude_external":{"type":"boolean","description":"Drop edges to/from the synthetic `std` and `external` modules so kernel-internal layering isn't buried by stdlib noise. Default false."},"direction":{"type":"string","enum":["out","in","both"],"description":"Edge direction to render. `out` (default) groups by src module and lists outgoing edges. `in` groups by dst module and lists inbound edges (`<- src (count)`); use this for blast-radius questions like 'who depends on caps?'. `both` emits both views."}},"additionalProperties":false}
     \\  },
     \\  {
     \\    "name": "callgraph_type",
@@ -86,7 +88,7 @@ const TOOLS_JSON =
     \\  },
     \\  {
     \\    "name": "callgraph_commits",
-    \\    "description": "Use this to see recent commits in the Zag kernel repo when orienting yourself in the project's history.",
+    \\    "description": "Use this to see recent commits in the Zag kernel repo when orienting yourself in the project's history. Output: one commit per line — `<short_sha>  <iso8601_date>  <subject>` with a trailing `  [stale]` marker on commits that predate the `-Demit_ir` build option (those commits can't be loaded by the callgraph tool — older than the scaffold).",
     \\    "inputSchema": {"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":500,"description":"Number of recent commits. Default 30."}},"additionalProperties":false}
     \\  }
     \\]
@@ -123,15 +125,36 @@ const INSTRUCTIONS =
     "  • Find a function name → `callgraph_find`.\n" ++
     "  • Look up a function's def location → `callgraph_loc` (cheap; trace strips locations).\n" ++
     "  • Read a function's source body → `callgraph_src`.\n\n" ++
-    "Note on `callgraph_trace` output: the default `compact` format is a terse " ++
-    "single-line-per-node form designed for token efficiency (~4-5× smaller than " ++
-    "the indented text tree). The format legend is in the `callgraph_trace` tool " ++
-    "schema's `format` description — read it once and the lines are self-describing " ++
-    "(first char = depth, second = type tag or start of fn name).\n\n" ++
     "These are typically 5–20× cheaper in tokens than reading source files directly, " ++
     "and they reflect the same call-graph the user reviews in the web UI, so your " ++
     "understanding stays aligned with theirs. Use them for anything kernel-related " ++
-    "before falling back to filesystem tools.";
+    "before falling back to filesystem tools.\n\n" ++
+    "## callgraph_trace compact format\n\n" ++
+    "Default `format=compact` is a terse single-line-per-node form (~3-5× smaller than " ++
+    "`text`). Lines are self-describing — first char = depth, second = tag or start of " ++
+    "a function name.\n\n" ++
+    "Header (always first line):\n" ++
+    "  `T fns=N cap=N d=N [top=<name>/<count>] [cap_top=<n1>/<c1>,...]`\n" ++
+    "  `cap` is the count of nodes that hit the depth limit; `cap_top` lists up to 3 of them " ++
+    "by call-site count. Use `cap_top` to deepen surgically instead of cranking `depth` blindly.\n\n" ++
+    "Body line shapes:\n" ++
+    "  `<depth><name>`         — descended function (the default; `name` starts with a letter or `_`)\n" ++
+    "  `<depth><tag><payload>` — tagged node (`tag` is one of the symbols below)\n\n" ++
+    "Depth is a single base-36 char: `0`-`9` for 0-9, then `a`-`z` for 10-35.\n\n" ++
+    "Tags:\n" ++
+    "  `^` capped — fn HAS callees but hit `depth` (deepen to expand)\n" ++
+    "  `@` no-body leaf — typically a compiler-inlined helper. Deepening will NOT expand it.\n" ++
+    "  `~` body shown elsewhere — either an ancestor on the call path (recursion) OR a fn whose body was already rendered earlier in this trace (sibling-repeat collapse). Look upward in the trace for the body.\n" ++
+    "  `&` indirect call — fn pointer / vtable / unresolved ref\n" ++
+    "  `!` unresolved direct call — name has no body in this graph\n" ++
+    "  `%` folded `debug.*` call\n" ++
+    "  `=` folded `std.*` / `builtin.*` call\n" ++
+    "  `?` branch (payload: `if_else` or `switch`)\n" ++
+    "  `*` loop (no payload)\n" ++
+    "  `>` branch arm label (payload truncated at 80 chars)\n" ++
+    "  `-` excluded by an `exclude` pattern\n\n" ++
+    "No file:line in the trace — use `callgraph_loc <name>` for source location, or " ++
+    "`callgraph_src <name>` to read a body.";
 
 const SERVER_INFO_JSON =
     \\{"name":"callgraph","version":"0.1.0"}
@@ -261,6 +284,15 @@ fn handleToolCall(
     }
 
     const body = httpGet(al, url.items) catch |err| {
+        // The daemon may have died since we last cached daemon_started.
+        // Clear the flag so the next tool call re-runs ensureDaemon and
+        // respawns it instead of immediately failing with the same error.
+        switch (err) {
+            error.ConnectionRefused, error.ConnectionResetByPeer, error.NetworkUnreachable => {
+                ctx.daemon_started = false;
+            },
+            else => {},
+        }
         const msg = try std.fmt.allocPrint(al, "daemon request failed: {s}", .{@errorName(err)});
         return writeError(out, id_val, -32000, msg);
     };
@@ -284,15 +316,23 @@ fn buildUrl(
         return;
     }
     if (std.mem.eql(u8, tool, "callgraph_commits")) {
-        try out.appendSlice(al, "/api/commits");
-        const limit_opt = jsonInt(args, "limit");
-        if (limit_opt) |n| try out.writer(al).print("?limit={d}", .{n});
+        // MCP shim always requests text; the daemon defaults /api/commits
+        // to JSON for the web UI.
+        try out.appendSlice(al, "/api/commits?format=text");
+        if (jsonInt(args, "limit")) |n| try out.writer(al).print("&limit={d}", .{n});
         return;
     }
     if (std.mem.eql(u8, tool, "callgraph_entries")) {
         try out.appendSlice(al, "/api/entries");
-        const arch_opt = jsonString(args, "arch");
-        if (arch_opt) |a| try out.writer(al).print("?arch={s}", .{a});
+        var first = true;
+        if (jsonString(args, "arch")) |a| {
+            try out.writer(al).print("{s}arch={s}", .{ if (first) "?" else "&", a });
+            first = false;
+        }
+        if (jsonString(args, "kind")) |k| {
+            try out.writer(al).print("{s}kind={s}", .{ if (first) "?" else "&", percentEncode(al, k) catch k });
+            first = false;
+        }
         return;
     }
     if (std.mem.eql(u8, tool, "callgraph_find")) {
@@ -314,6 +354,12 @@ fn buildUrl(
         }
         if (jsonBoolOpt(args, "hide_library")) |b| {
             try out.writer(al).print("&hide_library={d}", .{@intFromBool(b)});
+        }
+        if (jsonBoolOpt(args, "hide_assertions")) |b| {
+            try out.writer(al).print("&hide_assertions={d}", .{@intFromBool(b)});
+        }
+        if (jsonBoolOpt(args, "hide_ref_captures")) |b| {
+            try out.writer(al).print("&hide_ref_captures={d}", .{@intFromBool(b)});
         }
         if (jsonString(args, "exclude")) |e| {
             try out.writer(al).print("&exclude={s}", .{percentEncode(al, e) catch e});
@@ -376,6 +422,18 @@ fn buildUrl(
         }
         if (jsonBool(args, "intra")) {
             try out.writer(al).print("{s}intra=1", .{if (first) "?" else "&"});
+            first = false;
+        }
+        if (jsonInt(args, "min_edges")) |n| {
+            try out.writer(al).print("{s}min_edges={d}", .{ if (first) "?" else "&", n });
+            first = false;
+        }
+        if (jsonBool(args, "exclude_external")) {
+            try out.writer(al).print("{s}exclude_external=1", .{if (first) "?" else "&"});
+            first = false;
+        }
+        if (jsonString(args, "direction")) |d| {
+            try out.writer(al).print("{s}direction={s}", .{ if (first) "?" else "&", d });
             first = false;
         }
         return;
@@ -445,10 +503,8 @@ fn ensureDaemon(ctx: *Ctx) !void {
 fn pingDaemon(gpa: std.mem.Allocator, port: u16) !bool {
     const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/api/arches", .{port});
     defer gpa.free(url);
-    _ = httpGet(gpa, url) catch |err| switch (err) {
-        error.ConnectionRefused, error.ConnectionResetByPeer, error.NetworkUnreachable => return false,
-        else => return false,
-    };
+    const body = httpGet(gpa, url) catch return false;
+    gpa.free(body);
     return true;
 }
 
@@ -463,12 +519,18 @@ fn spawnDaemon(ctx: *Ctx) !void {
     const port_arg = try std.fmt.allocPrint(ctx.gpa, "{d}", .{ctx.args.daemon_port});
     defer ctx.gpa.free(port_arg);
 
+    // Spawn the daemon WITHOUT --no-build. Cold start now triggers a kernel
+    // rebuild + IR regeneration so the index reflects the working tree at
+    // spawn time. The daemon is long-lived; subsequent MCP sessions reuse
+    // it and pay no startup cost. Without this, deleted-or-renamed modules
+    // continued to surface in tool output indefinitely (the recurring
+    // "ghost symbol" problem). The freshness footer in the daemon flags
+    // long-running stale indexes after FRESHNESS_FOOTER_AFTER_SECS.
     const argv = [_][]const u8{
         self_path,
         "--port",                 port_arg,
         "--build-root",           ctx.args.build_root,
         "--kernel-root",          ctx.args.kernel_root,
-        "--no-build",
     };
 
     // Fork + setsid so the daemon outlives this MCP process. Redirect

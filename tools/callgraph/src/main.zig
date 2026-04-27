@@ -124,7 +124,7 @@ pub fn main() !void {
             "/var/tmp/cg-worktrees",
             &arch_specs,
         );
-        try server.serve(allocator, &graphs, "x86_64", args.build_root, &registry, args.port);
+        try server.serve(allocator, &graphs, "x86_64", args.build_root, &registry, args.port, std.time.timestamp());
         return;
     }
 
@@ -310,7 +310,7 @@ pub fn main() !void {
         return;
     }
 
-    try server.serve(allocator, &graphs, default_arch, args.build_root, &registry, args.port);
+    try server.serve(allocator, &graphs, default_arch, args.build_root, &registry, args.port, std.time.timestamp());
 }
 
 fn buildKernel(

@@ -59,6 +59,12 @@ pub const CallSiteMap = std.StringHashMap([]const Callee);
 /// fallback.
 pub const QNameIndex = std.StringHashMap(types.FnId);
 pub const KnownNames = std.StringHashMap(void);
+/// Global qname → return-type-qname index. Populated by join.zig from each
+/// AstFunction's `return_type_qname` slot. Used by `inferCallReturnType` so
+/// `const x = someFn(args);` bindings record the right struct qname for
+/// downstream `x.method()` resolution. Empty entries (functions whose
+/// return type couldn't be reduced) are simply omitted.
+pub const FnReturnTypeIndex = std.StringHashMap([]const u8);
 /// Global struct-qname → StructTypeInfo. Built by join.zig from the walker's
 /// struct_types output. The receiver-chain resolver walks each `.field`
 /// segment through this table until only the trailing method name remains.
@@ -118,6 +124,7 @@ pub fn buildIntra(
     receiver_type: []const u8,
     param_bindings: ?*const ParamBindings,
     aliases: ?*const ReexportAliasIndex,
+    fn_return_types: ?*const FnReturnTypeIndex,
 ) ![]const Atom {
     const node_idx: std.zig.Ast.Node.Index = @enumFromInt(fn_node);
 
@@ -139,11 +146,40 @@ pub fn buildIntra(
         .receiver_type = receiver_type,
         .param_bindings = param_bindings,
         .aliases = aliases,
+        .fn_return_types = fn_return_types,
         .locals_stack = .{},
     };
     // Push the function-scope local frame. Subsequent block entries push
     // additional frames; the `head`-lookup walk visits every active frame.
     try ctx.locals_stack.append(arena, .{});
+
+    // Register every named param with a resolvable struct type into the
+    // function-scope frame. Without this, top-level functions whose first
+    // arg is a struct-pointer-but-not-a-receiver (e.g. `pub fn recv(caller:
+    // *ExecutionContext, ...)` declared outside ExecutionContext's container)
+    // can't resolve `caller.field` chains — `computeReceiver` only marks the
+    // arg as a receiver when the fn is declared inside the type's container,
+    // and there's no other code path that knows the param's type. The locals
+    // table is the natural home.
+    {
+        var proto_buf: [1]std.zig.Ast.Node.Index = undefined;
+        if (ast.fullFnProto(&proto_buf, node_idx)) |fn_proto| {
+            var it = fn_proto.iterate(ast);
+            while (it.next()) |param| {
+                const tok = param.name_token orelse continue;
+                const pname = ast.tokenSlice(tok);
+                if (pname.len == 0) continue;
+                // Skip `self` / `this` / the explicit-receiver name — those
+                // already route through the receiver path.
+                if (receiver_name.len > 0 and std.mem.eql(u8, pname, receiver_name)) continue;
+                const type_expr = param.type_expr orelse continue;
+                const ptype = resolveLocalDeclType(&ctx, type_expr) catch "";
+                if (ptype.len == 0) continue;
+                const top = &ctx.locals_stack.items[0];
+                _ = try top.getOrPutValue(arena, try arena.dupe(u8, pname), ptype);
+            }
+        }
+    }
 
     var seq = std.ArrayList(IrNode){};
     try walkExpr(&ctx, body_node, &seq);
@@ -234,6 +270,12 @@ const Ctx = struct {
     /// `SpinLock` is `pub const SpinLock = spin_lock.SpinLock;`) gets
     /// rewritten to the underlying form before retrying the lookup.
     aliases: ?*const ReexportAliasIndex,
+    /// Optional fn-qname → return-type-qname index. Populated by join.zig.
+    /// Consulted by `inferInitType` when a local's RHS is a call: lets
+    /// `const port_ref = capability.typedRef(...) orelse return ...;`
+    /// stamp `port_ref` with the SlabRef return type so a later
+    /// `port_ref.lock(...)` call can resolve through the receiver path.
+    fn_return_types: ?*const FnReturnTypeIndex,
     /// Defer / errdefer expression nodes accumulated at function scope.
     /// Walked at function-end so their calls show up in the sequence.
     defers: std.ArrayList(std.zig.Ast.Node.Index) = .{},
@@ -842,11 +884,197 @@ fn recordLocalDecl(ctx: *Ctx, vd: std.zig.Ast.full.VarDecl) !void {
 
     var type_qname: []const u8 = "";
     if (vd.ast.type_node.unwrap()) |type_node| {
+        // `const x: T = ...;` — explicit annotation wins, treat the RHS
+        // as opaque.
         type_qname = resolveLocalDeclType(ctx, type_node) catch "";
+    } else if (vd.ast.init_node.unwrap()) |init_node| {
+        // `const x = expr;` — infer from the RHS so chains like
+        // `cd_ref.lock(...)` resolve once the local's type is known. The
+        // inference is deliberately conservative: returns "" for anything
+        // we can't reduce to a struct qname, so a later receiver lookup
+        // simply falls back to indirect rather than resolving wrong.
+        type_qname = inferInitType(ctx, init_node) catch "";
     }
 
     var top = &ctx.locals_stack.items[ctx.locals_stack.items.len - 1];
     try top.put(ctx.arena, name_dup, type_qname);
+}
+
+/// Walk an initializer expression and return the qname of its underlying
+/// struct type, or "" when not statically reducible. Handles the common
+/// patterns the kernel uses for local bindings:
+///
+///   identifier         — alias to a local in scope or to the enclosing
+///                        receiver; type qname comes from the locals stack
+///                        / receiver_type.
+///   field_access       — `head.field.chain.[…]`. Resolved via the same
+///                        struct-types index the receiver-method resolver
+///                        uses, walking each `.field` segment.
+///   unwrap_optional    — `expr.?`. Same type as LHS.
+///   deref              — `expr.*`. Same type as LHS (pointer→pointee
+///                        already strips in resolveLocalDeclType; here the
+///                        LHS already stores the pointee type).
+///   grouped_expression — `(expr)`. Same as inner.
+///   orelse / catch     — `expr orelse default` / `expr catch default`.
+///                        Same as LHS — the unwrap removes the optional /
+///                        error-union wrapping; the inferred type tracks
+///                        the success case the local actually holds.
+///   try                — `try expr`. Same as LHS.
+///   call               — `someFn(args)`. Resolved via the global fn
+///                        return-type index; "" when the callee or its
+///                        return type aren't reducible. This closes the
+///                        common `const x = receiver.method(...)` pattern.
+///
+/// All other forms (struct literals, builtins, comptime exprs, address-of,
+/// etc.) yield "" — the locals scope still records the binding so a later
+/// `x.method()` call sees "exists but unresolvable" and falls through to
+/// indirect, mirroring resolveByReceiver's behaviour for the explicit-
+/// annotation case.
+fn inferInitType(ctx: *Ctx, node: std.zig.Ast.Node.Index) ![]const u8 {
+    const tag = ctx.ast.nodeTag(node);
+    switch (tag) {
+        .identifier => {
+            const ident = nodeSource(ctx, node);
+            if (ident.len == 0) return "";
+            // Locals shadow the receiver, mirroring resolveByReceiver.
+            if (lookupLocal(ctx, ident)) |t| return t;
+            if (ctx.receiver_name.len > 0 and std.mem.eql(u8, ident, ctx.receiver_name)) {
+                return ctx.receiver_type;
+            }
+            return "";
+        },
+
+        .field_access => {
+            // Walk `head.tail.chain` through the struct-types index, exactly
+            // like resolveByReceiver — but here `chain` is the *whole*
+            // expression (no trailing method to strip), so the final segment
+            // also resolves to a field type.
+            const chain = chainSource(ctx, node) orelse return "";
+            const first_dot = std.mem.indexOfScalar(u8, chain, '.') orelse return "";
+            const head = chain[0..first_dot];
+            const tail = chain[first_dot + 1 ..];
+            if (tail.len == 0) return "";
+
+            var cur_type: []const u8 = "";
+            if (lookupLocal(ctx, head)) |t| {
+                cur_type = t;
+            } else if (ctx.receiver_name.len > 0 and std.mem.eql(u8, head, ctx.receiver_name)) {
+                cur_type = ctx.receiver_type;
+            } else {
+                return "";
+            }
+            if (cur_type.len == 0) return "";
+
+            const struct_idx = ctx.struct_types orelse return "";
+            var rest = tail;
+            while (true) {
+                const sti_ptr = struct_idx.get(cur_type) orelse return "";
+                const dot_pos = std.mem.indexOfScalar(u8, rest, '.');
+                if (dot_pos) |p| {
+                    const segment = rest[0..p];
+                    const next_type = findFieldType(sti_ptr.*, segment) orelse return "";
+                    if (next_type.len == 0) return "";
+                    cur_type = next_type;
+                    rest = rest[p + 1 ..];
+                    continue;
+                }
+                // Final segment.
+                const next_type = findFieldType(sti_ptr.*, rest) orelse return "";
+                if (next_type.len == 0) return "";
+                return next_type;
+            }
+        },
+
+        .unwrap_optional => {
+            // node_and_token[0] is the LHS, the token is the trailing `?`.
+            const lhs = ctx.ast.nodeData(node).node_and_token[0];
+            return try inferInitType(ctx, lhs);
+        },
+        .deref => {
+            // `.deref` carries a single child node — the pointer being
+            // dereferenced. The pointee type matches what the LHS already
+            // tracks (struct_types entries are stored stripped of pointer
+            // decoration in the field-type table), so just recurse.
+            const child = ctx.ast.nodeData(node).node;
+            return try inferInitType(ctx, child);
+        },
+        .grouped_expression => {
+            const inner = ctx.ast.nodeData(node).node_and_token[0];
+            return try inferInitType(ctx, inner);
+        },
+        .@"orelse", .@"catch" => {
+            // Both peel a layer: orelse strips optional, catch strips error
+            // union. The inferred type is whatever the success-case LHS
+            // resolves to; the fallback expression on the RHS doesn't bind
+            // back to this local on the success path.
+            const lhs = ctx.ast.nodeData(node).node_and_node[0];
+            return try inferInitType(ctx, lhs);
+        },
+        .@"try" => {
+            const child = ctx.ast.nodeData(node).node;
+            return try inferInitType(ctx, child);
+        },
+
+        .call, .call_comma, .call_one, .call_one_comma => {
+            return inferCallReturnType(ctx, node) catch "";
+        },
+
+        else => return "",
+    }
+}
+
+/// Resolve a call expression to its function's return-type qname. Mirrors
+/// emitCall's resolution ladder — IR-resolved callee → import-table lookup →
+/// receiver-chain — then consults the global return-type index. Returns ""
+/// for any miss so the caller falls through to "binding exists but
+/// unresolvable".
+fn inferCallReturnType(ctx: *Ctx, call_node: std.zig.Ast.Node.Index) ![]const u8 {
+    const ret_idx = ctx.fn_return_types orelse return "";
+    var buf: [1]std.zig.Ast.Node.Index = undefined;
+    const call = ctx.ast.fullCall(&buf, call_node) orelse return "";
+
+    const first_tok = ctx.ast.firstToken(call.ast.fn_expr);
+    const loc = ctx.ast.tokenLocation(0, first_tok);
+    const line: u32 = @intCast(loc.line + 1);
+    const col: u32 = @intCast(loc.column + 1);
+
+    // 1) IR-resolved direct call at this site — preferred when available.
+    const key = try callSiteKey(ctx.arena, ctx.file, line);
+    if (ctx.callsites.get(key)) |candidates| {
+        var best: ?Callee = null;
+        var best_dist: u32 = std.math.maxInt(u32);
+        for (candidates) |c| {
+            const cc: u32 = c.site.col;
+            const d: u32 = if (cc > col) cc - col else col - cc;
+            if (d < best_dist) {
+                best_dist = d;
+                best = c;
+            }
+        }
+        if (best) |c| {
+            if (c.kind != .indirect and c.name.len > 0) {
+                if (ret_idx.get(c.name)) |t| if (t.len > 0) return t;
+            }
+        }
+    }
+
+    // 2) Import-table / same-file lookup (mirrors resolveByImports). Catches
+    //    inlined-away calls the IR no longer carries.
+    if (try resolveByImports(ctx, call.ast.fn_expr, line, col)) |resolved| {
+        if (resolved.name.len > 0) {
+            if (ret_idx.get(resolved.name)) |t| if (t.len > 0) return t;
+        }
+    }
+
+    // 3) Receiver-chain lookup (mirrors resolveByReceiver). Catches
+    //    `local.method(...)` once the local's own type is known.
+    if (try resolveByReceiver(ctx, call.ast.fn_expr, line, col)) |resolved| {
+        if (resolved.name.len > 0) {
+            if (ret_idx.get(resolved.name)) |t| if (t.len > 0) return t;
+        }
+    }
+
+    return "";
 }
 
 /// Resolve a local var-decl's annotated type to a struct qname, mirroring
@@ -890,9 +1118,11 @@ fn resolveLocalDeclType(ctx: *Ctx, type_node: std.zig.Ast.Node.Index) ![]const u
     return "";
 }
 
-/// Strip leading pointer/optional/const decoration from a type source span.
-/// Mirrors walker.stripPointerOptional but lives here so branches.zig
-/// doesn't reach into the walker's private helpers.
+/// Strip leading pointer/optional/const decoration AND a trailing generic-
+/// args group from a type source span. Mirrors walker.stripPointerOptional
+/// (kept in sync — see the comment there for why generic-args stripping
+/// matters for the kernel's `Foo(comptime T: type) type {...}` factory
+/// pattern).
 fn stripPointerOptional(src: []const u8) []const u8 {
     var s = std.mem.trim(u8, src, &std.ascii.whitespace);
     while (s.len > 0) {
@@ -908,6 +1138,24 @@ fn stripPointerOptional(src: []const u8) []const u8 {
         }
         if (s[0] == '[') return "";
         break;
+    }
+    return stripTrailingGenericArgs(s);
+}
+
+fn stripTrailingGenericArgs(s: []const u8) []const u8 {
+    if (s.len == 0 or s[s.len - 1] != ')') return s;
+    var depth: usize = 0;
+    var i: usize = s.len;
+    while (i > 0) {
+        i -= 1;
+        switch (s[i]) {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if (depth == 0) return std.mem.trim(u8, s[0..i], &std.ascii.whitespace);
+            },
+            else => {},
+        }
     }
     return s;
 }
