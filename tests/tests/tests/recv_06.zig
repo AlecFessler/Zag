@@ -172,7 +172,7 @@ pub fn main(cap_table_base: u64) void {
     // queues a sender on `helper_port`; the kernel attempts to mint
     // a reply handle in our table, finds zero free slots, and must
     // return E_FULL per §[recv] test 06.
-    const result = syscall.recv(helper_port);
+    const result = syscall.recv(helper_port, 0);
     if (result.regs.v1 != @intFromEnum(errors.Error.E_FULL)) {
         testing.fail(4);
         return;

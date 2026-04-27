@@ -148,7 +148,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 4: dequeue W. The recv syscall word's reply_handle_id is
     // at bits 32-43 per §[recv].
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;

@@ -135,7 +135,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 4: recv. Reply handle id rides in the syscall word; W's
     // GPRs ride in vregs 2..13 because W's handle has `read`.
-    const got1 = syscall.recv(port_handle);
+    const got1 = syscall.recv(port_handle, 0);
     if (got1.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;
@@ -183,7 +183,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 7: recv again. G2 reflects W's current state.
-    const got2 = syscall.recv(port_handle);
+    const got2 = syscall.recv(port_handle, 0);
     if (got2.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(7);
         return;

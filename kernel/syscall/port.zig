@@ -175,7 +175,7 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64) i64 {
 /// [test 12] on success when the suspending EC handle did not have the `read` cap, all event-state vregs are zeroed.
 /// [test 13] when multiple senders are queued, the kernel selects the highest-priority sender; ties resolve FIFO.
 /// [test 14] on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
-pub fn recv(caller: *anyopaque, port: u64) i64 {
+pub fn recv(caller: *anyopaque, port: u64, timeout_ns: u64) i64 {
     if (port & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
@@ -193,5 +193,5 @@ pub fn recv(caller: *anyopaque, port: u64) i64 {
 
     if (!port_caps.recv) return errors.E_PERM;
 
-    return port_obj.recv(ec, port);
+    return port_obj.recv(ec, port, timeout_ns);
 }

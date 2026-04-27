@@ -206,7 +206,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
 
         .create_port => port.createPort(caller, arg(args, 0)),
         .@"suspend" => port.@"suspend"(caller, arg(args, 0), arg(args, 1)),
-        .recv => port.recv(caller, arg(args, 0)),
+        .recv => port.recv(caller, arg(args, 0), arg(args, 1)),
 
         .bind_event_route => event_route.bindEventRoute(
             caller,

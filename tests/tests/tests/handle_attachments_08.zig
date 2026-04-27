@@ -237,7 +237,7 @@ pub fn main(cap_table_base: u64) void {
     // holder and W queued as a suspended sender, so recv returns
     // immediately. The kernel has had its chance to perform the
     // attachment move/copy at recv time per §[handle_attachments].
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(5);
         return;

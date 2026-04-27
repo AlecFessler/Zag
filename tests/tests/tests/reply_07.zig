@@ -153,7 +153,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 4: recv. The test EC holds the port's recv cap and W is
     // queued, so recv returns immediately. The reply_handle_id is in
     // the syscall word's bits 32-43 per §[recv].
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;

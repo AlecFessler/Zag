@@ -250,74 +250,15 @@ pub const RecvReturn = struct {
     regs: Regs,
 };
 
+// The kernel writes the syscall return word into the receiver's rax
+// (vreg 1) via `setSyscallReturn` — rcx is sysret-clobbered (it carries
+// the user RIP back), so there is no way to deliver a separate "word"
+// out of band. `RecvReturn.word` here is just `regs.v1` lifted out for
+// callers that conceptually want the syscall return word; the two are
+// the same value.
 fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
-    var ov1: u64 = undefined;
-    var ov2: u64 = undefined;
-    var ov3: u64 = undefined;
-    var ov4: u64 = undefined;
-    var ov5: u64 = undefined;
-    var ov6: u64 = undefined;
-    var ov7: u64 = undefined;
-    var ov8: u64 = undefined;
-    var ov9: u64 = undefined;
-    var ov10: u64 = undefined;
-    var ov11: u64 = undefined;
-    var ov12: u64 = undefined;
-    var ov13: u64 = undefined;
-    var word_out: u64 = undefined;
-    asm volatile (
-        \\ subq $16, %%rsp
-        \\ movq %%rcx, (%%rsp)
-        \\ syscall
-        \\ movq (%%rsp), %%rcx
-        \\ addq $16, %%rsp
-        : [v1] "={rax}" (ov1),
-          [v2] "={rbx}" (ov2),
-          [v3] "={rdx}" (ov3),
-          [v4] "={rbp}" (ov4),
-          [v5] "={rsi}" (ov5),
-          [v6] "={rdi}" (ov6),
-          [v7] "={r8}" (ov7),
-          [v8] "={r9}" (ov8),
-          [v9] "={r10}" (ov9),
-          [v10] "={r12}" (ov10),
-          [v11] "={r13}" (ov11),
-          [v12] "={r14}" (ov12),
-          [v13] "={r15}" (ov13),
-          [wordout] "={rcx}" (word_out),
-        : [wordin] "{rcx}" (word_in),
-          [iv1] "{rax}" (in.v1),
-          [iv2] "{rbx}" (in.v2),
-          [iv3] "{rdx}" (in.v3),
-          [iv4] "{rbp}" (in.v4),
-          [iv5] "{rsi}" (in.v5),
-          [iv6] "{rdi}" (in.v6),
-          [iv7] "{r8}" (in.v7),
-          [iv8] "{r9}" (in.v8),
-          [iv9] "{r10}" (in.v9),
-          [iv10] "{r12}" (in.v10),
-          [iv11] "{r13}" (in.v11),
-          [iv12] "{r14}" (in.v12),
-          [iv13] "{r15}" (in.v13),
-        : .{ .r11 = true, .memory = true });
-    return .{
-        .word = word_out,
-        .regs = .{
-            .v1 = ov1,
-            .v2 = ov2,
-            .v3 = ov3,
-            .v4 = ov4,
-            .v5 = ov5,
-            .v6 = ov6,
-            .v7 = ov7,
-            .v8 = ov8,
-            .v9 = ov9,
-            .v10 = ov10,
-            .v11 = ov11,
-            .v12 = ov12,
-            .v13 = ov13,
-        },
-    };
+    const r = issueRawNoStack(word_in, in);
+    return .{ .word = r.v1, .regs = r };
 }
 
 // ---------------------------------------------------------------
@@ -692,9 +633,9 @@ pub fn suspendEc(target: u12, port: u12, attachments: []const u64) Regs {
     @panic("suspend with attachments: high-vreg layout not yet wired");
 }
 
-pub fn recv(port: u12) RecvReturn {
+pub fn recv(port: u12, timeout_ns: u64) RecvReturn {
     const word = buildWord(.recv, 0);
-    return issueRawCaptureWord(word, .{ .v1 = port });
+    return issueRawCaptureWord(word, .{ .v1 = port, .v2 = timeout_ns });
 }
 
 pub fn bindEventRoute(target: u12, event_type: u64, port: u12) Regs {

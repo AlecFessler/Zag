@@ -131,6 +131,26 @@ pub fn getEventVreg4(ctx: *const ArchCpuContext) u64 {
     };
 }
 
+/// Read event-state vreg 5 from a suspending EC — third propagated
+/// GPR (alongside vregs 3 and 4). x86-64: rsi; aarch64: x4.
+pub fn getEventVreg5(ctx: *const ArchCpuContext) u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.getEventVreg5(ctx),
+        .aarch64 => aarch64.interrupts.getEventVreg5(ctx),
+        else => unreachable,
+    };
+}
+
+/// Write event-state vreg 5 on a receiving EC — companion to
+/// `getEventVreg5`.
+pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.setEventVreg5(ctx, value),
+        .aarch64 => aarch64.interrupts.setEventVreg5(ctx, value),
+        else => unreachable,
+    }
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.interrupts.getIpcHandle(ctx),

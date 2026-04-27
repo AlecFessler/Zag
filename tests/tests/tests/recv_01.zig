@@ -39,7 +39,7 @@ pub fn main(cap_table_base: u64) void {
     // checks against the port.
     const empty_slot: u12 = caps.HANDLE_TABLE_MAX - 1;
 
-    const result = syscall.recv(empty_slot);
+    const result = syscall.recv(empty_slot, 0);
 
     if (result.regs.v1 != @intFromEnum(errors.Error.E_BADCAP)) {
         testing.fail(1);

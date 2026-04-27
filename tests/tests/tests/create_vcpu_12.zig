@@ -214,7 +214,7 @@ pub fn main(cap_table_base: u64) void {
     // 7. The kernel must have enqueued the initial vm_exit on
     //    exit_port at create_vcpu time, so this recv returns
     //    immediately with the synthetic event rather than blocking.
-    const got = syscall.recv(exit_port);
+    const got = syscall.recv(exit_port, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(7);
         return;

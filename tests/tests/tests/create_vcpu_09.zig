@@ -238,7 +238,7 @@ pub fn main(cap_table_base: u64) void {
     //    block. A successful recv leaves vreg 1 untouched by the
     //    error path; treat any value <= 15 (per §[error_codes]) as
     //    an error word and fail.
-    const first = syscall.recv(exit_port);
+    const first = syscall.recv(exit_port, 0);
     if (errors.isError(first.regs.v1)) {
         testing.fail(3);
         return;
@@ -260,7 +260,7 @@ pub fn main(cap_table_base: u64) void {
     //     is established by the kernel's recv state-transfer path and
     //     is not vreg-comparable here without an oracle for which
     //     fields are non-`_reserved` for the just-fired sub-code.
-    const second = syscall.recv(exit_port);
+    const second = syscall.recv(exit_port, 0);
     if (errors.isError(second.regs.v1)) {
         testing.fail(5);
         return;

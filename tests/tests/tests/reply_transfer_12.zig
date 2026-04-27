@@ -215,7 +215,7 @@ pub fn main(cap_table_base: u64) void {
     // 4. Block waiting for the sibling's suspension event. The kernel
     //    mints a reply handle in our table and returns its slot id in
     //    the recv syscall word's bits 32-43.
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     if (testing.isHandleError(got.regs.v1)) {
         testing.fail(4);
         return;

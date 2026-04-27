@@ -243,7 +243,7 @@ pub fn main(cap_table_base: u64) void {
     // ≥ SLOT_FIRST_PASSED (=3), so a zero in those bits is a recv
     // failure witness; on success the event_type for a `suspend`-
     // generated event is `suspension` (=4 per §[event_type]).
-    const got_r = syscall.recv(port_handle);
+    const got_r = syscall.recv(port_handle, 0);
     const reply_id_r: u12 = @truncate((got_r.word >> 32) & 0xFFF);
     const event_type_r: u5 = @truncate((got_r.word >> 44) & 0x1F);
     if (reply_id_r == 0 or event_type_r != 4) {
@@ -305,7 +305,7 @@ pub fn main(cap_table_base: u64) void {
     // pad we don't yet have, but the spec line's "zeroed" requirement
     // applies uniformly across all event-state vregs and verifying any
     // strict subset is sufficient evidence that the kernel honored it.
-    const got_z = syscall.recv(port_handle);
+    const got_z = syscall.recv(port_handle, 0);
     const reply_id_z: u12 = @truncate((got_z.word >> 32) & 0xFFF);
     const event_type_z: u5 = @truncate((got_z.word >> 44) & 0x1F);
     if (reply_id_z == 0 or event_type_z != 4) {

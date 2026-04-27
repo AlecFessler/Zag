@@ -172,7 +172,7 @@ pub fn main(cap_table_base: u64) void {
     // Block until the child delivers its suspension event. The
     // returned syscall word carries the reply handle id in bits
     // 32-43 (§[recv] return-word layout).
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     const reply_handle_id: u12 = @truncate((got.word >> 32) & 0xFFF);
 
     // Terminate the now-suspended child. Per §[terminate] test 04

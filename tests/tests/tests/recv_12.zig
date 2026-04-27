@@ -150,7 +150,7 @@ pub fn main(cap_table_base: u64) void {
     // holder and W queued as a suspension event, so recv returns
     // immediately with the syscall word and vregs populated per
     // §[recv] / §[event_state].
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;

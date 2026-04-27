@@ -103,8 +103,14 @@ pub fn globalInit() !void {
 }
 
 /// Per-core init — called once per core during SMP bring-up after the
-/// core's APIC / GIC is online. Allocates the idle EC for this core.
-pub fn perCoreInit() void {}
+/// core's APIC / GIC is online. Arms the per-core preemption timer so
+/// the scheduler tick fires every `TIMESLICE_NS` and round-robin
+/// between equal-priority ECs is honored. Without this call no LAPIC
+/// timer interrupt ever fires and a CPU-bound EC runs forever until
+/// it voluntarily yields.
+pub fn perCoreInit() void {
+    arch.time.getPreemptionTimer().armInterruptTimer(TIMESLICE_NS);
+}
 
 // ── Dispatch ─────────────────────────────────────────────────────────
 

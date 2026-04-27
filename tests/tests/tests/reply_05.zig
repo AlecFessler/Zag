@@ -164,7 +164,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 4: recv. With the test EC as a live bind-cap holder and W
     // queued, recv returns immediately. The syscall word's bits 32-43
     // carry the reply handle id per §[event_state].
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;

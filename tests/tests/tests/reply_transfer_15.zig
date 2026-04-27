@@ -241,7 +241,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 4: recv to materialize the reply handle. The reply handle
     // id lives in syscall word bits 32-43 per §[recv].
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;

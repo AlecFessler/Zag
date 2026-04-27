@@ -49,7 +49,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
-    const result = syscall.recv(port_handle);
+    const result = syscall.recv(port_handle, 0);
 
     if (result.regs.v1 != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(2);

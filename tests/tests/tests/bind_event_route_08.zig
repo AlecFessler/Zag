@@ -145,7 +145,7 @@ pub fn main(cap_table_base: u64) void {
     // and return its slot id in the syscall word's reply_handle_id
     // field (bits 32-43) along with event_type = suspension (bits
     // 44-48 = 4).
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;

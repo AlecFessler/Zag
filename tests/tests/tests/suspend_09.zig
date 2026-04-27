@@ -115,7 +115,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 4: recv. The port has the test EC as a live bind-cap holder
     // and a queued suspension event, so per §[recv] this returns
     // immediately with the event_type encoded in the syscall word.
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;

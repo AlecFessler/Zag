@@ -676,6 +676,16 @@ pub fn getEventVreg4(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.rbp;
 }
 
+/// Spec §[event_state] vreg 5 — rsi on x86-64. Sender's snapshot is
+/// propagated to the receiver alongside vreg 3 / vreg 4.
+pub fn getEventVreg5(ctx: *const ArchCpuContext) u64 {
+    return ctx.regs.rsi;
+}
+
+pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.rsi = value;
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.r13;
 }

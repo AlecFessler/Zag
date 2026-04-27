@@ -32,7 +32,108 @@ const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const KernelHandle = capability.KernelHandle;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
+const SpinLock = zag.utils.sync.SpinLock;
 const Word0 = capability.Word0;
+
+// ── Timed recv waiters ───────────────────────────────────────────────
+//
+// Parallel structure to sched.futex.timed_waiters: a fixed array of EC
+// pointers blocked in `recv` with a non-zero timeout. The scheduler
+// tick (arch.x64.irq.schedTimerHandler) drives `expireTimedRecvWaiters`
+// which dequeues expired ECs from their port's receiver queue, sets
+// their syscall return to E_TIMEOUT, and re-schedules them.
+//
+// 256 slots is more than the spec needs (one EC can hold at most one
+// recv-with-timeout in flight; concurrent recv-with-timeout count is
+// bounded by core count plus user-space concurrency).
+const MAX_TIMED_RECV_WAITERS: usize = 256;
+var timed_recv_waiters: [MAX_TIMED_RECV_WAITERS]?*ExecutionContext = blk: {
+    var arr: [MAX_TIMED_RECV_WAITERS]?*ExecutionContext = undefined;
+    for (&arr) |*slot| slot.* = null;
+    break :blk arr;
+};
+var timed_recv_lock: SpinLock = .{ .class = "port.timed_recv_lock" };
+
+fn addTimedRecvWaiter(ec: *ExecutionContext) bool {
+    const irq = timed_recv_lock.lockIrqSave(@src());
+    defer timed_recv_lock.unlockIrqRestore(irq);
+    for (&timed_recv_waiters) |*slot| {
+        if (slot.* == null) {
+            slot.* = ec;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn removeTimedRecvWaiter(ec: *ExecutionContext) void {
+    const irq = timed_recv_lock.lockIrqSave(@src());
+    defer timed_recv_lock.unlockIrqRestore(irq);
+    for (&timed_recv_waiters) |*slot| {
+        if (slot.* == ec) {
+            slot.* = null;
+            return;
+        }
+    }
+}
+
+/// Called from the scheduler tick to expire any recv-blocked ECs whose
+/// `recv_deadline_ns` has passed. Spec §[port].recv test 14.
+///
+/// Phase 1 snapshots expired ECs under `timed_recv_lock`; Phase 2
+/// removes each from its port's receiver queue under that port's
+/// `_gen_lock`. The split avoids holding `timed_recv_lock` across a
+/// Port lock acquisition (lock-order: Port locks may already be held
+/// when timed_recv_lock is taken in `addTimedRecvWaiter`).
+pub fn expireTimedRecvWaiters() void {
+    const now_ns = arch.time.getMonotonicClock().now();
+
+    const Snapshot = struct { ec: *ExecutionContext, deadline: u64 };
+    var expired: [MAX_TIMED_RECV_WAITERS]Snapshot = undefined;
+    var expired_count: usize = 0;
+    {
+        const irq = timed_recv_lock.lockIrqSave(@src());
+        defer timed_recv_lock.unlockIrqRestore(irq);
+        for (&timed_recv_waiters) |*slot| {
+            const ec = slot.* orelse continue;
+            if (ec.recv_deadline_ns == 0 or now_ns < ec.recv_deadline_ns) continue;
+            expired[expired_count] = .{ .ec = ec, .deadline = ec.recv_deadline_ns };
+            expired_count += 1;
+            slot.* = null;
+        }
+    }
+
+    for (expired[0..expired_count]) |entry| {
+        const ec = entry.ec;
+        // Re-check deadline. If a sender wake ran between phases the
+        // deadline is now 0; if the EC was woken and made a fresh recv
+        // it'd be a different value. Either way this snapshot is stale.
+        if (ec.recv_deadline_ns != entry.deadline) continue;
+
+        const port_ref = ec.suspend_port orelse continue;
+        const p = port_ref.lock(@src()) catch continue;
+
+        // Remove from the port's receiver queue if still present.
+        // (`waiters.remove` is a no-op if the EC was already dequeued
+        // by a sender on a different core.)
+        const removed = p.waiters.remove(ec);
+        if (removed and p.waiters.isEmpty()) p.waiter_kind = .none;
+        port_ref.unlock();
+
+        if (!removed) continue;
+
+        // EC has been removed from the wait queue; safe to wake.
+        while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        ec.recv_deadline_ns = 0;
+        ec.suspend_port = null;
+        ec.event_type = .none;
+        // Stash E_TIMEOUT in the syscall return slot. The scheduler's
+        // resume path puts vreg 1 back into rax on iretq.
+        ec.ctx.regs.rax = @bitCast(errors.E_TIMEOUT);
+        ec.state = .ready;
+        scheduler.markReady(ec);
+    }
+}
 
 /// Cap bits in `Capability.word0[48..63]` for port handles.
 /// Spec §[port] cap layout.
@@ -354,7 +455,7 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
 /// the reply slot). The Port lock is released before `deliverEvent` runs
 /// so the canonical CD → Port order is never inverted — see the lock-
 /// order note on `deliverEvent`.
-pub fn recv(caller: *ExecutionContext, port: u64) i64 {
+pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     const cd_ref = caller.domain;
     const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
     defer cd_ref.unlock();
@@ -396,6 +497,15 @@ pub fn recv(caller: *ExecutionContext, port: u64) i64 {
     caller.state = .suspended_on_port;
     caller.pending_reply_holder = null;
     caller.on_cpu.store(false, .release);
+
+    // Timed recv — register before dropping the port lock so the wakeup
+    // path can find us. Spec §[port].recv test 14.
+    if (timeout_ns != 0) {
+        const now_ns = arch.time.getMonotonicClock().now();
+        caller.recv_deadline_ns = now_ns + timeout_ns;
+        _ = addTimedRecvWaiter(caller);
+    }
+
     port_ref.unlock();
 
     const core_id = arch.smp.coreID();
@@ -790,6 +900,7 @@ fn deliverEvent(
     _ = event_addr;
     arch.syscall.setEventAddr(target_ctx, sender.event_vreg3);
     arch.syscall.setEventVreg4(target_ctx, sender.event_vreg4);
+    arch.syscall.setEventVreg5(target_ctx, sender.event_vreg5);
 
     return 0;
 }
@@ -818,6 +929,14 @@ pub fn rendezvousWithReceiver(
     const receiver = popHighestPriorityReceiver(p) orelse return false;
     receiver.event_type = .none;
     receiver.suspend_port = null;
+
+    // Cancel any pending recv-with-timeout deadline before delivery.
+    // Setting deadline to 0 also makes a stale-snapshot phase-2 expiry
+    // skip this EC.
+    if (receiver.recv_deadline_ns != 0) {
+        receiver.recv_deadline_ns = 0;
+        removeTimedRecvWaiter(receiver);
+    }
 
     // Snapshot receiver's CD ref under the port lock, then drop the
     // port lock before acquiring the CD lock. The receiver is no

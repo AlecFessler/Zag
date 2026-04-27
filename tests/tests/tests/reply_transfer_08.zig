@@ -199,7 +199,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 5: recv. With W queued and our port carrying bind+recv+xfer,
     // recv returns immediately with reply_handle_id in the syscall word
     // bits 32-43 (per §[recv]).
-    const got = syscall.recv(p_recv);
+    const got = syscall.recv(p_recv, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(5);
         return;

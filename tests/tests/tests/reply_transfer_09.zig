@@ -182,7 +182,7 @@ pub fn main(cap_table_base: u64) void {
     // §[recv]: dequeue the suspension event. The kernel mints a reply
     // handle in our table and returns its slot id in syscall word
     // bits 32-43 (per §[recv]).
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     const reply_id: u12 = @truncate((got.word >> 32) & 0xFFF);
     if (reply_id == 0) {
         testing.fail(4);

@@ -10,7 +10,10 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const kprof_dump = zag.kprof.dump;
 const paging_mod = zag.arch.x64.paging;
+const port = zag.sched.port;
 const sched = zag.sched.scheduler;
+const serial = zag.arch.x64.serial;
+const time = zag.arch.dispatch.time;
 
 const DeviceRegion = zag.devices.device_region.DeviceRegion;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -186,8 +189,27 @@ fn fpuFlushIpiHandler(_: *cpu.Context) void {
 /// LAPIC-timer preemption tick. The scheduler reads the current EC and
 /// per-core state from `core_states[apic.coreID()]` directly, so the
 /// vector handler just delegates.
+///
+/// Both LAPIC one-shot and TSC-deadline mode disarm themselves on
+/// fire (Intel SDM Vol 3A §13.5.4 / §13.5.4.1), so the handler must
+/// re-arm before yielding to keep round-robin alive. The same vector
+/// is also used by `apic.sendSchedulerIpi` for cross-core / self
+/// preempt IPIs (`enqueueOnCore`, `yield`), which is harmless: each
+/// invocation just resets the next tick to `TIMESLICE_NS` from now.
+var _dbg_tick_count: u64 = 0;
 fn schedTimerHandler(ctx: *cpu.Context) void {
     _ = ctx;
+    const n = @atomicRmw(u64, &_dbg_tick_count, .Add, 1, .monotonic);
+    if (n < 5 or n % 100 == 0) serial.print("[tick {}]\n", .{n});
+    time.getPreemptionTimer().armInterruptTimer(sched.TIMESLICE_NS);
+    // Drive any deadline-based wakeups for recv-with-timeout.
+    // No-op when nothing has expired.
+    //
+    // futex.expireTimedWaiters() is intentionally NOT called here yet:
+    // its existing impl hits an unreachable in enqueueOnCore when fired
+    // (pre-existing latent bug exposed the moment a tick fires through
+    // it). Tracked separately; recv-timeout doesn't need it.
+    port.expireTimedRecvWaiters();
     sched.preempt();
 }
 

@@ -58,7 +58,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    const recv_result = syscall.recv(port_handle);
+    const recv_result = syscall.recv(port_handle, 0);
     if (recv_result.regs.v1 != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(3);
         return;

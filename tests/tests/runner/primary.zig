@@ -30,7 +30,15 @@ const embedded_tests = @import("embedded_tests");
 const serial_mod = @import("serial.zig");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
+
+// Spec §[port].recv [2] timeout_ns. 5 s is roughly 50× the all-test
+// completion budget (the in-kernel-parallel runner's healthy-tests
+// path finishes near-instant per result), so any test still pending
+// at this point is hung and gets recorded as MISS via the not_run
+// initial state of the results table.
+const RECV_TIMEOUT_NS: u64 = 5_000_000_000;
 
 pub const ResultCode = enum(u64) {
     fail = 0,
@@ -98,9 +106,28 @@ pub fn main(cap_table_base: u64) void {
     // injected via tests/tests/build.zig.
     var collected: usize = 0;
     while (collected < successful_spawns) {
-        const got = syscall.recv(port_handle);
+        const got = syscall.recv(port_handle, RECV_TIMEOUT_NS);
 
-        const reply_handle_id: caps.HandleId = @truncate((got.word >> 32) & 0xFFF);
+        // E_TIMEOUT lands in vreg 1 because no reply handle was minted.
+        // Stop draining; remaining slots stay `.not_run` (= MISS in
+        // summarize). Sender ECs that were still hung are reaped at
+        // domain teardown when the runner returns / power_shutdown.
+        if (got.regs.v1 == @intFromEnum(errors.Error.E_TIMEOUT)) {
+            serial.print("[runner] recv timeout after ");
+            serial.printU64(RECV_TIMEOUT_NS / 1_000_000_000);
+            serial.print("s with ");
+            serial.printU64(collected);
+            serial.print(" / ");
+            serial.printU64(successful_spawns);
+            serial.print(" results — dumping partial table\n");
+            break;
+        }
+
+        // §[event_state] return word — composed by sched.port.deliverEvent
+        // and written to the receiver's rax (vreg 1) via setSyscallReturn.
+        // Layout: pair_count [12..19], tstart [20..31],
+        // reply_handle_id [32..43], event_type [44..].
+        const reply_handle_id: caps.HandleId = @truncate((got.regs.v1 >> 32) & 0xFFF);
         const result_code: ResultCode = @enumFromInt(got.regs.v3);
         const assertion_id: u64 = got.regs.v4;
         const tag: u64 = got.regs.v5;

@@ -426,6 +426,15 @@ pub fn getEventVreg4(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.x3;
 }
 
+/// Spec §[event_state] vreg 5 — x4 on aarch64.
+pub fn getEventVreg5(ctx: *const ArchCpuContext) u64 {
+    return ctx.regs.x4;
+}
+
+pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.x4 = value;
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.x5;
 }

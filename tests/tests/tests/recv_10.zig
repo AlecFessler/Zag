@@ -186,7 +186,7 @@ pub fn main(cap_table_base: u64) void {
     // the suspension event and unblocks this recv. The returned
     // syscall word carries reply_handle_id in bits 32-43 and
     // pair_count in bits 12-19 per §[recv] / §[event_state].
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
 
     // Sanity: the recv must have taken the success branch. A zero
     // reply_handle_id means the kernel did not install a reply handle

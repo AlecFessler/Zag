@@ -57,7 +57,7 @@ pub fn main(cap_table_base: u64) void {
 
     // No bind-cap holders, no event_routes targeting this port, and
     // no queued events. recv must return E_CLOSED rather than block.
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
 
     if (got.regs.v1 != @intFromEnum(errors.Error.E_CLOSED)) {
         testing.fail(2);

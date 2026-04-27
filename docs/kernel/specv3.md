@@ -1836,7 +1836,7 @@ Handle attachments in the suspension event payload follow §[handle_attachments]
 Blocks waiting for an event on a port. On return, the kernel has dequeued one suspended sender, allocated a reply handle for it in the caller's table, allocated slots for any handles the sender attached, written the suspended EC's state to the caller's vregs per §[event_state] (and §[vm_exit_state] for vm_exits), and populated the syscall word with the reply handle id, event_type, pair_count, and tstart.
 
 ```
-recv([1] port) -> void
+recv([1] port, [2] timeout_ns) -> void
   syscall_num = 35
 
   syscall word return layout (per §[event_state]):
@@ -1848,6 +1848,8 @@ recv([1] port) -> void
     bits 49-63: _reserved
 
   [1] port: port handle
+  [2] timeout_ns: 0 = block indefinitely; nonzero = give up after this
+                  many nanoseconds with E_TIMEOUT
 ```
 
 Port cap required on [1]: `recv`.
@@ -1871,6 +1873,8 @@ Returns E_FULL if the caller's handle table cannot accommodate the reply handle 
 [test 11] on success when the suspending EC handle had the `read` cap, the receiver's vregs reflect the suspended EC's state per §[event_state] (or §[vm_exit_state] when event_type = vm_exit).
 [test 12] on success when the suspending EC handle did not have the `read` cap, all event-state vregs are zeroed.
 [test 13] when multiple senders are queued, the kernel selects the highest-priority sender; ties resolve FIFO.
+[test 14] returns E_TIMEOUT if [2] timeout_ns is nonzero, no sender is queued, and no sender becomes queued within [2] timeout_ns.
+[test 15] on success when [2] timeout_ns is nonzero and a sender is delivered before the deadline, the deadline is cancelled and no E_TIMEOUT is later observed.
 [test 14] on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
 
 ### §[event_type] Event Type

@@ -212,17 +212,24 @@ pub const ExecutionContext = struct {
     /// suspend time. Snapshotted in `suspendOnPort` and rewritten into
     /// the receiver's matching GPR slots in `port.deliverEvent` so the
     /// sender's payload (e.g. test runner's result_code/assertion_id in
-    /// vreg 3/4) is observable on recv. Currently only vreg 3 (rdx /
-    /// x2) and vreg 4 (rbp / x3) are propagated — the two vregs the
-    /// userspace test ABI uses for `report(result_code, assertion_id)`.
-    /// Other GPR-backed vregs land in the receiver as zero until a
-    /// fuller snapshot is wired (no test asserts them today).
+    /// vreg 3/4/5) is observable on recv. Currently vregs 3 (rdx / x2),
+    /// 4 (rbp / x3), and 5 (rsi / x4) are propagated — the vregs the
+    /// userspace test ABI uses for
+    /// `report(result_code, assertion_id, tag)`. Other GPR-backed
+    /// vregs land in the receiver as zero until a fuller snapshot is
+    /// wired (no test asserts them today).
     event_vreg3: u64 = 0,
     event_vreg4: u64 = 0,
+    event_vreg5: u64 = 0,
 
     /// Port we joined the wait queue on. Lets cleanup find us if the
     /// port closes while we are queued. `null` outside a suspension.
     suspend_port: ?SlabRef(Port) = null,
+
+    /// Deadline for a timed `recv`. Zero outside a recv-with-timeout.
+    /// Set when recv blocks with timeout_ns != 0; cleared by either the
+    /// normal sender-wake path or `expireTimedRecvWaiters`.
+    recv_deadline_ns: u64 = 0,
 
     /// Back-pointer to the receiver-side handle table entry that holds
     /// the outstanding reply against this EC. Set when we are dequeued
@@ -505,6 +512,7 @@ pub fn suspendOnPort(
     const sender_ctx = ec.iret_frame orelse ec.ctx;
     ec.event_vreg3 = arch.syscall.getEventVreg3(sender_ctx);
     ec.event_vreg4 = arch.syscall.getEventVreg4(sender_ctx);
+    ec.event_vreg5 = arch.syscall.getEventVreg5(sender_ctx);
     ec.suspend_port = SlabRef(Port).init(port, port._gen_lock.currentGen());
     ec.state = .suspended_on_port;
     ec.pending_reply_holder = null;

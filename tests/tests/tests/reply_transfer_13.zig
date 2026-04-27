@@ -168,7 +168,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 4: recv. Returns immediately because W is already queued
     // and the test EC holds the port's bind cap (no E_CLOSED) and the
     // domain has plenty of free slots (no E_FULL).
-    const got = syscall.recv(port_handle);
+    const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;

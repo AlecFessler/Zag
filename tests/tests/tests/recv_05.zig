@@ -120,7 +120,7 @@ fn workerEntry() callconv(.c) noreturn {
     // happens-before the worker's first instruction, and the slot id
     // is published before the spawn.
     const slot = worker_port_slot;
-    const got = syscall.recv(slot);
+    const got = syscall.recv(slot, 0);
     @atomicStore(u64, &worker_recv_result, got.regs.v1, .release);
     @atomicStore(u64, &worker_done, 1, .release);
     while (true) asm volatile ("hlt");
