@@ -1065,11 +1065,20 @@ fn deliverEvent(
         // delivered iff the originating EC handle had the `read` cap;
         // otherwise the GPR-backed event-state vregs are zeroed.
         arch.syscall.setEventStateGprs(target_ctx, [_]u64{0} ** 13);
-        // Surface `subcode` in vreg 2 for events that rely on it
-        // (memory_fault read/write/execute, etc.). When `read` is set
-        // the sender's rbx (vreg 2) wins — see the read-cap branch
-        // above which already overwrote rbx with the snapshot.
-        arch.syscall.setEventSubcode(target_ctx, subcode);
+    }
+    // Surface `subcode` in vreg 2 for events that carry an event-
+    // specific sub-code (memory_fault, thread_fault, breakpoint,
+    // vm_exit, pmu_overflow). The firing-site sub-code overlays the
+    // GPR projection's vreg 2 slot — §[create_vcpu] test 12 requires
+    // the synthetic initial vm_exit to surface the initial-state
+    // sentinel even though the sender's GPR snapshot is all zero.
+    // For `suspension` the spec leaves `subcode` 0, so we leave the
+    // snapshot's rbx (the suspending EC's value) untouched.
+    switch (event_type) {
+        .memory_fault, .thread_fault, .breakpoint, .vm_exit, .pmu_overflow => {
+            arch.syscall.setEventSubcode(target_ctx, subcode);
+        },
+        .none, .suspension => {},
     }
 
     // i64 return == OK on success. The composed `ret_word` is delivered
