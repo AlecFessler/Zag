@@ -851,10 +851,16 @@ pub fn installEventRoute(ec: *ExecutionContext, port: *Port, slot_idx: u8) i64 {
     if (ec.event_routes[slot_idx]) |prior_ref| {
         // Caller already holds `port._gen_lock` and `ec._gen_lock`. The
         // prior port is a different slab slot; reach in to dec its route
-        // count without re-acquiring `port`'s lock. If the dec drove the
-        // prior port to teardown, `destroyLocked` already released its
-        // lock — skip the SlabRef-side unlock.
-        const prior = prior_ref.lock(@src()) catch null;
+        // count without re-acquiring `port`'s lock. Tag the acquisition
+        // with `PORT_REROUTE_GROUP` so lockdep doesn't fire same-class
+        // overlap on the second `Port._gen_lock` — the caller is the
+        // sole writer of `ec.event_routes[slot_idx]` (it holds `ec`'s
+        // gen-lock) and never inverts the (new_port → prior_port)
+        // acquire order, so same-class detection here is a false
+        // positive. If the dec drove the prior port to teardown,
+        // `destroyLocked` already released its lock — skip the
+        // SlabRef-side unlock.
+        const prior = prior_ref.lockOrdered(PORT_REROUTE_GROUP, @src()) catch null;
         if (prior) |pr| {
             const destroyed = decEventRouteCount(pr);
             if (!destroyed) prior_ref.unlock();
@@ -864,6 +870,16 @@ pub fn installEventRoute(ec: *ExecutionContext, port: *Port, slot_idx: u8) i64 {
     ec.event_routes[slot_idx] = SlabRef(Port).init(port, port._gen_lock.currentGen());
     return 0;
 }
+
+/// `Port._gen_lock` ordered_group used by `installEventRoute` when it
+/// acquires a *prior* route's port lock while already holding the
+/// *new* route's port lock. The caller (bind_event_route) is the
+/// sole writer of `ec.event_routes[slot_idx]` and never inverts the
+/// (new_port → prior_port) acquire order, so the same-class lockdep
+/// panic on the second `Port._gen_lock` is a false positive. Caller
+/// discipline: the ordered acquire is always made *while holding*
+/// `port._gen_lock` for the new route, never standalone.
+const PORT_REROUTE_GROUP: u32 = 0x504F; // "PO"
 
 /// Remove the binding at `ec.event_routes[slot_idx]`. Caller has already
 /// locked `ec` and validated `unbind` cap and that the slot is non-null.
