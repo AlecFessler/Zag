@@ -49,18 +49,25 @@
 // as a missing/timed-out result rather than a spurious pass.
 
 const lib = @import("lib");
+const test_tag = @import("test_tag");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+// Local report variant — mirrors `lib.testing.report` but takes the
+// EC slot as a parameter (the standard helper hardcodes
+// SLOT_INITIAL_EC, which this test deletes before reporting). Must
+// still load `test_tag.TAG` into vreg 5 so the runner attributes the
+// result to this test rather than dropping the event for missing magic.
 fn report(ec_slot: u12, code: u64, assertion_id: u64) void {
     _ = syscall.issueReg(.@"suspend", 0, .{
         .v1 = ec_slot,
         .v2 = caps.SLOT_FIRST_PASSED,
         .v3 = code,
         .v4 = assertion_id,
+        .v5 = test_tag.TAG,
     });
 }
 

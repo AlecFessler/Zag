@@ -444,12 +444,22 @@ fn patchInitialIretFrame(
 /// `acquire_ecs` syscall handler.
 /// Spec §[capability_domain].acquire_ecs.
 ///
-/// v0 implementation focused on the E_FULL gate (test 04). Walks the
-/// target IDC's referenced domain counting non-vCPU ECs and bails
-/// E_FULL when the caller's table cannot accommodate the full set.
-/// Successful enumeration (mint + count writeback for tests 05-07)
-/// is left as a follow-up — this stub returns 0 on the success path
-/// without minting handles or setting the syscall word's count field.
+/// Walks the target IDC's referenced domain enumerating non-vCPU ECs,
+/// mints a handle in the caller's table for each (caps =
+/// `target.ec_outer_ceiling` ∩ `idc.ec_cap_ceiling`), writes the slot
+/// ids into vregs `[1..N]`, and returns N in the syscall word's count
+/// field (bits 12-19).
+///
+/// On the wire:
+///   - Vreg 1 (rax / x0) carries the first handle word (caps + type +
+///     slot via Word0.pack); userspace disambiguates against the
+///     §[error_codes] 1..15 range using the type tag in bits 12-15.
+///     N == 0 surfaces as `errors.OK` in vreg 1 and count=0 in the
+///     syscall word — no handles to write back.
+///   - Vregs 2..min(N, 5) reuse the existing `setSyscallVreg{2,3,4,5}`
+///     helpers. v0 spawns one EC per test domain, so N is bounded at 1
+///     in the spec test surface; vregs 6+ remain TODO until a test
+///     spawns a multi-EC domain through acquire_ecs.
 pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
     const cd_ref = caller.domain;
     const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
@@ -470,28 +480,117 @@ pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
     // an unimplemented call site is loud rather than silently wrong.
     if (target_cd != cd) return errors.E_BADCAP;
 
-    // Count non-vCPU ECs bound to the target domain. The kernel_table
-    // walks every slot; the type tag in user_table picks ECs, and
-    // ec.vm == null filters vCPUs out per spec §[acquire_ecs] test 07.
-    var ec_count: u32 = 0;
-    var i: u16 = 0;
-    while (i < MAX_HANDLES_PER_DOMAIN) {
-        const tag = Word0.typeTag(target_cd.user_table[i].word0);
-        if (tag == .execution_context) {
-            const ec_ref = target_cd.kernel_table[i].ref;
-            if (ec_ref.ptr) |ec_ptr| {
-                const ec_obj: *ExecutionContext = @ptrCast(@alignCast(ec_ptr));
-                if (ec_obj.vm == null) ec_count += 1;
-            }
-        }
-        i += 1;
-    }
+    // Spec §[acquire_ecs] [test 06]: each minted EC handle gets caps =
+    // `target.ec_outer_ceiling` ∩ `idc.ec_cap_ceiling`.
+    //   - target.ec_outer_ceiling lives in slot-0 self-handle field1
+    //     bits 0-7 (ceilings_outer layout).
+    //   - idc.ec_cap_ceiling lives in user_table[slot].field0 bits 0-15.
+    const ec_outer_ceiling: u16 = @truncate(target_cd.user_table[0].field1 & 0xFF);
+    const idc_ec_cap_ceiling: u16 = @truncate(cd.user_table[slot].field0 & 0xFFFF);
+    const minted_caps: u16 = ec_outer_ceiling & idc_ec_cap_ceiling;
 
-    // Spec §[acquire_ecs] test 04: caller's table must have at least
-    // ec_count free slots to hold the returned handles.
+    // EC enumeration. Handle-table walks find every EC bound to the
+    // target whose handle is still alive; the calling EC is always a
+    // non-vCPU member of its own domain even when its self-handle has
+    // been deleted (spec §[self] [test 01] — the test exercises that
+    // exact shape via `acquire_ecs(SLOT_SELF_IDC)` after dropping the
+    // initial-EC handle). Track seen EC pointers so we don't double-
+    // mint the calling EC if its handle still exists.
+    //
+    // E_FULL pre-check ([test 04]): scan once to count, ensuring no
+    // partial-mint state if the table is too small. The mint loop
+    // re-walks rather than caching pointers because the count loop
+    // reads through user_table whose word0 type tag is the
+    // discriminator, while mint needs the kernel_table ref.
+    var ec_count: u32 = 0;
+    {
+        var j: u16 = 0;
+        var caller_seen: bool = false;
+        while (j < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) : (j += 1) {
+            const tag = Word0.typeTag(target_cd.user_table[j].word0);
+            if (tag != .execution_context) continue;
+            const ec_ptr = target_cd.kernel_table[j].ref.ptr orelse continue;
+            const ec_obj: *ExecutionContext = @ptrCast(@alignCast(ec_ptr));
+            if (ec_obj.vm != null) continue;
+            if (ec_obj == caller) caller_seen = true;
+            ec_count += 1;
+        }
+        if (!caller_seen and target_cd == cd and caller.vm == null) ec_count += 1;
+    }
     if (cd.free_count < ec_count) return errors.E_FULL;
 
-    return 0;
+    var minted_slots: [13]u12 = undefined;
+    var n: u8 = 0;
+    var seen_caller: bool = false;
+
+    var i: u16 = 0;
+    while (i < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) : (i += 1) {
+        const tag = Word0.typeTag(target_cd.user_table[i].word0);
+        if (tag != .execution_context) continue;
+        const ec_ref = target_cd.kernel_table[i].ref;
+        const ec_ptr = ec_ref.ptr orelse continue;
+        const ec_obj: *ExecutionContext = @ptrCast(@alignCast(ec_ptr));
+        if (ec_obj.vm != null) continue; // [test 07] excludes vCPUs
+
+        if (ec_obj == caller) seen_caller = true;
+        if (n >= minted_slots.len) break; // TODO: vreg 6+ writeback
+        const new_slot = mintHandle(
+            cd,
+            ec_ref,
+            .execution_context,
+            minted_caps,
+            0, // EC handle field0/field1 carry priority/affinity/etc.
+            0, // refreshed lazily by `sync`; zero-init is fine for v0.
+        ) catch return errors.E_FULL;
+        minted_slots[n] = new_slot;
+        n += 1;
+    }
+
+    // Always include the calling EC when its domain matches the target.
+    // The handle-table scan above misses an EC that has had every
+    // handle to it deleted (the at-most-one invariant + prior `delete`
+    // → no handle in the table → no scan hit), but the EC object is
+    // still bound to the domain and the spec requires its enumeration.
+    if (!seen_caller and target_cd == cd and caller.vm == null and n < minted_slots.len) {
+        // Coalescing in `mintHandle.findExistingHandle` matches by
+        // (ptr, gen, type) — must use the EC's own gen so subsequent
+        // ops via the minted handle resolve correctly through SlabRef.
+        const caller_ref: ErasedSlabRef = .{
+            .ptr = @ptrCast(caller),
+            .gen = @intCast(caller._gen_lock.currentGen()),
+        };
+        const new_slot = mintHandle(
+            cd,
+            caller_ref,
+            .execution_context,
+            minted_caps,
+            0,
+            0,
+        ) catch return errors.E_FULL;
+        minted_slots[n] = new_slot;
+        n += 1;
+    }
+
+    // Stage the syscall-word count writeback. The dispatch path flushes
+    // `pending_event_word` to user `[rsp+0]` after the handler returns,
+    // matching how recv delivers its composed return word.
+    const count_field: u64 = @as(u64, n) << 12;
+    caller.pending_event_word = count_field;
+    caller.pending_event_word_valid = true;
+
+    // Vregs 2..N — use the existing helpers for the secondary slots.
+    // Vreg 1 rides the i64 return value below.
+    if (n >= 2) arch.syscall.setSyscallVreg2(caller.ctx, packHandleWord(minted_slots[1], minted_caps));
+    if (n >= 3) arch.syscall.setSyscallVreg3(caller.ctx, packHandleWord(minted_slots[2], minted_caps));
+    if (n >= 4) arch.syscall.setSyscallVreg4(caller.ctx, packHandleWord(minted_slots[3], minted_caps));
+    if (n >= 5) arch.syscall.setEventVreg5(caller.ctx, packHandleWord(minted_slots[4], minted_caps));
+
+    if (n == 0) return @bitCast(@as(i64, errors.OK));
+    return @intCast(packHandleWord(minted_slots[0], minted_caps));
+}
+
+inline fn packHandleWord(slot: u12, caps_word: u16) u64 {
+    return Word0.pack(slot, .execution_context, caps_word);
 }
 
 /// `acquire_vars` syscall handler.
@@ -588,10 +687,19 @@ pub fn allocCapabilityDomain(
     kernel_table[1].ref = .{};
 
     // Slot 2 — self-IDC. Caps = `cridc_ceiling` from field0_ceilings
-    // bits 24-31 per spec §[cridc_ceiling].
+    // bits 24-31 per spec §[cridc_ceiling]. The IDC's per-handle
+    // `ec_cap_ceiling` (field0 bits 0-15) and `var_cap_ceiling` (field0
+    // bits 16-23) are not constrained by the spec at create time; pick
+    // a permissive default so `acquire_ecs` / `acquire_vars` through the
+    // self-IDC mint EC/VAR handles whose cap masks are limited only by
+    // the domain's `*_outer_ceiling`. Spec §[idc_handle] / §[acquire_ecs]
+    // ([test 06]) use this self-IDC to enumerate the calling domain's
+    // own ECs; without a permissive `ec_cap_ceiling` the intersection
+    // is zero and the minted handles carry no caps.
     const cridc_ceiling: u16 = @truncate((field0_ceilings >> 24) & 0xFF);
+    const idc_self_field0: u64 = 0x0000_0000_00FF_FFFF; // ec_cap_ceiling=0xFFFF, var_cap_ceiling=0xFF
     user_table[2].word0 = Word0.pack(2, .capability_domain, cridc_ceiling);
-    user_table[2].field0 = 0;
+    user_table[2].field0 = idc_self_field0;
     user_table[2].field1 = 0;
     kernel_table[2].ref = .{
         .ptr = cd,

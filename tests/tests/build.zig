@@ -530,6 +530,13 @@ fn buildTestElf(
         .omit_frame_pointer = true,
     });
     app_mod.addImport("lib", test_lib_mod);
+    // Tests that need to construct their own suspend frame (rather
+    // than going through `lib.testing.report`) must include
+    // `test_tag.TAG` in vreg 5 so the runner attributes the result
+    // correctly. Wire the per-test tag module so `@import("test_tag")`
+    // resolves in the app source, mirroring its availability inside
+    // `libz/testing.zig`.
+    app_mod.addImport("test_tag", tag_mod);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/start.zig" },
