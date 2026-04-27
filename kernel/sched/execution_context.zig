@@ -540,17 +540,56 @@ pub fn setPriority(caller: *ExecutionContext, target: u64, new_priority: u64) i6
 }
 
 /// `affinity` syscall handler. Spec §[execution_context].affinity.
+///
+/// The syscall layer has already validated reserved bits, the
+/// new_affinity range, resolved the handle as an EC, and verified
+/// `saff`. This handler updates the target EC's authoritative
+/// affinity mask and refreshes the handle's field1 snapshot (spec
+/// §[execution_context] field1 bits 0-63 = affinity mask).
+///
+/// If the target EC has been terminated, the slot still references the
+/// destroyed slab but its gen has flipped to "freed". `lockWithGen`
+/// catches the parity mismatch and we surface `E_TERM` while evicting
+/// the slot from the caller's table — the spec line "syscalls invoked
+/// with any handle to the terminated EC return E_TERM and remove that
+/// handle from the caller's table on the same call" (test 05).
+///
+/// Re-enqueuing the target on a core that satisfies the new mask if it
+/// is currently parked or running on an excluded core is not yet
+/// implemented; the affinity field is updated unconditionally so the
+/// next enqueue picks it up.
 pub fn setAffinity(caller: *ExecutionContext, target: u64, new_affinity: u64) i64 {
-    _ = caller;
-    _ = target;
-    const core_count: u64 = @intCast(arch.smp.coreCount());
-    if (core_count < 64) {
-        const valid_mask: u64 = (@as(u64, 1) << @intCast(core_count)) - 1;
-        if (new_affinity != 0 and (new_affinity & ~valid_mask) != 0) return errors.E_INVAL;
-    }
-    // Awaits handle resolution; on success the queue-aware migration
-    // below applies it.
-    return errors.E_BADCAP;
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+
+    const slot: u12 = @truncate(target);
+    const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+
+    const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+
+    const target_ec = target_ref.lock(@src()) catch {
+        // Stale handle — target EC was terminated. Evict the slot from
+        // the caller's table and surface E_TERM (spec test 05).
+        capability.clearAndFreeSlot(cd, slot, entry);
+        cd_ref.unlock();
+        return errors.E_TERM;
+    };
+
+    target_ec.affinity = new_affinity;
+    target_ref.unlock();
+
+    // Refresh the handle's field1 snapshot (affinity occupies bits
+    // 0-63 of field1).
+    cd.user_table[slot].field1 = new_affinity;
+
+    cd_ref.unlock();
+    return errors.OK;
 }
 
 /// `perfmon_info` syscall handler. Spec §[execution_context].perfmon_info.
