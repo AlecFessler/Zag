@@ -510,7 +510,9 @@ pub fn perfmonStart(
     configs: []const u64,
 ) i64 {
     const ec = checkPmuTarget(caller, target) catch |e| return pmuErrorCode(e);
-    const num_configs_u8: u8 = if (num_configs > 0xFF) 0xFF else @intCast(num_configs);
+    const info = arch.pmu.pmuGetInfo();
+    if (num_configs == 0 or num_configs > info.num_counters) return errors.E_INVAL;
+    const num_configs_u8: u8 = @intCast(num_configs);
     return execution_context.perfmonStart(ec, target, num_configs_u8, configs);
 }
 
