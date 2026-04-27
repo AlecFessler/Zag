@@ -352,6 +352,29 @@ pub fn freeStage2Root(vm: *VirtualMachine) void {
     vm.guest_pt_root = PAddr.fromInt(0);
 }
 
+/// Validate a `VmPolicy` struct seeded into the policy page frame.
+/// Spec §[create_virtual_machine] tests 05/06/07: the page frame must
+/// be at least `sizeof(VmPolicy)` bytes, and the table-count fields
+/// must not exceed their static array bounds. The struct lives at
+/// offset 0 of the frame and is read through the kernel physmap.
+pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
+    const page_bytes: u64 = switch (policy_pf.sz) {
+        .sz_4k => 0x1000,
+        .sz_2m => 0x20_0000,
+        .sz_1g => 0x4000_0000,
+        ._reserved => 0,
+    };
+    const frame_bytes: u64 = page_bytes * @as(u64, policy_pf.page_count);
+    if (frame_bytes < @sizeOf(vm_hw.VmPolicy)) return error.InvalidPolicy;
+
+    const phys_va = VAddr.fromPAddr(policy_pf.phys_base, null);
+    const policy_ptr: *const vm_hw.VmPolicy = @ptrFromInt(phys_va.addr);
+    if (policy_ptr.num_cpuid_responses > vm_hw.VmPolicy.MAX_CPUID_POLICIES)
+        return error.InvalidPolicy;
+    if (policy_ptr.num_cr_policies > vm_hw.VmPolicy.MAX_CR_POLICIES)
+        return error.InvalidPolicy;
+}
+
 pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
     _ = policy_pf;
     if (!vm_hw.vmSupported()) return error.NoDevice;

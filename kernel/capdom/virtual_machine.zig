@@ -120,6 +120,13 @@ pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64
     const policy_pf_obj = lookupPageFrame(domain, @truncate(policy_pf)) orelse
         return errors.E_BADCAP;
 
+    // Spec §[create_virtual_machine] tests 05/06/07: reject policy
+    // page frames smaller than `sizeof(VmPolicy)` and reject seeded
+    // policies whose num_*_responses fields exceed the static array
+    // bounds. The struct lives at offset 0 of the page frame; the
+    // arch dispatch reads it through the kernel physmap.
+    vm_dispatch.validateVmPolicy(policy_pf_obj) catch return errors.E_INVAL;
+
     const new_vm = allocVm(domain, policy_pf_obj) catch |err| switch (err) {
         // Spec §[create_virtual_machine]: E_NODEV if the platform
         // does not support hardware virtualization. The arch dispatch

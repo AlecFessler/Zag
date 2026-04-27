@@ -195,6 +195,11 @@ fn writeGuestGpr(gs: *vm_hw.GuestState, n: u8, value: u64) void {
 // mapping, arch state allocation, and IRQ routing are reached through
 // `zag.arch.dispatch.vm`, driven by `capdom.virtual_machine`.
 
+pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
+    _ = policy_pf;
+    @panic("step 6: rewrite for spec-v3");
+}
+
 pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
     _ = vm;
     _ = policy_pf;

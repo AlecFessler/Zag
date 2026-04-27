@@ -90,6 +90,23 @@ pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque 
     };
 }
 
+/// Validate a `VmPolicy` struct seeded into `policy_pf` against the
+/// per-arch VmPolicy layout invariants defined in §[vm_policy]:
+///   - page frame must be at least `sizeof(VmPolicy)` bytes
+///   - `num_cpuid_responses` (x86) / `num_id_reg_responses` (aarch64)
+///     must not exceed the static array bound
+///   - `num_cr_policies` (x86) / `num_sysreg_policies` (aarch64) must
+///     not exceed the static array bound
+/// Returns `error.InvalidPolicy` when any of the bounds checks fail.
+/// Spec §[create_virtual_machine] tests 05, 06, 07.
+pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.validateVmPolicy(policy_pf),
+        .aarch64 => aarch64.kvm.vm.validateVmPolicy(policy_pf),
+        else => unreachable,
+    };
+}
+
 /// Free per-VM arch state allocated by `allocVmArchState`. Caller has
 /// already torn down all vCPUs and stage-2 mappings.
 pub fn freeVmArchState(vm: *VirtualMachine) void {
