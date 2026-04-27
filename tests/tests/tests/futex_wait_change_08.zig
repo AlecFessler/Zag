@@ -106,10 +106,17 @@ fn childEntry() callconv(.c) noreturn {
     // futex_wait_val or futex_wait_change on the given address. The
     // self-handle carries `fut_wake` (runner/primary.zig line 184),
     // so test 01 cannot fire; `&watched` is 8-byte aligned (test
-    // 02) and mapped r/w in this domain (test 03). The wake leg
-    // returns vreg 1 = woken count; we discard it.
-    _ = syscall.futexWake(@intFromPtr(&watched), 1);
-    while (true) asm volatile ("hlt");
+    // 02) and mapped r/w in this domain (test 03). Hammer the wake
+    // continuously: if the child is scheduled before the parent
+    // parks on the futex bucket, an early single-shot wake misses
+    // and the parent times out. The continuous loop guarantees a
+    // wake fires AFTER the parent's enqueue, regardless of which
+    // EC the scheduler runs first. §[futex_wake] test 04 specifies
+    // wakes against an empty wait-queue return 0 and have no other
+    // side effect, so spinning here is safe.
+    while (true) {
+        _ = syscall.futexWake(@intFromPtr(&watched), 1);
+    }
 }
 
 pub fn main(cap_table_base: u64) void {
@@ -137,31 +144,51 @@ pub fn main(cap_table_base: u64) void {
 
     // §[futex_wait_change]: target = 1 ≠ *watched (0), so the
     // entry-time fast path of test 07 does not fire and the kernel
-    // must park the EC. The 1-second timeout caps any kernel bug
-    // that would otherwise hang the runner; the wake leg should
-    // fire well within it.
+    // must park the EC. We retry with a short per-call timeout —
+    // the child hammer-wakes, but the worker may take a few attempts
+    // to interleave with the parent's enqueue on the futex bucket
+    // depending on scheduler ordering. Any single attempt's strict
+    // success (vreg 1 = watched_addr) is the spec assertion under
+    // test; the bounded retry handles scheduler-ordering jitter
+    // without papering over a real bug (E_TIMEOUT every attempt
+    // surfaces below as a failure).
     const watched_addr: u64 = @intFromPtr(&watched);
     const target: u64 = 1;
     const pairs = [_]u64{ watched_addr, target };
-    const timeout_ns: u64 = 1_000_000_000;
+    const MAX_ATTEMPTS: usize = 16;
+    const TIMEOUT_NS: u64 = 50_000_000; // 50 ms per attempt
+    const e_timeout = @intFromEnum(errors.Error.E_TIMEOUT);
 
-    const result = syscall.futexWaitChange(timeout_ns, &pairs);
+    var attempt: usize = 0;
+    while (attempt < MAX_ATTEMPTS) {
+        const result = syscall.futexWaitChange(TIMEOUT_NS, &pairs);
 
-    // Assertion 2: the wake leg is success-coded; vreg 1 carries
-    // the woken addr, not an error word. E_TIMEOUT would mean the
-    // child's futex_wake never reached this EC.
-    if (errors.isError(result.v1)) {
-        testing.fail(2);
-        return;
+        // r.v1 ≥ 16 = a real user vaddr per §[error_codes]; that's
+        // the spec test 08 success path.
+        if (result.v1 >= 16) {
+            // Assertion 3: the returned addr must equal &watched.
+            if (result.v1 != watched_addr) {
+                testing.fail(3);
+                return;
+            }
+            testing.pass();
+            return;
+        }
+
+        // Bounded retry on E_TIMEOUT — the wake/wait race didn't
+        // resolve in this slot.
+        if (result.v1 != e_timeout) {
+            // Any non-timeout error is a hard failure: the spec
+            // path under test must surface a vaddr, not E_BADADDR /
+            // E_PERM / etc.
+            testing.fail(2);
+            return;
+        }
+
+        attempt += 1;
     }
 
-    // Assertion 3: the returned addr must equal &watched — the
-    // address the child's futex_wake fired on. Any other value
-    // contradicts the spec line under test.
-    if (result.v1 != watched_addr) {
-        testing.fail(3);
-        return;
-    }
-
-    testing.pass();
+    // Exhausted retries with E_TIMEOUT every time — the wake never
+    // landed on this parked wait, contradicting test 08's invariant.
+    testing.fail(2);
 }

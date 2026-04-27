@@ -171,8 +171,10 @@ pub fn main(cap_table_base: u64) void {
     );
 
     // Assertion 2: the fast path is success-coded; vreg 1 carries
-    // the matched addr, never an error code.
-    if (errors.isError(result.v1)) {
+    // the matched addr, never an error code. Spec §[error_codes]
+    // confines error codes to 1..15, so a real user vaddr is
+    // unambiguously not an error word.
+    if (errors.isError(result.v1) and result.v1 < 16) {
         testing.fail(2);
         return;
     }

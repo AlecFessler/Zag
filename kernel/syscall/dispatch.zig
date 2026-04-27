@@ -284,7 +284,14 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             // (number of (addr, expected) pairs, 1..63). The pairs
             // occupy vregs 2..1+2N — args[1..1+2N]. Without this slice
             // the handler sees uninitialized vregs as junk pairs.
+            //
+            // [test 02] N = 0 or N > 63 must surface E_INVAL. We
+            // validate the raw N here BEFORE slicing — otherwise an
+            // out-of-range N could silently truncate to a smaller
+            // valid count once clamped against args.len, masking the
+            // bounds violation.
             const n: u64 = (syscall_word >> 12) & 0xFF;
+            if (n == 0 or n > 63) break :blk errors.E_INVAL;
             const pair_words: usize = @intCast(n * 2);
             const end_idx: usize = @min(1 + pair_words, args.len);
             break :blk futex.futexWaitVal(
@@ -294,7 +301,10 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             );
         },
         .futex_wait_change => blk: {
+            // Spec §[futex_wait_change]: identical N-bounds rule as
+            // futex_wait_val — see comment above.
             const n: u64 = (syscall_word >> 12) & 0xFF;
+            if (n == 0 or n > 63) break :blk errors.E_INVAL;
             const pair_words: usize = @intCast(n * 2);
             const end_idx: usize = @min(1 + pair_words, args.len);
             break :blk futex.futexWaitChange(
