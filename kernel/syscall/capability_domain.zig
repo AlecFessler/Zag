@@ -229,6 +229,24 @@ pub fn createCapabilityDomain(
         cd_ref.unlock();
         return errors.E_BADCAP;
     }
+
+    // Spec §[create_capability_domain] test 14: every entry in
+    // `passed_handles` must reference a slot that holds a valid handle
+    // in the caller's table. This check fires BEFORE the ELF parse
+    // (test 15 / 16) per the spec test ordering — userspace can pre-
+    // validate its source slots without having to also stage a valid
+    // ELF image. The all-zero entry sentinel mirrors capdom's
+    // convention: an entry of 0 means "end of list" (no handle 0 has
+    // caps=0 / move=0 — the canonical termination pattern).
+    for (passed_handles) |entry| {
+        if (entry == 0) break;
+        const src_slot: u12 = @truncate(entry & 0xFFF);
+        if (capability.resolveHandleOnDomain(cd, src_slot, null) == null) {
+            cd_ref.unlock();
+            return errors.E_BADCAP;
+        }
+    }
+
     cd_ref.unlock();
 
     return capability_domain.createCapabilityDomain(
