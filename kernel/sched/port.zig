@@ -519,8 +519,16 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
         const evt_sub = sender.event_subcode;
         const evt_addr = sender.event_addr;
         const pair_count = sender.pending_pair_count;
+        // Spec §[reply]: the minted reply handle inherits `xfer = 1`
+        // iff the recv'ing port carried the `xfer` cap. Snapshot the
+        // recv'ing port's xfer cap from the caller's table while the
+        // CD lock is still held; deliverEvent uses it to set the
+        // minted reply handle's caps below.
+        const port_caps_word: u16 = @truncate(Word0.caps(cd.user_table[port_slot].word0));
+        const port_caps_typed: PortCaps = @bitCast(port_caps_word);
+        const port_xfer = port_caps_typed.xfer;
         port_ref.unlock();
-        return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, pair_count);
+        return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, pair_count, port_xfer);
     }
 
     // No sender ready. Spec §[port].recv test 04: if the port has no
@@ -544,6 +552,15 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     enqueueReceiver(p, caller);
     caller.event_type = .none;
     caller.suspend_port = SlabRef(Port).init(p, p._gen_lock.currentGen());
+    // Spec §[reply]: cache the recv'ing port's xfer cap so the
+    // rendezvous-with-receiver wake path can mint the reply handle
+    // with `xfer` derived from the recv'ing handle, not from
+    // pair_count.
+    {
+        const port_caps_word: u16 = @truncate(Word0.caps(cd.user_table[port_slot].word0));
+        const port_caps_typed: PortCaps = @bitCast(port_caps_word);
+        caller.recv_port_xfer = port_caps_typed.xfer;
+    }
     caller.state = .suspended_on_port;
     caller.pending_reply_holder = null;
     caller.pending_reply_domain = null;
@@ -940,8 +957,13 @@ fn deliverEvent(
     subcode: u8,
     event_addr: u64,
     pair_count: u8,
+    port_xfer: bool,
 ) i64 {
-    const xfer_allowed = pair_count > 0;
+    // Spec §[reply]: minted reply handle inherits `xfer = 1` iff the
+    // recv'ing port carried the `xfer` cap. Caller threads that bit
+    // through from the recv-time port-handle resolution (it is NOT
+    // derived from `pair_count`).
+    const xfer_allowed = port_xfer;
     const reply_slot = mintReply(dom, sender, xfer_allowed) catch {
         // Receiver's table is full — surface E_FULL into the receiver's
         // iret frame so the rendezvous wake path delivers it correctly.
@@ -1106,7 +1128,16 @@ pub fn rendezvousWithReceiver(
     };
     defer receiver_dom_ref.unlock();
 
-    _ = deliverEvent(sender, receiver, dom, event_type, subcode, event_addr, sender.pending_pair_count);
+    _ = deliverEvent(
+        sender,
+        receiver,
+        dom,
+        event_type,
+        subcode,
+        event_addr,
+        sender.pending_pair_count,
+        receiver.recv_port_xfer,
+    );
     receiver.state = .ready;
     scheduler.markReady(receiver);
     return true;

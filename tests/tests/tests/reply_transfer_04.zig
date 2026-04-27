@@ -121,10 +121,9 @@ fn replyTransferWithOnePairAtV127(reply_handle: u64, entry: u64) syscall.Regs {
     var ov13: u64 = undefined;
     asm volatile (
         \\ subq %[pad], %%rsp
+        \\ movq %%rcx, (%%rsp)
         \\ movq %[entry], 912(%%rsp)
-        \\ pushq %%rcx
         \\ syscall
-        \\ addq $8, %%rsp
         \\ addq %[pad], %%rsp
         : [v1] "={rax}" (ov1),
           [v2] "={rbx}" (ov2),

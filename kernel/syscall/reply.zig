@@ -1,6 +1,7 @@
 const zag = @import("zag");
 
 const capability = zag.caps.capability;
+const cpu = zag.arch.dispatch.cpu;
 const device_region = zag.devices.device_region;
 const errors = zag.syscall.errors;
 const port = zag.sched.port;
@@ -23,6 +24,10 @@ const PAIR_VALID_MASK: u64 = PAIR_SOURCE_MASK | PAIR_CAPS_MASK | PAIR_MOVE_BIT;
 
 const MIN_PAIR_COUNT: usize = 1;
 const MAX_PAIR_COUNT: usize = 63;
+
+/// Stack-allocated upper bound for pair entries read from the user
+/// stack. Matches `MAX_PAIR_COUNT`.
+const PAIR_BUF_LEN: usize = MAX_PAIR_COUNT;
 
 /// Consumes a reply handle and resumes the suspended EC. State
 /// modifications written to the receiver's event-state vregs (per
@@ -97,44 +102,86 @@ pub fn reply(caller: *anyopaque, reply_handle: u64) i64 {
 /// [test 13] on success, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
 /// [test 14] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
 /// [test 15] on success, the suspended EC is resumed.
-pub fn replyTransfer(caller: *anyopaque, reply_handle: u64, pair_entries: []const u64) i64 {
+pub fn replyTransfer(caller: *anyopaque, reply_handle: u64, n: u8) i64 {
+    // Spec §[capabilities]: handle ids occupy bits 0-11; upper bits are
+    // _reserved. Test 04a fires here.
     if (reply_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
-    if (pair_entries.len < MIN_PAIR_COUNT or pair_entries.len > MAX_PAIR_COUNT) return errors.E_INVAL;
 
-    if (validatePairEntryBits(pair_entries)) |err| return err;
-    if (hasDuplicateSources(pair_entries)) return errors.E_INVAL;
+    // Spec §[reply].reply_transfer test 03: N range.
+    if (@as(usize, n) < MIN_PAIR_COUNT or @as(usize, n) > MAX_PAIR_COUNT) return errors.E_INVAL;
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const slot: u12 = @truncate(reply_handle);
 
+    // Pre-resolve the reply handle so test 02 (xfer cap) can fire
+    // before any pair-entry read — see tests/reply_transfer_02 header
+    // ("the kernel rejects on the missing xfer cap before reading any
+    // pair-entry vreg") — and so test 01 fires early when the slot is
+    // outright empty. Test 04b (per-entry reserved-bit) must fire
+    // before test 01 *only when the slot is occupied as a non-reply
+    // handle* (per tests/reply_transfer_04 case B which uses
+    // SLOT_SELF, an in-domain capability_domain entry).
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    const reply_present = capability.resolveHandleOnDomain(cd, slot, .reply) != null;
+    const cd_pre = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const slot_occupied = capability.resolveHandleOnDomain(cd_pre, slot, null) != null;
+    const reply_present = slot_occupied and
+        capability.resolveHandleOnDomain(cd_pre, slot, .reply) != null;
     var has_xfer = false;
     if (reply_present) {
-        const caps_word = Word0.caps(cd.user_table[slot].word0);
+        const caps_word = Word0.caps(cd_pre.user_table[slot].word0);
         const reply_caps: ReplyCaps = @bitCast(caps_word);
         has_xfer = reply_caps.xfer;
     }
-    if (!reply_present) {
-        cd_ref.unlock();
-        return errors.E_BADCAP;
+    cd_ref.unlock();
+
+    // Test 01 — fires here iff the slot is unoccupied. An occupied
+    // non-reply slot keeps going so test 04b can trip first.
+    if (!slot_occupied) return errors.E_BADCAP;
+    // Test 02 — xfer-cap check on a confirmed reply handle.
+    if (reply_present and !has_xfer) return errors.E_PERM;
+
+    // Read pair entries from the user stack. Spec §[syscall_abi]: vreg
+    // M for 14 ≤ M ≤ 127 lives at `[rsp + (M - 13) * 8]` when the
+    // syscall executes. Spec §[handle_attachments] places N entries at
+    // vregs `[128-N..127]`. SMAP gates the load via STAC/CLAC.
+    var entries: [PAIR_BUF_LEN]u64 = undefined;
+    const len: usize = n;
+    const user_rsp = ec.ctx.rsp;
+    const first_vreg: u64 = 128 - @as(u64, n);
+    const first_off: u64 = (first_vreg - 13) * 8;
+
+    cpu.userAccessBegin();
+    var i: usize = 0;
+    while (i < len) {
+        const off = first_off + i * 8;
+        const ptr: *const u64 = @ptrFromInt(user_rsp + off);
+        entries[i] = ptr.*;
+        i += 1;
     }
-    if (!has_xfer) {
-        cd_ref.unlock();
-        return errors.E_PERM;
-    }
+    cpu.userAccessEnd();
+
+    const pair_entries: []const u64 = entries[0..len];
+
+    // Test 04b: per-entry reserved-bit check (fires before test 01 per
+    // the reply_transfer_04 ladder).
+    if (validatePairEntryBits(pair_entries)) |err| return err;
+    // Test 09: intra-batch duplicate source ids.
+    if (hasDuplicateSources(pair_entries)) return errors.E_INVAL;
+
+    // Test 01: reply handle resolves as a reply. Deferred to here so
+    // test 04b fires first against in-domain non-reply slots.
+    if (!reply_present) return errors.E_BADCAP;
 
     // Spec §[reply].reply_transfer per-entry gates (tests 05/06/07/08).
-    // Resolved under the same domain lock so the check is atomic against
+    // Resolved under the domain lock so the check is atomic against
     // concurrent revoke/delete on the source handles.
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
     if (validatePairEntrySources(cd, pair_entries)) |err| {
         cd_ref.unlock();
         return err;
     }
     cd_ref.unlock();
 
-    const n: u8 = @intCast(pair_entries.len);
     return port.replyTransfer(ec, reply_handle, n);
 }
 

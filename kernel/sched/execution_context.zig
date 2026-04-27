@@ -294,6 +294,15 @@ pub const ExecutionContext = struct {
     /// port closes while we are queued. `null` outside a suspension.
     suspend_port: ?SlabRef(Port) = null,
 
+    /// Snapshot of the recv'ing port handle's `xfer` cap, taken under
+    /// the receiver's CD lock when `recv` blocks. Spec §[reply]: the
+    /// reply handle minted at recv resume inherits `xfer = 1` iff the
+    /// recv'ing port carried `xfer`. The rendezvous-with-receiver path
+    /// no longer has the receiver's CD locked when minting the reply,
+    /// so we cache the bit here on the suspend side. Zero outside a
+    /// suspended recv.
+    recv_port_xfer: bool = false,
+
     /// Deadline for a timed `recv`. Zero outside a recv-with-timeout.
     /// Set when recv blocks with timeout_ns != 0; cleared by either the
     /// normal sender-wake path or `expireTimedRecvWaiters`.

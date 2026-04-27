@@ -173,20 +173,15 @@ pub fn main(cap_table_base: u64) void {
     var rax: u64 = undefined;
     asm volatile (
         \\ subq $920, %%rsp
-        \\ movq %[word], %%rcx
         \\ movq %%rcx, (%%rsp)
-        \\ movq %[entry], %%rcx
-        \\ movq %%rcx, 912(%%rsp)
+        \\ movq %[entry], 912(%%rsp)
         \\ syscall
         \\ addq $920, %%rsp
         : [rax] "={rax}" (rax),
-        : [word] "m" (word),
-          [entry] "m" (pair_u64),
+        : [word] "{rcx}" (word),
+          [entry] "{rdi}" (pair_u64),
           [v1] "{rax}" (reply_handle_u64),
-        : .{ .rcx = true, .r11 = true, .rbx = true, .rdx = true,
-             .rbp = true, .rsi = true, .rdi = true, .r8 = true,
-             .r9 = true, .r10 = true, .r12 = true, .r13 = true,
-             .r14 = true, .r15 = true, .memory = true });
+        : .{ .rcx = true, .r11 = true, .memory = true });
 
     if (rax != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(5);
