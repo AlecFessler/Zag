@@ -548,24 +548,22 @@ pub fn onFire(t: *Timer) void {
 /// kicking idle remote cores so they re-evaluate the wake. Spec §[timer]
 /// (eager but non-atomic propagation across copies).
 fn propagateAndWake(t: *Timer, value: u64) void {
-    var iter = handleHolderIterator(t);
-    while (iter.next()) |loc| {
-        const field0_paddr = computeFieldPaddr(loc.domain, loc.slot, .field0);
-        arch.userio.writeU64ViaPhysmap(field0_paddr, value);
-        _ = futex.wake(field0_paddr, std.math.maxInt(u32));
-        if (loc.core_id) |core| arch.smp.sendWakeIpi(core);
-    }
+    var ctx = PropagateCtx{ .timer = t, .value = value };
+    zag.capdom.capability_domain.slab_instance.forEachAlive(
+        &ctx,
+        propagateField0Visitor,
+    );
 }
 
 /// Mirror updated `field1` (arm/pd bits) into every domain-local copy.
 /// No futex wake — userspace observes arm/pd transitions through
 /// `sync` or as a side effect of the field0 wake.
 fn propagateField1(t: *Timer, value: u64) void {
-    var iter = handleHolderIterator(t);
-    while (iter.next()) |loc| {
-        const field1_paddr = computeFieldPaddr(loc.domain, loc.slot, .field1);
-        arch.userio.writeU64ViaPhysmap(field1_paddr, value);
-    }
+    var ctx = PropagateCtx{ .timer = t, .value = value };
+    zag.capdom.capability_domain.slab_instance.forEachAlive(
+        &ctx,
+        propagateField1Visitor,
+    );
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -577,47 +575,19 @@ const TimerLookup = struct {
 
 const HandleField = enum { field0, field1 };
 
-const HandleLocation = struct {
-    domain: *CapabilityDomain,
-    slot: u12,
-    /// Core a wake IPI should target if any EC bound to this domain is
-    /// currently idle. `null` = no wake hint available.
-    core_id: ?u64,
-};
-
-/// Enumerator over every `(CapabilityDomain, slot)` pair holding a
-/// handle to `t`. v0 implementation: no inverse index exists in the
-/// capability layer, so this walks every alive `CapabilityDomain` slot
-/// and scans its kernel_table for entries whose `ref` points at `t`.
-/// O(domains * MAX_HANDLES_PER_DOMAIN) per fire — acceptable at v0
-/// fire rates (test loads); a real cross-domain index can replace
-/// this without changing call sites.
-const HandleHolderIterator = struct {
+/// Visitor context for `propagateAndWake` / `propagateField1`. The
+/// visitor fires the side effect (memory write + optional futex_wake)
+/// inline rather than staging matches into an array on the kernel
+/// stack — staging would need worst-case
+/// `MAX_DOMAINS * MAX_HANDLES_PER_DOMAIN` slots, which the kernel
+/// stack frame cannot afford. Spec §[timer] (eager but non-atomic
+/// propagation across copies).
+const PropagateCtx = struct {
     timer: *Timer,
-    locations: [MAX_HOLDERS]HandleLocation = undefined,
-    count: usize = 0,
-    cursor: usize = 0,
-
-    /// Upper bound on holders enumerated per fire. Set to the global
-    /// Timer slab capacity (each domain holds at most one handle per
-    /// object via mintHandle's coalescing, and there are at most
-    /// 256 capability domains in the slab).
-    const MAX_HOLDERS: usize = 256;
-
-    fn next(self: *HandleHolderIterator) ?HandleLocation {
-        if (self.cursor >= self.count) return null;
-        const loc = self.locations[self.cursor];
-        self.cursor += 1;
-        return loc;
-    }
+    value: u64,
 };
 
-const HolderScanCtx = struct {
-    timer: *Timer,
-    iter: *HandleHolderIterator,
-};
-
-fn collectHolder(ctx: *HolderScanCtx, cd: *CapabilityDomain, gen: u63) bool {
+fn propagateField0Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) bool {
     _ = gen;
     const timer_ptr: *anyopaque = @ptrCast(ctx.timer);
     var slot: u16 = 0;
@@ -626,29 +596,38 @@ fn collectHolder(ctx: *HolderScanCtx, cd: *CapabilityDomain, gen: u63) bool {
         if (entry.ref.ptr) |obj_ptr| {
             if (obj_ptr == timer_ptr) {
                 const tag = capability.Word0.typeTag(cd.user_table[slot].word0);
-                if (tag == .timer and ctx.iter.count < HandleHolderIterator.MAX_HOLDERS) {
-                    ctx.iter.locations[ctx.iter.count] = .{
-                        .domain = cd,
-                        .slot = @truncate(slot),
-                        .core_id = null,
-                    };
-                    ctx.iter.count += 1;
+                if (tag == .timer) {
+                    const slot12: u12 = @truncate(slot);
+                    const paddr = computeFieldPaddr(cd, slot12, .field0);
+                    arch.userio.writeU64ViaPhysmap(paddr, ctx.value);
+                    _ = futex.wake(paddr, std.math.maxInt(u32));
                 }
             }
         }
         slot += 1;
     }
-    return ctx.iter.count < HandleHolderIterator.MAX_HOLDERS;
+    return true;
 }
 
-fn handleHolderIterator(t: *Timer) HandleHolderIterator {
-    var iter: HandleHolderIterator = .{ .timer = t };
-    var ctx = HolderScanCtx{ .timer = t, .iter = &iter };
-    zag.capdom.capability_domain.slab_instance.forEachAlive(
-        &ctx,
-        collectHolder,
-    );
-    return iter;
+fn propagateField1Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) bool {
+    _ = gen;
+    const timer_ptr: *anyopaque = @ptrCast(ctx.timer);
+    var slot: u16 = 0;
+    while (slot < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) {
+        const entry = &cd.kernel_table[slot];
+        if (entry.ref.ptr) |obj_ptr| {
+            if (obj_ptr == timer_ptr) {
+                const tag = capability.Word0.typeTag(cd.user_table[slot].word0);
+                if (tag == .timer) {
+                    const slot12: u12 = @truncate(slot);
+                    const paddr = computeFieldPaddr(cd, slot12, .field1);
+                    arch.userio.writeU64ViaPhysmap(paddr, ctx.value);
+                }
+            }
+        }
+        slot += 1;
+    }
+    return true;
 }
 
 fn callerDomain(caller: *anyopaque) ?*CapabilityDomain {
