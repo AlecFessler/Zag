@@ -316,22 +316,54 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             arg(args, 2),
             arg(args, 3),
         ),
-        .map_guest => virtual_machine.mapGuest(
-            caller,
-            arg(args, 0),
-            if (args.len > 1) args[1..] else &.{},
-        ),
-        .unmap_guest => virtual_machine.unmapGuest(
-            caller,
-            arg(args, 0),
-            if (args.len > 1) args[1..] else &.{},
-        ),
-        .vm_set_policy => virtual_machine.vmSetPolicy(
-            caller,
-            syscall_word,
-            arg(args, 0),
-            if (args.len > 1) args[1..] else &.{},
-        ),
+        .map_guest => blk: {
+            // Spec §[virtual_machine].map_guest: syscall word bits 12-19
+            // carry N, the number of (guest_addr, page_frame) pairs. The
+            // pairs occupy vregs 2..2+2N-1 — args[1..1+2N]. Without this
+            // slice the handler sees uninitialized vregs above the user's
+            // payload as junk pairs (pairs.len ends up odd or carries
+            // garbage handles, tripping E_INVAL/E_BADCAP before the
+            // user's actual error path can fire).
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const pair_words: usize = @intCast(n * 2);
+            const end_idx: usize = @min(1 + pair_words, args.len);
+            break :blk virtual_machine.mapGuest(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
+        .unmap_guest => blk: {
+            // Spec §[virtual_machine].unmap_guest: syscall word bits 12-19
+            // carry N, the number of page_frames to unmap. The handles
+            // occupy vregs 2..1+N — args[1..1+N]. Without this slice the
+            // handler sees uninitialized vregs above the user's payload
+            // as junk handles, tripping E_BADCAP before the user's
+            // intended error path runs.
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const end_idx: usize = @min(1 + @as(usize, @intCast(n)), args.len);
+            break :blk virtual_machine.unmapGuest(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
+        .vm_set_policy => blk: {
+            // Spec §[virtual_machine].vm_set_policy: syscall word bit 12
+            // = kind, bits 13-20 = count. The count entries occupy vregs
+            // 2..1+count — args[1..1+count]. Without this slice the
+            // handler sees uninitialized vregs above the user's payload
+            // as junk entries, overcounting against the per-(kind,arch)
+            // MAX_* and tripping E_INVAL on garbage reserved-bit checks.
+            const count: u64 = (syscall_word >> 13) & 0xFF;
+            const end_idx: usize = @min(1 + @as(usize, @intCast(count)), args.len);
+            break :blk virtual_machine.vmSetPolicy(
+                caller,
+                syscall_word,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
         .vm_inject_irq => virtual_machine.vmInjectIrq(
             caller,
             arg(args, 0),
