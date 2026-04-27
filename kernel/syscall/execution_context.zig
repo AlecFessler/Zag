@@ -128,15 +128,22 @@ pub fn createExecutionContext(
     }
 
     // Caller's `ec_inner_ceiling` lives in self-handle field0 bits 0-7
-    // (spec §[capability_domain] field0 layout). Test 03: when target=0
-    // the new EC handle is minted in the caller's own domain, so its
-    // caps must be a subset of `ec_inner_ceiling`.
+    // (spec §[capability_domain] field0 layout) and bounds the basic
+    // EcCap rights at bits 0-7 (move/copy/saff/spri/term/susp/read/
+    // write). EcCap bits 8-9 (`restart_policy`) are bounded separately
+    // by `restart_policy_ceiling`; bits 10-12 (`bind`/`rebind`/
+    // `unbind`) carry their own runtime gates in
+    // bind_event_route/clear_event_route and are not constrained at
+    // mint time. Test 03: when target=0 the new EC handle is minted in
+    // the caller's own domain, so its caps[0..7] must be a subset of
+    // `ec_inner_ceiling`.
     const new_caps: u16 = @truncate(caps & 0xFFFF);
     const target_caps: u16 = @truncate((caps >> 16) & 0xFFFF);
-    const ec_inner_ceiling: u16 = @truncate(cd.user_table[SELF_HANDLE_SLOT].field0 & 0xFF);
+    const ec_inner_ceiling: u8 = @truncate(cd.user_table[SELF_HANDLE_SLOT].field0 & 0xFF);
 
     if (target == 0) {
-        if (new_caps & ~ec_inner_ceiling != 0) {
+        const new_caps_low: u8 = @truncate(new_caps & 0xFF);
+        if (new_caps_low & ~ec_inner_ceiling != 0) {
             cd_ref.unlock();
             return errors.E_PERM;
         }
