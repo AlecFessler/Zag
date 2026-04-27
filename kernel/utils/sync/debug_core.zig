@@ -68,6 +68,13 @@ pub const PairEntry = struct {
 pub const PairRegistry = struct {
     entries: [PAIR_REGISTRY_CAPACITY]PairEntry = [_]PairEntry{.{}} ** PAIR_REGISTRY_CAPACITY,
     lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Scratch BFS frontier for `pathExists`. Lives inside the registry so it
+    /// shares the registry's spinlock (`pathExists` requires the caller hold
+    /// `lock`). Moved off the kernel stack — at 4 KiB it dominated frame size
+    /// for any caller of `acquireOn`, and under deep nested-lockdep checks
+    /// the cumulative stack pressure was overwriting adjacent frames'
+    /// saved-RIP slots, producing cascading downstream panics.
+    pathexists_visited: [PAIR_REGISTRY_CAPACITY][*:0]const u8 = undefined,
 
     fn acquireLock(self: *PairRegistry) void {
         while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
@@ -153,8 +160,14 @@ pub const PairRegistry = struct {
 
     /// BFS the directed graph (outer -> inner) for a path from `start` to
     /// `target`. Caller must hold the registry lock. Bounded by capacity.
+    ///
+    /// Uses `self.pathexists_visited` as the BFS frontier so the 4 KiB
+    /// working set sits in the registry rather than on the caller's kernel
+    /// stack. `pathExists` itself does not recurse, and the caller already
+    /// holds `lock` for the duration of this function, so single-buffer
+    /// reuse is safe.
     fn pathExists(self: *PairRegistry, start: [*:0]const u8, target: [*:0]const u8) bool {
-        var visited: [PAIR_REGISTRY_CAPACITY][*:0]const u8 = undefined;
+        const visited = &self.pathexists_visited;
         visited[0] = start;
         var visited_count: usize = 1;
         var head: usize = 0;
