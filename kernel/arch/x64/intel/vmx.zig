@@ -476,40 +476,59 @@ pub fn perCoreInit() void {
 /// the first 4 bytes per Table 25-1.
 /// Returns the physical address of the VMCS, or null on failure.
 pub fn allocVmStructures() ?PAddr {
-    // Allocate VMCS page
+    const ept_phys = allocEptRoot() orelse return null;
+    const vmcs_phys = allocVmcsWithEpt(ept_phys) orelse {
+        freeEptRoot(ept_phys);
+        return null;
+    };
+    return vmcs_phys;
+}
+
+/// Allocate and zero a single 4K page to serve as the EPT PML4 root.
+/// Spec-v3 split: caller (`arch.x64.kvm.vm.allocStage2Root`) holds this
+/// PAddr in `VirtualMachine.guest_pt_root` and feeds it into
+/// `allocVmcsWithEpt` when the per-VM control state is allocated.
+pub fn allocEptRoot() ?PAddr {
+    const ept_page = allocPage() orelse return null;
+    @memset(&ept_page.mem, 0);
+    return pageToPhys(ept_page);
+}
+
+/// Free an EPT PML4 page allocated by `allocEptRoot`. Caller has
+/// already torn down any intermediate tables (TODO: stage-2 mapping
+/// teardown lives elsewhere).
+pub fn freeEptRoot(paddr: PAddr) void {
+    const virt = VAddr.fromPAddr(paddr, null);
+    const page: *paging.PageMem(.page4k) = @ptrFromInt(virt.addr);
+    freePage(page);
+}
+
+/// Allocate a VMCS page initialized against a pre-allocated EPT root.
+/// Mirrors the VMCLEAR + VMPTRLD + `initVmcs` sequence from the legacy
+/// `allocVmStructures` so callers (spec-v3 `allocVmArchState`) can keep
+/// the EPT root and per-VM control state in distinct dispatch slots.
+pub fn allocVmcsWithEpt(ept_root_phys: PAddr) ?PAddr {
     const vmcs_page = allocPage() orelse return null;
     @memset(&vmcs_page.mem, 0);
 
-    // Write revision ID
     const rev_ptr: *u32 = @ptrCast(@alignCast(&vmcs_page.mem));
     rev_ptr.* = vmx_revision_id;
 
     const vmcs_phys = pageToPhys(vmcs_page);
 
-    // Allocate EPT PML4 page
-    const ept_page = allocPage() orelse {
-        freePage(vmcs_page);
-        return null;
-    };
-    @memset(&ept_page.mem, 0);
-    const ept_phys = pageToPhys(ept_page);
-
-    // VMCLEAR the VMCS to initialize it
     asm volatile (
         \\vmclear (%[addr])
         :
         : [addr] "r" (&vmcs_phys.addr),
         : .{ .memory = true, .cc = true });
 
-    // VMPTRLD to make it current
     asm volatile (
         \\vmptrld (%[addr])
         :
         : [addr] "r" (&vmcs_phys.addr),
         : .{ .memory = true, .cc = true });
 
-    // Initialize all VMCS fields
-    initVmcs(ept_phys);
+    initVmcs(ept_root_phys);
 
     return vmcs_phys;
 }

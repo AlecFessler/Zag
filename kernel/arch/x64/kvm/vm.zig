@@ -10,6 +10,7 @@ const kvm = zag.arch.x64.kvm;
 const lapic_mod = zag.arch.x64.kvm.lapic;
 const mmio_decode = zag.arch.x64.mmio_decode;
 const paging = zag.memory.paging;
+const pmm = zag.memory.pmm;
 const sched = zag.sched.scheduler;
 const vcpu_mod = kvm.vcpu;
 const vm_hw = zag.arch.x64.vm;
@@ -325,40 +326,79 @@ fn ioapicInjectExternal(ctx: *anyopaque, vector: u8) void {
     vm_obj.lapic.injectExternal(vector);
 }
 
-// ── Spec-v3 dispatch backings (STUB) ─────────────────────────────────
-
-pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
-    // SPEC AMBIGUITY: x64 KVM arch-state (VMCS/EPT) allocation not yet
-    // implemented. Surface as NoDevice so create_virtual_machine returns
-    // E_NODEV per spec §[create_virtual_machine] ("returns E_NODEV if
-    // the platform does not support hardware virtualization") — which
-    // is the test-suite-acceptable bail path on platforms without an
-    // implemented KVM backing.
-    _ = vm;
-    _ = policy_pf;
-    return error.NoDevice;
-}
-
-pub fn freeVmArchState(vm: *VirtualMachine) void {
-    // SPEC AMBIGUITY: x64 KVM teardown not yet implemented. Soft-noop
-    // so create_virtual_machine error paths can still tear down without
-    // panicking; the allocStage2Root error return below ensures we
-    // never construct a VM on x64 in the first place.
-    _ = vm;
-}
+// ── Spec-v3 dispatch backings ────────────────────────────────────────
+//
+// Wire-up is intentionally minimal: it fans out to the existing low-
+// level VMX/SVM primitives (alloc/free of EPT/NPT root + VMCS/VMCB
+// pages). vCPU run-time bring-up (loadGuestState/enterGuest/etc.) and
+// guest stage-2 page-table population (stage2MapPage) still TODO —
+// those are exercised by later spec-v3 tests, not create_virtual_machine
+// or create_vcpu themselves.
 
 pub fn allocStage2Root(vm: *VirtualMachine) !PAddr {
-    // SPEC AMBIGUITY: x64 KVM stage-2 page-table root allocation not
-    // yet implemented. Surface as NoDevice so create_virtual_machine
-    // returns E_NODEV per spec §[create_virtual_machine] — see
-    // allocVmArchState above.
+    // Caller (`capdom.virtual_machine.allocVm`) writes the returned
+    // PAddr into `vm.guest_pt_root` and then calls allocVmArchState,
+    // which patches the same root into the VMCS / VMCB.
     _ = vm;
-    return error.NoDevice;
+    if (!vm_hw.vmSupported()) return error.NoDevice;
+    return vm_hw.allocStage2RootPage() orelse error.OutOfMemory;
 }
 
 pub fn freeStage2Root(vm: *VirtualMachine) void {
-    // Symmetric soft-noop — see allocStage2Root.
-    _ = vm;
+    // Only walk if a non-zero root was actually installed — error paths
+    // in `allocVm` may call us after a partial setup.
+    if (vm.guest_pt_root.addr == 0) return;
+    vm_hw.freeStage2RootPage(vm.guest_pt_root);
+    vm.guest_pt_root = PAddr.fromInt(0);
+}
+
+pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
+    _ = policy_pf;
+    if (!vm_hw.vmSupported()) return error.NoDevice;
+
+    // EPT/NPT root has been allocated by allocStage2Root above and
+    // stored in `vm.guest_pt_root`. The Intel path patches that root
+    // into the VMCS via initVmcs; the AMD path is not yet split out
+    // and surfaces NoDevice (see arch.x64.vm.allocVmCtrlState).
+    const ctrl_phys = vm_hw.allocVmCtrlState(vm.guest_pt_root) orelse
+        return error.NoDevice;
+
+    // Pin the per-VM control PAddr in a heap-resident *anyopaque so
+    // the dispatch contract returns a stable pointer. The pointer is
+    // currently a tagged-PAddr cell (single u64) and is freed by
+    // freeVmArchState. If/when the per-VM control state grows to a
+    // larger struct (kernel LAPIC/IOAPIC state, exit_box, etc.) this
+    // is the seam to swap to a slab allocation.
+    const cell = pmm.global_pmm.?.create(CtrlStateCell) catch {
+        vm_hw.vmFreeStructures(ctrl_phys);
+        return error.OutOfMemory;
+    };
+    cell.* = .{ .ctrl_phys = ctrl_phys };
+    return @ptrCast(cell);
+}
+
+pub fn freeVmArchState(vm: *VirtualMachine) void {
+    const erased = vm.arch_state orelse return;
+    const cell: *CtrlStateCell = @ptrCast(@alignCast(erased));
+    vm_hw.vmFreeStructures(cell.ctrl_phys);
+    pmm.global_pmm.?.destroy(cell);
+    vm.arch_state = null;
+}
+
+/// Per-VM control-state envelope returned from `allocVmArchState`.
+/// Page-sized + page-aligned so it fits the PMM's `create`/`destroy`
+/// contract; the only payload today is the VMCS/VMCB physical address.
+/// Future arch-specific per-VM state (kernel LAPIC/IOAPIC,
+/// MSRPM/IOPM bookkeeping, exit_box, etc.) is the natural occupant of
+/// the rest of the page.
+pub const CtrlStateCell = extern struct {
+    ctrl_phys: PAddr align(paging.PAGE4K),
+    _pad: [paging.PAGE4K - @sizeOf(PAddr)]u8 = undefined,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(CtrlStateCell) == paging.PAGE4K);
+    std.debug.assert(@alignOf(CtrlStateCell) == paging.PAGE4K);
 }
 
 // SPEC AMBIGUITY: x64 KVM stage-2 paging / policy / IRQ injection

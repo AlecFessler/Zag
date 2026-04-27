@@ -216,6 +216,24 @@ pub fn perCoreInit() void {
     host_vmcb_pa[core_id] = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(host_vmcb_page)), null).addr;
 }
 
+/// Allocate and zero a 4K page to serve as the NPT PML4 root.
+/// Spec-v3 split: caller (`arch.x64.kvm.vm.allocStage2Root`) holds this
+/// PAddr in `VirtualMachine.guest_pt_root`. On AMD the NPT root has to
+/// be patched into the VMCB (`N_CR3`) by per-VM control state setup.
+pub fn allocNptRoot() ?PAddr {
+    const pmm_mgr = &pmm.global_pmm.?;
+    const npt_page = pmm_mgr.create(paging.PageMem(.page4k)) catch return null;
+    return PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(npt_page)), null);
+}
+
+/// Free an NPT PML4 page allocated by `allocNptRoot`.
+pub fn freeNptRoot(paddr: PAddr) void {
+    const pmm_mgr = &pmm.global_pmm.?;
+    const vaddr = VAddr.fromPAddr(paddr, null).addr;
+    const page: *paging.PageMem(.page4k) = @ptrFromInt(vaddr);
+    pmm_mgr.destroy(page);
+}
+
 /// Allocate VMCB + NPT PML4 for a new VM.
 /// AMD APM Vol 2, Section 15.5.1: VMCB is a 4KB-aligned page.
 /// Returns physical address of the VMCB page. The NPT PML4 physical

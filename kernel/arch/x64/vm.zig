@@ -284,6 +284,40 @@ pub fn vmFreeStructures(paddr: PAddr) void {
     }
 }
 
+/// Allocate the stage-2 nested-paging root page (EPT PML4 / NPT PML4).
+/// Spec-v3 dispatch primitive — backs `kvm.vm.allocStage2Root`.
+pub fn allocStage2RootPage() ?PAddr {
+    return switch (active_backend) {
+        .intel_vmx => vmx.allocEptRoot(),
+        .amd_svm => svm.allocNptRoot(),
+        .none => null,
+    };
+}
+
+/// Free a stage-2 nested-paging root page allocated by
+/// `allocStage2RootPage`. TODO: walk and free intermediate tables.
+pub fn freeStage2RootPage(paddr: PAddr) void {
+    switch (active_backend) {
+        .intel_vmx => vmx.freeEptRoot(paddr),
+        .amd_svm => svm.freeNptRoot(paddr),
+        .none => {},
+    }
+}
+
+/// Allocate per-VM control state (VMCS / VMCB) wired to a pre-allocated
+/// stage-2 root. On Intel this returns the VMCS PAddr after VMCLEAR +
+/// VMPTRLD + `initVmcs(ept_root)`. On AMD this is not yet split out and
+/// returns null so the caller surfaces `error.NoDevice`.
+pub fn allocVmCtrlState(stage2_root: PAddr) ?PAddr {
+    return switch (active_backend) {
+        .intel_vmx => vmx.allocVmcsWithEpt(stage2_root),
+        // TODO: split AMD `allocVmStructures` into NPT-root vs VMCB
+        //       so create_virtual_machine can mint a VM on SVM hosts.
+        .amd_svm => null,
+        .none => null,
+    };
+}
+
 /// Map a guest physical page in the arch-specific guest memory translation structures.
 pub fn mapGuestPage(vm_structures: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8) !void {
     switch (active_backend) {
