@@ -674,8 +674,19 @@ pub fn build(b: *std.Build) void {
     const tag_wf = b.addWriteFiles();
     const test_elfs = b.allocator.alloc(std.Build.LazyPath, selected_entries.len) catch
         @panic("OOM allocating test_elfs");
+    // Each tag is namespaced under TAG_MAGIC (high u16 bit) so that the
+    // runner can discriminate genuine `testing.report` events from
+    // incidental suspensions that happen to land on the result port
+    // with rsi=0 (or other small accidental values). A test with
+    // manifest index `i` gets `tag = TAG_MAGIC | i`. Sentinel TAG =
+    // 0xFFFF (used by libz consumers that aren't tests) also has the
+    // high bit set but maps to an out-of-range index, so it is dropped
+    // by the runner's bounds check just like before. Total test count
+    // is bounded by 0x7FFF (32767) so the index never collides with
+    // the magic bit.
+    const tag_magic: u16 = 0x8000;
     for (selected_entries, 0..) |t, i| {
-        const tag: u16 = @intCast(i);
+        const tag: u16 = @intCast(@as(u16, @intCast(i)) | tag_magic);
         test_elfs[i] = buildTestElf(b, target, tag_wf, t.name, t.path, tag);
         _ = embedded_wf.addCopyFile(test_elfs[i], b.fmt("{s}.elf", .{t.name}));
     }
@@ -702,9 +713,10 @@ pub fn build(b: *std.Build) void {
         \\
     ) catch unreachable;
     for (selected_entries, 0..) |t, i| {
+        const manifest_tag: u16 = @intCast(@as(u16, @intCast(i)) | tag_magic);
         manifest.writer().print(
             "    .{{ .name = \"{s}\", .bytes = @embedFile(\"{s}.elf\"), .tag = {d} }},\n",
-            .{ t.name, t.name, i },
+            .{ t.name, t.name, manifest_tag },
         ) catch unreachable;
     }
     manifest.appendSlice("};\n") catch unreachable;

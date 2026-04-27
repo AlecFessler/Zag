@@ -40,6 +40,17 @@ const syscall = lib.syscall;
 // initial state of the results table.
 const RECV_TIMEOUT_NS: u64 = 5_000_000_000;
 
+// Tag magic. The build emits each test ELF with `test_tag.TAG =
+// TAG_MAGIC | manifest_index`. Tests that explicitly suspend their
+// initial EC on the runner's result port outside of `testing.report`
+// (or whose suspend frame happens to ride rsi=0 / some other small
+// accidental value) would otherwise spoof a real test result and
+// overwrite a genuine entry. The runner enforces the magic on every
+// inbound event: events without it are dropped before they touch the
+// results table. Must match `tag_magic` in `tests/tests/build.zig`.
+const TAG_MAGIC: u64 = 0x8000;
+const TAG_INDEX_MASK: u64 = 0x7FFF;
+
 pub const ResultCode = enum(u64) {
     fail = 0,
     pass = 1,
@@ -265,18 +276,31 @@ fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
     return pf_handle;
 }
 
-// Writes the result for a tag into the table. Out-of-range tags are
-// dropped — the sentinel TAG = 0xFFFF (used by the primary's own
-// libz so testing.zig compiles when imported by non-test code) won't
-// alias a real test slot for any plausible suite size.
+// Writes the result for a tag into the table. Events whose tag does
+// not carry `TAG_MAGIC` are silently dropped — they come from
+// suspensions that landed on the result port outside of
+// `testing.report` (e.g. tests that build their own `suspend`-on-
+// port-3 syscall frames, or sentinel-libz consumers — TAG = 0xFFFF
+// — both include the magic bit but the latter falls out via the
+// out-of-range check). Out-of-range real tags after stripping the
+// magic are dropped with a diagnostic so unexpected build/runtime
+// drift surfaces immediately.
 fn record(tag: u64, r: TestResult) void {
-    if (tag >= TOTAL_TESTS) {
+    if ((tag & TAG_MAGIC) == 0) return;
+    const index = tag & TAG_INDEX_MASK;
+    if (index >= TOTAL_TESTS) {
+        // Sentinel TAG = 0x7FFF (post-strip from 0xFFFF) lands here for
+        // any libz consumer that imports the sentinel test_tag module
+        // and then somehow ends up suspending on the result port. The
+        // runner-internal primary uses the sentinel so we don't print
+        // for it, but anything else gets a diagnostic.
+        if (index == TAG_INDEX_MASK) return;
         serial.print("[runner] OOB tag=");
-        serial.printU64(tag);
+        serial.printU64(index);
         serial.print(" — dropping\n");
         return;
     }
-    results[@intCast(tag)] = r;
+    results[@intCast(index)] = r;
 }
 
 fn summarize() void {

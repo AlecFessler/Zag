@@ -902,7 +902,15 @@ fn deliverEvent(
     arch.syscall.setEventVreg4(target_ctx, sender.event_vreg4);
     arch.syscall.setEventVreg5(target_ctx, sender.event_vreg5);
 
-    return 0;
+    // Return the composed `ret_word` as i64 so the recv-fast-path
+    // caller (sender already waiting at recv time) can propagate it
+    // through `syscallDispatch`'s `r.rax = ret` epilogue. Without this
+    // the receiver's saved rax would land as the dispatch's i64 return
+    // (0 here) and clobber the `setSyscallReturn` write above. The
+    // rendezvous path discards this return and relies on the direct
+    // setSyscallReturn write since its receiver is asleep and never
+    // re-enters syscallDispatch's epilogue.
+    return @bitCast(ret_word);
 }
 
 /// Sender-side rendezvous with a waiting receiver. Caller is the
