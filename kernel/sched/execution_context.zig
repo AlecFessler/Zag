@@ -441,6 +441,32 @@ pub fn self(caller: *ExecutionContext) i64 {
 /// `SlabRef.lock`, surfaces `E_TERM`, and lazily evicts the slot. The
 /// same lazy eviction applies to stale handles in other capability
 /// domains.
+/// Park the calling EC out of every run queue with no possibility of
+/// resuming. Used by no-route fault fallbacks (§[event_route]): when an
+/// exception fires and the EC has no thread_fault route bound, the
+/// kernel must keep the faulting EC from being re-dispatched. Otherwise
+/// the EC re-iretq's onto the same instruction, faults again, and
+/// (especially at higher-than-default priority) starves every other EC
+/// in its domain. A full `destroyExecutionContext` from this path would
+/// unmap the kernel stack the exception handler is currently running
+/// on, so we instead clear the local core's `current_ec` slot and mark
+/// the EC `.exited`. The EC's slab + stacks stay pinned until its
+/// owning domain is torn down. After this returns the caller
+/// (`exceptionHandler`) calls `scheduler.yieldTo(null)` — with
+/// `current_ec` cleared, `yieldTo` skips the re-enqueue path and
+/// dispatches the next runnable EC.
+pub fn parkSelfFaulted(ec: *ExecutionContext) void {
+    const core_id = arch.smp.coreID();
+    if (scheduler.core_states[core_id].current_ec == ec) {
+        scheduler.core_states[core_id].current_ec = null;
+    }
+    // `.exited` is the closest existing state for "will never run again";
+    // no `markReady`/`enqueue*` path observes it, and the EC stays in
+    // the slab so outstanding handles still resolve (just to a parked
+    // EC) until the owning domain is destroyed.
+    ec.state = .exited;
+}
+
 pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     const cd_ref = caller.domain;
     const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;

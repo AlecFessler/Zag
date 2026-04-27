@@ -38,7 +38,7 @@ const PRIORITY_ARG_MASK: u64 = 0b11;
 /// in a target domain referenced by an IDC handle.
 ///
 /// ```
-/// create_execution_context([1] caps, [2] entry, [3] stack_pages, [4] target, [5] vm_handle, [6] affinity)
+/// create_execution_context([1] caps, [2] entry, [3] stack_pages, [4] target, [5] affinity)
 ///   -> [1] handle
 ///   syscall_num = 7
 ///
@@ -91,11 +91,8 @@ pub fn createExecutionContext(
     entry: u64,
     stack_pages: u64,
     target: u64,
-    vm_handle: u64,
     affinity_mask: u64,
 ) i64 {
-    _ = vm_handle;
-
     if (caps & ~CREATE_EC_CAPS_MASK != 0) return errors.E_INVAL;
     if (target & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;
     if (stack_pages == 0) return errors.E_INVAL;

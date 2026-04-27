@@ -657,12 +657,25 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
     @panic("memory_fault with no event_route — restartDomain/releaseSelf are stubbed; cannot recover");
 }
 
-/// Fire a thread_fault event. Fallback on no route: terminate EC.
+/// Fire a thread_fault event. Fallback on no route: park the EC so the
+/// same fault doesn't loop forever.
 pub fn fireThreadFault(ec: *ExecutionContext, subcode: u8, payload: u64) void {
     if (fireRouted(ec, .thread_fault, subcode, payload)) return;
-    // No-route fallback: terminate the EC. The terminate path destroys
-    // the slab slot, which gen-bumps every outstanding handle to E_TERM.
-    _ = execution_context.terminate(ec, 0);
+    // No-route fallback. Earlier this called `execution_context.terminate(
+    // ec, 0)`, but `terminate(caller, target)` resolves `target` as a
+    // handle in the caller's table — slot 0 is the SELF capability_domain
+    // handle, so resolution as `.execution_context` always returned
+    // E_BADCAP. The faulting EC was then iretq'd back onto the same RIP,
+    // faulted again, and (when higher-priority than its peers) starved
+    // every other EC in the domain.
+    //
+    // Park instead of destroying: `parkSelfFaulted` clears the local
+    // core's `current_ec` and marks state `.exited` so the scheduler
+    // stops re-enqueueing it. We don't free the slab or kernel stack
+    // here — we're still running on that very stack inside the
+    // exception handler. The slab + stack are reclaimed when the
+    // owning domain is torn down.
+    execution_context.parkSelfFaulted(ec);
 }
 
 /// Fire a breakpoint event. Fallback: drop, advance past trap, resume.

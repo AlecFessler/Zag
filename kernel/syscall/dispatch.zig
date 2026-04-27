@@ -125,7 +125,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             arg(args, 2),
             arg(args, 3),
             arg(args, 4),
-            arg(args, 5),
         ),
         .self => execution_context.self(caller),
         .terminate => execution_context.terminate(caller, arg(args, 0)),
