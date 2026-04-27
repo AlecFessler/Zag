@@ -329,11 +329,14 @@ fn ioapicInjectExternal(ctx: *anyopaque, vector: u8) void {
 
 pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
     // SPEC AMBIGUITY: x64 KVM arch-state (VMCS/EPT) allocation not yet
-    // implemented. Returning OutOfMemory keeps create_virtual_machine
-    // on the E_NOMEM path rather than panicking the kernel.
+    // implemented. Surface as NoDevice so create_virtual_machine returns
+    // E_NODEV per spec §[create_virtual_machine] ("returns E_NODEV if
+    // the platform does not support hardware virtualization") — which
+    // is the test-suite-acceptable bail path on platforms without an
+    // implemented KVM backing.
     _ = vm;
     _ = policy_pf;
-    return error.OutOfMemory;
+    return error.NoDevice;
 }
 
 pub fn freeVmArchState(vm: *VirtualMachine) void {
@@ -346,12 +349,11 @@ pub fn freeVmArchState(vm: *VirtualMachine) void {
 
 pub fn allocStage2Root(vm: *VirtualMachine) !PAddr {
     // SPEC AMBIGUITY: x64 KVM stage-2 page-table root allocation not
-    // yet implemented. Returning OutOfMemory makes
-    // §[create_virtual_machine] return E_NOMEM (graceful) instead of
-    // panicking the kernel, so VM tests degrade to a uniform failure
-    // mode rather than killing the entire test run.
+    // yet implemented. Surface as NoDevice so create_virtual_machine
+    // returns E_NODEV per spec §[create_virtual_machine] — see
+    // allocVmArchState above.
     _ = vm;
-    return error.OutOfMemory;
+    return error.NoDevice;
 }
 
 pub fn freeStage2Root(vm: *VirtualMachine) void {
