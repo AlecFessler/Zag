@@ -6,6 +6,7 @@ const port_obj = zag.sched.port;
 
 const CapabilityDomainCaps = zag.capdom.capability_domain.CapabilityDomainCaps;
 const CapabilityType = capability.CapabilityType;
+const EcCaps = zag.sched.execution_context.EcCaps;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PortCaps = port_obj.PortCaps;
 const Word0 = capability.Word0;
@@ -95,15 +96,28 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64) i64 {
     const cd_ref = ec.domain;
     const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
 
+    // Spec §[suspend] gate order: [1] target validity (test 01) before
+    // [2] port validity (test 02) before per-handle cap checks (tests
+    // 03/04). The previous implementation checked port first, so an
+    // invalid target with a valid port returned E_PERM (port lacks
+    // bind) instead of E_BADCAP.
+    const target_slot: u12 = @truncate(target);
+    if (capability.resolveHandleOnDomain(cd, target_slot, .execution_context) == null) {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    }
+
     const port_slot: u12 = @truncate(port);
     if (capability.resolveHandleOnDomain(cd, port_slot, .port) == null) {
         cd_ref.unlock();
         return errors.E_BADCAP;
     }
+    const ec_caps: EcCaps = @bitCast(Word0.caps(cd.user_table[target_slot].word0));
     const port_caps: PortCaps = @bitCast(Word0.caps(cd.user_table[port_slot].word0));
 
     cd_ref.unlock();
 
+    if (!ec_caps.susp) return errors.E_PERM;
     if (!port_caps.bind) return errors.E_PERM;
 
     return port_obj.suspendEc(ec, target, port);

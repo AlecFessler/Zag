@@ -7,7 +7,8 @@
 // userspace distinguishes errors via the value-range check (the small
 // positive error codes 1..15 cannot be confused with a real handle
 // word, which always carries a non-zero type tag in bits 12-15 making
-// the value >= 0x1000).
+// the value >= 0x1000). Internal helpers that distinguish success
+// from failure must use `!= 0`, never `< 0`.
 
 pub const OK: i64 = 0;
 pub const E_ABANDONED: i64 = 1;

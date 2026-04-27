@@ -161,6 +161,7 @@ pub fn removeBlockedEc(ec: *ExecutionContext) void {
             i += 1;
         }
         ec.futex_wait_nodes = null;
+        ec.futex_wait_vaddrs = null;
         ec.futex_bucket_count = 0;
     }
     if (ec.futex_deadline_ns != 0) {
@@ -351,11 +352,18 @@ pub fn wakeFromIrq(paddr: PAddr) WakeResult {
 /// `futex_wait_val` — block while every `(addrs[i], expected[i])`
 /// satisfies `*addr == expected`. Spec §[futex].futex_wait_val.
 ///
+/// `vaddrs[i]` is the caller-domain virtual address corresponding to
+/// `addrs[i]`. The success path returns the user vaddr that satisfied
+/// the wait per spec §[futex_wait_val] vreg-1 contract; this avoids any
+/// collision between an index (0..n-1) and a positive spec error code
+/// (1..15) that the syscall layer would otherwise have to disambiguate.
+///
 /// Returns:
-///   0..count-1 = index of the first mismatched address (mismatch, no block), or
-///   0..count-1 = index of the address that was woken (after blocking),
-///   E_TIMEOUT if timeout expired, E_NOMEM if no timed waiter slot.
-pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeout_ns: u64, ec: *ExecutionContext) i64 {
+///   vaddrs[i]  = caller-domain vaddr of the first mismatched address
+///                (immediate, no block) or the woken address (after
+///                blocking).
+///   E_TIMEOUT  if timeout expired, E_NOMEM if no timed waiter slot.
+pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64, count: usize, timeout_ns: u64, ec: *ExecutionContext) i64 {
     var sorted: [MAX_FUTEX_ADDRS]u8 = undefined;
     for (0..count) |i| sorted[i] = @intCast(i);
     sortByBucket(sorted[0..count], addrs);
@@ -367,7 +375,7 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
         const value_ptr: *const u64 = @ptrFromInt(vaddr.addr);
         if (@atomicLoad(u64, value_ptr, .acquire) != expected[i]) {
             releaseBucketLocks(&lock_state);
-            return @intCast(i);
+            return @bitCast(vaddrs[i]);
         }
     }
 
@@ -395,6 +403,7 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
         };
     }
     ec.futex_wait_nodes = &nodes;
+    ec.futex_wait_vaddrs = vaddrs.ptr;
     ec.futex_bucket_count = @intCast(count);
     ec.state = .futex_wait;
 
@@ -410,6 +419,7 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
             releaseBucketLocks(&lock_state);
             ec.state = .running;
             ec.futex_wait_nodes = null;
+            ec.futex_wait_vaddrs = null;
             ec.futex_bucket_count = 0;
             ec.futex_deadline_ns = 0;
             return errors.E_NOMEM;
@@ -424,17 +434,22 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
     const was_timeout: bool = ec.futex_deadline_ns == FUTEX_TIMEOUT_SENTINEL;
     ec.futex_deadline_ns = 0;
     if (was_timeout) return errors.E_TIMEOUT;
-    return @intCast(ec.futex_wake_index);
+    const woken_idx: usize = ec.futex_wake_index;
+    return @bitCast(if (woken_idx < count) vaddrs[woken_idx] else @as(u64, 0));
 }
 
 /// `futex_wait_change` — block while every `(addrs[i], targets[i])`
 /// satisfies `*addr != target`. Spec §[futex].futex_wait_change.
 ///
+/// `vaddrs[i]` parallels `addrs[i]` and is the caller-domain user vaddr;
+/// the success path returns one of these per spec §[futex_wait_change].
+///
 /// Returns:
-///   0..count-1 = index of the first matched address (already at target, no block), or
-///   0..count-1 = index of the address that was woken (after blocking),
-///   E_TIMEOUT if timeout expired, E_NOMEM if no timed waiter slot.
-pub fn waitChange(addrs: []const PAddr, targets: []const u64, count: usize, timeout_ns: u64, ec: *ExecutionContext) i64 {
+///   vaddrs[i]  = caller-domain vaddr of the first matched address
+///                (immediate, no block) or the woken address (after
+///                blocking).
+///   E_TIMEOUT  if timeout expired, E_NOMEM if no timed waiter slot.
+pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u64, count: usize, timeout_ns: u64, ec: *ExecutionContext) i64 {
     var sorted: [MAX_FUTEX_ADDRS]u8 = undefined;
     for (0..count) |i| sorted[i] = @intCast(i);
     sortByBucket(sorted[0..count], addrs);
@@ -446,7 +461,7 @@ pub fn waitChange(addrs: []const PAddr, targets: []const u64, count: usize, time
         const value_ptr: *const u64 = @ptrFromInt(vaddr.addr);
         if (@atomicLoad(u64, value_ptr, .acquire) == targets[i]) {
             releaseBucketLocks(&lock_state);
-            return @intCast(i);
+            return @bitCast(vaddrs[i]);
         }
     }
 
@@ -474,6 +489,7 @@ pub fn waitChange(addrs: []const PAddr, targets: []const u64, count: usize, time
         };
     }
     ec.futex_wait_nodes = &nodes;
+    ec.futex_wait_vaddrs = vaddrs.ptr;
     ec.futex_bucket_count = @intCast(count);
     ec.state = .futex_wait;
 
@@ -489,6 +505,7 @@ pub fn waitChange(addrs: []const PAddr, targets: []const u64, count: usize, time
             releaseBucketLocks(&lock_state);
             ec.state = .running;
             ec.futex_wait_nodes = null;
+            ec.futex_wait_vaddrs = null;
             ec.futex_bucket_count = 0;
             ec.futex_deadline_ns = 0;
             return errors.E_NOMEM;
@@ -503,7 +520,8 @@ pub fn waitChange(addrs: []const PAddr, targets: []const u64, count: usize, time
     const was_timeout: bool = ec.futex_deadline_ns == FUTEX_TIMEOUT_SENTINEL;
     ec.futex_deadline_ns = 0;
     if (was_timeout) return errors.E_TIMEOUT;
-    return @intCast(ec.futex_wake_index);
+    const woken_idx: usize = ec.futex_wake_index;
+    return @bitCast(if (woken_idx < count) vaddrs[woken_idx] else @as(u64, 0));
 }
 
 /// Holds lock state for multi-bucket acquisition.

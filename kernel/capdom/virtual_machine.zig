@@ -257,7 +257,7 @@ pub fn mapGuest(caller: *ExecutionContext, vm_handle: u64, pairs: []const u64) i
         const pf = lookupPageFrame(domain, pf_slot) orelse return errors.E_BADCAP;
         const pf_caps: PageFrameCaps = @bitCast(Word0.caps(domain.user_table[pf_slot].word0));
         const rc = installPageFrame(vm, pairs[2 * i], pf, pageFramePerms(pf_caps));
-        if (rc < 0) return rc;
+        if (rc != 0) return rc;
         i += 1;
     }
 
@@ -280,7 +280,7 @@ pub fn unmapGuest(caller: *ExecutionContext, vm_handle: u64, page_frames: []cons
         const pf = lookupPageFrame(domain, @truncate(pf_handle_word)) orelse
             return errors.E_BADCAP;
         const rc = uninstallPageFrame(vm, pf);
-        if (rc < 0) return rc;
+        if (rc != 0) return rc;
     }
 
     return 0;

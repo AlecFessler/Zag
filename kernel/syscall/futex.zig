@@ -82,17 +82,19 @@ pub fn futexWaitVal(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) i64
     if (n > fut_wait_max) return errors.E_INVAL;
 
     var addrs: [MAX_PAIRS]PAddr = undefined;
+    var vaddrs: [MAX_PAIRS]u64 = undefined;
     var expected: [MAX_PAIRS]u64 = undefined;
     var i: usize = 0;
     while (i < n) {
         const va = pairs[i * 2];
         if ((va & 7) != 0) return errors.E_INVAL;
         addrs[i] = resolveCallerVa(ec, va) orelse return errors.E_BADADDR;
+        vaddrs[i] = va;
         expected[i] = pairs[i * 2 + 1];
         i += 1;
     }
 
-    return futex.waitVal(addrs[0..n], expected[0..n], n, timeout_ns, @ptrCast(ec));
+    return futex.waitVal(addrs[0..n], vaddrs[0..n], expected[0..n], n, timeout_ns, @ptrCast(ec));
 }
 
 /// Blocks while every `(addr, target)` pair satisfies `*addr != target`.
@@ -136,17 +138,19 @@ pub fn futexWaitChange(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) 
     if (n > fut_wait_max) return errors.E_INVAL;
 
     var addrs: [MAX_PAIRS]PAddr = undefined;
+    var vaddrs: [MAX_PAIRS]u64 = undefined;
     var targets: [MAX_PAIRS]u64 = undefined;
     var i: usize = 0;
     while (i < n) {
         const va = pairs[i * 2];
         if ((va & 7) != 0) return errors.E_INVAL;
         addrs[i] = resolveCallerVa(ec, va) orelse return errors.E_BADADDR;
+        vaddrs[i] = va;
         targets[i] = pairs[i * 2 + 1];
         i += 1;
     }
 
-    return futex.waitChange(addrs[0..n], targets[0..n], n, timeout_ns, @ptrCast(ec));
+    return futex.waitChange(addrs[0..n], vaddrs[0..n], targets[0..n], n, timeout_ns, @ptrCast(ec));
 }
 
 /// Wakes up to `count` ECs blocked in `futex_wait_val` or
