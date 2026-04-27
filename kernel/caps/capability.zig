@@ -555,7 +555,7 @@ fn restartPolicyMask(type_tag: CapabilityType) u16 {
 /// The user table is mapped read-only into the holding domain but
 /// kernel writes go through the kernel-side R/W view of the same
 /// physical pages — see `CapabilityDomain.user_table` doc comment.
-fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
+pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
     const user_entry = &holder.user_table[slot];
     const type_tag = Word0.typeTag(user_entry.word0);
     switch (type_tag) {

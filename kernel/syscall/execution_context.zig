@@ -368,6 +368,14 @@ pub fn yield(caller: *anyopaque, target: u64) i64 {
         cd_ref.unlock();
         return errors.E_BADCAP;
     };
+
+    // Spec §[yield] test 04: implicit-sync side effect — refresh the
+    // handle's field0/field1 snapshot from the kernel's authoritative
+    // EC state. Done while holding the caller's domain lock so the
+    // user-table write is sequenced correctly against concurrent
+    // mutators.
+    capability.refreshSnapshot(cd, slot, entry);
+
     cd_ref.unlock();
 
     // Resolve the target EC pointer under its own gen lock just long
