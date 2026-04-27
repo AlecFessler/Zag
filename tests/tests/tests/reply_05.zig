@@ -82,25 +82,27 @@ const testing = lib.testing;
 // Cell W stores its rbx into. Sentinel 0 is distinguishable from MAGIC
 // (a non-zero pattern) so a "never wrote" outcome is detectable. The
 // test EC and W share an address space (W is created with target=self
-// in step 2 below), so W writes here directly.
-var observed: u64 = 0;
+// in step 2 below), so W writes here directly. `export` so the inline
+// asm can address it via rip-relative addressing; an "m" memory operand
+// would route through a stack temp, which a naked entry has no
+// well-formed frame for (mirrors the reply_transfer_14 precedent).
+export var observed: u64 = 0;
 
 const MAGIC: u64 = 0xC0FFEE_CAFE_BEEF_50;
 
 // W's entry. Naked so no function prologue clobbers rbx before the
-// store. The store goes through a memory operand so the compiler emits
-// PIC-correct addressing for `observed`. After the store W spins so it
+// store. The store uses rip-relative addressing on the exported
+// `observed` symbol directly — no asm operands, so LLVM cannot spill
+// through the (nonexistent) stack frame. After the store W spins so it
 // neither faults nor races the test EC's reporter — the runner only
 // cares about the test EC's eventual `pass()`/`fail()` suspension on
 // the result port; W never touches the result port.
 fn observerEntry() callconv(.naked) noreturn {
     asm volatile (
-        \\ movq %%rbx, %[obs]
+        \\ movq %%rbx, observed(%%rip)
         \\ 1: pause
         \\    jmp 1b
-        :
-        : [obs] "m" (observed),
-        : .{ .memory = true });
+        ::: .{ .memory = true });
 }
 
 pub fn main(cap_table_base: u64) void {
