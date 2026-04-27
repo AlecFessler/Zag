@@ -346,14 +346,16 @@ pub fn idcRead(caller: *anyopaque, var_handle: u64, offset: u64, count: u8) i64 
 /// [test 06] returns E_INVAL if any reserved bits are set in [1] or [2].
 /// [test 07] on success, the qwords from vregs `[3..2+count]` are written into the VAR starting at [2] offset.
 /// [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-pub fn idcWrite(caller: *anyopaque, var_handle: u64, offset: u64, qwords: []const u64) i64 {
+pub fn idcWrite(caller: *anyopaque, var_handle: u64, offset: u64, count: u8, qwords: []const u64) i64 {
     if (var_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (offset & 0x7 != 0) return errors.E_INVAL;
-    if (qwords.len == 0) return errors.E_INVAL;
-    if (qwords.len > IDC_QWORDS_MAX) return errors.E_INVAL;
+    // The raw count comes straight from the syscall word so we can gate
+    // count > 125 even though the args slice tops out at the 13-vreg
+    // register window. The qwords slice carries only the payload that
+    // was actually delivered (≤ 11 register-vreg qwords today).
+    if (count == 0) return errors.E_INVAL;
+    if (count > IDC_QWORDS_MAX) return errors.E_INVAL;
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    // var_range.idcWrite stub takes (caller, var, offset, count); the
-    // dispatcher pre-stages the qwords payload from the caller's vregs.
-    return var_range.idcWrite(ec, var_handle, offset, @truncate(qwords.len));
+    return var_range.idcWrite(ec, var_handle, offset, count, qwords);
 }

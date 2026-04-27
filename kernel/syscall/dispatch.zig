@@ -202,16 +202,17 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .idc_write => blk: {
             // Spec §[var].idc_write: syscall word bits 12-19 carry count
             // (number of qwords, max 125). Qwords occupy vregs 3..2+count
-            // — args[2..2+count]. Without this slice the handler would
-            // see uninitialized vregs above the user's payload as junk
-            // qwords and (a) overcount, or (b) write garbage into the
-            // VAR on the success path.
-            const n: u64 = (syscall_word >> 12) & 0xFF;
-            const end_idx: usize = @min(2 + @as(usize, @intCast(n)), args.len);
+            // — args[2..2+count]. The handler needs the *raw* count
+            // (before slice truncation) so it can return E_INVAL for
+            // count > 125 even though the args slice tops out at 13
+            // entries (test 04 boundary).
+            const n: u8 = @truncate((syscall_word >> 12) & 0xFF);
+            const end_idx: usize = @min(2 + @as(usize, n), args.len);
             break :blk var_.idcWrite(
                 caller,
                 arg(args, 0),
                 arg(args, 1),
+                n,
                 if (end_idx > 2) args[2..end_idx] else &.{},
             );
         },

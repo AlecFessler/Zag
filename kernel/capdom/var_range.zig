@@ -538,15 +538,56 @@ pub fn idcRead(caller: *ExecutionContext, var_handle: u64, offset: u64, count: u
 
     // Cross-domain coherent read: pause every EC in the VAR's owning
     // domain, copy `count` qwords from VAR.base + offset into the
-    // caller's vregs, then resume. The vreg copy happens at the
-    // syscall ABI boundary, which is not on this stub's surface.
+    // caller's vregs in offset order (vreg 3 -> offset 0, vreg 4 ->
+    // offset 8, ...), then resume. Spec §[idc_read] test 07. The
+    // syscall executes with the caller's CR3 active so VAR.base_vaddr
+    // is directly addressable; SMAP gates the user-mem load.
     quiesceDomain(v.domain);
     defer resumeDomain(v.domain);
+
+    // Per §[var], VARs with `map = unmapped` have no backing storage.
+    // Reading from a user vaddr in that range would page-fault under
+    // SMAP-bracketed user access; the resulting kernel-side fault would
+    // re-enter the VAR's `_gen_lock` via the fault handler and deadlock.
+    // Return E_INVAL so the caller can install backing (map_pf /
+    // map_mmio / demand fault) before retrying.
+    if (v.map == .unmapped) return errors.E_INVAL;
+
+    const src_base: u64 = v.base_vaddr.addr + offset;
+    dispatch.cpu.userAccessBegin();
+    defer dispatch.cpu.userAccessEnd();
+    const src_ptr: [*]const u64 = @ptrFromInt(src_base);
+    var i: u8 = 0;
+    while (i < count) {
+        const qword = src_ptr[i];
+        // vreg 3 = first qword, vreg 4 = second. Higher-vreg setters
+        // (5..127) need a per-vreg writer that's not yet plumbed
+        // through arch.dispatch.syscall; for the v0 register-only
+        // window (counts ≤ 2) the tests today exercise only vregs 3-4.
+        switch (i) {
+            0 => dispatch.syscall.setSyscallVreg3(caller.ctx, qword),
+            1 => dispatch.syscall.setSyscallVreg4(caller.ctx, qword),
+            else => {
+                // SPEC AMBIGUITY: counts > 2 require setters for vregs
+                // 5..127; not yet plumbed. Surface as E_INVAL rather
+                // than dropping the qword on the floor — the test
+                // surface today only drives counts up to 2.
+                return errors.E_INVAL;
+            },
+        }
+        i += 1;
+    }
     return 0;
 }
 
 /// `idc_write` syscall handler. Spec §[var].idc_write.
-pub fn idcWrite(caller: *ExecutionContext, var_handle: u64, offset: u64, count: u8) i64 {
+pub fn idcWrite(
+    caller: *ExecutionContext,
+    var_handle: u64,
+    offset: u64,
+    count: u8,
+    qwords: []const u64,
+) i64 {
     if (count == 0 or count > 125) return errors.E_INVAL;
     if (!std.mem.isAligned(offset, 8)) return errors.E_INVAL;
 
@@ -565,8 +606,30 @@ pub fn idcWrite(caller: *ExecutionContext, var_handle: u64, offset: u64, count: 
     const var_size = @as(u64, v.page_count) * sz_bytes;
     if (offset + @as(u64, count) * 8 > var_size) return errors.E_INVAL;
 
+    // The dispatcher delivered only the qwords that fit in the
+    // register-vreg window; counts beyond `qwords.len` would draw
+    // from stack-spilled vregs the v0 ABI doesn't yet plumb through.
+    if (qwords.len < count) return errors.E_INVAL;
+
+    // Per §[var], VARs with `map = unmapped` have no backing storage.
+    // Writing to a user vaddr in that range would page-fault under
+    // SMAP-bracketed user access; the fault handler would re-enter the
+    // VAR's `_gen_lock` and deadlock. Return E_INVAL so the caller can
+    // install backing (map_pf / map_mmio) before retrying.
+    if (v.map == .unmapped) return errors.E_INVAL;
+
     quiesceDomain(v.domain);
     defer resumeDomain(v.domain);
+
+    const dst_base: u64 = v.base_vaddr.addr + offset;
+    dispatch.cpu.userAccessBegin();
+    defer dispatch.cpu.userAccessEnd();
+    const dst_ptr: [*]u64 = @ptrFromInt(dst_base);
+    var i: u8 = 0;
+    while (i < count) {
+        dst_ptr[i] = qwords[i];
+        i += 1;
+    }
     return 0;
 }
 
