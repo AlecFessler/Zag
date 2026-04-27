@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const ast = @import("ast/index.zig");
+const cache = @import("cache.zig");
 const commits = @import("commits.zig");
 const def_deps = @import("def_deps.zig");
 const entry = @import("entry.zig");
@@ -30,6 +31,10 @@ const Args = struct {
     demo_graph: bool = false,
     repl: bool = false,
     mcp: bool = false,
+    /// When true, skip the on-disk cache entirely: don't try to load
+    /// and don't save after a fresh build. Use for debugging the
+    /// builder or forcing a known-clean rebuild.
+    no_cache: bool = false,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -61,6 +66,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             args.repl = true;
         } else if (std.mem.eql(u8, arg, "--mcp")) {
             args.mcp = true;
+        } else if (std.mem.eql(u8, arg, "--no-cache")) {
+            args.no_cache = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printHelp();
             std.process.exit(0);
@@ -90,6 +97,7 @@ fn printHelp() !void {
         \\  --demo-graph        Skip IR parsing; serve a synthetic 3-function graph
         \\  --repl              Drop into an interactive REPL instead of starting the HTTP server
         \\  --mcp               Run as an MCP server over stdio (auto-spawns the daemon)
+        \\  --no-cache          Skip the on-disk parse cache (force a fresh build)
         \\  --help              Show this help
         \\
     , .{});
@@ -175,11 +183,19 @@ pub fn main() !void {
         }
     }
 
-    // Walk AST once.
-    const walk = try ast.walkKernelFull(arena_allocator, args.kernel_root);
-    const ast_fns = walk.fns;
-    const file_count = countDistinctFiles(arena_allocator, ast_fns) catch ast_fns.len;
-    std.debug.print("ast: {d} functions across {d} files\n", .{ ast_fns.len, file_count });
+    // Resolve cache directory once. Failure (e.g. no $HOME) just disables
+    // caching for this run.
+    const cache_dir_opt: ?[]const u8 = if (args.no_cache) null else (cache.cacheDir(arena_allocator) catch |err| blk: {
+        std.debug.print("[cache] disabled (cacheDir: {s})\n", .{@errorName(err)});
+        break :blk null;
+    });
+
+    // AST hash is shared across arches (same kernel sources). Compute once.
+    // Skipped when cache is off — the value isn't used.
+    const ast_input_hash: u64 = if (cache_dir_opt != null)
+        cache.hashAstInputs(arena_allocator, args.kernel_root)
+    else
+        0;
 
     // For each arch with an IR file present, build a Graph.
     var graphs = server.GraphMap.init(allocator);
@@ -187,6 +203,11 @@ pub fn main() !void {
 
     var loaded_arches = std.ArrayList([]const u8){};
     defer loaded_arches.deinit(allocator);
+
+    // AST walk is the second-most-expensive startup step (after IR parse).
+    // Defer it until the first cache miss; if every arch hits, we skip
+    // it entirely.
+    var walk_opt: ?ast.WalkResult = null;
 
     for (arch_specs) |spec| {
         const ir_path = try std.fs.path.join(
@@ -198,6 +219,38 @@ pub fn main() !void {
             std.debug.print("[arch {s}] no IR at {s}; skipping\n", .{ spec.api_tag, ir_path });
             continue;
         };
+
+        // Cache hot path: hash the IR and try to load. On any error,
+        // fall through to the full build below — load() never throws.
+        if (cache_dir_opt) |cache_dir_path| {
+            const ir_hash = cache.hashFile(ir_path);
+            if (ir_hash != 0) {
+                const cpath = cache.cachePath(arena_allocator, cache_dir_path, spec.api_tag, ir_hash) catch null;
+                if (cpath) |cp| {
+                    const key = cache.KeyInputs{ .ir_hash = ir_hash, .ast_hash = ast_input_hash };
+                    if (cache.load(arena_allocator, cp, key, spec.api_tag)) |hit| {
+                        const ms = hit.elapsed_ns / std.time.ns_per_ms;
+                        std.debug.print(
+                            "[arch {s}] loaded cache ({d}ms, {d} fns, {d} eps, {d} defs)\n",
+                            .{ spec.api_tag, ms, hit.graph.functions.len, hit.graph.entry_points.len, hit.graph.definitions.len },
+                        );
+                        try graphs.put(spec.api_tag, hit.graph);
+                        try loaded_arches.append(allocator, spec.api_tag);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Cache miss path. Need the AST walk; build it lazily.
+        if (walk_opt == null) {
+            const w = try ast.walkKernelFull(arena_allocator, args.kernel_root);
+            walk_opt = w;
+            const file_count = countDistinctFiles(arena_allocator, w.fns) catch w.fns.len;
+            std.debug.print("ast: {d} functions across {d} files\n", .{ w.fns.len, file_count });
+        }
+        const walk = walk_opt.?;
+        const ast_fns = walk.fns;
 
         std.debug.print("[arch {s}] parsing {s}\n", .{ spec.api_tag, ir_path });
         const ir_graph = ir.parse(&arena, ir_path) catch |err| {
@@ -268,6 +321,17 @@ pub fn main() !void {
             "[arch {s}] reachability: {d}/{d} ({d:.1}%)\n",
             .{ spec.api_tag, reach_stats.reachable, reach_stats.total, reach_pct },
         );
+
+        // Persist this arch's freshly-built graph for next startup.
+        if (cache_dir_opt) |cache_dir_path| {
+            const ir_hash = cache.hashFile(ir_path);
+            if (ir_hash != 0) {
+                const key = cache.KeyInputs{ .ir_hash = ir_hash, .ast_hash = ast_input_hash };
+                if (cache.save(allocator, cache_dir_path, spec.api_tag, key, &graph)) |ns| {
+                    std.debug.print("[arch {s}] wrote cache ({d}ms)\n", .{ spec.api_tag, ns / std.time.ns_per_ms });
+                }
+            }
+        }
 
         try graphs.put(spec.api_tag, graph);
         try loaded_arches.append(allocator, spec.api_tag);
