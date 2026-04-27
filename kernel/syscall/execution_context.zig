@@ -205,6 +205,23 @@ pub fn createExecutionContext(
         cd.user_table[slot].field1 = affinity_mask;
 
         cd_ref.unlock();
+
+        // Enqueue the new EC on a core that satisfies its affinity
+        // mask so it becomes runnable. Without this enqueue, a yield
+        // targeting the new handle finds the EC `.ready` but absent
+        // from every per-core run queue and the scheduler can never
+        // dispatch it. Mirrors the enqueue path in
+        // `createCapabilityDomain` for the child's initial EC.
+        const calling_core: u64 = arch.smp.coreID();
+        const enqueue_core: u64 = blk: {
+            if (affinity_mask == 0) break :blk calling_core;
+            if ((affinity_mask >> @intCast(calling_core)) & 1 != 0) {
+                break :blk calling_core;
+            }
+            break :blk @ctz(affinity_mask);
+        };
+        scheduler.enqueueOnCore(@intCast(enqueue_core), new_ec);
+
         // Spec §[error_codes]: a successful create_* returns the packed
         // Word0 so the type tag in bits 12-15 disambiguates from the
         // 1..15 error range.
@@ -311,6 +328,17 @@ pub fn yield(caller: *anyopaque, target: u64) i64 {
     if (target & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+
+    // `yieldTo` may switch contexts via `switchTo`, which abandons
+    // this kernel call stack and never returns. The caller's rax
+    // would then iret back to userspace carrying the syscall-entry
+    // value instead of the OK status, so we stamp the OK return
+    // value onto the caller's saved iret frame *before* the switch.
+    // The fall-through `return 0` covers the no-switch path (e.g.
+    // empty run queue → idle, or yieldTo returns when there is
+    // nothing to switch to) for which the asm trampoline writes rax
+    // from the dispatch return value.
+    arch.syscall.setSyscallReturn(ec.ctx, @bitCast(@as(i64, 0)));
 
     if (target == 0) {
         scheduler.yieldTo(null);

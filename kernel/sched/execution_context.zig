@@ -802,12 +802,45 @@ pub fn allocExecutionContext(
     const ustack: ?Stack = if (vm != null) null else blk: {
         // VM vCPUs run guest code; no host user stack needed.
         // Otherwise reserve `stack_pages` pages in `domain`'s address
-        // space. `domain.vmm` is the per-domain VMM; until that
-        // accessor lands, mark stack as null and rely on caller to
-        // backfill. Real impl: try stack.createUser(&domain.vmm,
-        // stack_pages).
-        _ = stack_pages;
-        break :blk null;
+        // space using the domain's bump pointer. The full per-domain
+        // VMM is still pending; this minimal allocator advances
+        // `next_var_base` page-by-page so each new EC gets a fresh
+        // non-overlapping stack range. Map the pages as user data so
+        // userspace ring-3 entry can fetch from RSP and (under SMEP)
+        // the iret_frame's user-mode CS lets the CPU execute the
+        // entry point at all.
+        const stack_bytes: u64 = @as(u64, stack_pages) * paging_consts.PAGE4K;
+        // Leave a one-page guard below and above the populated range.
+        const guard_below: u64 = paging_consts.PAGE4K;
+        const guard_above: u64 = paging_consts.PAGE4K;
+        const total: u64 = guard_below + stack_bytes + guard_above;
+        const region_base: u64 = std.mem.alignForward(u64, domain.next_var_base, paging_consts.PAGE4K);
+        domain.next_var_base = region_base + total;
+
+        const stack_base: u64 = region_base + guard_below;
+        const stack_top: u64 = stack_base + stack_bytes;
+
+        var off: u64 = 0;
+        while (off < stack_bytes) {
+            const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
+            const page = try pmm_mgr.create(paging_consts.PageMem(.page4k));
+            const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
+            try arch_paging.mapPage(
+                domain.addr_space_root,
+                phys,
+                VAddr.fromInt(stack_base + off),
+                .{ .read = true, .write = true },
+                .user_data,
+            );
+            off += paging_consts.PAGE4K;
+        }
+
+        break :blk Stack{
+            .top = VAddr.fromInt(stack_top),
+            .base = VAddr.fromInt(stack_base),
+            .guard = VAddr.fromInt(region_base),
+            .slot = std.math.maxInt(u64),
+        };
     };
 
     // Build the first-dispatch iret frame at the top of the kernel
