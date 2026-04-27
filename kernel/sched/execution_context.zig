@@ -465,6 +465,13 @@ pub fn returnToReady(ec: *ExecutionContext) void {
 /// state after this call (current_ec→null, ec.state=suspended_on_port,
 /// ec enqueued on port wait queue) must be identical to what the fast
 /// path produces, so the two are interchangeable.
+///
+/// Lock contract: caller MUST hold `port._gen_lock` on entry.
+/// `suspendOnPort` ALWAYS releases that lock before returning — either
+/// directly (no-receiver path) or transitively via
+/// `rendezvousWithReceiver` (which drops Port before locking the
+/// receiver's CD to honor the canonical CD → Port order). Callers
+/// must NOT keep their own `defer port_ref.unlock()`.
 pub fn suspendOnPort(
     ec: *ExecutionContext,
     port: *Port,
@@ -473,7 +480,10 @@ pub fn suspendOnPort(
     addr: u64,
     originating_write_cap: bool,
 ) i64 {
-    if (ec.vm != null and event != .vm_exit) return errors.E_PERM;
+    if (ec.vm != null and event != .vm_exit) {
+        port._gen_lock.unlock();
+        return errors.E_PERM;
+    }
     std.debug.assert(ec.state == .running or ec.state == .ready);
 
     if (ec.state == .ready) {
@@ -508,10 +518,9 @@ pub fn suspendOnPort(
     // because the matching suspend() only enqueues into the wait
     // queue without consulting `waiter_kind == .receivers`.
     //
-    // We delegate the dequeue + delivery to `port.rendezvousWithReceiver`
-    // (defined alongside its mirror `port.recv`) so both sides share
-    // identical event-state framing (reply mint, vreg layout, state
-    // transitions).
+    // `rendezvousWithReceiver` releases Port internally on the success
+    // path so it can take the receiver's CD lock without inverting the
+    // canonical CD → Port order. On `false` it leaves Port held.
     if (port.waiter_kind == .receivers) {
         if (zag.sched.port.rendezvousWithReceiver(ec, port, event, subcode, addr)) {
             const core_id = arch.smp.coreID();
@@ -534,6 +543,7 @@ pub fn suspendOnPort(
     if (scheduler.core_states[core_id].current_ec == ec) {
         scheduler.core_states[core_id].current_ec = null;
     }
+    port._gen_lock.unlock();
     return 0;
 }
 

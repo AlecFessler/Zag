@@ -212,7 +212,9 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
     target_ref.unlock();
 
     const p = port_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer port_ref.unlock();
+    // `suspendOnPort` releases the port lock before returning (directly
+    // on the no-receiver path, transitively via `rendezvousWithReceiver`
+    // on the success path) so we MUST NOT add `defer port_ref.unlock()`.
 
     // Snapshot the originating EC handle's `write` cap so reply-time
     // can decide whether receiver mutations apply (Spec §[reply] tests
@@ -227,33 +229,48 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
 /// the caller's domain, deliver event state via vregs, and return. If no
 /// sender is queued and the port has bind holders or routes, the caller
 /// suspends as a receiver; otherwise returns E_CLOSED.
+///
+/// Lock order: caller's CD `_gen_lock` is acquired first, held for the
+/// duration of the Port lock acquisition + port-side work, and only
+/// dropped after `deliverEvent` finishes (which needs CD held to mint
+/// the reply slot). The Port lock is released before `deliverEvent` runs
+/// so the canonical CD → Port order is never inverted — see the lock-
+/// order note on `deliverEvent`.
 pub fn recv(caller: *ExecutionContext, port: u64) i64 {
     const cd_ref = caller.domain;
     const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    defer cd_ref.unlock();
 
     const port_slot: u12 = @truncate(port);
-    const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse {
-        cd_ref.unlock();
+    const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse
         return errors.E_BADCAP;
-    };
-    const port_ref = capability.typedRef(Port, port_entry.*) orelse {
-        cd_ref.unlock();
+    const port_ref = capability.typedRef(Port, port_entry.*) orelse
         return errors.E_BADCAP;
-    };
-    cd_ref.unlock();
 
     const p = port_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer port_ref.unlock();
 
     if (p.waiter_kind == .senders) {
-        const sender = popHighestPrioritySender(p) orelse return errors.E_CLOSED;
-        return deliverEvent(sender, caller, p, sender.event_type, sender.event_subcode, sender.event_addr, 0);
+        const sender = popHighestPrioritySender(p) orelse {
+            port_ref.unlock();
+            return errors.E_CLOSED;
+        };
+        // Drop the Port lock before deliverEvent — it needs receiver-CD
+        // (the caller's CD, already held by us). Holding both would
+        // re-introduce the Port → CD inversion.
+        const evt_type = sender.event_type;
+        const evt_sub = sender.event_subcode;
+        const evt_addr = sender.event_addr;
+        port_ref.unlock();
+        return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, 0);
     }
 
     // No sender ready. Spec §[port].recv test 04: if the port has no
     // bind-cap holders, no event_routes, and no events queued, return
     // E_CLOSED rather than blocking forever.
-    if (p.send_refcount == 0 and p.event_route_count == 0) return errors.E_CLOSED;
+    if (p.send_refcount == 0 and p.event_route_count == 0) {
+        port_ref.unlock();
+        return errors.E_CLOSED;
+    }
 
     enqueueReceiver(p, caller);
     caller.event_type = .none;
@@ -261,6 +278,7 @@ pub fn recv(caller: *ExecutionContext, port: u64) i64 {
     caller.state = .suspended_on_port;
     caller.pending_reply_holder = null;
     caller.on_cpu.store(false, .release);
+    port_ref.unlock();
 
     const core_id = arch.smp.coreID();
     if (scheduler.core_states[core_id].current_ec == caller) {
@@ -382,7 +400,9 @@ fn fireRouted(
     const slot_idx = execution_context.eventRouteSlot(event) orelse return false;
     const route_ref = ec.event_routes[slot_idx] orelse return false;
     const port_ptr = route_ref.lock(@src()) catch return false;
-    defer route_ref.unlock();
+    // `suspendOnPort` is responsible for releasing `port_ptr._gen_lock`
+    // (it must drop Port before any receiver-CD acquisition to honor the
+    // canonical CD → Port order). We must NOT also `defer route_ref.unlock()`.
 
     // A route whose port has lost every bind-cap holder AND has no other
     // routes pointing at it survives only on the route's own increment.
@@ -440,7 +460,9 @@ pub fn firePmuOverflow(ec: *ExecutionContext, counter_idx: u64) void {
 pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
     const exit_port_ref = ec.exit_port orelse return;
     const port_ptr = exit_port_ref.lock(@src()) catch return;
-    defer exit_port_ref.unlock();
+    // `suspendOnPort` releases the port lock before returning — see its
+    // contract. Do NOT add `defer exit_port_ref.unlock()` here.
+
     // The originating EC handle for vm_exit is the vCPU EC handle held
     // by the VMM. Its write-cap snapshot drives whether reply applies
     // receiver mutations. The lookup that captures that bit per-vCPU
@@ -600,19 +622,24 @@ fn popHighestPriorityReceiver(p: *Port) ?*ExecutionContext {
 /// Slow-path mirror of arch/x64/interrupts.zig Phase 4: the syscall
 /// return word and event-state vregs written here MUST match what the
 /// fast path produces so the two are interchangeable.
+///
+/// LOCK ORDER: Caller MUST already hold `dom` (receiver's CD `_gen_lock`)
+/// AND MUST NOT hold any Port `_gen_lock`. Canonical order across the
+/// kernel is `CapabilityDomain` → `Port`; the matching `delete` path
+/// takes CD then dispatches to `port.releaseHandle` which takes Port,
+/// so this side must finish all Port-held work and drop Port BEFORE
+/// reaching here. Holding Port across the CD acquisition done by the
+/// previous version of this function created an AB-BA cycle observed
+/// by lockdep at port.zig:613 vs port.zig:552.
 fn deliverEvent(
     sender: *ExecutionContext,
     receiver: *ExecutionContext,
-    p: *Port,
+    dom: *CapabilityDomain,
     event_type: EventType,
     subcode: u8,
     event_addr: u64,
     pair_count: u8,
 ) i64 {
-    const dom_ref = receiver.domain;
-    const dom = dom_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer dom_ref.unlock();
-
     const xfer_allowed = pair_count > 0;
     const reply_slot = mintReply(dom, sender, xfer_allowed) catch return errors.E_FULL;
 
@@ -646,7 +673,6 @@ fn deliverEvent(
     arch.syscall.setEventAddr(target_ctx, sender.event_vreg3);
     arch.syscall.setEventVreg4(target_ctx, sender.event_vreg4);
 
-    _ = p;
     return 0;
 }
 
@@ -657,9 +683,13 @@ fn deliverEvent(
 /// event-state syscall return into the receiver's iret frame, and
 /// enqueue the receiver as ready.
 ///
-/// Returns `true` if a receiver was woken — the caller must NOT then
-/// also enqueue the sender as a port waiter (already parked, awaiting
-/// reply). Returns `false` if no receiver was eligible.
+/// Caller MUST hold `p._gen_lock`. On a successful match (`true`
+/// returned) the function RELEASES that Port lock before acquiring the
+/// receiver's CD lock — canonical kernel order is CD → Port and Port
+/// must be dropped before deliverEvent reaches mintReply. Callers must
+/// therefore not also unlock `p` themselves on the success path.
+/// Returns `false` (with `p._gen_lock` still held) if no receiver was
+/// eligible — the caller resumes the slow-path enqueue.
 pub fn rendezvousWithReceiver(
     sender: *ExecutionContext,
     p: *Port,
@@ -670,7 +700,27 @@ pub fn rendezvousWithReceiver(
     const receiver = popHighestPriorityReceiver(p) orelse return false;
     receiver.event_type = .none;
     receiver.suspend_port = null;
-    _ = deliverEvent(sender, receiver, p, event_type, subcode, event_addr, 0);
+
+    // Snapshot receiver's CD ref under the port lock, then drop the
+    // port lock before acquiring the CD lock. The receiver is no
+    // longer queued on the port; its slab slot stays alive while
+    // state is `.suspended_on_port`. Holding port across the CD
+    // acquisition would re-introduce the AB-BA cycle that lockdep
+    // catches against the `delete → releaseHandle` path.
+    const receiver_dom_ref = receiver.domain;
+    p._gen_lock.unlock();
+
+    const dom = receiver_dom_ref.lock(@src()) catch {
+        // Receiver's CD was torn down between the pop and our lock —
+        // the receiver itself is doomed via the same teardown. Drop
+        // the rendezvous; the sender remains parked (state already set
+        // by suspendOnPort) and will be woken by E_CLOSED when the
+        // port's last refcount drops, or be reaped at sender teardown.
+        return true;
+    };
+    defer receiver_dom_ref.unlock();
+
+    _ = deliverEvent(sender, receiver, dom, event_type, subcode, event_addr, 0);
     receiver.state = .ready;
     scheduler.markReady(receiver);
     return true;
