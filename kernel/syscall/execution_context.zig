@@ -7,10 +7,13 @@ const errors = zag.syscall.errors;
 const execution_context = zag.sched.execution_context;
 const scheduler = zag.sched.scheduler;
 
+const CapabilityDomain = capability_domain.CapabilityDomain;
 const CapabilityDomainCaps = capability_domain.CapabilityDomainCaps;
 const EcCaps = execution_context.EcCaps;
 const ExecutionContext = execution_context.ExecutionContext;
 const IdcCaps = capability_domain.IdcCaps;
+const Priority = execution_context.Priority;
+const VAddr = zag.memory.address.VAddr;
 const Word0 = capability.Word0;
 
 /// `caps` argument layout for `create_execution_context`: bits 0-33 valid
@@ -124,6 +127,21 @@ pub fn createExecutionContext(
         return errors.E_PERM;
     }
 
+    // Caller's `ec_inner_ceiling` lives in self-handle field0 bits 0-7
+    // (spec §[capability_domain] field0 layout). Test 03: when target=0
+    // the new EC handle is minted in the caller's own domain, so its
+    // caps must be a subset of `ec_inner_ceiling`.
+    const new_caps: u16 = @truncate(caps & 0xFFFF);
+    const target_caps: u16 = @truncate((caps >> 16) & 0xFFFF);
+    const ec_inner_ceiling: u16 = @truncate(cd.user_table[SELF_HANDLE_SLOT].field0 & 0xFF);
+
+    if (target == 0) {
+        if (new_caps & ~ec_inner_ceiling != 0) {
+            cd_ref.unlock();
+            return errors.E_PERM;
+        }
+    }
+
     if (target != 0) {
         const idc_slot: u12 = @truncate(target);
         if (capability.resolveHandleOnDomain(cd, idc_slot, .capability_domain) == null) {
@@ -136,6 +154,56 @@ pub fn createExecutionContext(
             return errors.E_PERM;
         }
     }
+
+    // Self-target success path: allocate the EC bound to the caller's
+    // domain and mint a handle in that same domain with caps =
+    // caps[0..15]. IDC-target paths still await per-domain handle-table
+    // resolution against the target domain's ceilings (tests 04/05/12)
+    // and remain stubbed below.
+    if (target == 0) {
+        _ = target_caps;
+        const priority_enum: Priority = @enumFromInt(requested_priority);
+        const new_ec = execution_context.allocExecutionContext(
+            cd,
+            VAddr.fromInt(entry),
+            @intCast(stack_pages),
+            affinity_mask,
+            priority_enum,
+            null,
+            null,
+        ) catch {
+            cd_ref.unlock();
+            return errors.E_NOMEM;
+        };
+
+        const slot = capability_domain.mintHandle(
+            cd,
+            .{
+                .ptr = new_ec,
+                .gen = @intCast(new_ec._gen_lock.currentGen()),
+            },
+            .execution_context,
+            new_caps,
+            0,
+            0,
+        ) catch {
+            cd_ref.unlock();
+            return errors.E_FULL;
+        };
+
+        // Field0/field1 carry the kernel-mutable priority/affinity
+        // snapshot per §[execution_context]. Spec field0 bits 0-1 =
+        // priority, field1 bits 0-63 = affinity mask.
+        cd.user_table[slot].field0 = @intFromEnum(priority_enum);
+        cd.user_table[slot].field1 = affinity_mask;
+
+        cd_ref.unlock();
+        // Spec §[error_codes]: a successful create_* returns the packed
+        // Word0 so the type tag in bits 12-15 disambiguates from the
+        // 1..15 error range.
+        return @intCast(Word0.pack(slot, .execution_context, new_caps));
+    }
+
     cd_ref.unlock();
 
     return execution_context.createExecutionContext(
