@@ -1,9 +1,17 @@
 const zag = @import("zag");
 
+const capability = zag.caps.capability;
 const errors = zag.syscall.errors;
 const var_range = zag.capdom.var_range;
 
+const CapabilityDomainCaps = zag.capdom.capability_domain.CapabilityDomainCaps;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const Word0 = capability.Word0;
+
+/// Self-handle slot. Spec §[capability_domain]: slot 0 is reserved for
+/// the domain's self-handle and carries the per-domain caps the kernel
+/// gates the create_* syscalls on.
+const SELF_HANDLE_SLOT: u12 = 0;
 
 /// Reserved-bit masks for `create_var` arguments. Spec §[var].create_var
 /// returns E_INVAL when bits outside the documented fields are set.
@@ -87,6 +95,14 @@ pub fn createVar(
     // on the decoded caps word.
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+    const cd_ref = ec.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0));
+    cd_ref.unlock();
+
+    // Spec §[create_var] test 01: caller's self-handle must carry `crvr`.
+    if (!self_caps.crvr) return errors.E_PERM;
+
     return var_range.createVar(ec, caps, props, pages, preferred_base, device_region);
 }
 
