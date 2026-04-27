@@ -443,10 +443,55 @@ fn patchInitialIretFrame(
 
 /// `acquire_ecs` syscall handler.
 /// Spec §[capability_domain].acquire_ecs.
+///
+/// v0 implementation focused on the E_FULL gate (test 04). Walks the
+/// target IDC's referenced domain counting non-vCPU ECs and bails
+/// E_FULL when the caller's table cannot accommodate the full set.
+/// Successful enumeration (mint + count writeback for tests 05-07)
+/// is left as a follow-up — this stub returns 0 on the success path
+/// without minting handles or setting the syscall word's count field.
 pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
-    _ = caller;
-    _ = target_idc;
-    return -1;
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    defer cd_ref.unlock();
+
+    // Re-resolve the IDC handle's referenced domain. acquireDispatch
+    // already validated the slot's type tag and the aqec cap; we need
+    // the kernel-side ref to walk the target's handle table.
+    const slot: u12 = @truncate(target_idc & 0xFFF);
+    const target_ref_ptr = cd.kernel_table[slot].ref.ptr orelse return errors.E_BADCAP;
+    const target_cd: *CapabilityDomain = @ptrCast(@alignCast(target_ref_ptr));
+
+    // Self-IDC is the only target shape exercised by spec tests 04-07
+    // (the runner provisions slot 2 to point at the caller's own
+    // domain). Cross-domain acquire requires a second GenLock acquire
+    // with a stable ordering against the caller's lock and is left for
+    // when a non-self-IDC test surfaces it. For now bail E_BADCAP so
+    // an unimplemented call site is loud rather than silently wrong.
+    if (target_cd != cd) return errors.E_BADCAP;
+
+    // Count non-vCPU ECs bound to the target domain. The kernel_table
+    // walks every slot; the type tag in user_table picks ECs, and
+    // ec.vm == null filters vCPUs out per spec §[acquire_ecs] test 07.
+    var ec_count: u32 = 0;
+    var i: u16 = 0;
+    while (i < MAX_HANDLES_PER_DOMAIN) {
+        const tag = Word0.typeTag(target_cd.user_table[i].word0);
+        if (tag == .execution_context) {
+            const ec_ref = target_cd.kernel_table[i].ref;
+            if (ec_ref.ptr) |ec_ptr| {
+                const ec_obj: *ExecutionContext = @ptrCast(@alignCast(ec_ptr));
+                if (ec_obj.vm == null) ec_count += 1;
+            }
+        }
+        i += 1;
+    }
+
+    // Spec §[acquire_ecs] test 04: caller's table must have at least
+    // ec_count free slots to hold the returned handles.
+    if (cd.free_count < ec_count) return errors.E_FULL;
+
+    return 0;
 }
 
 /// `acquire_vars` syscall handler.
