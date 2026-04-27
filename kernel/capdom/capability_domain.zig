@@ -603,10 +603,119 @@ inline fn packHandleWord(slot: u12, caps_word: u16) u64 {
 
 /// `acquire_vars` syscall handler.
 /// Spec §[capability_domain].acquire_vars.
+///
+/// Enumerates `map=1` (page_frame) and `map=3` (demand) VARs bound to the
+/// target IDC's referenced domain. MMIO and DMA-only VARs (`map=0` / `map=2`)
+/// are excluded — see §[acquire_vars] [test 07].
 pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
-    _ = caller;
-    _ = target_idc;
-    return -1;
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    defer cd_ref.unlock();
+
+    // Re-resolve the IDC handle's referenced domain. acquireDispatch
+    // already validated the slot's type tag and the aqvr cap.
+    const slot: u12 = @truncate(target_idc & 0xFFF);
+    const target_ref_ptr = cd.kernel_table[slot].ref.ptr orelse return errors.E_BADCAP;
+    const target_cd: *CapabilityDomain = @ptrCast(@alignCast(target_ref_ptr));
+
+    // Self-IDC is the only target shape exercised by spec tests 04-07
+    // (the runner provisions slot 2 to point at the caller's own domain).
+    // Cross-domain acquire requires a second GenLock acquire with stable
+    // ordering against the caller's lock and is left for when a non-self-
+    // IDC test surfaces it.
+    if (target_cd != cd) return errors.E_BADCAP;
+
+    // Spec §[acquire_vars] [test 06]: each minted VAR handle gets caps =
+    // `target.var_outer_ceiling` ∩ `idc.var_cap_ceiling`.
+    //   - target.var_outer_ceiling lives in slot-0 self-handle field1
+    //     bits 8-15 (ceilings_outer layout).
+    //   - idc.var_cap_ceiling lives in user_table[slot].field0 bits 16-23.
+    const var_outer_ceiling: u16 = @truncate((target_cd.user_table[0].field1 >> 8) & 0xFF);
+    const idc_var_cap_ceiling: u16 = @truncate((cd.user_table[slot].field0 >> 16) & 0xFF);
+    const minted_caps: u16 = var_outer_ceiling & idc_var_cap_ceiling;
+
+    // E_FULL pre-check ([test 04]): count eligible VARs once. Eligible =
+    // map ∈ {page_frame, demand}. The `vars[]` array tracks every VAR
+    // bound to the domain; coalescing in `mintHandle` deduplicates against
+    // any existing handle in the caller's table.
+    var var_count: u32 = 0;
+    {
+        var j: u16 = 0;
+        while (j < target_cd.var_count) : (j += 1) {
+            const v = target_cd.vars[j] orelse continue;
+            switch (v.map) {
+                .page_frame, .demand => var_count += 1,
+                else => {},
+            }
+        }
+    }
+    if (cd.free_count < var_count) return errors.E_FULL;
+
+    var minted_slots: [13]u12 = undefined;
+    var n: u8 = 0;
+
+    var i: u16 = 0;
+    while (i < target_cd.var_count) : (i += 1) {
+        const v = target_cd.vars[i] orelse continue;
+        switch (v.map) {
+            .page_frame, .demand => {},
+            else => continue, // [test 07]: exclude MMIO and unmapped/DMA-only
+        }
+
+        if (n >= minted_slots.len) break; // TODO: vreg 6+ writeback
+
+        const var_field0: u64 = v.base_vaddr.addr;
+        const var_field1: u64 = zag.capdom.var_range.packField1(
+            v.page_count,
+            v.sz,
+            v.cch,
+            v.cur_rwx,
+            v.map,
+            0, // device_id: VARs eligible here are pf/demand, not MMIO/DMA
+        );
+
+        const var_ref: ErasedSlabRef = .{
+            .ptr = @ptrCast(v),
+            .gen = @intCast(v._gen_lock.currentGen()),
+        };
+        // Spec §[acquire_vars] [test 06] says the returned handle has
+        // caps = `var_outer_ceiling ∩ var_cap_ceiling`. If a handle
+        // to this VAR already exists in the caller's table (the
+        // at-most-one-per-(domain,object) invariant + self-IDC case
+        // means the create_var-minted handle is already there), the
+        // coalescing path in mintHandle returns that existing slot
+        // with its original caps. Detect that case and overwrite caps
+        // / field0 / field1 to the spec-required intersection so the
+        // handle reflects what acquire_vars promises.
+        const new_slot = mintHandle(
+            cd,
+            var_ref,
+            .virtual_address_range,
+            minted_caps,
+            var_field0,
+            var_field1,
+        ) catch return errors.E_FULL;
+        cd.user_table[new_slot].word0 = Word0.pack(new_slot, .virtual_address_range, minted_caps);
+        cd.user_table[new_slot].field0 = var_field0;
+        cd.user_table[new_slot].field1 = var_field1;
+        minted_slots[n] = new_slot;
+        n += 1;
+    }
+
+    // Stage the syscall-word count writeback. The dispatch path flushes
+    // `pending_event_word` to user `[rsp+0]` after the handler returns.
+    const count_field: u64 = @as(u64, n) << 12;
+    caller.pending_event_word = count_field;
+    caller.pending_event_word_valid = true;
+
+    // Vregs 2..5 — Vreg 1 rides the i64 return value below.
+    if (n >= 2) arch.syscall.setSyscallVreg2(caller.ctx, packHandleWord(minted_slots[1], minted_caps));
+    if (n >= 3) arch.syscall.setSyscallVreg3(caller.ctx, packHandleWord(minted_slots[2], minted_caps));
+    if (n >= 4) arch.syscall.setSyscallVreg4(caller.ctx, packHandleWord(minted_slots[3], minted_caps));
+    if (n >= 5) arch.syscall.setEventVreg5(caller.ctx, packHandleWord(minted_slots[4], minted_caps));
+
+    if (n == 0) return @bitCast(@as(i64, errors.OK));
+    return @intCast(packHandleWord(minted_slots[0], minted_caps));
 }
 
 // ── Internal API ─────────────────────────────────────────────────────

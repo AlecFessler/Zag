@@ -743,7 +743,7 @@ pub fn idcWrite(
 
 // ── Internal API ─────────────────────────────────────────────────────
 
-inline fn packField1(
+pub inline fn packField1(
     pages: u32,
     sz: PageSize,
     cch: CacheType,

@@ -82,7 +82,10 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 1: baseline.
     const baseline = syscall.acquireVars(caps.SLOT_SELF_IDC);
-    if (errors.isError(baseline.regs.v1)) {
+    // On success, v1 is either OK (no handles returned) or a packed
+    // handle word; only error codes 1..15 indicate failure per
+    // §[error_codes].
+    if (testing.isHandleError(baseline.regs.v1)) {
         testing.fail(1);
         return;
     }
@@ -124,7 +127,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 3: post-creation count.
     const after = syscall.acquireVars(caps.SLOT_SELF_IDC);
-    if (errors.isError(after.regs.v1)) {
+    if (testing.isHandleError(after.regs.v1)) {
         testing.fail(3);
         return;
     }
