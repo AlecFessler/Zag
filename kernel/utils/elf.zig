@@ -24,6 +24,9 @@ pub const Section = struct {
 pub const ParsedElf = struct {
     bytes: []u8,
     entry: VAddr,
+    /// ELF `e_type` field (ET_DYN, ET_EXEC, etc.). Spec
+    /// §[create_capability_domain] requires PIE images (ET_DYN).
+    e_type: u16,
     sections: [@intFromEnum(ElfSection.num_sections)]Section,
     dwarf: Dwarf,
 };
@@ -36,6 +39,7 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
     const elf_hdr = try elf.Header.read(&rd);
 
     result.entry = VAddr.fromInt(elf_hdr.entry);
+    result.e_type = @intFromEnum(elf_hdr.type);
     result.dwarf = .{
         .endian = elf_hdr.endian,
         .is_macho = false,

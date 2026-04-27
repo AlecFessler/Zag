@@ -58,33 +58,138 @@ const ROOT_EC_CAPS = EcCaps{
     .unbind = true,
 };
 
-/// User stack top VA in the root domain. Placed near the top of the
-/// 31-bit user range so it does not collide with the ELF segments
-/// (which are linked at origin 0 and extend into the low ~2 MiB).
-pub const ROOT_USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
-
 /// Pages reserved for the per-EC user stack created by
 /// create_capability_domain.
 pub const USER_STACK_PAGES: u64 = 16;
 pub const USER_STACK_BYTES: u64 = USER_STACK_PAGES * paging_consts.PAGE4K;
 
-/// User VA where the user_table view is mapped read-only. Spec
-/// §[create_capability_domain]: "The pointer to the new domain's
-/// read-only view of its capability table is passed as the first
-/// argument to the initial EC's entry point." 96 KiB (24 pages) at
-/// MAX_HANDLES_PER_DOMAIN * sizeof(Capability) = 4096 * 24 = 96 KiB.
-pub const ROOT_USER_TABLE_BASE: u64 = 0x0000_0000_4000_0000;
+/// Bytes reserved for the read-only cap-table view mapped into a new
+/// domain. MAX_HANDLES_PER_DOMAIN * sizeof(Capability) = 4096 * 24 =
+/// 96 KiB, rounded up to the next page.
 pub const ROOT_USER_TABLE_BYTES: u64 = 96 * 1024;
+
+/// Resolved per-domain layout in the ASLR zone: where the ELF image
+/// loads, where its user stack tops out, and where the read-only
+/// cap-table view is mapped. All three live inside the ASLR zone (spec
+/// §[address_space]) and are picked so they cannot overlap each other.
+pub const DomainLayout = struct {
+    elf_slide: u64,
+    stack_top: u64,
+    table_base: u64,
+};
+
+/// Compute the maximum `p_vaddr + p_memsz` across the ELF's PT_LOAD
+/// segments. Used to size the slide-target window so segments stay
+/// inside the ASLR zone after applying the slide.
+fn elfImageSpan(elf_bytes: []const u8) !u64 {
+    const hdr_sz = @sizeOf(std.elf.Elf64_Ehdr);
+    var rd = std.Io.Reader.fixed(elf_bytes[0..hdr_sz]);
+    const hdr = try std.elf.Header.read(&rd);
+
+    var max_end: u64 = 0;
+    var phdr_itr = hdr.iterateProgramHeadersBuffer(@constCast(elf_bytes));
+    while (try phdr_itr.next()) |phdr| {
+        if (phdr.p_type != std.elf.PT_LOAD) continue;
+        const end = std.mem.alignForward(u64, phdr.p_vaddr + phdr.p_memsz, paging_consts.PAGE4K);
+        if (end > max_end) max_end = end;
+    }
+    return max_end;
+}
+
+/// Sample one 64-bit value of randomness for ASLR placement. Uses the
+/// hardware RNG (RDRAND/RNDR) when available, with a TSC-mixed
+/// fallback so back-to-back calls remain distinct under entropy
+/// stalls.
+fn aslrRandom() u64 {
+    if (arch.cpu.getRandom()) |hw| return hw;
+    const ts = arch.time.readTimestamp(false);
+    aslr_fallback_counter +%= 1;
+    return ts ^ (aslr_fallback_counter *% 0x9E3779B97F4A7C15);
+}
+
+var aslr_fallback_counter: u64 = 0;
+
+/// Pick a page-aligned base inside `[lo, hi - bytes]` for a region of
+/// `bytes` bytes. Returns null if the requested span doesn't fit.
+fn pickAslrBase(lo: u64, hi: u64, bytes: u64) ?u64 {
+    if (bytes == 0 or hi <= lo or bytes > hi - lo) return null;
+    const max_base = hi - bytes;
+    if (max_base < lo) return null;
+    const span = max_base - lo + paging_consts.PAGE4K;
+    const off = aslrRandom() % span;
+    const candidate = lo + std.mem.alignBackward(u64, off, paging_consts.PAGE4K);
+    if (candidate < lo or candidate > max_base) return null;
+    return candidate;
+}
+
+/// Resolve a non-overlapping (elf, stack, table) layout in the ASLR
+/// zone. Each region is picked uniformly within the zone; collisions
+/// are retried up to RETRY_LIMIT times before falling back to a tiled
+/// layout that places the regions adjacent to one another in zone
+/// order. Spec §[address_space].
+pub fn resolveDomainLayout(elf_bytes: []const u8) !DomainLayout {
+    const aslr = arch.paging.user_aslr;
+    const elf_span = try elfImageSpan(elf_bytes);
+    if (elf_span == 0) return error.ElfHasNoLoadableSegments;
+
+    const RETRY_LIMIT = 16;
+    var attempt: u8 = 0;
+    while (attempt < RETRY_LIMIT) {
+        const elf_base = pickAslrBase(aslr.start, aslr.end, elf_span) orelse
+            return error.OutOfMemory;
+        const stack_base = pickAslrBase(aslr.start, aslr.end, USER_STACK_BYTES) orelse
+            return error.OutOfMemory;
+        const table_base = pickAslrBase(aslr.start, aslr.end, ROOT_USER_TABLE_BYTES) orelse
+            return error.OutOfMemory;
+
+        const elf_end = elf_base + elf_span;
+        const stack_end = stack_base + USER_STACK_BYTES;
+        const table_end = table_base + ROOT_USER_TABLE_BYTES;
+
+        const overlap_es = elf_base < stack_end and stack_base < elf_end;
+        const overlap_et = elf_base < table_end and table_base < elf_end;
+        const overlap_st = stack_base < table_end and table_base < stack_end;
+        if (!overlap_es and !overlap_et and !overlap_st) {
+            return .{
+                .elf_slide = elf_base,
+                .stack_top = stack_end,
+                .table_base = table_base,
+            };
+        }
+        attempt += 1;
+    }
+
+    // Fallback: tile sequentially from a randomized origin so jitter
+    // is preserved while collisions are impossible by construction.
+    const total = elf_span + USER_STACK_BYTES + ROOT_USER_TABLE_BYTES;
+    const origin = pickAslrBase(aslr.start, aslr.end, total) orelse
+        return error.OutOfMemory;
+    return .{
+        .elf_slide = origin,
+        .stack_top = origin + elf_span + USER_STACK_BYTES,
+        .table_base = origin + elf_span + USER_STACK_BYTES,
+    };
+}
 
 pub fn init(root_service_elf: []const u8) !void {
     var parsed: ParsedElf = undefined;
     try elf_util.parseElf(&parsed, @constCast(root_service_elf));
 
+    // Spec §[create_capability_domain] test 16a: the ELF must be PIE
+    // (e_type == ET_DYN). Even at boot we enforce this so the loader
+    // path is the single source of truth for the rule.
+    if (parsed.e_type != @intFromEnum(std.elf.ET.DYN)) {
+        return error.NotPositionIndependent;
+    }
+
+    const layout = try resolveDomainLayout(root_service_elf);
+    const slid_entry = VAddr.fromInt(parsed.entry.addr + layout.elf_slide);
+
     const root_cd = try capdom.allocCapabilityDomain(
         @bitCast(ROOT_SELF_CAPS),
         0,
         0,
-        parsed.entry,
+        slid_entry,
     );
 
     // Re-mirror kernel-half PML4 entries from the kernel root into the
@@ -95,44 +200,32 @@ pub fn init(root_service_elf: []const u8) !void {
     // address space root. Without this re-copy, swapAddrSpace into the
     // new domain leaves the kernel-stack VAs unmapped and the iret
     // epilogue's stack pop / writethrough faults.
-    //
-    // This is a v0 expedient until per-domain PML4s share their kernel
-    // L3 pointers from boot; longer term, memory.init eagerly
-    // pre-allocates the L3 layer so copyKernelMappings hands out the
-    // same physical L3 to every domain.
     const root_virt = VAddr.fromPAddr(root_cd.addr_space_root, null);
     arch_paging.copyKernelMappings(root_virt);
 
-    // Map the root_service ELF segments + user stack into the new
-    // domain's user half. The runner ELF is built with linker origin
-    // = 0x0 and PIE; entry is 0x0 and segments are mapped at their
-    // p_vaddr without slide. R_X86_64_RELATIVE relocations have already
-    // been applied with a 0 base — they're correct as-is.
-    try loadElfSegments(root_cd, root_service_elf, &parsed);
-    try mapUserStack(root_cd);
-    try mapUserTableView(root_cd);
+    try loadElfSegments(root_cd, root_service_elf, &parsed, layout.elf_slide);
+    try mapUserStack(root_cd, layout.stack_top);
+    try mapUserTableView(root_cd, layout.table_base);
 
-    // Reuse a slot-1 EC handle if one survived a kernel-side restart of the
-    // root domain (per feedback_restartable_init.md). Otherwise mint fresh.
-    const root_ec = try resolveOrSpawnRootEc(root_cd, parsed.entry);
+    const root_ec = try resolveOrSpawnRootEc(root_cd, slid_entry, layout);
 
     grantDevices(root_cd);
 
     // Re-mirror once more — the user mappings we just installed live in
     // user-half PML4 entries (0..255), which copyKernelMappings does
     // not touch. They went into root_cd's PML4 directly via mapPage.
-    // The kernel-half re-copy is what we need; user-half entries stay
-    // local to root_cd as desired.
     arch_paging.copyKernelMappings(root_virt);
 
-    arch.boot.print("[boot] root EC ready: entry=0x{x} stack_top=0x{x} ut=0x{x}\n", .{ parsed.entry.addr, ROOT_USER_STACK_TOP, ROOT_USER_TABLE_BASE });
+    arch.boot.print("[boot] root EC ready: entry=0x{x} stack_top=0x{x} ut=0x{x}\n", .{ slid_entry.addr, layout.stack_top, layout.table_base });
 
     sched.enqueueOnCore(@intCast(arch.smp.coreID()), root_ec);
 }
 
 /// Walk PT_LOAD headers in `elf_bytes`, allocate user pages from PMM,
-/// copy bytes from the bootloader-loaded ELF blob (in physmap),
-/// and map into the new domain's PML4 with per-segment R/W/X perms.
+/// copy bytes from the bootloader-loaded ELF blob (in physmap), and
+/// map into the new domain's PML4 with per-segment R/W/X perms,
+/// shifted by `slide` (spec §[address_space] — PIE images load at a
+/// kernel-chosen randomized base in the ASLR zone).
 ///
 /// PIE ELFs (linker origin = 0) frequently pack two segments onto one
 /// 4 KiB page — e.g. .text ending mid-page and .rodata starting later
@@ -145,7 +238,12 @@ pub fn init(root_service_elf: []const u8) !void {
 ///      and leave the original PTE perms intact (the most permissive
 ///      perms — text/exec — must not be stripped by a subsequent
 ///      rodata mapping).
-pub fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed: *const ParsedElf) !void {
+pub fn loadElfSegments(
+    root_cd: *CapabilityDomain,
+    elf_bytes: []const u8,
+    parsed: *const ParsedElf,
+    slide: u64,
+) !void {
     _ = parsed;
     const hdr_sz = @sizeOf(std.elf.Elf64_Ehdr);
     var rd = std.Io.Reader.fixed(elf_bytes[0..hdr_sz]);
@@ -157,9 +255,10 @@ pub fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed
         const writable = (phdr.p_flags & std.elf.PF_W) != 0;
         const executable = (phdr.p_flags & std.elf.PF_X) != 0;
 
-        const seg_start = std.mem.alignBackward(u64, phdr.p_vaddr, paging_consts.PAGE4K);
-        const seg_end = std.mem.alignForward(u64, phdr.p_vaddr + phdr.p_memsz, paging_consts.PAGE4K);
-        const skip_head = phdr.p_vaddr - seg_start;
+        const slid_vaddr = phdr.p_vaddr + slide;
+        const seg_start = std.mem.alignBackward(u64, slid_vaddr, paging_consts.PAGE4K);
+        const seg_end = std.mem.alignForward(u64, slid_vaddr + phdr.p_memsz, paging_consts.PAGE4K);
+        const skip_head = slid_vaddr - seg_start;
         const file_bytes = phdr.p_filesz;
 
         var off: u64 = 0;
@@ -176,7 +275,7 @@ pub fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed
             // entry point faults. Walk every segment's per-page span
             // and OR the perms here so the eventual mapPage call
             // installs the merged perms.
-            const page_perms = unionPagePerms(elf_bytes, target_vaddr.addr) catch zag.memory.address.MemoryPerms{
+            const page_perms = unionPagePerms(elf_bytes, target_vaddr.addr, slide) catch zag.memory.address.MemoryPerms{
                 .read = true,
                 .write = writable,
                 .exec = executable,
@@ -224,16 +323,10 @@ pub fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed
     // PIE; any pointer in initialized .data (notably the embedded test
     // ELF manifest's `bytes.ptr` slots) is encoded as a RELATIVE
     // relocation in `.rela.dyn` whose addend is the unslided VA. The
-    // bootloader's KASLR pass only relocates the kernel ELF and skips
-    // when slide==0; the userspace ELF (loaded at p_vaddr without
-    // slide) is loaded verbatim with the relocation slots holding
-    // file-time zeros. Without applying these, the runner reads
-    // `bytes.ptr == 0` and dereferences user-VA 0, which maps to the
-    // .text page — the kernel-side reads of pf.phys_base then see the
-    // runner's `_start` prologue (`48 83 ec 68 ...`) instead of the
-    // staged test ELF's magic (`7f 45 4c 46 ...`), and parseElf bails
-    // E_INVAL on every spawn.
-    try applyRelativeRelocations(root_cd, elf_bytes);
+    // patched value is `addend + slide`; the relocation target's VA is
+    // also slid before the kernel walks the page tables to find the
+    // backing physical page.
+    try applyRelativeRelocations(root_cd, elf_bytes, slide);
 }
 
 /// Walk PT_LOADs and return the union of perms across every segment
@@ -244,6 +337,7 @@ pub fn loadElfSegments(root_cd: *CapabilityDomain, elf_bytes: []const u8, parsed
 fn unionPagePerms(
     elf_bytes: []const u8,
     page_va: u64,
+    slide: u64,
 ) !zag.memory.address.MemoryPerms {
     const hdr_sz = @sizeOf(std.elf.Elf64_Ehdr);
     var rd = std.Io.Reader.fixed(elf_bytes[0..hdr_sz]);
@@ -253,8 +347,9 @@ fn unionPagePerms(
     var phdr_itr = hdr.iterateProgramHeadersBuffer(@constCast(elf_bytes));
     while (try phdr_itr.next()) |phdr| {
         if (phdr.p_type != std.elf.PT_LOAD) continue;
-        const seg_start = std.mem.alignBackward(u64, phdr.p_vaddr, paging_consts.PAGE4K);
-        const seg_end = std.mem.alignForward(u64, phdr.p_vaddr + phdr.p_memsz, paging_consts.PAGE4K);
+        const slid = phdr.p_vaddr + slide;
+        const seg_start = std.mem.alignBackward(u64, slid, paging_consts.PAGE4K);
+        const seg_end = std.mem.alignForward(u64, slid + phdr.p_memsz, paging_consts.PAGE4K);
         if (page_va < seg_start or page_va >= seg_end) continue;
         if ((phdr.p_flags & std.elf.PF_W) != 0) perms.write = true;
         if ((phdr.p_flags & std.elf.PF_X) != 0) perms.exec = true;
@@ -263,17 +358,18 @@ fn unionPagePerms(
 }
 
 /// Walk SHT_RELA sections and apply R_X86_64_RELATIVE entries against
-/// the user address space. Slide is 0 (segments loaded at p_vaddr), so
-/// the patched value is just the addend. We translate the relocation's
-/// runtime VA (`r_offset`) to a PA via `resolveVaddr` and write through
-/// the kernel physmap rather than touching the file bytes — the file
-/// bytes live in either the bootloader's `loader_data` blob (root
-/// service path) or a page frame's physmap (createCapabilityDomain
-/// path), and patching them in place would corrupt the original ELF
-/// the caller still holds a reference to.
+/// the user address space. The patched value is `addend + slide`; the
+/// relocation target's runtime VA (`r_offset + slide`) is translated
+/// to a PA via `resolveVaddr` and written through the kernel physmap
+/// rather than touching the file bytes — the file bytes live in
+/// either the bootloader's `loader_data` blob (root service path) or
+/// a page frame's physmap (createCapabilityDomain path), and patching
+/// them in place would corrupt the original ELF the caller still
+/// holds a reference to.
 fn applyRelativeRelocations(
     root_cd: *CapabilityDomain,
     elf_bytes: []const u8,
+    slide: u64,
 ) !void {
     const hdr_sz = @sizeOf(std.elf.Elf64_Ehdr);
     if (elf_bytes.len < hdr_sz) return;
@@ -303,27 +399,29 @@ fn applyRelativeRelocations(
             // is statically linked, so all live relocations are RELATIVE.
             if (rtype != @intFromEnum(std.elf.R_X86_64.RELATIVE)) continue;
 
-            const target_va = VAddr.fromInt(rela.r_offset);
+            const slid_target = rela.r_offset + slide;
+            const target_va = VAddr.fromInt(slid_target);
             const target_pa = arch_paging.resolveVaddr(
                 root_cd.addr_space_root,
                 target_va,
             ) orelse return error.RelocationTargetUnmapped;
 
-            const page_off: u64 = rela.r_offset & (paging_consts.PAGE4K - 1);
+            const page_off: u64 = slid_target & (paging_consts.PAGE4K - 1);
             const km_va = VAddr.fromPAddr(target_pa, null).addr + page_off;
 
-            const new_val: u64 = @as(u64, @bitCast(rela.r_addend));
+            const new_val: u64 = @as(u64, @bitCast(rela.r_addend)) +% slide;
             const slot: *align(1) u64 = @ptrFromInt(km_va);
             slot.* = new_val;
         }
     }
 }
 
-/// Allocate ROOT_USER_STACK_BYTES of user pages and map them ending at
-/// ROOT_USER_STACK_TOP. The EC's iret frame uses ROOT_USER_STACK_TOP as
-/// the initial RSP.
-pub fn mapUserStack(root_cd: *CapabilityDomain) !void {
-    const base: u64 = ROOT_USER_STACK_TOP - USER_STACK_BYTES;
+/// Allocate USER_STACK_BYTES of user pages and map them ending at
+/// `stack_top`. The EC's iret frame uses `stack_top` as the initial
+/// RSP. Spec §[create_execution_context] / §[create_capability_domain]
+/// — stack lives at a kernel-chosen randomized base in the ASLR zone.
+pub fn mapUserStack(root_cd: *CapabilityDomain, stack_top: u64) !void {
+    const base: u64 = stack_top - USER_STACK_BYTES;
     var off: u64 = 0;
     while (off < USER_STACK_BYTES) {
         const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
@@ -341,10 +439,10 @@ pub fn mapUserStack(root_cd: *CapabilityDomain) !void {
 }
 
 /// Map the user_table backing pages read-only into the new domain's
-/// user half at ROOT_USER_TABLE_BASE. The kernel writes to the table
-/// via its own kernel-half pointer (root_cd.user_table); user code
-/// reads through this view.
-pub fn mapUserTableView(root_cd: *CapabilityDomain) !void {
+/// user half at `table_base`. The kernel writes to the table via its
+/// own kernel-half pointer (root_cd.user_table); user code reads
+/// through this view.
+pub fn mapUserTableView(root_cd: *CapabilityDomain, table_base: u64) !void {
     const ut_kernel_va: u64 = @intFromPtr(root_cd.user_table);
     var off: u64 = 0;
     while (off < ROOT_USER_TABLE_BYTES) {
@@ -353,7 +451,7 @@ pub fn mapUserTableView(root_cd: *CapabilityDomain) !void {
         try arch_paging.mapPage(
             root_cd.addr_space_root,
             phys,
-            VAddr.fromInt(ROOT_USER_TABLE_BASE + off),
+            VAddr.fromInt(table_base + off),
             .{ .read = true },
             .user_data,
         );
@@ -361,7 +459,11 @@ pub fn mapUserTableView(root_cd: *CapabilityDomain) !void {
     }
 }
 
-fn resolveOrSpawnRootEc(root_cd: *CapabilityDomain, entry: VAddr) !*ExecutionContext {
+fn resolveOrSpawnRootEc(
+    root_cd: *CapabilityDomain,
+    entry: VAddr,
+    layout: DomainLayout,
+) !*ExecutionContext {
     const existing = capability.typedRef(ExecutionContext, root_cd.kernel_table[1]);
     if (existing) |ref| return ref.ptr;
 
@@ -376,20 +478,15 @@ fn resolveOrSpawnRootEc(root_cd: *CapabilityDomain, entry: VAddr) !*ExecutionCon
     );
 
     // allocExecutionContext built an iret frame in kernel-mode (no user
-    // stack was wired through allocVar yet). Patch it for user mode:
-    // CS/SS = user selectors, RSP = ROOT_USER_STACK_TOP, RDI =
-    // cap_table_base (slot-0 self-handle's user_table is mapped read-
-    // only in the new domain — the user_table pointer falls through
-    // here via the kernel mapping, which is the v0 placeholder until
-    // the spec'd read-only user-table mapping lands).
+    // stack was wired through allocVar yet). Patch it for user mode.
     const ctx = ec.ctx;
     const gdt = zag.arch.x64.gdt;
     const ring_3: u64 = 3;
     ctx.cs = gdt.USER_CODE_OFFSET | ring_3;
     ctx.ss = gdt.USER_DATA_OFFSET | ring_3;
-    ctx.rsp = ROOT_USER_STACK_TOP;
+    ctx.rsp = layout.stack_top;
     ctx.rip = entry.addr;
-    ctx.regs.rdi = ROOT_USER_TABLE_BASE;
+    ctx.regs.rdi = layout.table_base;
 
     const obj_ref: ErasedSlabRef = .{
         .ptr = ec,

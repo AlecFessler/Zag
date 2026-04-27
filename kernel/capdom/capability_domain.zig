@@ -248,6 +248,18 @@ pub fn createCapabilityDomain(
     var parsed: ParsedElf = undefined;
     elf_util.parseElf(&parsed, elf_bytes) catch return errors.E_INVAL;
 
+    // Spec §[create_capability_domain] test 16a: ELF must be PIE
+    // (e_type == ET_DYN) so the kernel can place it at a randomized
+    // base in the ASLR zone (§[address_space]).
+    if (parsed.e_type != @intFromEnum(std.elf.ET.DYN)) return errors.E_INVAL;
+
+    // Spec §[address_space]: pick randomized non-overlapping bases
+    // for the ELF image, the user stack, and the read-only cap-table
+    // view. Each lives inside the ASLR zone.
+    const layout = userspace_init.resolveDomainLayout(elf_bytes) catch
+        return errors.E_NOMEM;
+    const slid_entry = VAddr.fromInt(parsed.entry.addr + layout.elf_slide);
+
     // Allocate the child capability domain. Self caps come from caps[0..15];
     // ceilings flow through verbatim (callers are trusted to pass valid
     // ceilings — spec validation deferred to per-test pass).
@@ -256,7 +268,7 @@ pub fn createCapabilityDomain(
         self_caps,
         ceilings_inner,
         ceilings_outer,
-        parsed.entry,
+        slid_entry,
     ) catch return errors.E_NOMEM;
 
     // Re-mirror kernel-half PML4 entries into the child's PML4 (per
@@ -268,16 +280,16 @@ pub fn createCapabilityDomain(
     zag.arch.x64.paging.copyKernelMappings(child_root_virt);
 
     // Load ELF segments into the child's address space.
-    userspace_init.loadElfSegments(child_cd, elf_bytes, &parsed) catch
+    userspace_init.loadElfSegments(child_cd, elf_bytes, &parsed, layout.elf_slide) catch
         return errors.E_NOMEM;
-    userspace_init.mapUserStack(child_cd) catch return errors.E_NOMEM;
-    userspace_init.mapUserTableView(child_cd) catch return errors.E_NOMEM;
+    userspace_init.mapUserStack(child_cd, layout.stack_top) catch return errors.E_NOMEM;
+    userspace_init.mapUserTableView(child_cd, layout.table_base) catch return errors.E_NOMEM;
 
     // Allocate the initial EC bound to the child domain. Entry =
-    // parsed.entry; affinity = 0 (any core); priority = normal.
+    // slid_entry; affinity = 0 (any core); priority = normal.
     const child_ec = execution_context_mod.allocExecutionContext(
         child_cd,
-        parsed.entry,
+        slid_entry,
         16, // user stack pages — same as boot's root stack reservation
         0,
         .normal,
@@ -285,11 +297,8 @@ pub fn createCapabilityDomain(
         null,
     ) catch return errors.E_NOMEM;
 
-    // Patch the initial EC's iret frame for user-mode dispatch:
-    // CS/SS = user selectors, RSP = ROOT_USER_STACK_TOP (matches the
-    // mapUserStack call above), RDI = ROOT_USER_TABLE_BASE (spec —
-    // entry point's first arg is the cap-table view pointer).
-    patchInitialIretFrame(child_ec.ctx);
+    // Patch the initial EC's iret frame for user-mode dispatch.
+    patchInitialIretFrame(child_ec.ctx, slid_entry, layout);
 
     // Mint slot-1 EC handle in the child for the initial EC. Caps =
     // ec_inner_ceiling from ceilings_inner bits 0-7 per spec §[20].
@@ -388,15 +397,18 @@ inline fn pageFrameSizeBytes(sz: zag.capdom.var_range.PageSize) u64 {
 /// for ECs without a pre-allocated user stack) leaves the frame in
 /// kernel-mode shape; this writes the user selectors, the user RSP,
 /// and the entry-point arg expected by the spec.
-fn patchInitialIretFrame(ctx: *zag.arch.dispatch.cpu.ArchCpuContext) void {
-    const ring_3 = 3;
+fn patchInitialIretFrame(
+    ctx: *zag.arch.dispatch.cpu.ArchCpuContext,
+    entry: VAddr,
+    layout: userspace_init.DomainLayout,
+) void {
     const USER_CODE_SEL: u64 = 0x23; // (USER_CODE >> 3) | 3 — matches gdt
     const USER_DATA_SEL: u64 = 0x1b;
     ctx.cs = USER_CODE_SEL;
     ctx.ss = USER_DATA_SEL;
-    _ = ring_3;
-    ctx.rsp = userspace_init.ROOT_USER_STACK_TOP;
-    ctx.regs.rdi = userspace_init.ROOT_USER_TABLE_BASE;
+    ctx.rip = entry.addr;
+    ctx.rsp = layout.stack_top;
+    ctx.regs.rdi = layout.table_base;
 }
 
 /// `acquire_ecs` syscall handler.

@@ -203,6 +203,17 @@ pub fn createVar(
     if (preferred_base != 0 and !std.mem.isAligned(preferred_base, sz_bytes)) {
         return errors.E_INVAL;
     }
+    if (preferred_base != 0) {
+        // Spec §[create_var] test 23: preferred_base must lie wholly
+        // within the static zone — see §[address_space].
+        const range_bytes = pages * sz_bytes;
+        const static = dispatch.paging.user_static;
+        const end = @addWithOverflow(preferred_base, range_bytes);
+        if (end[1] != 0) return errors.E_INVAL;
+        if (preferred_base < static.start or end[0] > static.end) {
+            return errors.E_INVAL;
+        }
+    }
 
     const domain = caller.domain.ptr;
 
@@ -674,15 +685,11 @@ fn destroyVar(v: *VAR) void {
 /// Allocate a contiguous VA range of `pages * sz` bytes for a new VAR.
 /// `preferred_base != 0` returns that base verbatim (the create_var
 /// caller is asking for a specific address; the per-domain overlap
-/// check still has the final say). Otherwise bump-allocate from
-/// `domain.next_var_base`, advancing past the allocated range and
-/// aligning to `sz`. Spec §[var].create_var (E_NOSPC).
-///
-/// v0: no recycling of freed ranges. Domains creating + deleting many
-/// VARs slowly leak VA space until the bump pointer hits user_aslr.end.
-/// The 47-bit user half from 64 GiB upward holds 16 TiB - 64 GiB ≈
-/// many test cycles before exhaustion; replaced by a real first-fit /
-/// freelist allocator once the test runner exercises that pressure.
+/// check still has the final say). Otherwise pick a randomized,
+/// `sz`-aligned base inside the ASLR zone (spec §[create_var] test 24
+/// + §[address_space]). On overlap with an existing VAR, retry a
+/// bounded number of times then fall back to a bump pointer for
+/// forward progress.
 fn vaRangeAllocate(
     domain: *CapabilityDomain,
     pages: u32,
@@ -693,12 +700,72 @@ fn vaRangeAllocate(
 
     const sz_bytes = pageSizeBytes(sz);
     const range_bytes = @as(u64, pages) * sz_bytes;
+    const aslr = dispatch.paging.user_aslr;
+    if (range_bytes > aslr.end - aslr.start) return null;
+    const max_base = aslr.end - range_bytes;
+    if (max_base < aslr.start) return null;
+
+    // Try a small number of randomized placements first. The overlap
+    // check below is the authoritative collision test; here we simply
+    // probe distinct random bases.
+    const RETRY_LIMIT = 8;
+    var attempt: u8 = 0;
+    while (attempt < RETRY_LIMIT) {
+        const r = aslrRandom();
+        const span = max_base - aslr.start + sz_bytes;
+        const off = r % span;
+        const candidate = aslr.start + std.mem.alignBackward(u64, off, sz_bytes);
+        if (candidate >= aslr.start and candidate <= max_base) {
+            if (!domainOverlaps(domain, candidate, range_bytes)) {
+                return .fromInt(candidate);
+            }
+        }
+        attempt += 1;
+    }
+
+    // Fallback: bump-allocate from `next_var_base` so a VA-pressured
+    // domain still makes forward progress when randomized probing
+    // keeps colliding.
     const aligned = std.mem.alignForward(u64, domain.next_var_base, sz_bytes);
     const new_top = aligned + range_bytes;
-    if (new_top > dispatch.paging.user_aslr.end) return null;
+    if (new_top > aslr.end) return null;
     domain.next_var_base = new_top;
     return .fromInt(aligned);
 }
+
+/// Cheap overlap test against the domain's already-bound VARs. Used
+/// during randomized base selection — `checkVaRangeOverlap` has the
+/// same logic but returns an i64 status; here we want a bool to drive
+/// retry decisions.
+fn domainOverlaps(domain: *const CapabilityDomain, base: u64, bytes: u64) bool {
+    const new_end = base + bytes;
+    var i: u16 = 0;
+    while (i < domain.var_count) {
+        const v = domain.vars[i] orelse {
+            i += 1;
+            continue;
+        };
+        const v_sz_bytes = pageSizeBytes(v.sz);
+        const v_start = v.base_vaddr.addr;
+        const v_end = v_start + @as(u64, v.page_count) * v_sz_bytes;
+        if (base < v_end and v_start < new_end) return true;
+        i += 1;
+    }
+    return false;
+}
+
+/// Sample one 64-bit value of randomness for ASLR placement. Uses the
+/// hardware RNG (RDRAND/RNDR) when available; falls back to TSC bits
+/// xor'd with a per-call counter so two back-to-back calls still
+/// produce distinct values when the entropy source stalls.
+pub fn aslrRandom() u64 {
+    if (dispatch.cpu.getRandom()) |hw| return hw;
+    const ts = dispatch.time.readTimestamp(false);
+    aslr_fallback_counter +%= 1;
+    return ts ^ (aslr_fallback_counter *% 0x9E3779B97F4A7C15);
+}
+
+var aslr_fallback_counter: u64 = 0;
 
 /// Install a page_frame at offset, increments mapcnt, programs PTE or
 /// IOMMU PTE. Spec §[var].map_pf — installs every page in the page

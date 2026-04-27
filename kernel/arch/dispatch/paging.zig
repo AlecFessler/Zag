@@ -60,7 +60,17 @@ pub const addr_space = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-/// ASLR range for userspace allocations (subset of addr_space.user).
+/// NULL guard at the bottom of every user address space. The first
+/// page must always fault — no mapping path may install a leaf into
+/// `[0, 0x1000)`. Spec §[address_space].
+pub const user_null_guard: Range = .{
+    .start = 0x0000_0000_0000_0000,
+    .end = 0x0000_0000_0000_1000,
+};
+
+/// ASLR zone — kernel-chosen base, randomized at placement time. Used
+/// for ELF segments, EC stacks, and `create_var(preferred_base = 0)`.
+/// Spec §[address_space].
 pub const user_aslr: Range = switch (builtin.cpu.arch) {
     .x86_64 => .{
         .start = 0x0000_0000_0000_1000,
@@ -69,6 +79,20 @@ pub const user_aslr: Range = switch (builtin.cpu.arch) {
     .aarch64 => .{
         .start = 0x0000_0000_0000_1000,
         .end = 0x0000_1000_0000_0000,
+    },
+    else => unreachable,
+};
+
+/// Static zone — userspace-chosen base via `create_var(preferred_base
+/// != 0)`. Placement is deterministic. Spec §[address_space].
+pub const user_static: Range = switch (builtin.cpu.arch) {
+    .x86_64 => .{
+        .start = 0x0000_1000_0000_0000,
+        .end = 0x0000_8000_0000_0000,
+    },
+    .aarch64 => .{
+        .start = 0x0000_1000_0000_0000,
+        .end = 0x0001_0000_0000_0000,
     },
     else => unreachable,
 };
