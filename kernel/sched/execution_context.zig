@@ -18,6 +18,8 @@ const stack = zag.memory.stack;
 
 const ArchCpuContext = arch.cpu.ArchCpuContext;
 const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const CapabilityType = zag.caps.capability.CapabilityType;
+const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const KernelHandle = zag.caps.capability.KernelHandle;
 const PAddr = zag.memory.address.PAddr;
@@ -35,6 +37,26 @@ const WaitNode = zag.sched.futex.WaitNode;
 /// EC's in-place wait-node / vaddr storage matches the kernel's
 /// per-call cap.
 pub const MAX_FUTEX_ADDRS_PER_EC: usize = 63;
+
+/// Maximum handle attachments (pair entries) carried on a suspend.
+/// Mirrors `syscall/port.zig::MAX_PAIR_COUNT`. Spec §[handle_attachments].
+pub const MAX_PAIR_ENTRIES_PER_EC: usize = 63;
+
+/// Decoded pair entry stashed on the suspending EC at `validatePairEntries`
+/// time and consumed at recv time in `port.deliverEvent`. Captures the
+/// kernel-side `ErasedSlabRef` to the source object (lock-validated at
+/// stash time so the gen baked here matches the live object), the type
+/// tag to install on the receiver, the caps to install verbatim, the
+/// move flag (drives the sender-side slot-clear at recv), and the
+/// source slot id in the sender's domain (used to clear the sender slot
+/// when `move == true`).
+pub const PairEntryStashed = struct {
+    obj_ref: ErasedSlabRef,
+    obj_type: CapabilityType,
+    caps: u16,
+    move: bool,
+    src_slot: u12,
+};
 
 /// Cap bits in `Capability.word0[48..63]` for execution_context handles.
 /// Spec §[execution_context] cap layout.
@@ -249,6 +271,24 @@ pub const ExecutionContext = struct {
     /// for ones suspended mid-execution) and flushed onto the
     /// receiver's user stack at recv resume time.
     event_rip: u64 = 0,
+
+    /// Number of valid entries in `pending_pair_entries`. Set by the
+    /// suspend-side syscall layer from the syscall word's `pair_count`
+    /// field after `validatePairEntries` has decoded each entry. Read
+    /// at recv time in `port.deliverEvent` to drive contiguous handle
+    /// installation in the receiver's domain. Spec §[handle_attachments].
+    pending_pair_count: u8 = 0,
+
+    /// Decoded pair entries stashed by the suspending EC's syscall
+    /// path. Spec §[handle_attachments] mandates that the actual
+    /// move/copy happens at recv time, so the entries ride the EC
+    /// across the suspend → recv rendezvous. Each entry carries the
+    /// captured `ErasedSlabRef` (gen-validated at stash time), the
+    /// type tag and caps to install verbatim on the receiver, the
+    /// move flag (drives the sender-slot-clear at recv), and the
+    /// source slot id in the sender's domain. Sized to
+    /// `MAX_PAIR_ENTRIES_PER_EC` to match the spec ceiling.
+    pending_pair_entries: [MAX_PAIR_ENTRIES_PER_EC]PairEntryStashed = undefined,
 
     /// Port we joined the wait queue on. Lets cleanup find us if the
     /// port closes while we are queued. `null` outside a suspension.
@@ -1001,6 +1041,7 @@ pub fn resumeFromReply(ec: *ExecutionContext, apply_writes: bool) void {
     ec.pending_reply_domain = null;
     ec.pending_reply_slot = 0;
     ec.originating_write_cap = false;
+    ec.pending_pair_count = 0;
     ec.state = .ready;
     scheduler.markReady(ec);
 }
@@ -1064,6 +1105,7 @@ pub fn restartEntry(ec: *ExecutionContext) void {
     ec.pending_reply_domain = null;
     ec.pending_reply_slot = 0;
     ec.originating_write_cap = false;
+    ec.pending_pair_count = 0;
     ec.iret_frame = null;
     ec.futex_wait_nodes = null;
     ec.futex_wait_vaddrs = null;
@@ -1205,6 +1247,7 @@ pub fn allocExecutionContext(
     ec.pending_reply_domain = null;
     ec.pending_reply_slot = 0;
     ec.originating_write_cap = false;
+    ec.pending_pair_count = 0;
     ec.event_routes = .{ null, null, null, null };
     ec.entry_point = entry;
     ec.vm = if (vm) |v| SlabRef(VirtualMachine).init(v, v._gen_lock.currentGen()) else null;

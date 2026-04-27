@@ -9,7 +9,9 @@ const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
 const CapabilityDomainCaps = zag.capdom.capability_domain.CapabilityDomainCaps;
 const CapabilityType = capability.CapabilityType;
 const EcCaps = zag.sched.execution_context.EcCaps;
+const ErasedSlabRef = capability.ErasedSlabRef;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const PairEntryStashed = zag.sched.execution_context.PairEntryStashed;
 const PortCaps = port_obj.PortCaps;
 const Word0 = capability.Word0;
 
@@ -226,7 +228,6 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
         const move_flag: bool = (entries[i] & PAIR_MOVE_BIT) != 0;
 
         const handle = capability.resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
-        _ = handle;
 
         const src_caps: u16 = @truncate(Word0.caps(cd.user_table[slot].word0));
 
@@ -251,8 +252,30 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
             if (!has_copy) return errors.E_PERM;
         }
 
+        // Stash the decoded entry on the suspending EC. The kernel
+        // ref captures the source object at its current gen so the
+        // recv side can mint a handle with a known-live ref. The
+        // sender's source handle keeps the underlying object alive
+        // across the suspend → recv rendezvous; the at-recv
+        // mintHandleAlwaysNew installs a fresh slot in the receiver
+        // domain with the entry's caps verbatim (or intersected with
+        // idc_rx for IDC handles, when that path is wired).
+        const obj_type = Word0.typeTag(cd.user_table[slot].word0);
+        ec.pending_pair_entries[i] = .{
+            .obj_ref = handle.ref,
+            .obj_type = obj_type,
+            .caps = entry_caps,
+            .move = move_flag,
+            .src_slot = slot,
+        };
+
         i += 1;
     }
+
+    // Publish the count last so a partial validation failure leaves
+    // `pending_pair_count == 0` and the recv path doesn't try to
+    // install half-decoded entries.
+    ec.pending_pair_count = pair_count;
 
     return null;
 }

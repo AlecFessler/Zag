@@ -790,6 +790,54 @@ pub fn mintHandle(
     }
 
     const slot = allocFreeSlot(cd) orelse return error.OutOfHandles;
+    writeHandleSlot(cd, slot, obj, obj_type, caps, field0, field1);
+    return slot;
+}
+
+/// Variant of `mintHandle` that bypasses the at-most-one-per-(domain,
+/// object) coalescing. Used by §[handle_attachments] recv-time delivery
+/// where the spec mandates N contiguous NEW slots `[tstart, tstart+N)`
+/// even when the receiver already holds a handle to the same object.
+/// Allocates from the free list and writes the slot unconditionally.
+pub fn mintHandleAlwaysNew(
+    cd: *CapabilityDomain,
+    obj: ErasedSlabRef,
+    obj_type: CapabilityType,
+    caps: u16,
+    field0: u64,
+    field1: u64,
+) !u12 {
+    const slot = allocFreeSlot(cd) orelse return error.OutOfHandles;
+    writeHandleSlot(cd, slot, obj, obj_type, caps, field0, field1);
+    return slot;
+}
+
+/// Mint a handle into a specific pre-reserved free slot. Used by the
+/// contiguous-slot allocator in `allocContiguousFreeSlots` where the
+/// caller has already unlinked the slot from the free list. Bypasses
+/// coalescing — the caller has explicitly committed to placing the
+/// handle at this slot id (spec §[handle_attachments] tstart..tstart+N).
+pub fn mintHandleAt(
+    cd: *CapabilityDomain,
+    slot: u12,
+    obj: ErasedSlabRef,
+    obj_type: CapabilityType,
+    caps: u16,
+    field0: u64,
+    field1: u64,
+) void {
+    writeHandleSlot(cd, slot, obj, obj_type, caps, field0, field1);
+}
+
+fn writeHandleSlot(
+    cd: *CapabilityDomain,
+    slot: u12,
+    obj: ErasedSlabRef,
+    obj_type: CapabilityType,
+    caps: u16,
+    field0: u64,
+    field1: u64,
+) void {
     cd.user_table[slot].word0 = Word0.pack(slot, obj_type, caps);
     cd.user_table[slot].field0 = field0;
     cd.user_table[slot].field1 = field1;
@@ -797,7 +845,74 @@ pub fn mintHandle(
     cd.kernel_table[slot].parent = .{};
     cd.kernel_table[slot].first_child = .{};
     cd.kernel_table[slot].next_sibling = .{};
-    return slot;
+}
+
+/// Reserve N contiguous free slots `[base, base+N)` and unlink each
+/// from the free-slot list. Returns the starting slot id, or
+/// `error.OutOfHandles` if no contiguous run of N slots is available.
+/// Used by §[handle_attachments] recv-time delivery; the spec requires
+/// the inserted handles occupy a contiguous range and the receiver's
+/// syscall word reports `tstart`.
+///
+/// Walk strategy: scan kernel_table from slot 3 upward for runs of
+/// `ref.ptr == null` entries (free slots), then for each candidate run
+/// of length ≥ N, splice all N out of the free list. Slots 0/1/2 are
+/// reserved and never on the free list. O(N + free_list_walk) per
+/// attempted run.
+pub fn allocContiguousFreeSlots(cd: *CapabilityDomain, n: u8) !u12 {
+    if (n == 0) return 0;
+    if (cd.free_count < n) return error.OutOfHandles;
+
+    var run_start: u16 = 3;
+    var i: u16 = 3;
+    while (i < MAX_HANDLES_PER_DOMAIN) {
+        if (cd.kernel_table[i].ref.ptr == null) {
+            const run_len = i + 1 - run_start;
+            if (run_len >= n) {
+                // Found a run [run_start, run_start + n). Splice each
+                // slot out of the free list. The list is singly-linked;
+                // walk it removing matching nodes.
+                var k: u16 = 0;
+                while (k < n) {
+                    const target_slot = run_start + k;
+                    unlinkFreeSlot(cd, @intCast(target_slot));
+                    k += 1;
+                }
+                return @intCast(run_start);
+            }
+            i += 1;
+        } else {
+            run_start = i + 1;
+            i += 1;
+        }
+    }
+    return error.OutOfHandles;
+}
+
+/// Unlink a specific slot from the free-slot list. Caller has verified
+/// the slot is on the list (`kernel_table[slot].ref.ptr == null`).
+fn unlinkFreeSlot(cd: *CapabilityDomain, slot: u12) void {
+    const slot_u16: u16 = slot;
+    if (cd.free_head == slot_u16) {
+        cd.free_head = zag.caps.capability.decodeFreeNext(cd.kernel_table[slot].parent);
+        cd.free_count -= 1;
+        return;
+    }
+    var prev: u16 = cd.free_head;
+    while (prev != zag.caps.capability.FREE_LIST_TAIL) {
+        const prev_idx: u12 = @truncate(prev);
+        const next = zag.caps.capability.decodeFreeNext(cd.kernel_table[prev_idx].parent);
+        if (next == slot_u16) {
+            const after = zag.caps.capability.decodeFreeNext(cd.kernel_table[slot].parent);
+            cd.kernel_table[prev_idx].parent = zag.caps.capability.encodeFreeNext(after);
+            cd.free_count -= 1;
+            return;
+        }
+        prev = next;
+    }
+    // Slot was not on the free list — caller violated precondition.
+    // Leave free_count unchanged; downstream handle write will still
+    // succeed but the slot may double-link next free.
 }
 
 /// Read a self-handle ceiling sub-field. All ceilings live in slot-0's

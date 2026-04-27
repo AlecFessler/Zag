@@ -435,6 +435,23 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
         target_ref.unlock();
         return errors.E_INVAL;
     }
+    // Spec §[handle_attachments]: when the caller is suspending a
+    // different EC, the pair entries were validated against the
+    // caller's domain in `validatePairEntries` and stashed on the
+    // caller's EC. The actual move/copy at recv time runs against
+    // the suspended EC (which is what `deliverEvent` sees), so we
+    // hand the stash off to the target before the suspension is
+    // committed. A self-suspend leaves the stash where it already
+    // lives.
+    if (target_ec != caller and caller.pending_pair_count > 0) {
+        target_ec.pending_pair_count = caller.pending_pair_count;
+        var k: usize = 0;
+        while (k < caller.pending_pair_count) {
+            target_ec.pending_pair_entries[k] = caller.pending_pair_entries[k];
+            k += 1;
+        }
+        caller.pending_pair_count = 0;
+    }
     target_ref.unlock();
 
     const p = port_ref.lock(@src()) catch return errors.E_BADCAP;
@@ -476,27 +493,34 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     const p = port_ref.lock(@src()) catch return errors.E_BADCAP;
 
     if (p.waiter_kind == .senders) {
-        // Spec §[port].recv test 06: if our handle table cannot
-        // accommodate the reply handle (and any pair_count attached
-        // handles), return E_FULL before disturbing the sender queue.
-        // Pair attachments are not yet plumbed through this path; the
-        // current minimum is 1 free slot for the reply handle alone.
-        if (cd.free_count == 0) {
-            port_ref.unlock();
-            return errors.E_FULL;
-        }
         const sender = popHighestPrioritySender(p) orelse {
             port_ref.unlock();
             return errors.E_CLOSED;
         };
+        // Spec §[port].recv test 06: the receiver needs free slots
+        // for the reply handle plus every attached handle. Compare
+        // against `1 + sender.pending_pair_count` before disturbing
+        // the sender's resume state. (The check moved past the pop
+        // because the slot count depends on the sender's stash, but
+        // we reset and re-enqueue if we bail.)
+        const need: u32 = 1 + @as(u32, sender.pending_pair_count);
+        if (cd.free_count < need) {
+            // Re-enqueue: the sender was popped from the head; push
+            // it back so a future recv can match it.
+            p.waiters.enqueue(sender);
+            p.waiter_kind = .senders;
+            port_ref.unlock();
+            return errors.E_FULL;
+        }
         // Drop the Port lock before deliverEvent — it needs receiver-CD
         // (the caller's CD, already held by us). Holding both would
         // re-introduce the Port → CD inversion.
         const evt_type = sender.event_type;
         const evt_sub = sender.event_subcode;
         const evt_addr = sender.event_addr;
+        const pair_count = sender.pending_pair_count;
         port_ref.unlock();
-        return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, 0);
+        return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, pair_count);
     }
 
     // No sender ready. Spec §[port].recv test 04: if the port has no
@@ -931,12 +955,54 @@ fn deliverEvent(
         return errors.E_FULL;
     };
 
+    // Spec §[handle_attachments]: when the sender stashed pair entries
+    // at suspend time, install them now in `[tstart, tstart+N)` of the
+    // receiver's domain. The sender stash captured the source object's
+    // ErasedSlabRef under the sender's domain lock, so the gen baked
+    // into each entry matches a live object as long as the object
+    // hasn't been destroyed in the interim. We install via
+    // `mintHandleAt` to bypass the at-most-one-per-(domain, object)
+    // coalescing (spec test 08 requires N fresh slots even when the
+    // receiver already holds a handle to the same object).
+    var tstart: u12 = 0;
+    if (pair_count > 0) {
+        tstart = capability_domain.allocContiguousFreeSlots(dom, pair_count) catch {
+            // Couldn't reserve a contiguous run — should have been
+            // caught by the free_count pre-check, but the contiguous
+            // requirement can fail even when there are enough total
+            // free slots (fragmented table). Surface E_FULL.
+            return errors.E_FULL;
+        };
+        var k: u8 = 0;
+        while (k < pair_count) {
+            const entry = sender.pending_pair_entries[k];
+            const target_slot: u12 = @intCast(@as(u16, tstart) + k);
+            capability_domain.mintHandleAt(
+                dom,
+                target_slot,
+                entry.obj_ref,
+                entry.obj_type,
+                entry.caps,
+                0,
+                0,
+            );
+            k += 1;
+        }
+        // Consume the stash — the move/copy completes here. Spec
+        // §[handle_attachments] test 10 specifies that if the suspend
+        // resumes with E_CLOSED before any recv, no entry is moved or
+        // copied; clearing only on the recv-success path preserves
+        // that contract.
+        sender.pending_pair_count = 0;
+    }
+
     // Compose §[event_state] syscall return word: pair_count, tstart,
     // reply_handle_id, event_type. tstart only meaningful when pair_count
     // > 0; the fast path leaves it 0 in the no-attachment case so this
     // mirror does the same.
     const ret_word: u64 =
         (@as(u64, pair_count) << PAIR_COUNT_SHIFT) |
+        (@as(u64, tstart) << TSTART_SHIFT) |
         (@as(u64, reply_slot) << REPLY_HANDLE_SHIFT) |
         (@as(u64, @intFromEnum(event_type)) << EVENT_TYPE_SHIFT);
 
@@ -1040,7 +1106,7 @@ pub fn rendezvousWithReceiver(
     };
     defer receiver_dom_ref.unlock();
 
-    _ = deliverEvent(sender, receiver, dom, event_type, subcode, event_addr, 0);
+    _ = deliverEvent(sender, receiver, dom, event_type, subcode, event_addr, sender.pending_pair_count);
     receiver.state = .ready;
     scheduler.markReady(receiver);
     return true;
