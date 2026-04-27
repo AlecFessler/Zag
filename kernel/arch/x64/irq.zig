@@ -5,6 +5,7 @@ const cpu = zag.arch.x64.cpu;
 const device_region = zag.devices.device_region;
 const exceptions = zag.arch.x64.exceptions;
 const fpu = zag.sched.fpu;
+const futex = zag.sched.futex;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
@@ -202,14 +203,10 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     const n = @atomicRmw(u64, &_dbg_tick_count, .Add, 1, .monotonic);
     if (n < 5 or n % 100 == 0) serial.print("[tick {}]\n", .{n});
     time.getPreemptionTimer().armInterruptTimer(sched.TIMESLICE_NS);
-    // Drive any deadline-based wakeups for recv-with-timeout.
-    // No-op when nothing has expired.
-    //
-    // futex.expireTimedWaiters() is intentionally NOT called here yet:
-    // its existing impl hits an unreachable in enqueueOnCore when fired
-    // (pre-existing latent bug exposed the moment a tick fires through
-    // it). Tracked separately; recv-timeout doesn't need it.
+    // Drive any deadline-based wakeups for recv-with-timeout and
+    // futex_wait_val/futex_wait_change. No-op when nothing has expired.
     port.expireTimedRecvWaiters();
+    futex.expireTimedWaiters();
     sched.preempt();
 }
 

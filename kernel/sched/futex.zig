@@ -13,6 +13,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const arch_syscall = zag.arch.dispatch.syscall;
 const errors = zag.syscall.errors;
 const sched = zag.sched.scheduler;
 
@@ -281,8 +282,18 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
             ec.futex_deadline_ns = 0;
             removeTimedWaiter(ec);
         }
+        // Spec §[futex_wait_val] / §[futex_wait_change]: on a wake the
+        // syscall returns with vreg 1 set to the user vaddr that was
+        // woken. The waiting EC is parked in user-mode space (its
+        // syscall handler frame already returned a placeholder); the
+        // resume path iretq's via `ec.ctx`, so write the real return
+        // value into ctx.regs.rax (vreg 1) before marking it ready.
+        if (ec.futex_wait_vaddrs) |vaddrs_ptr| {
+            arch_syscall.setSyscallReturn(ec.ctx, vaddrs_ptr[node_idx]);
+        }
         ec.futex_bucket_count = 0;
         ec.futex_wait_nodes = null;
+        ec.futex_wait_vaddrs = null;
         ec.state = .ready;
         sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec);
         woken += 1;
@@ -333,8 +344,15 @@ pub fn wakeFromIrq(paddr: PAddr) WakeResult {
             ec.futex_deadline_ns = 0;
             removeTimedWaiter(ec);
         }
+        // Spec §[futex_wait_val] / §[futex_wait_change]: write the woken
+        // user vaddr into the parked EC's syscall return slot before
+        // marking it ready. See `wake` above for the rationale.
+        if (ec.futex_wait_vaddrs) |vaddrs_ptr| {
+            arch_syscall.setSyscallReturn(ec.ctx, vaddrs_ptr[node_idx]);
+        }
         ec.futex_bucket_count = 0;
         ec.futex_wait_nodes = null;
+        ec.futex_wait_vaddrs = null;
         ec.state = .ready;
 
         const target_core = pickCoreForEc(ec);
@@ -428,14 +446,20 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
 
     releaseBucketLocks(&lock_state);
 
-    arch.cpu.enableInterrupts();
-    sched.yieldTo(null);
-
-    const was_timeout: bool = ec.futex_deadline_ns == FUTEX_TIMEOUT_SENTINEL;
-    ec.futex_deadline_ns = 0;
-    if (was_timeout) return errors.E_TIMEOUT;
-    const woken_idx: usize = ec.futex_wake_index;
-    return @bitCast(if (woken_idx < count) vaddrs[woken_idx] else @as(u64, 0));
+    // Park the EC: drop currency on the local core. The syscall
+    // dispatcher (`arch.x64.interrupts.syscallDispatch`) sees
+    // `current_ec == null` and routes to `scheduler.run()` instead of
+    // iretq'ing back to the now-parked user EC. The wake/timeout path
+    // overwrites this EC's syscall-return slot with the real return
+    // value (vaddr or E_TIMEOUT) before re-marking it ready, so the
+    // placeholder returned here only needs to be a value the parked
+    // EC will never observe.
+    ec.on_cpu.store(false, .release);
+    const core_id = arch.smp.coreID();
+    if (sched.core_states[core_id].current_ec == ec) {
+        sched.core_states[core_id].current_ec = null;
+    }
+    return 0;
 }
 
 /// `futex_wait_change` — block while every `(addrs[i], targets[i])`
@@ -514,14 +538,13 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
 
     releaseBucketLocks(&lock_state);
 
-    arch.cpu.enableInterrupts();
-    sched.yieldTo(null);
-
-    const was_timeout: bool = ec.futex_deadline_ns == FUTEX_TIMEOUT_SENTINEL;
-    ec.futex_deadline_ns = 0;
-    if (was_timeout) return errors.E_TIMEOUT;
-    const woken_idx: usize = ec.futex_wake_index;
-    return @bitCast(if (woken_idx < count) vaddrs[woken_idx] else @as(u64, 0));
+    // Park the EC: see `waitVal` for the full rationale.
+    ec.on_cpu.store(false, .release);
+    const core_id = arch.smp.coreID();
+    if (sched.core_states[core_id].current_ec == ec) {
+        sched.core_states[core_id].current_ec = null;
+    }
+    return 0;
 }
 
 /// Holds lock state for multi-bucket acquisition.
@@ -625,8 +648,15 @@ pub fn expireTimedWaiters() void {
         if (removed) {
             while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
             ec.futex_deadline_ns = FUTEX_TIMEOUT_SENTINEL;
+            // Spec §[futex_wait_val] [test 06] / §[futex_wait_change]
+            // [test 06]: timeout returns E_TIMEOUT in vreg 1. The
+            // waiting EC's syscall handler already returned a
+            // placeholder, so we must overwrite ec.ctx.regs.rax with
+            // the real timeout error before iretq resumes the EC.
+            arch_syscall.setSyscallReturn(ec.ctx, @bitCast(@as(i64, errors.E_TIMEOUT)));
             ec.futex_bucket_count = 0;
             ec.futex_wait_nodes = null;
+            ec.futex_wait_vaddrs = null;
             ec.state = .ready;
             sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec);
         }
