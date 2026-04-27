@@ -125,19 +125,22 @@ const testing = lib.testing;
 //   write vreg 127 at offset 904 from the pre-push rsp. The syscall
 //   word (rcx) is then pushed at [rsp - 8], landing at [rsp + 0]
 //   relative to the post-push rsp.
+//
+// Inputs are passed via register constraints rather than memory operands
+// — `subq $920, %%rsp` would otherwise invalidate any RSP-relative
+// memory operand the compiler chose to back the local input variables
+// with. Pinning each input to a specific call-clobbered register that
+// is NOT consumed by the syscall ABI (rax/rbx/rcx are reserved for
+// v1/v2/word) keeps the values intact across the RSP move. Same fix
+// pattern as `handle_attachments_10`.
 fn suspendWithOneAttachment(target: u12, port: u12, entry: u64) u64 {
     const SUSPEND_NUM: u64 = 34;
     const PAIR_COUNT_ONE: u64 = 1 << 12;
     const word: u64 = SUSPEND_NUM | PAIR_COUNT_ONE;
     var v1_out: u64 = undefined;
-    // Single-use scratch register to ferry `entry` into the high-vreg
-    // slot. r11 is already clobbered by sysret, so using it here costs
-    // nothing extra. rbx carries the port handle (vreg 2) into the
-    // syscall and is restored from the input binding by the compiler.
     asm volatile (
         \\ subq $920, %%rsp
-        \\ movq %[entry], %%r11
-        \\ movq %%r11, 904(%%rsp)
+        \\ movq %%r8, 904(%%rsp)
         \\ pushq %%rcx
         \\ syscall
         \\ addq $928, %%rsp
@@ -145,8 +148,8 @@ fn suspendWithOneAttachment(target: u12, port: u12, entry: u64) u64 {
         : [word] "{rcx}" (word),
           [iv1] "{rax}" (@as(u64, target)),
           [iv2] "{rbx}" (@as(u64, port)),
-          [entry] "m" (entry),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+          [entry] "{r8}" (entry),
+        : .{ .rcx = true, .r8 = true, .r11 = true, .memory = true });
     return v1_out;
 }
 
