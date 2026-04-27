@@ -175,6 +175,40 @@ pub fn createCapabilityDomain(
         return errors.E_PERM;
     }
 
+    // Spec §[create_capability_domain] test 07: every field in
+    // `restart_policy_ceiling` (bits 16-31 of [3]) must be ≤ the
+    // caller's corresponding field on its self-handle field1. The
+    // sub-field is partitioned per the syscall doc above:
+    //   bits 16-17 ec_restart_max   (2-bit numeric, 0..3)
+    //   bits 18-19 var_restart_max  (2-bit numeric, 0..3)
+    //   bit 20     pf_restart_max   (bool)
+    //   bit 21     dr_restart_max   (bool)
+    //   bit 22     port_restart_max (bool)
+    //   bit 23     vm_restart_max   (bool)
+    //   bit 24     idc_restart_max  (bool)
+    //   bit 25     tm_restart_max   (bool)
+    //   bits 26-31 _reserved
+    // For numeric fields "exceeds" means a strict numeric greater-than;
+    // for bool fields it reduces to the bitwise-superset case (a 1-bit
+    // requested value with the caller's bit clear). Reserved bit
+    // violations belong to test 17 (E_INVAL) and are out of scope here.
+    const caller_field1 = cd.user_table[SELF_HANDLE_SLOT].field1;
+    const caller_rpc: u16 = @truncate((caller_field1 >> 16) & 0xFFFF);
+    const requested_rpc: u16 = @truncate((ceilings_outer >> 16) & 0xFFFF);
+    const caller_ec_rmax: u2 = @truncate(caller_rpc & 0x3);
+    const requested_ec_rmax: u2 = @truncate(requested_rpc & 0x3);
+    const caller_var_rmax: u2 = @truncate((caller_rpc >> 2) & 0x3);
+    const requested_var_rmax: u2 = @truncate((requested_rpc >> 2) & 0x3);
+    const caller_bools: u8 = @truncate((caller_rpc >> 4) & 0x3F);
+    const requested_bools: u8 = @truncate((requested_rpc >> 4) & 0x3F);
+    if (requested_ec_rmax > caller_ec_rmax or
+        requested_var_rmax > caller_var_rmax or
+        (requested_bools & ~caller_bools) != 0)
+    {
+        cd_ref.unlock();
+        return errors.E_PERM;
+    }
+
     const elf_slot: u12 = @truncate(elf_pf_slot);
     if (capability.resolveHandleOnDomain(cd, elf_slot, .page_frame) == null) {
         cd_ref.unlock();
