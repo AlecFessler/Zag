@@ -586,20 +586,69 @@ const HandleLocation = struct {
 };
 
 /// Enumerator over every `(CapabilityDomain, slot)` pair holding a
-/// handle to `t`. The cross-domain handle index needed to back this
-/// lives in the capability layer; this iterator is the call-site shape
-/// timer fire/cancel/rearm propagation needs once that index lands.
+/// handle to `t`. v0 implementation: no inverse index exists in the
+/// capability layer, so this walks every alive `CapabilityDomain` slot
+/// and scans its kernel_table for entries whose `ref` points at `t`.
+/// O(domains * MAX_HANDLES_PER_DOMAIN) per fire — acceptable at v0
+/// fire rates (test loads); a real cross-domain index can replace
+/// this without changing call sites.
 const HandleHolderIterator = struct {
     timer: *Timer,
+    locations: [MAX_HOLDERS]HandleLocation = undefined,
+    count: usize = 0,
+    cursor: usize = 0,
+
+    /// Upper bound on holders enumerated per fire. Set to the global
+    /// Timer slab capacity (each domain holds at most one handle per
+    /// object via mintHandle's coalescing, and there are at most
+    /// 256 capability domains in the slab).
+    const MAX_HOLDERS: usize = 256;
 
     fn next(self: *HandleHolderIterator) ?HandleLocation {
-        _ = self;
-        return null;
+        if (self.cursor >= self.count) return null;
+        const loc = self.locations[self.cursor];
+        self.cursor += 1;
+        return loc;
     }
 };
 
+const HolderScanCtx = struct {
+    timer: *Timer,
+    iter: *HandleHolderIterator,
+};
+
+fn collectHolder(ctx: *HolderScanCtx, cd: *CapabilityDomain, gen: u63) bool {
+    _ = gen;
+    const timer_ptr: *anyopaque = @ptrCast(ctx.timer);
+    var slot: u16 = 0;
+    while (slot < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) {
+        const entry = &cd.kernel_table[slot];
+        if (entry.ref.ptr) |obj_ptr| {
+            if (obj_ptr == timer_ptr) {
+                const tag = capability.Word0.typeTag(cd.user_table[slot].word0);
+                if (tag == .timer and ctx.iter.count < HandleHolderIterator.MAX_HOLDERS) {
+                    ctx.iter.locations[ctx.iter.count] = .{
+                        .domain = cd,
+                        .slot = @truncate(slot),
+                        .core_id = null,
+                    };
+                    ctx.iter.count += 1;
+                }
+            }
+        }
+        slot += 1;
+    }
+    return ctx.iter.count < HandleHolderIterator.MAX_HOLDERS;
+}
+
 fn handleHolderIterator(t: *Timer) HandleHolderIterator {
-    return .{ .timer = t };
+    var iter: HandleHolderIterator = .{ .timer = t };
+    var ctx = HolderScanCtx{ .timer = t, .iter = &iter };
+    zag.capdom.capability_domain.slab_instance.forEachAlive(
+        &ctx,
+        collectHolder,
+    );
+    return iter;
 }
 
 fn callerDomain(caller: *anyopaque) ?*CapabilityDomain {

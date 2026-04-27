@@ -447,6 +447,37 @@ pub fn SecureSlab(
             self.destroyLockedInner(ptr, expected_gen);
         }
 
+        /// Visit every currently-allocated slot. The visitor receives a
+        /// `*T` and a `u63` gen for the live slot, then returns whether
+        /// to continue iterating. Slots whose gen-lock parity is even
+        /// (freed) or zero (never allocated) are skipped.
+        ///
+        /// No lock is held across the visitor — callers must take the
+        /// per-slot gen-lock themselves if they need exclusive access
+        /// to T's fields. Liveness across the visitor is best-effort:
+        /// a slot can be destroyed concurrently. The `gen` returned
+        /// alongside the pointer is the snapshot the visitor would use
+        /// to construct a `SlabRef(T)` for verify-and-acquire.
+        ///
+        /// Used by cross-domain object-holder lookups (e.g. timer
+        /// fire propagation walks every CapabilityDomain to find handles
+        /// pointing at a given Timer) where no inverse index exists.
+        pub fn forEachAlive(self: *Self, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *T, u63) bool) void {
+            // Snapshot count_total once. New slots minted concurrently
+            // will sit at indices >= the snapshot; visiting them is
+            // optional and could be racy with their initialization.
+            const total = @atomicLoad(u32, &self.count_total, .acquire);
+            var i: u32 = 0;
+            while (i < total) {
+                const ptr = self.ptrAt(i);
+                const gen = ptr._gen_lock.currentGen();
+                if (gen != 0 and (gen % 2) == 1) {
+                    if (!visit(ctx, ptr, gen)) return;
+                }
+                i += 1;
+            }
+        }
+
         /// Shared tail of `destroy` / `destroyLocked`. Caller has already
         /// established the slot's gen-lock is held at `expected_gen`.
         fn destroyLockedInner(self: *Self, ptr: *T, expected_gen: u63) void {

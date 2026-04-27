@@ -162,13 +162,19 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
 
     if (next) |n| {
         switchTo(n);
-    } else {
-        // Empty queue and no idle EC. Drop to the idle loop in `run`
-        // by clearing `current_ec` and halting; an IPI / device IRQ
-        // will return us to the dispatch loop.
-        core_states[core].current_ec = null;
-        arch.cpu.idle();
+        return;
     }
+
+    // Empty queue and no idle EC. Clear `current_ec` and return to the
+    // caller — `dispatchInterrupt` then sends EOI and iretq's back to
+    // the interrupted context. If that context was a halted
+    // `scheduler.run`, control resumes past `hlt`, the loop iterates,
+    // and `run` itself enters the top-level idle (outside any IRQ
+    // handler) where halting won't strand the LAPIC's in-service
+    // bit. Halting *here* would leave the timer IRQ never EOI'd —
+    // any subsequent same-priority LAPIC tick would be blocked,
+    // wedging the scheduler tick on this core.
+    core_states[core].current_ec = null;
 }
 
 /// Preemption tick — invoked from the per-core timer interrupt when

@@ -410,7 +410,14 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
         ec.futex_deadline_ns = 0;
     }
 
-    var nodes: [MAX_FUTEX_ADDRS]WaitNode = undefined;
+    // Store WaitNodes and vaddrs in EC-resident storage rather than on
+    // the caller's kernel stack: `waitVal` returns a placeholder to
+    // `syscallDispatch` before the EC actually parks, so the stack
+    // frame is reclaimed before wake/expiry runs. The bucket and
+    // wake path both keep `&nodes[i]` / `vaddrs_ptr` references that
+    // must remain valid until the wake completes.
+    const nodes = &ec.futex_wait_nodes_storage;
+    const vaddrs_storage = &ec.futex_wait_vaddrs_storage;
     const ec_ref = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
     for (0..count) |i| {
         nodes[i] = .{
@@ -419,14 +426,16 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
             .next = null,
             .priority = ec.priority,
         };
+        vaddrs_storage[i] = vaddrs[i];
     }
-    ec.futex_wait_nodes = &nodes;
-    ec.futex_wait_vaddrs = vaddrs.ptr;
+    ec.futex_wait_nodes = nodes;
+    ec.futex_wait_vaddrs = vaddrs_storage;
     ec.futex_bucket_count = @intCast(count);
     ec.state = .futex_wait;
 
     for (0..count) |i| {
-        buckets[bucketIdx(addrs[i])].pq.enqueue(&nodes[i]);
+        const idx = bucketIdx(addrs[i]);
+        buckets[idx].pq.enqueue(&nodes[i]);
     }
 
     if (ec.futex_deadline_ns != 0) {
@@ -502,7 +511,9 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
         ec.futex_deadline_ns = 0;
     }
 
-    var nodes: [MAX_FUTEX_ADDRS]WaitNode = undefined;
+    // Same EC-resident storage discipline as `waitVal`.
+    const nodes = &ec.futex_wait_nodes_storage;
+    const vaddrs_storage = &ec.futex_wait_vaddrs_storage;
     const ec_ref = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
     for (0..count) |i| {
         nodes[i] = .{
@@ -511,9 +522,10 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
             .next = null,
             .priority = ec.priority,
         };
+        vaddrs_storage[i] = vaddrs[i];
     }
-    ec.futex_wait_nodes = &nodes;
-    ec.futex_wait_vaddrs = vaddrs.ptr;
+    ec.futex_wait_nodes = nodes;
+    ec.futex_wait_vaddrs = vaddrs_storage;
     ec.futex_bucket_count = @intCast(count);
     ec.state = .futex_wait;
 

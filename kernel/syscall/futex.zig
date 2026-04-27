@@ -16,10 +16,20 @@ const MAX_PAIRS: usize = 63;
 /// Returns null when the address is unmapped. Holds the domain `_gen_lock`
 /// for the duration of the walk so the page tables cannot be torn down by
 /// a concurrent domain delete mid-translation.
+///
+/// `paging.resolveVaddr` returns the page-base paddr — re-add the
+/// intra-page offset so futex value loads/wakes key on the exact
+/// 8-byte field. (Capability slots are 24 bytes and never straddle
+/// a page boundary, so a single page walk suffices.)
 fn resolveCallerVa(caller: *ExecutionContext, vaddr: u64) ?PAddr {
     const dom = caller.domain.lock(@src()) catch return null;
     defer caller.domain.unlock();
-    return paging.resolveVaddr(dom.addr_space_root, VAddr.fromInt(vaddr));
+    const PAGE_MASK: u64 = 0xFFF;
+    const page_base = paging.resolveVaddr(
+        dom.addr_space_root,
+        VAddr.fromInt(vaddr & ~PAGE_MASK),
+    ) orelse return null;
+    return .{ .addr = page_base.addr | (vaddr & PAGE_MASK) };
 }
 
 /// Read `fut_wait_max` (slot-0 self-handle outer-ceiling, field1 bits

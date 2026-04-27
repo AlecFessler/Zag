@@ -30,6 +30,12 @@ const VAddr = zag.memory.address.VAddr;
 const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
 const WaitNode = zag.sched.futex.WaitNode;
 
+/// Upper bound on simultaneous futex wait addresses for a single EC.
+/// Mirrors `futex.MAX_FUTEX_ADDRS` (the public spec ceiling) so each
+/// EC's in-place wait-node / vaddr storage matches the kernel's
+/// per-call cap.
+pub const MAX_FUTEX_ADDRS_PER_EC: usize = 63;
+
 /// Cap bits in `Capability.word0[48..63]` for execution_context handles.
 /// Spec §[execution_context] cap layout.
 pub const EcCaps = packed struct(u16) {
@@ -176,11 +182,24 @@ pub const ExecutionContext = struct {
     /// so the syscall's return `[1] = addr` names the right one.
     futex_wake_index: u8 = 0,
 
-    /// Pointer to an array of N `WaitNode`s allocated on this EC's own
-    /// kernel stack while blocked. One node per watched address; each
-    /// node has its own `next` so the EC simultaneously occupies N
-    /// independent bucket chains without aliasing a shared link. `null`
-    /// outside `.futex_wait`.
+    /// In-place backing storage for the wait nodes the futex bucket
+    /// chains link into while this EC is blocked. Must live on the
+    /// EC, not the calling kernel stack: `futex_wait_val` returns a
+    /// placeholder before the EC parks, so by the time wake/expiry
+    /// runs, any waitVal-local stack frame has been reused. Sized to
+    /// `MAX_FUTEX_ADDRS_PER_EC` (one node per watched address).
+    futex_wait_nodes_storage: [MAX_FUTEX_ADDRS_PER_EC]WaitNode = undefined,
+
+    /// In-place backing storage for the per-node user vaddrs the wake
+    /// path needs to surface in vreg 1. Same lifetime concern as
+    /// `futex_wait_nodes_storage`.
+    futex_wait_vaddrs_storage: [MAX_FUTEX_ADDRS_PER_EC]u64 = undefined,
+
+    /// Pointer to the prefix of `futex_wait_nodes_storage` actually in
+    /// use this wait. One node per watched address; each node has its
+    /// own `next` so the EC simultaneously occupies N independent
+    /// bucket chains without aliasing a shared link. `null` outside
+    /// `.futex_wait`.
     futex_wait_nodes: ?[*]WaitNode = null,
 
     /// N — number of valid entries in `futex_wait_nodes`. 1 for
