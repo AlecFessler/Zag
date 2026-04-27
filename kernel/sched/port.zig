@@ -894,23 +894,29 @@ fn deliverEvent(
     // vreg slot. The sender snapshot wins per spec §[event_state] —
     // event-specific u64 payloads must move to vreg 19+ (x86-64) /
     // vreg 36+ (aarch64) when those tests come online.
+    // Spec §[syscall_abi]: vreg 0 (`[rsp+0]`) carries the recv-success
+    // syscall return word; vreg 1 (rax) holds an error code on failure
+    // and is 0 on success. Stage `ret_word` in `pending_event_word` so
+    // the receiver's resume path can flush it to user `[rsp+0]` while
+    // running in the receiver's address space (only safe at iretq
+    // time — both the sender-already-waiting path and the rendezvous
+    // path can run with a different CR3 active here).
     const target_ctx = receiver.iret_frame orelse receiver.ctx;
-    arch.syscall.setSyscallReturn(target_ctx, ret_word);
+    receiver.pending_event_word = ret_word;
+    receiver.pending_event_word_valid = true;
+    arch.syscall.setSyscallReturn(target_ctx, @as(u64, @bitCast(errors.OK)));
     arch.syscall.setEventSubcode(target_ctx, subcode);
     _ = event_addr;
     arch.syscall.setEventAddr(target_ctx, sender.event_vreg3);
     arch.syscall.setEventVreg4(target_ctx, sender.event_vreg4);
     arch.syscall.setEventVreg5(target_ctx, sender.event_vreg5);
 
-    // Return the composed `ret_word` as i64 so the recv-fast-path
-    // caller (sender already waiting at recv time) can propagate it
-    // through `syscallDispatch`'s `r.rax = ret` epilogue. Without this
-    // the receiver's saved rax would land as the dispatch's i64 return
-    // (0 here) and clobber the `setSyscallReturn` write above. The
-    // rendezvous path discards this return and relies on the direct
-    // setSyscallReturn write since its receiver is asleep and never
-    // re-enters syscallDispatch's epilogue.
-    return @bitCast(ret_word);
+    // i64 return == OK on success. The composed `ret_word` is delivered
+    // out-of-band via `pending_event_word` rather than through
+    // syscallDispatch's `r.rax = ret` epilogue; the syscall-result
+    // register-1 contract in §[error_codes] reserves vreg 1 for error
+    // codes only.
+    return errors.OK;
 }
 
 /// Sender-side rendezvous with a waiting receiver. Caller is the

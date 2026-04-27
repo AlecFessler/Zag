@@ -232,6 +232,18 @@ pub const ExecutionContext = struct {
     /// normal sender-wake path or `expireTimedRecvWaiters`.
     recv_deadline_ns: u64 = 0,
 
+    /// Spec §[syscall_abi]: vreg 0 (the syscall word at `[rsp+0]`) is
+    /// the recv-success return path — pair_count, tstart, reply_handle
+    /// id, and event_type are packed here per §[event_state]. vreg 1
+    /// (rax) carries error codes only and is 0 on success. The kernel
+    /// stages the composed word here in `deliverEvent` and the
+    /// per-arch resume path flushes it to user `[ctx.rsp + 0]` while
+    /// running in this EC's address space, just before iretq.
+    /// `pending_event_word_valid` discriminates "no pending write"
+    /// from "pending write of value 0" since 0 is a legal return word.
+    pending_event_word: u64 = 0,
+    pending_event_word_valid: bool = false,
+
     /// Back-pointer to the receiver-side handle table entry that holds
     /// the outstanding reply against this EC. Set when we are dequeued
     /// by recv (the receiver's `recv` writes its handle entry pointing

@@ -399,6 +399,14 @@ pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x0 = value;
 }
 
+/// Write the syscall return word into vreg 0 — `[user_sp + 0]` per
+/// Spec §[syscall_abi]. Mirrors `arch.x64.interrupts.writeUserSyscallWord`;
+/// see that function's doc comment for the full contract. aarch64 does
+/// not gate user-page kernel writes through SMAP — the write is direct.
+pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
+    @as(*u64, @ptrFromInt(ctx.sp_el0)).* = value;
+}
+
 /// Spec §[event_state] vreg 2 — x1 on aarch64.
 pub fn setEventSubcode(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x1 = value;

@@ -42,6 +42,20 @@ pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
+/// Write the syscall return word to vreg 0 (`[user_sp + 0]`) — the
+/// per Spec §[syscall_abi] location for syscalls whose return payload
+/// (e.g. recv's reply_handle_id / event_type / pair_count / tstart)
+/// lives in the syscall word rather than vreg 1. MUST be called with
+/// the caller's address space active — the syscall epilogue runs in
+/// the caller's CR3 / TTBR0; the resume path must `switchTo` first.
+pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.writeUserSyscallWord(ctx, value),
+        .aarch64 => aarch64.interrupts.writeUserSyscallWord(ctx, value),
+        else => unreachable,
+    }
+}
+
 /// Write syscall-return vreg 2 — used by handle-creating syscalls to
 /// deliver the new handle's field0 snapshot alongside the slot id in
 /// vreg 1. Reuses the same physical reg as `setEventSubcode` (rbx on

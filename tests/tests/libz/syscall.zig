@@ -250,15 +250,91 @@ pub const RecvReturn = struct {
     regs: Regs,
 };
 
-// The kernel writes the syscall return word into the receiver's rax
-// (vreg 1) via `setSyscallReturn` — rcx is sysret-clobbered (it carries
-// the user RIP back), so there is no way to deliver a separate "word"
-// out of band. `RecvReturn.word` here is just `regs.v1` lifted out for
-// callers that conceptually want the syscall return word; the two are
-// the same value.
+// Spec §[syscall_abi]: vreg 0 (`[rsp + 0]`) is the syscall word — on
+// return the kernel may write a syscall-word-shaped payload here (the
+// recv path packs reply_handle_id / event_type / pair_count / tstart
+// into vreg 0; vreg 1 / rax then carries the success/error code per
+// §[error_codes]). This helper preserves the slot across the syscall
+// instruction and reads vreg 0 back into `RecvReturn.word` after the
+// syscall returns. Errors land in `regs.v1` per the error-code
+// contract.
+//
+// The vreg-0 readback rides in `rcx` because the inline-asm operand
+// budget is tight: vregs 1..13 already pin 13 registers via tied
+// `{reg}` constraints, plus rcx for the input word and r11 as
+// SYSRET-clobbered. The asm restores `(%%rsp)` into `%rcx` AFTER the
+// syscall (overwriting the user-RIP rcx left by SYSRET, which is now
+// stale anyway because we are back in our own RIP), then `addq` and
+// publishes rcx to the `oword` Zig output via the existing
+// `={rcx}`-class output operand.
 fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
-    const r = issueRawNoStack(word_in, in);
-    return .{ .word = r.v1, .regs = r };
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    var oword: u64 = undefined;
+    asm volatile (
+        \\ subq $16, %%rsp
+        \\ movq %%rcx, (%%rsp)
+        \\ syscall
+        \\ movq (%%rsp), %%rcx
+        \\ addq $16, %%rsp
+        : [v1] "={rax}" (ov1),
+          [v2] "={rbx}" (ov2),
+          [v3] "={rdx}" (ov3),
+          [v4] "={rbp}" (ov4),
+          [v5] "={rsi}" (ov5),
+          [v6] "={rdi}" (ov6),
+          [v7] "={r8}" (ov7),
+          [v8] "={r9}" (ov8),
+          [v9] "={r10}" (ov9),
+          [v10] "={r12}" (ov10),
+          [v11] "={r13}" (ov11),
+          [v12] "={r14}" (ov12),
+          [v13] "={r15}" (ov13),
+          [oword] "={rcx}" (oword),
+        : [word] "{rcx}" (word_in),
+          [iv1] "{rax}" (in.v1),
+          [iv2] "{rbx}" (in.v2),
+          [iv3] "{rdx}" (in.v3),
+          [iv4] "{rbp}" (in.v4),
+          [iv5] "{rsi}" (in.v5),
+          [iv6] "{rdi}" (in.v6),
+          [iv7] "{r8}" (in.v7),
+          [iv8] "{r9}" (in.v8),
+          [iv9] "{r10}" (in.v9),
+          [iv10] "{r12}" (in.v10),
+          [iv11] "{r13}" (in.v11),
+          [iv12] "{r14}" (in.v12),
+          [iv13] "{r15}" (in.v13),
+        : .{ .r11 = true, .memory = true });
+    return .{
+        .word = oword,
+        .regs = .{
+            .v1 = ov1,
+            .v2 = ov2,
+            .v3 = ov3,
+            .v4 = ov4,
+            .v5 = ov5,
+            .v6 = ov6,
+            .v7 = ov7,
+            .v8 = ov8,
+            .v9 = ov9,
+            .v10 = ov10,
+            .v11 = ov11,
+            .v12 = ov12,
+            .v13 = ov13,
+        },
+    };
 }
 
 // ---------------------------------------------------------------

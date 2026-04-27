@@ -275,6 +275,20 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     const ret = zag.syscall.dispatch.dispatch(caller, syscall_word, args[0..]);
     r.rax = @bitCast(ret);
 
+    // Spec §[syscall_abi]: vreg 0 (`[user_rsp + 0]`) is the syscall
+    // word — `recv` event delivery surfaces its return payload here
+    // (reply_handle_id / event_type / pair_count / tstart) while vreg
+    // 1 (rax) carries OK. The caller is still the running EC on this
+    // core when dispatch returned without suspending us, and we are
+    // still in the caller's CR3, so the user-page write is safe here.
+    if (caller.pending_event_word_valid and
+        scheduler.core_states[apic.coreID()].current_ec == caller)
+    {
+        writeUserSyscallWord(ctx, caller.pending_event_word);
+        caller.pending_event_word = 0;
+        caller.pending_event_word_valid = false;
+    }
+
     // If the dispatch suspended the calling EC (recv/suspend/futex
     // wait), `current_ec` was cleared on this core and `caller.state`
     // was retargeted to `.suspended_on_port` / `.futex_wait`. The asm
@@ -499,6 +513,20 @@ pub fn switchTo(ec: *ExecutionContext) void {
 
     apic.endOfInterrupt();
 
+    // Spec §[syscall_abi]: flush the recv-deferred syscall word into
+    // user `[ctx.rsp + 0]` while we are guaranteed to be in the EC's
+    // address space. `deliverEvent` stages the value when the receiver
+    // is parked (rendezvous wake) — at that moment the kernel is still
+    // running in the sender's CR3, so the write must be deferred to
+    // the resume path. Flush after the CR3 swap above and before the
+    // iretq trampoline; the EC's user stack page is mapped in the
+    // domain we just switched into.
+    if (ec.pending_event_word_valid) {
+        writeUserSyscallWord(ec.ctx, ec.pending_event_word);
+        ec.pending_event_word = 0;
+        ec.pending_event_word_valid = false;
+    }
+
     // lockdep: this asm `jmp interruptStubEpilogue` abandons the call stack
     // the IRQ-handler dispatcher (`dispatchInterrupt`) was using; its
     // `defer exitIrqContext` never executes. Re-balance the per-core IRQ
@@ -652,6 +680,21 @@ pub fn getSyscallReturn(ctx: *const ArchCpuContext) u64 {
 
 pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rax = value;
+}
+
+/// Write the syscall return word into vreg 0 — `[user_rsp + 0]` per
+/// Spec §[syscall_abi]. MUST be called with the user's address space
+/// active in CR3 (the syscall epilogue runs in the caller's CR3; the
+/// resume path swaps via `switchTo` first). STAC opens user-page
+/// access under SMAP; CLAC re-arms the trap. Aliased on aarch64 to
+/// the matching `[sp + 0]` slot. Used by `recv` event delivery —
+/// vreg 1 (rax) carries OK in that path while the composed
+/// pair_count / tstart / reply_handle_id / event_type word lands at
+/// vreg 0.
+pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
+    cpu.stac();
+    @as(*u64, @ptrFromInt(ctx.rsp)).* = value;
+    cpu.clac();
 }
 
 /// Spec §[event_state] vreg 2 — rbx on x86-64.
