@@ -350,10 +350,15 @@ pub fn vmInjectIrq(
 
 /// `vm_set_policy` syscall handler. Spec §[virtual_machine].vm_set_policy.
 /// Proxies to `dispatch.vm.applyVmPolicyTable` for the per-arch encoding.
+/// `count` is the spec-defined entry count from syscall word bits 13-20;
+/// the per-arch handler bounds-checks it against the active (kind, arch)
+/// MAX_* and validates the entries slice carries the right number of
+/// vregs.
 pub fn applyVmPolicyTable(
     caller: *ExecutionContext,
     vm_handle: u64,
     kind: u8,
+    count: u8,
     entries: []const u64,
 ) i64 {
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
@@ -368,7 +373,7 @@ pub fn applyVmPolicyTable(
     if (!vm_caps.policy) return errors.E_PERM;
 
     const vm = lookupVirtualMachine(domain, slot) orelse return errors.E_BADCAP;
-    return vm_dispatch.applyVmPolicyTable(vm, kind, entries);
+    return vm_dispatch.applyVmPolicyTable(vm, kind, count, entries);
 }
 
 // ── Internal API ─────────────────────────────────────────────────────

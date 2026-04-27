@@ -256,9 +256,15 @@ pub fn invalidateStage2Range(
     @panic("step 6: rewrite for spec-v3");
 }
 
-pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, entries: []const u64) i64 {
+pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
+    // TODO step 6: aarch64 vm_set_policy. Per §[vm_set_policy] aarch64
+    // kind=0 (id_reg_responses) uses 2 vregs/entry, kind=1
+    // (sysreg_policies) uses 3 vregs/entry. Mirror the x86-64
+    // implementation in `arch/x64/kvm/vm.zig` against the aarch64
+    // VmPolicy fields.
     _ = vm;
     _ = kind;
+    _ = count;
     _ = entries;
     @panic("step 6: rewrite for spec-v3");
 }

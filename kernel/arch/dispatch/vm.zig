@@ -251,12 +251,14 @@ pub fn lastVmExitInfo(vcpu_ec: *ExecutionContext) VmExitInfo {
 
 /// Apply a typed slice of VM policy entries to the VM (MSR bitmap,
 /// sysreg passthrough table, exception passthrough mask, etc. — see
-/// Spec §[vm_policy] for the per-kind encoding). Returns 0 on success
+/// Spec §[vm_policy] for the per-kind encoding). `count` is the
+/// caller-supplied entry count from syscall word bits 13-20; `entries`
+/// carries the entry payload as raw u64 vregs. Returns 0 on success
 /// or a negative error code.
-pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, entries: []const u64) i64 {
+pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.applyVmPolicyTable(vm, kind, entries),
-        .aarch64 => aarch64.kvm.vm.applyVmPolicyTable(vm, kind, entries),
+        .x86_64 => x64.kvm.vm.applyVmPolicyTable(vm, kind, count, entries),
+        .aarch64 => aarch64.kvm.vm.applyVmPolicyTable(vm, kind, count, entries),
         else => unreachable,
     };
 }

@@ -464,11 +464,82 @@ pub fn invalidateStage2Range(
     _ = page_count;
 }
 
-pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, entries: []const u64) i64 {
-    _ = vm;
-    _ = kind;
-    _ = entries;
-    return @import("zag").syscall.errors.E_NODEV;
+/// Spec §[vm_set_policy] x86-64 — replace `cpuid_responses` (kind=0) or
+/// `cr_policies` (kind=1) on `vm`. The VmPolicy struct lives at offset 0
+/// of `vm.policy_pf` and is read on guest exits; this routine writes the
+/// new entries into that struct atomically (kernel-owned mapping; no
+/// concurrent reader since vCPU exits run on the same kernel-mode core
+/// that owns the syscall). Each entry is 3 vregs:
+///   kind=0: [3i+0]={leaf u32, subleaf u32}; [3i+1]={eax u32, ebx u32};
+///           [3i+2]={ecx u32, edx u32}.
+///   kind=1: [3i+0]={cr_num u8, _pad u8[7]}; [3i+1]=read_value u64;
+///           [3i+2]=write_mask u64.
+pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
+    const errors = zag.syscall.errors;
+
+    // Spec §[vm_set_policy] test 03: count > MAX_<kind> ⇒ E_INVAL. The
+    // bound is per-(kind, arch); on x86-64 kind=0 is bounded by
+    // MAX_CPUID_POLICIES, kind=1 by MAX_CR_POLICIES.
+    const max: u32 = switch (kind) {
+        0 => vm_hw.VmPolicy.MAX_CPUID_POLICIES,
+        1 => vm_hw.VmPolicy.MAX_CR_POLICIES,
+        else => return errors.E_INVAL,
+    };
+    if (@as(u32, count) > max) return errors.E_INVAL;
+
+    // Both x86-64 kinds occupy 3 vregs/entry per §[vm_set_policy]. The
+    // dispatch layer hands us the full vreg space above [1]; reject
+    // wires whose payload cannot supply `count * 3` vregs of entry data.
+    const VREGS_PER_ENTRY: usize = 3;
+    const need: usize = @as(usize, count) * VREGS_PER_ENTRY;
+    if (entries.len < need) return errors.E_INVAL;
+
+    // The seeded VmPolicy lives at offset 0 of `policy_pf`; the kernel
+    // physmap exposes it via VAddr.fromPAddr. policy_pf is held for the
+    // VM's lifetime by capdom (§[create_virtual_machine]) so the pointer
+    // stays valid for as long as the VM is reachable from the syscall.
+    const pf = vm.policy_pf orelse return errors.E_NODEV;
+    const phys_va = VAddr.fromPAddr(pf.phys_base, null);
+    const policy_ptr: *vm_hw.VmPolicy = @ptrFromInt(phys_va.addr);
+
+    switch (kind) {
+        0 => {
+            var i: usize = 0;
+            while (i < @as(usize, count)) {
+                const w0 = entries[i * VREGS_PER_ENTRY + 0];
+                const w1 = entries[i * VREGS_PER_ENTRY + 1];
+                const w2 = entries[i * VREGS_PER_ENTRY + 2];
+                policy_ptr.cpuid_responses[i] = .{
+                    .leaf = @truncate(w0),
+                    .subleaf = @truncate(w0 >> 32),
+                    .eax = @truncate(w1),
+                    .ebx = @truncate(w1 >> 32),
+                    .ecx = @truncate(w2),
+                    .edx = @truncate(w2 >> 32),
+                };
+                i += 1;
+            }
+            policy_ptr.num_cpuid_responses = @as(u32, count);
+        },
+        1 => {
+            var i: usize = 0;
+            while (i < @as(usize, count)) {
+                const w0 = entries[i * VREGS_PER_ENTRY + 0];
+                const w1 = entries[i * VREGS_PER_ENTRY + 1];
+                const w2 = entries[i * VREGS_PER_ENTRY + 2];
+                policy_ptr.cr_policies[i] = .{
+                    .cr_num = @truncate(w0),
+                    .read_value = w1,
+                    .write_mask = w2,
+                };
+                i += 1;
+            }
+            policy_ptr.num_cr_policies = @as(u32, count);
+        },
+        else => unreachable,
+    }
+
+    return 0;
 }
 
 /// Inject (assert/de-assert) a virtual IRQ line on the VM's emulated

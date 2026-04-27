@@ -360,13 +360,14 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         },
         .vm_set_policy => blk: {
             // Spec §[virtual_machine].vm_set_policy: syscall word bit 12
-            // = kind, bits 13-20 = count. The count entries occupy vregs
-            // 2..1+count — args[1..1+count]. Without this slice the
-            // handler sees uninitialized vregs above the user's payload
-            // as junk entries, overcounting against the per-(kind,arch)
-            // MAX_* and tripping E_INVAL on garbage reserved-bit checks.
-            const count: u64 = (syscall_word >> 13) & 0xFF;
-            const end_idx: usize = @min(1 + @as(usize, @intCast(count)), args.len);
+            // = kind, bits 13-20 = count. Each entry occupies a per-arch,
+            // per-kind number of vregs (3 on x86-64 for kind 0/1; 2 or 3
+            // on aarch64 per §[vm_set_policy]). The handler resolves the
+            // exact vreg count against count + the (kind, arch) layout;
+            // dispatch hands it the full vreg space above [1] so the
+            // handler can validate `entries.len == count * vregs/entry`
+            // and reject malformed wires.
+            const end_idx: usize = args.len;
             break :blk virtual_machine.vmSetPolicy(
                 caller,
                 syscall_word,
