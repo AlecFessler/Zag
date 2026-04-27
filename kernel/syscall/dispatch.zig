@@ -172,12 +172,22 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         ),
         .remap => var_.remap(caller, arg(args, 0), arg(args, 1)),
         .snapshot => var_.snapshot(caller, arg(args, 0), arg(args, 1)),
-        .idc_read => var_.idcRead(
-            caller,
-            arg(args, 0),
-            arg(args, 1),
-            @truncate(arg(args, 2)),
-        ),
+        .idc_read => blk: {
+            // Spec §[var].idc_read: syscall word bits 12-19 carry count
+            // (number of qwords, max 125). Args carry only [1] var and
+            // [2] offset — vreg 3 onwards holds the *return* qwords, so
+            // sourcing count from `arg(args, 2)` would read whatever the
+            // caller left in rdx (typically 0) and trip the count-zero
+            // guard before the BADCAP / alignment / size checks ever
+            // run, breaking [test 01] / [test 02] / [test 07] / [test 08].
+            const n: u8 = @truncate((syscall_word >> 12) & 0xFF);
+            break :blk var_.idcRead(
+                caller,
+                arg(args, 0),
+                arg(args, 1),
+                n,
+            );
+        },
         .idc_write => blk: {
             // Spec §[var].idc_write: syscall word bits 12-19 carry count
             // (number of qwords, max 125). Qwords occupy vregs 3..2+count
