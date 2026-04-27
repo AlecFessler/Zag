@@ -205,7 +205,14 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .ack => reply.ack(caller, arg(args, 0)),
 
         .create_port => port.createPort(caller, arg(args, 0)),
-        .@"suspend" => port.@"suspend"(caller, arg(args, 0), arg(args, 1)),
+        .@"suspend" => blk: {
+            // Spec §[handle_attachments]: syscall word bits 12-19 carry
+            // `pair_count` `N`. When N > 0 the [2] port handle must
+            // carry the `xfer` cap (test 01), entries must be valid,
+            // etc. The handler needs the count to gate that check.
+            const pair_count: u8 = @truncate((syscall_word >> 12) & 0xFF);
+            break :blk port.@"suspend"(caller, arg(args, 0), arg(args, 1), pair_count);
+        },
         .recv => port.recv(caller, arg(args, 0), arg(args, 1)),
 
         .bind_event_route => event_route.bindEventRoute(

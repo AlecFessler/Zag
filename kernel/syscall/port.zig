@@ -88,7 +88,7 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
 /// [test 10] on success, when [1] has the `read` cap, the suspension event payload exposes the target's EC state per §[event_state]; otherwise the state in the payload is zeroed.
 /// [test 11] on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's EC state on reply; otherwise modifications are discarded.
 /// [test 12] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64) i64 {
+pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i64 {
     if (target & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (port & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
@@ -119,6 +119,13 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64) i64 {
 
     if (!ec_caps.susp) return errors.E_PERM;
     if (!port_caps.bind) return errors.E_PERM;
+
+    // Spec §[handle_attachments] test 01: when the suspending EC
+    // attaches handles (pair_count > 0), [2] must carry the `xfer`
+    // cap. This gate runs after the §[suspend] prelude tests so a
+    // failure here is unambiguously the handle-attachment policy
+    // rather than a §[suspend] cap miss.
+    if (pair_count > 0 and !port_caps.xfer) return errors.E_PERM;
 
     return port_obj.suspendEc(ec, target, port);
 }
