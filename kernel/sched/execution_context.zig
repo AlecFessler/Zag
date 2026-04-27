@@ -6,6 +6,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const arch_paging = zag.arch.x64.paging;
+const capability = zag.caps.capability;
 const errors = zag.syscall.errors;
 const fpu = zag.sched.fpu;
 const memory_init = zag.memory.init;
@@ -362,14 +363,51 @@ pub fn self(caller: *ExecutionContext) i64 {
 }
 
 /// `terminate` syscall handler. Spec §[execution_context].terminate.
+///
+/// Reserved-bit validation, handle resolution, and `term` cap check are
+/// performed by the syscall-layer wrapper. By the time we get here the
+/// target has been verified as an EC handle in `caller.domain` carrying
+/// `term`. This stage performs the actual teardown:
+///
+///   1. Re-resolve the slot under the cd lock to recover the worker
+///      EC's typed slab ref (pointer + gen).
+///   2. Clear the caller's slot while the cd lock is still held — once
+///      we drop the lock another EC could see and observe the entry,
+///      so the slot must be retired before any teardown side effect.
+///   3. Drop the cd lock, then fire `destroyExecutionContext`. The
+///      destroy path locks the worker's domain itself to read the
+///      addr-space root for kstack unmap, so it must run with the cd
+///      lock released (worker.domain == caller.domain in the
+///      target=self construction the spec tests use).
+///
+/// Other capability domains' stale handles to the destroyed EC are
+/// caught lazily by the gen mismatch on their next syscall (spec test
+/// 05) — no eager fan-out is needed here.
 pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
-    _ = caller;
-    _ = target;
-    // Resolve EC handle from caller's table, validate `term` cap,
-    // remove from any queue, mark every kernel handle pointing at it
-    // as E_TERM (driven by gen-bump on slab destroy), abandon pending
-    // reply, fire `destroyExecutionContext`. Awaits handle table.
-    return errors.E_BADCAP;
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+
+    const slot: u12 = @truncate(target);
+    const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+
+    const worker_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+
+    // Detach + free the caller's slot while the cd lock is held. The
+    // EC slab itself is still alive at this point (gen unchanged); the
+    // worker may still be running on another core. Stale handles in
+    // other domains will hit E_TERM via the gen-bump that
+    // destroyExecutionContext performs below.
+    capability.clearAndFreeSlot(cd, slot, entry);
+    cd_ref.unlock();
+
+    destroyExecutionContext(worker_ref.ptr);
+    return errors.OK;
 }
 
 /// `yield` syscall handler. Spec §[execution_context].yield.
