@@ -344,7 +344,13 @@ pub fn main(cap_table_base: u64) void {
             .write = true,
             .restart_policy = 0,
         };
-        const ec_caps_word: u64 = @as(u64, w1_caps.toU16());
+        // Priority = 1 (normal) at bits 32-33 of the caps word so W1
+        // is dispatchable on equal footing with the test EC. Without
+        // this W1 would sit at the default pri=0 (idle) and the
+        // yield-poll loop below could never witness an altEntry write
+        // — the test EC always outranks an idle sibling on the run
+        // queue.
+        const ec_caps_word: u64 = @as(u64, w1_caps.toU16()) | (@as(u64, 1) << 32);
         const entry: u64 = @intFromPtr(&testing.dummyEntry);
         const cec = syscall.createExecutionContext(
             ec_caps_word,
@@ -417,7 +423,14 @@ pub fn main(cap_table_base: u64) void {
             // .write intentionally omitted
             .restart_policy = 0,
         };
-        const ec_caps_word: u64 = @as(u64, w2_caps.toU16());
+        // Priority = 1 (normal) for the same reason as branch A — see
+        // comment there. Branch B asserts the SENTINEL is NOT
+        // observed, but we still need W2 to be schedulable so it can
+        // resume into its dummyEntry hlt loop. If the kernel
+        // erroneously applied the RIP modification despite the
+        // missing `write` cap, W2 must be capable of running for the
+        // sentinel-distinct baseline to be falsified.
+        const ec_caps_word: u64 = @as(u64, w2_caps.toU16()) | (@as(u64, 1) << 32);
         const entry: u64 = @intFromPtr(&testing.dummyEntry);
         const cec = syscall.createExecutionContext(
             ec_caps_word,

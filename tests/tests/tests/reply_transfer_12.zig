@@ -189,13 +189,18 @@ pub fn main(cap_table_base: u64) void {
     //    rp=0. susp is necessary because the sibling self-suspends; we
     //    don't actually use term but it keeps the cap profile minimal.
     //    rp=0 sidesteps any restart_policy ceiling interaction.
+    //    Priority = 1 (normal) so the sibling can be dispatched while
+    //    the test EC is also at pri=1 — without this, sibling sits at
+    //    pri=0 (idle) and never preempts the test EC's busy-poll on
+    //    g_sibling_done, leaving the result undelivered.
     const ec_caps = caps.EcCap{
         .susp = true,
         .term = true,
         .restart_policy = 0,
     };
+    const ec_caps_word: u64 = @as(u64, ec_caps.toU16()) | (@as(u64, 1) << 32);
     const cec = syscall.createExecutionContext(
-        @as(u64, ec_caps.toU16()),
+        ec_caps_word,
         @intFromPtr(&siblingEntry),
         1, // stack_pages
         0, // target = self (this domain)
