@@ -149,6 +149,21 @@ pub fn createExecutionContext(
         }
     }
 
+    // Spec §[restart_semantics] test 01: requested `caps.restart_policy`
+    // (EcCap bits 8-9) must not exceed the calling domain's
+    // `restart_policy_ceiling.ec_restart_max` (self-handle field1 bits
+    // 16-17 — the low 2 bits of the 16-bit restart_policy_ceiling
+    // sub-word at field1[16..31]). This gate applies regardless of
+    // whether the new handle is minted in the caller's own table or the
+    // target domain's table because `restart_policy` carries the same
+    // semantics in both directions.
+    const requested_restart_policy: u2 = @truncate((new_caps >> 8) & 0x3);
+    const ec_restart_max: u2 = @truncate((cd.user_table[SELF_HANDLE_SLOT].field1 >> 16) & 0x3);
+    if (requested_restart_policy > ec_restart_max) {
+        cd_ref.unlock();
+        return errors.E_PERM;
+    }
+
     if (target != 0) {
         const idc_slot: u12 = @truncate(target);
         if (capability.resolveHandleOnDomain(cd, idc_slot, .capability_domain) == null) {

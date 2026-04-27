@@ -542,7 +542,7 @@ fn restartPolicyMask(type_tag: CapabilityType) u16 {
         .page_frame => 0b1 << 7, // PageFrameCaps bit 7
         .device_region => 0b1 << 4, // DeviceRegionCaps bit 4
         .timer => 0b1 << 4, // TimerCaps bit 4
-        .virtual_machine => 0b1 << 3, // VmCaps bit 3
+        .virtual_machine => 0b1 << 1, // VmCaps bit 1
         .capability_domain => 0b1 << 5, // IdcCaps bit 5
         else => 0,
     };

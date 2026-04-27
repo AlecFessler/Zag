@@ -36,14 +36,13 @@ const VarPageSize = zag.capdom.var_range.PageSize;
 const Word0 = zag.caps.capability.Word0;
 
 /// Cap bits in `Capability.word0[48..63]` for VM handles.
-/// Spec §[virtual_machine] cap layout — exact cap bits TBD beyond
-/// `policy` and `restart_policy`.
+/// Spec §[virtual_machine]: bit 0 = `policy`, bit 1 = `restart_policy`;
+/// bits 2-15 are reserved. VM handles are non-transferable so there are
+/// no `move`/`copy` bits.
 pub const VmCaps = packed struct(u16) {
-    move: bool = false,
-    copy: bool = false,
     policy: bool = false,
     restart_policy: u1 = 0,
-    _reserved: u12 = 0,
+    _reserved: u14 = 0,
 };
 
 pub const VirtualMachine = struct {
@@ -114,8 +113,24 @@ pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64
     const self_caps_struct: cd_mod.CapabilityDomainCaps = @bitCast(readSelfCaps(domain));
     if (!self_caps_struct.crvm) return errors.E_PERM;
 
+    // Spec §[virtual_machine] VmCap layout: bit 0 = `policy`, bit 1 =
+    // `restart_policy`. `vm_ceiling` (self-handle field0 bits 48-55)
+    // gates only `policy`; `restart_policy` is gated separately by
+    // `restart_policy_ceiling.vm_restart_max` per §[restart_semantics]
+    // and is enforced below.
     const vm_ceiling: u8 = @truncate(readSelfField0(domain) >> 48);
-    if ((requested_caps & vm_ceiling) != requested_caps) return errors.E_PERM;
+    const requested_policy: u16 = requested_caps & 0x1;
+    const ceiling_policy: u16 = vm_ceiling & 0x1;
+    if ((requested_policy & ~ceiling_policy) != 0) return errors.E_PERM;
+
+    // Spec §[restart_semantics] test 04: `caps.restart_policy` (bit 1)
+    // must not exceed the calling domain's
+    // `restart_policy_ceiling.vm_restart_max` — a 1-bit field at
+    // self-handle field1 bit 23 (= bit 7 of the 16-bit
+    // restart_policy_ceiling sub-word at field1[16..31]).
+    const requested_vm_restart: u1 = @truncate((requested_caps >> 1) & 0x1);
+    const vm_restart_max: u1 = @truncate((readSelfField1(domain) >> 23) & 0x1);
+    if (requested_vm_restart > vm_restart_max) return errors.E_PERM;
 
     const policy_pf_obj = lookupPageFrame(domain, @truncate(policy_pf)) orelse
         return errors.E_BADCAP;
@@ -505,6 +520,10 @@ fn readSelfCaps(domain: *CapabilityDomain) u16 {
 
 fn readSelfField0(domain: *CapabilityDomain) u64 {
     return domain.user_table[0].field0;
+}
+
+fn readSelfField1(domain: *CapabilityDomain) u64 {
+    return domain.user_table[0].field1;
 }
 
 fn lookupHandle(domain: *CapabilityDomain, slot: u12, expected: CapabilityType) ?*KernelHandle {
