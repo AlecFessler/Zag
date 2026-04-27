@@ -622,9 +622,203 @@ pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
 }
 
 /// `reply_transfer` syscall handler. Spec §[reply].reply_transfer.
+///
+/// The pair entries were validated and stashed onto
+/// `caller.pending_pair_entries[0..n]` by the syscall layer
+/// (kernel/syscall/reply.zig::replyTransfer); each stashed entry
+/// carries the source's `ErasedSlabRef`, type tag, install caps, the
+/// `move` flag, and the source slot id in the caller's domain.
+///
+/// Order:
+///   1. Resolve the reply handle in caller's domain (no clear yet —
+///      test 11 demands the caller's table is unchanged on E_FULL).
+///      Pull the suspended sender out of the entry's typed ref and
+///      surface E_TERM if the sender slab generation moved (test 10).
+///   2. Lock the resumed sender's domain (== `sender.domain`) and
+///      reserve N contiguous slots via `allocContiguousFreeSlots`. On
+///      failure, drop locks and return E_FULL with the reply handle
+///      still in the caller's table and the stash untouched (test 11).
+///   3. With contiguous slots reserved, install each pair entry via
+///      `mintHandleAt` at `[tstart, tstart+N)` in the sender's domain.
+///   4. Drop the sender's CD lock; re-acquire the caller's CD lock to
+///      clear `move == 1` source slots and free the reply slot. The
+///      reply handle is consumed last so test 11's "[1] is NOT
+///      consumed on E_FULL" stays observably true above.
+///   5. Stage the §[event_state] return word (`pair_count`, `tstart`)
+///      on the resumed sender's `pending_event_word` so the iretq
+///      flush writes it to `[user_rsp + 0]` while CR3 is the sender's.
+///   6. Apply receiver-side GPR mods (gated by sender's
+///      `originating_write_cap`, mirroring `consumeReply`) and resume
+///      the sender via `resumeFromReply`.
 pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
-    _ = n;
-    return reply(caller, reply_handle);
+    const caller_cd_ref = caller.domain;
+    const slot: u12 = @truncate(reply_handle);
+
+    // Phase 1 — caller's CD: resolve the reply handle, capture the
+    // sender's typed ref, snapshot reply caps. Drop the CD lock before
+    // taking the sender's EC lock to honor the canonical CD-at-a-time
+    // discipline observed by `terminate` (which holds CD across an EC
+    // lock and so registers the order CD → EC with lockdep). Holding
+    // CD across an EC acquire here would otherwise invert that.
+    const cd_phase1 = caller_cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const entry = capability.resolveHandleOnDomain(cd_phase1, slot, .reply) orelse {
+        caller_cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    const sender_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
+        caller_cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    // Spec §[terminate] test 07: a reply handle whose suspended sender
+    // was destroyed via terminate carries the `abandoned` bit.
+    const reply_caps: ReplyCaps = @bitCast(Word0.caps(cd_phase1.user_table[slot].word0));
+    caller_cd_ref.unlock();
+
+    if (reply_caps.abandoned) {
+        // Spec §[reply_transfer] test 10 names E_TERM for the
+        // reply_transfer path when the suspended sender was terminated;
+        // §[terminate] test 07 names E_ABANDONED for the symmetric
+        // `reply` and `delete` paths. We honor reply_transfer's spec
+        // verbatim here — the abandoned bit is the witness that the
+        // sender was destroyed via `terminate`, and reply_transfer
+        // surfaces that as E_TERM. The reply slot is consumed in
+        // either case so subsequent ops don't loop on the same id.
+        const cd_clear = caller_cd_ref.lock(@src()) catch return errors.E_TERM;
+        if (capability.resolveHandleOnDomain(cd_clear, slot, .reply)) |e| {
+            capability.clearAndFreeSlot(cd_clear, slot, e);
+        }
+        caller_cd_ref.unlock();
+        caller.pending_pair_count = 0;
+        return errors.E_TERM;
+    }
+
+    // Phase 2 — sender liveness probe. Take the sender's EC lock just
+    // long enough to validate the slab gen and capture the sender's
+    // domain ref. The lock is dropped before the sender's CD is
+    // acquired — sender_cd_ref.lock validates that ref's own gen so
+    // the sender domain pointer doesn't dangle even with the EC lock
+    // released. Holding the EC lock here while taking the CD lock
+    // would invert the kernel-wide CD → EC order.
+    const sender = sender_ref.lock(@src()) catch {
+        const cd_clear = caller_cd_ref.lock(@src()) catch return errors.E_TERM;
+        if (capability.resolveHandleOnDomain(cd_clear, slot, .reply)) |e| {
+            capability.clearAndFreeSlot(cd_clear, slot, e);
+        }
+        caller_cd_ref.unlock();
+        caller.pending_pair_count = 0;
+        return errors.E_TERM;
+    };
+    const sender_cd_ref = sender.domain;
+    sender_ref.unlock();
+
+    // Phase 3 — sender's CD: reserve N contiguous slots and install
+    // each pair entry. CD-at-a-time: caller's CD is unlocked here, no
+    // other lock is held.
+    const sender_cd = sender_cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const tstart = capability_domain.allocContiguousFreeSlots(sender_cd, n) catch {
+        // Test 11: [1] is NOT consumed and the caller's table is
+        // unchanged on E_FULL.
+        sender_cd_ref.unlock();
+        caller.pending_pair_count = 0;
+        return errors.E_FULL;
+    };
+
+    var k: u8 = 0;
+    while (k < n) : (k += 1) {
+        const stash = caller.pending_pair_entries[k];
+        const target_slot: u12 = @intCast(@as(u16, tstart) + k);
+        capability_domain.mintHandleAt(
+            sender_cd,
+            target_slot,
+            stash.obj_ref,
+            stash.obj_type,
+            stash.caps,
+            0,
+            0,
+        );
+    }
+    sender_cd_ref.unlock();
+
+    // Phase 4 — caller's CD: clear `move = 1` source slots and consume
+    // the reply slot. Same single-CD-at-a-time pattern.
+    const cd_phase4 = caller_cd_ref.lock(@src()) catch {
+        // Caller's CD is gone mid-transfer. The sender-side install
+        // already committed; resume the sender so the test EC's death
+        // doesn't strand a parked sender forever.
+        caller.pending_pair_count = 0;
+        const sender2 = sender_ref.lock(@src()) catch return errors.OK;
+        defer sender_ref.unlock();
+        deliverReplyTransferResume(caller, sender2, n, tstart);
+        return errors.OK;
+    };
+    k = 0;
+    while (k < n) : (k += 1) {
+        const stash = caller.pending_pair_entries[k];
+        if (!stash.move) continue;
+        const src_slot = stash.src_slot;
+        if (capability.resolveHandleOnDomain(cd_phase4, src_slot, null)) |src_entry| {
+            capability.clearAndFreeSlot(cd_phase4, src_slot, src_entry);
+        }
+    }
+    if (capability.resolveHandleOnDomain(cd_phase4, slot, .reply)) |reply_entry| {
+        capability.clearAndFreeSlot(cd_phase4, slot, reply_entry);
+    }
+    caller_cd_ref.unlock();
+
+    caller.pending_pair_count = 0;
+
+    // Phase 5 — sender's EC: stage the §[event_state] return word and
+    // resume. Re-lock the sender; if the slab gen has moved between
+    // phases the sender was reaped concurrently, in which case the
+    // installed handles in the sender's CD become orphans (they share
+    // the domain's lifetime, so they'll be reclaimed when the domain
+    // dies). The reply handle is already consumed; surface OK so the
+    // caller observes a clean transfer.
+    const sender2 = sender_ref.lock(@src()) catch return errors.OK;
+    defer sender_ref.unlock();
+    deliverReplyTransferResume(caller, sender2, n, tstart);
+    return errors.OK;
+}
+
+/// Stage the resumed sender's syscall return state and re-enqueue them.
+/// Mirrors `consumeReply` for GPR write-back, plus stages the
+/// §[event_state] syscall return word with `pair_count`/`tstart` so
+/// the iretq flush surfaces the spec-mandated values to the sender.
+fn deliverReplyTransferResume(
+    caller: *ExecutionContext,
+    sender: *ExecutionContext,
+    pair_count: u8,
+    tstart: u12,
+) void {
+    // Stage the §[event_state] post-resume word for the sender. Field
+    // positions mirror the recv-side composition: pair_count at bits
+    // 12-19, tstart at bits 20-31. event_type/reply_handle_id are
+    // zeroed — the resumed sender is exiting `suspend`, not entering
+    // a recv, so those fields stay 0.
+    const ret_word: u64 =
+        (@as(u64, pair_count) << PAIR_COUNT_SHIFT) |
+        (@as(u64, tstart) << TSTART_SHIFT);
+    sender.pending_event_word = ret_word;
+    sender.pending_event_word_valid = true;
+
+    // Apply receiver-side GPR mods if the originating handle had
+    // write. Mirrors `consumeReply`: receiver's current syscall frame
+    // holds the post-recv, pre-reply_transfer GPR values; copy them
+    // into the sender's saved frame. Spec §[reply_transfer] test 14
+    // additionally pulls vreg 14 (RIP) from the receiver's user stack
+    // at `[user_rsp + 8]` and re-installs it onto the sender's saved
+    // RIP — the receiver may have rewritten the resume RIP between
+    // recv and reply_transfer. The receiver is the running EC on this
+    // core, so CR3 already references the receiver's address space and
+    // the user-stack read is safe via SMAP STAC/CLAC inside the helper.
+    if (sender.originating_write_cap) {
+        const sender_frame = sender.iret_frame orelse sender.ctx;
+        const receiver_frame = caller.iret_frame orelse caller.ctx;
+        arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
+        const new_rip = arch.syscall.readUserVreg14(receiver_frame);
+        arch.syscall.setEventRip(sender_frame, new_rip);
+    }
+    execution_context.resumeFromReply(sender, sender.originating_write_cap);
 }
 
 /// `bind_event_route` syscall handler. Spec §[event_route].bind_event_route.

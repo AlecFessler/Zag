@@ -179,6 +179,18 @@ pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
     };
 }
 
+/// Write the saved instruction pointer on a resumed sender's frame.
+/// Used by reply_transfer §[reply] test 14 to commit a write-cap
+/// receiver's vreg 14 modification onto the suspended EC's iret frame
+/// before `resumeFromReply` re-enqueues it.
+pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.setEventRip(ctx, value),
+        .aarch64 => aarch64.interrupts.setEventRip(ctx, value),
+        else => unreachable,
+    }
+}
+
 /// Write the event-state vreg 14 (x86-64 `[user_rsp + 8]`) / vreg 32
 /// (aarch64 `[user_sp + 8]`) slot on a receiving EC — the suspended
 /// EC's RIP/PC per Spec §[event_state]. MUST be called with the
@@ -191,6 +203,20 @@ pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
         .aarch64 => aarch64.interrupts.writeUserVreg14(ctx, value),
         else => unreachable,
     }
+}
+
+/// Read the event-state vreg 14 (x86-64 `[user_rsp + 8]`) / vreg 32
+/// (aarch64 `[user_sp + 8]`) slot on the receiving EC — used by
+/// reply_transfer §[reply] test 14 to harvest a receiver-side RIP
+/// modification and commit it onto the resumed sender's saved frame.
+/// Companion to `writeUserVreg14`; the same CR3/TTBR0 contract
+/// applies (caller MUST be in the receiver's address space).
+pub fn readUserVreg14(ctx: *const ArchCpuContext) u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.readUserVreg14(ctx),
+        .aarch64 => aarch64.interrupts.readUserVreg14(ctx),
+        else => unreachable,
+    };
 }
 
 /// Copy the §[event_state] GPR-backed vregs from `src` (the receiver's

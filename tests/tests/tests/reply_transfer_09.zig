@@ -107,17 +107,23 @@ fn issueReplyTransferDup(reply_id: u12, entry: u64) u64 {
 
     var rax_out: u64 = undefined;
     asm volatile (
-        \\ subq $920, %%rsp
-        \\ movq %[entry], 904(%%rsp)
-        \\ movq %[entry], 912(%%rsp)
-        \\ pushq %%rcx
-        \\ syscall
-        \\ addq $928, %%rsp
+    // Reserve 920 bytes: 8 for the syscall word at [rsp+0], plus
+    // 114 * 8 = 912 for vregs 14..127 starting at [rsp+8]. Vreg 126
+    // = [rsp + (126-13)*8] = [rsp+904]; vreg 127 = [rsp+912]. Write
+    // the word and the two pair-entry slots directly (no `pushq`)
+    // so post-allocation offsets coincide with the spec-mandated
+    // vreg offsets without an intervening 8-byte shift.
+    \\ subq $920, %%rsp
+    \\ movq %%rcx, (%%rsp)
+    \\ movq %[entry], 904(%%rsp)
+    \\ movq %[entry], 912(%%rsp)
+    \\ syscall
+    \\ addq $920, %%rsp
         : [rax] "={rax}" (rax_out),
         : [word] "{rcx}" (word),
           [entry] "r" (entry),
           [reply] "{rax}" (@as(u64, reply_id)),
-        : .{ .r11 = true, .memory = true });
+        : .{ .rcx = true, .r11 = true, .memory = true });
     return rax_out;
 }
 

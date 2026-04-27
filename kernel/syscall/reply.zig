@@ -174,9 +174,14 @@ pub fn replyTransfer(caller: *anyopaque, reply_handle: u64, n: u8) i64 {
 
     // Spec §[reply].reply_transfer per-entry gates (tests 05/06/07/08).
     // Resolved under the domain lock so the check is atomic against
-    // concurrent revoke/delete on the source handles.
+    // concurrent revoke/delete on the source handles. While the lock is
+    // held we also stash decoded entries on the caller's EC for the
+    // port-layer install pass — capturing each source's ErasedSlabRef
+    // here pins the underlying object across the upcoming reply ops
+    // even if the source slot is later cleared on a `move = 1` path.
     const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    if (validatePairEntrySources(cd, pair_entries)) |err| {
+    if (validatePairEntrySources(cd, ec, pair_entries)) |err| {
+        ec.pending_pair_count = 0;
         cd_ref.unlock();
         return err;
     }
@@ -197,16 +202,26 @@ fn validatePairEntryBits(entries: []const u64) ?i64 {
 /// Per-entry source-id resolution + caps subset + move/copy authority
 /// for `reply_transfer`. Spec §[reply].reply_transfer tests 05/06/07/08.
 /// Caller holds `cd._gen_lock`. Returns `null` on full pass; otherwise
-/// the first failing test's error code.
-fn validatePairEntrySources(cd: *CapabilityDomain, entries: []const u64) ?i64 {
-    for (entries) |entry| {
+/// the first failing test's error code. Stashes each decoded entry on
+/// `ec.pending_pair_entries` as a side effect — the kernel-side
+/// `port.replyTransfer` consumes the stash to install handles in the
+/// resumed sender's domain. `ec.pending_pair_count` is published only
+/// on full pass to keep partial failure observably equivalent to "no
+/// entries stashed" for cleanup / re-entry.
+fn validatePairEntrySources(
+    cd: *CapabilityDomain,
+    ec: *ExecutionContext,
+    entries: []const u64,
+) ?i64 {
+    var idx: usize = 0;
+    while (idx < entries.len) : (idx += 1) {
+        const entry = entries[idx];
         const slot: u12 = @truncate(entry & PAIR_SOURCE_MASK);
         const entry_caps: u16 = @truncate((entry >> 16) & 0xFFFF);
         const move_flag: bool = (entry & PAIR_MOVE_BIT) != 0;
 
         // Test 05: source handle must resolve in the caller's domain.
         const src = capability.resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
-        _ = src;
 
         const src_caps: u16 = @truncate(Word0.caps(cd.user_table[slot].word0));
 
@@ -225,7 +240,20 @@ fn validatePairEntrySources(cd: *CapabilityDomain, entries: []const u64) ?i64 {
         } else {
             if (!has_copy) return errors.E_PERM;
         }
+
+        // Stash the decoded entry. Captures the source object's
+        // ErasedSlabRef under `cd._gen_lock` so the gen baked into the
+        // ref matches a live object until at least the install phase.
+        const obj_type = Word0.typeTag(cd.user_table[slot].word0);
+        ec.pending_pair_entries[idx] = .{
+            .obj_ref = src.ref,
+            .obj_type = obj_type,
+            .caps = entry_caps,
+            .move = move_flag,
+            .src_slot = slot,
+        };
     }
+    ec.pending_pair_count = @intCast(entries.len);
     return null;
 }
 

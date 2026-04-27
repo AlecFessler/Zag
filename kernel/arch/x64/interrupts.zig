@@ -777,6 +777,13 @@ pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
     return ctx.rip;
 }
 
+/// Spec §[event_state] vreg 14 write into the resumed sender's saved
+/// frame. Used by reply_transfer test 14 to commit a write-cap
+/// receiver's RIP modification onto the suspended EC's iret frame.
+pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
+    ctx.rip = value;
+}
+
 /// Spec §[event_state] vreg 14 write — writes the suspended EC's RIP
 /// into the receiver's user stack at `[ctx.rsp + 8]`. STAC/CLAC
 /// bracket the write under SMAP; caller MUST ensure CR3 already
@@ -787,6 +794,20 @@ pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
     cpu.stac();
     @as(*u64, @ptrFromInt(ctx.rsp + 8)).* = value;
     cpu.clac();
+}
+
+/// Spec §[event_state] vreg 14 read — pulls the value the receiver
+/// wrote at `[ctx.rsp + 8]` between recv and reply / reply_transfer.
+/// Companion to `writeUserVreg14`. STAC/CLAC bracket the load under
+/// SMAP; caller MUST ensure CR3 already references the receiver's
+/// address space (the user stack page is only mapped there). Used
+/// by reply_transfer §[reply] test 14 to commit a receiver's RIP
+/// modification onto the resumed sender's saved frame.
+pub fn readUserVreg14(ctx: *const ArchCpuContext) u64 {
+    cpu.stac();
+    const v = @as(*u64, @ptrFromInt(ctx.rsp + 8)).*;
+    cpu.clac();
+    return v;
 }
 
 /// Copy the §[event_state] GPR-backed vregs (vregs 1..13 on x86-64:

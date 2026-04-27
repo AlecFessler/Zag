@@ -451,6 +451,13 @@ pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
     return ctx.elr_el1;
 }
 
+/// Spec §[event_state] vreg 32 write into the resumed sender's saved
+/// frame. Used by reply_transfer test 14 to commit a write-cap
+/// receiver's PC modification onto the suspended EC's saved frame.
+pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
+    ctx.elr_el1 = value;
+}
+
 /// Spec §[event_state] vreg 32 write — writes the suspended EC's PC
 /// into the receiver's user stack at `[ctx.sp_el0 + 8]`. Caller MUST
 /// ensure TTBR0 already references the receiver's address space (the
@@ -459,6 +466,14 @@ pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
 /// store is direct.
 pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
     @as(*u64, @ptrFromInt(ctx.sp_el0 + 8)).* = value;
+}
+
+/// Companion read for `writeUserVreg14`. Returns the value the
+/// receiver wrote at `[sp_el0 + 8]` so reply_transfer can harvest a
+/// vreg 32 modification (Spec §[reply] test 14) before resuming the
+/// sender. TTBR0 must reference the receiver's address space.
+pub fn readUserVreg14(ctx: *const ArchCpuContext) u64 {
+    return @as(*u64, @ptrFromInt(ctx.sp_el0 + 8)).*;
 }
 
 /// Copy the §[event_state] GPR-backed vregs (vregs 1..31 on aarch64:
