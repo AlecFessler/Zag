@@ -135,6 +135,7 @@ pub fn buildGraphWithStats(
     for (ir_graph.functions, 0..) |ir_fn, i| {
         var display_name: []const u8 = ir_fn.mangled;
         var def_loc: types.SourceLoc = ir_fn.def_loc orelse .{ .file = "<unknown>", .line = 0, .col = 0 };
+        var body_line_end: u32 = 0;
 
         if (ir_fn.def_loc) |loc| {
             const resolved = resolvePath(arena, &realpath_cache, loc.file) catch loc.file;
@@ -146,6 +147,7 @@ pub fn buildGraphWithStats(
                 // Substitute resolved file in def_loc so the frontend's
                 // /api/source endpoint sees a path it can open.
                 def_loc = .{ .file = resolved, .line = loc.line, .col = loc.col };
+                body_line_end = af.line_end;
             } else if (lookupByQName(arena, &ast_by_qname, ir_fn.mangled)) |af| {
                 // Fallback: name-based lookup. Snap the IR-reported def_loc
                 // onto the AST's truth so downstream consumers (intra
@@ -154,6 +156,7 @@ pub fn buildGraphWithStats(
                 matched += 1;
                 try matched_ast.put(af, {});
                 def_loc = .{ .file = af.file, .line = af.line_start, .col = 0 };
+                body_line_end = af.line_end;
             }
         }
 
@@ -166,6 +169,7 @@ pub fn buildGraphWithStats(
             .name = display_name,
             .mangled = ir_fn.mangled,
             .def_loc = def_loc,
+            .body_line_end = body_line_end,
             .is_entry = false,
             .entry_kind = null,
             .callees = callees,
@@ -198,6 +202,7 @@ pub fn buildGraphWithStats(
             .name = af.qualified_name,
             .mangled = af.qualified_name,
             .def_loc = .{ .file = af.file, .line = af.line_start, .col = 0 },
+            .body_line_end = af.line_end,
             .is_entry = false,
             .entry_kind = null,
             .callees = &.{},

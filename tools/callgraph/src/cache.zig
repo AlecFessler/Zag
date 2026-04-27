@@ -57,7 +57,7 @@ const SourceLoc = types.SourceLoc;
 
 pub const MAGIC: [8]u8 = .{ 'C', 'G', 'C', 'A', 'C', 'H', 'E', 0 };
 pub const TRAILER: [10]u8 = .{ 'C', 'G', 'C', 'A', 'C', 'H', 'E', 'E', 'N', 'D' };
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Path inputs the cache key is computed from.
 pub const KeyInputs = struct {
@@ -314,6 +314,7 @@ fn writeFunction(w: *Writer, f: Function) !void {
     try w.writeStr(f.name);
     try w.writeStr(f.mangled);
     try w.writeLoc(f.def_loc);
+    try w.writeU32(f.body_line_end);
     try w.writeU8(if (f.is_entry) 1 else 0);
     if (f.entry_kind) |k| {
         try w.writeU8(1);
@@ -552,6 +553,7 @@ fn readFunction(r: *Reader) !Function {
     const name = try r.readStr();
     const mangled = try r.readStr();
     const def_loc = try r.readLoc();
+    const body_line_end = try r.readU32();
     const is_entry = (try r.readU8()) != 0;
     const has_entry_kind = (try r.readU8()) != 0;
     const entry_kind: ?EntryKind = if (has_entry_kind) try r.readEnumU8(EntryKind) else null;
@@ -578,6 +580,7 @@ fn readFunction(r: *Reader) !Function {
         .name = name,
         .mangled = mangled,
         .def_loc = def_loc,
+        .body_line_end = body_line_end,
         .is_entry = is_entry,
         .entry_kind = entry_kind,
         .callees = callees,

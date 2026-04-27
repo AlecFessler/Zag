@@ -65,6 +65,13 @@ pub const Function = struct {
     name: []const u8,
     mangled: []const u8,
     def_loc: SourceLoc,
+    /// Line of the function's closing brace, sourced from the AST walker.
+    /// 0 when the join couldn't pin a matching AstFunction (rare — IR
+    /// fns whose def_loc didn't match any AST record). Consumers should
+    /// fall back to a heuristic when 0 (e.g. next-fn boundary).
+    /// Used by the review classifier to bound hunk-to-fn overlap to the
+    /// real body extent instead of the loose next-fn-boundary heuristic.
+    body_line_end: u32 = 0,
     is_entry: bool = false,
     entry_kind: ?EntryKind = null,
     callees: []EnrichedEdge,

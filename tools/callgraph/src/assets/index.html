@@ -122,6 +122,16 @@
       color: var(--fg-dim);
       font-style: italic;
     }
+    /* Review-coverage tints. Browsers vary in how aggressively they
+       restrict <option> styling, but background-color is reliable
+       enough across Chrome/Firefox to be useful — and the [AH] glyph
+       prefix in the option text means the indicator survives even
+       when the browser ignores the color. */
+    select#compare_commit option.opt_reviewed_mcp { color: #6fd17a; }
+    select#compare_commit option.opt_reviewed_http { color: #4a9eff; }
+    select#compare_commit option.opt_reviewed_mcp.opt_reviewed_http {
+      color: #b06ef0;
+    }
 
     .compare_status {
       color: var(--fg-dim);
@@ -1239,6 +1249,66 @@
     }
     .review_unit_row .unit_side_chip.side_live  { background: rgba(80, 180, 80, 0.18); color: #6fd17a; }
     .review_unit_row .unit_side_chip.side_older { background: rgba(220, 80, 80, 0.18); color: #f06060; }
+    /* Per-symbol review footer (summary textarea + Mark Reviewed
+       button), shown at the bottom of the review tracker once
+       /api/review/open has populated the item list. */
+    .review_footer {
+      padding: 8px 10px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .review_footer .review_summary_input {
+      width: 100%;
+      box-sizing: border-box;
+      background: var(--bg-input, #1a1d22);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 4px 6px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 10.5px;
+      resize: vertical;
+    }
+    .review_footer .review_summary_input:focus {
+      outline: none;
+      border-color: #4a9eff;
+    }
+    .review_footer .review_summary_readonly {
+      white-space: pre-wrap;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 10.5px;
+      color: var(--fg-dim);
+      padding: 4px 6px;
+      background: rgba(80, 180, 80, 0.05);
+      border-left: 2px solid #6fd17a;
+      border-radius: 2px;
+    }
+    .review_footer .review_complete_btn {
+      align-self: flex-end;
+      padding: 4px 12px;
+      background: #6fd17a;
+      color: #0a0a0a;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 11px;
+    }
+    .review_footer .review_complete_btn:hover:not(:disabled) {
+      background: #8ae29a;
+    }
+    .review_footer .review_complete_btn:disabled {
+      background: rgba(111, 209, 122, 0.25);
+      color: var(--fg-dim);
+      cursor: not-allowed;
+    }
+    .review_footer .review_complete_msg {
+      color: #6fd17a;
+      font-weight: 600;
+      font-size: 11px;
+    }
     /* Legacy classes kept for any in-flight transitional rendering. */
     .diff_changes_subrow {
       display: flex;

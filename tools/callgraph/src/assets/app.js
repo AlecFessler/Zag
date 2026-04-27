@@ -1020,56 +1020,13 @@
       const tdNum = document.createElement("td");
       tdNum.className = "source_gutter";
       tdNum.textContent = String(absLine);
-      // Review checkbox: drawn at the FIRST line of every unit whose
-      // start matches absLine on this pane's side. Click toggles the
-      // unit's reviewed state (POSTs to /api/review_state in parent
-      // mode, in-memory otherwise). When the unit is reviewed, the
-      // line(s) get a `.unit_reviewed` class so CSS can desaturate
-      // the diff tint and signal "I've looked at this".
-      const sideTag = diffOpts && diffOpts.side ? diffOpts.side : null;
-      if (sideTag === "new" || sideTag === "old") {
-        const fileRel = sideTag === "new" ?
-          defLocToRepoRel(file) :
-          secondaryPathToRepoRel(file);
-        if (fileRel && compareState.unitsByFileSide) {
-          const sideKey = sideTag === "new" ? "added" : "removed";
-          const unitsHere = unitsStartingAt(fileRel, sideKey, absLine);
-          if (unitsHere.length > 0) {
-            const u = unitsHere[0];
-            const cb = document.createElement("input");
-            cb.type = "checkbox";
-            cb.className = "unit_checkbox";
-            cb.dataset.unitId = u.id;
-            const rec = compareState.reviewed.get(u.id);
-            cb.checked = !!(rec && rec.reviewed);
-            if (rec && rec.at) {
-              const when = rec.at;
-              const who = rec.by || "";
-              cb.title = "reviewed" + (who ? " by " + who : "") +
-                " at " + when;
-            } else {
-              cb.title = "mark this " + u.kind + " hunk reviewed";
-            }
-            cb.addEventListener("click", function (e) {
-              e.stopPropagation();
-              toggleUnitReviewed(u.id, cb.checked);
-            });
-            tdNum.insertBefore(cb, tdNum.firstChild);
-            if (cb.checked) {
-              tr.classList.add("unit_reviewed");
-              // Also fade the trailing lines of the unit. We add the
-              // class on subsequent rows during the loop below by
-              // tracking `pendingReviewedLines`.
-            }
-          }
-        }
-        // Mark interior lines of any unit currently being-reviewed.
-        if (sideTag === "new" || sideTag === "old") {
-          if (isLineInsideReviewedUnit(file, sideTag, absLine)) {
-            tr.classList.add("unit_reviewed");
-          }
-        }
-      }
+      // Per-symbol review state lives in the right-side review panel
+      // (driven by /api/review/* with channel=http), not inline in the
+      // diff. The previous per-hunk-checkbox annotations were removed
+      // when the human review flow migrated to per-symbol items —
+      // checking off one hunk at a time doesn't compose with the
+      // symbol-level deps gate that the agent flow uses, and a panel
+      // checklist is easier to scan for "what's left to review".
 
       const tdCode = document.createElement("td");
       tdCode.className = "source_code";
@@ -2148,28 +2105,26 @@
     // Populated by recomputeDiffSets so the source pane can tint each
     // line as added/removed/unchanged. Empty when compare is off.
     hunksByFile: new Map(),
-    // Review unit catalog derived from hunksByFile in recomputeDiffSets.
-    // Each unit: { id, kind: "added"|"removed", file, new_start,
-    // new_count, old_start, old_count }. Stable IDs follow the schema
-    // <file>:<new_start>:<a|r> so they can be persisted across sessions
-    // (parent mode only; head mode is in-memory).
-    units: [],
-    // Map<unit_id, {file, kind, new_start, new_count, old_start,
-    // old_count}> for quick lookup by id.
-    unitById: new Map(),
-    // Per-(file, side) → [unit] lookup. Side is "added" (new side, primary
-    // pane) or "removed" (old side, secondary pane). Source rendering
-    // walks this to draw a checkbox at the start of each unit.
-    unitsByFileSide: new Map(),
-    // Map<unit_id, {reviewed, at, by}>. Loaded from /api/review_state in
-    // parent mode (and on POST responses). Head mode keeps it
-    // in-memory (toggles persist within the session only). Missing entry
-    // means "not reviewed yet" — equivalent to {reviewed: false}.
-    reviewed: new Map(),
-    // True when persistent review state is available (parent mode with
-    // both shas being full hex commits). When false, toggles still work
-    // but only in-memory.
-    canPersistReview: false,
+    // Per-symbol review for the http channel. Loaded from
+    // /api/review/open?sha=X&channel=http when entering parent mode
+    // with a ready-loaded commit. Items are server-classified per
+    // symbol (one per changed fn/type, plus orphan hunks).
+    //   sha            — commit being reviewed (== compareState.selectedSha)
+    //   status         — null | 'in_progress' | 'complete'
+    //   items          — [{id, kind, deps_kind, file, loc, qualified_name,
+    //                      deps_count, deps_required, deps_viewed,
+    //                      checked_off, trivial, notes}]
+    //   draftSummary   — local-only until user clicks Mark Reviewed
+    //   loading        — fetch in flight
+    //   error          — last error message, or null
+    review: {
+      sha: null,
+      status: null,
+      items: [],
+      draftSummary: "",
+      loading: false,
+      error: null,
+    },
   };
 
   function setCompareStatus(text, kind) {
@@ -2219,11 +2174,27 @@
       const truncated = subj.length > 60 ? subj.slice(0, 57) + "…" : subj;
       const compat = c.cg_compatible !== false; // default-true if absent
       const prefix = compat ? "" : "[no cg] ";
-      opt.textContent = `${prefix}${c.short}  ${truncated}`;
+      // Review badges: A=agent (mcp), H=human (http). Shown only when
+      // at least one channel has a `.md` artifact on disk. Empty when
+      // unreviewed so the dropdown stays clean.
+      const reviewers = c.reviewed_by || [];
+      const isMcp = reviewers.indexOf("mcp") >= 0;
+      const isHttp = reviewers.indexOf("http") >= 0;
+      const reviewBadge = (isMcp || isHttp)
+        ? `[${isMcp ? "A" : "·"}${isHttp ? "H" : "·"}] `
+        : "";
+      opt.textContent = `${prefix}${reviewBadge}${c.short}  ${truncated}`;
+      const reviewedNote = (isMcp && isHttp)
+        ? "\n\nReviewed by agent and human"
+        : isMcp ? "\n\nReviewed by agent"
+        : isHttp ? "\n\nReviewed by human"
+        : "";
       opt.title = compat
-        ? `${c.short}\n${c.author}  ${c.date}\n${subj}`
-        : `${c.short}\n${c.author}  ${c.date}\n${subj}\n\nThis commit predates the -Demit_ir kernel build option (commit 207770e), so the callgraph tool can't review it.`;
+        ? `${c.short}\n${c.author}  ${c.date}\n${subj}${reviewedNote}`
+        : `${c.short}\n${c.author}  ${c.date}\n${subj}\n\nThis commit predates the -Demit_ir kernel build option (commit 207770e), so the callgraph tool can't review it.${reviewedNote}`;
       if (!compat) opt.classList.add("opt_incompatible");
+      if (isMcp) opt.classList.add("opt_reviewed_mcp");
+      if (isHttp) opt.classList.add("opt_reviewed_http");
       els.compareCommit.appendChild(opt);
     }
   }
@@ -2634,14 +2605,21 @@
     compareState.changedFnNames = changedFnNames;
     compareState.changedDefIds = changedDefIds;
 
-    // Derive review-unit catalog from hunks. Each hunk yields up to two
-    // units: one "removed" (when old_count > 0) and one "added" (when
-    // new_count > 0). IDs are stable so the persistence file can key
-    // by them across sessions in parent mode.
-    rebuildUnitsFromHunks();
-    // Fetch persisted review state (parent mode only) — fire and forget;
-    // checkboxes update when the response arrives.
-    fetchReviewStateIfPersistable();
+    // Load (or create + load) the http-channel review for the
+    // selected commit. Parent mode only — head mode has no stable
+    // sha to attest against. Fires when the secondary commit is
+    // already 'ready'; otherwise we defer until load completes.
+    if (compareState.mode === "parent" && compareState.selectedSha) {
+      const sec_sha = secondarySha();
+      const sec_status = sec_sha ? compareState.statuses[sec_sha] : null;
+      if (sec_status && sec_status.status === "ready") {
+        loadHttpReview(compareState.selectedSha);
+      } else {
+        clearHttpReview();
+      }
+    } else {
+      clearHttpReview();
+    }
 
     // Build simpleName → Definition map for source-pane ident highlight.
     // We index by simpleName (last dotted segment of qualified_name) so a
@@ -2802,170 +2780,133 @@
     return null;
   }
 
-  function rebuildUnitsFromHunks() {
-    compareState.units = [];
-    compareState.unitById = new Map();
-    compareState.unitsByFileSide = new Map();
-    if (!compareState.hunksByFile) return;
-    for (const [path, hunks] of compareState.hunksByFile.entries()) {
-      for (const h of hunks) {
-        if (h.old_count > 0) {
-          const u = {
-            id: path + ":" + h.start + ":r",
-            kind: "removed",
-            file: path,
-            new_start: h.start,
-            new_count: h.count,
-            old_start: h.old_start,
-            old_count: h.old_count,
-          };
-          compareState.units.push(u);
-          compareState.unitById.set(u.id, u);
-          pushIntoFileSide(path, "removed", u);
-        }
-        if (h.count > 0) {
-          const u = {
-            id: path + ":" + h.start + ":a",
-            kind: "added",
-            file: path,
-            new_start: h.start,
-            new_count: h.count,
-            old_start: h.old_start,
-            old_count: h.old_count,
-          };
-          compareState.units.push(u);
-          compareState.unitById.set(u.id, u);
-          pushIntoFileSide(path, "added", u);
-        }
-      }
-    }
+  /** Reset the per-symbol review state. Called when leaving compare
+   *  mode, switching commits, or when the secondary build isn't ready
+   *  yet. Updates the panel so it doesn't show stale items. */
+  function clearHttpReview() {
+    compareState.review = {
+      sha: null,
+      status: null,
+      items: [],
+      draftSummary: "",
+      loading: false,
+      error: null,
+    };
+    if (typeof updateChangesPanel === "function") updateChangesPanel();
   }
 
-  function pushIntoFileSide(file, side, unit) {
-    const key = file + ":" + side;
-    if (!compareState.unitsByFileSide.has(key)) {
-      compareState.unitsByFileSide.set(key, []);
-    }
-    compareState.unitsByFileSide.get(key).push(unit);
-  }
-
-  /** Lookup units that start exactly at `line` on `side` of file. Used
-   *  by the source render to draw a checkbox at that line. Returns
-   *  empty array when no unit matches. */
-  function unitsStartingAt(file, side, line) {
-    const key = file + ":" + side;
-    const list = compareState.unitsByFileSide.get(key);
-    if (!list) return [];
-    return list.filter(function (u) {
-      const start = side === "added" ? u.new_start : u.old_start;
-      return start === line;
-    });
-  }
-
-  /** True when `line` (on `sideTag` "new"|"old" of `filePath`) is inside
-   *  any unit whose reviewed state is true. Used by the source render
-   *  to apply `.unit_reviewed` to interior lines of reviewed units, so
-   *  the entire diff hunk visibly fades, not just the first row. */
-  function isLineInsideReviewedUnit(filePath, sideTag, line) {
-    const fileRel = sideTag === "new"
-      ? defLocToRepoRel(filePath)
-      : secondaryPathToRepoRel(filePath);
-    if (!fileRel) return false;
-    const sideKey = sideTag === "new" ? "added" : "removed";
-    const list = compareState.unitsByFileSide.get(fileRel + ":" + sideKey);
-    if (!list) return false;
-    for (const u of list) {
-      const start = sideKey === "added" ? u.new_start : u.old_start;
-      const count = sideKey === "added" ? u.new_count : u.old_count;
-      if (count === 0) continue;
-      if (line < start || line >= start + count) continue;
-      const rec = compareState.reviewed.get(u.id);
-      if (rec && rec.reviewed) return true;
-    }
-    return false;
-  }
-
-  async function fetchReviewStateIfPersistable() {
-    const pair = reviewPair();
-    compareState.canPersistReview = pair != null;
-    if (!pair) {
-      // Head mode: keep an empty in-memory state. We DON'T clobber an
-      // existing in-session reviewed map — it's session-only by design.
+  /** Open (or re-open) the http-channel review for `sha` and load its
+   *  classified item list. The server creates the channel on first
+   *  call and persists it under .callgraph/review/<sha>.json — so a
+   *  subsequent reload sees the same items + any check-offs the user
+   *  recorded. Idempotent: re-calling for an in-progress channel
+   *  returns the existing state without re-classifying. */
+  async function loadHttpReview(sha) {
+    if (!sha) {
+      clearHttpReview();
       return;
     }
-    try {
-      const url = "/api/review_state?sha_a=" + encodeURIComponent(pair.sha_a) +
-        "&sha_b=" + encodeURIComponent(pair.sha_b);
-      const r = await fetch(url);
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      const j = await r.json();
-      compareState.reviewed = new Map();
-      const units = (j && j.units) || {};
-      for (const id of Object.keys(units)) {
-        compareState.reviewed.set(id, units[id]);
-      }
-      // Refresh whichever surfaces care about reviewed state.
-      if (typeof rerenderSourceForReview === "function") rerenderSourceForReview();
-    } catch (err) {
-      console.error("/api/review_state GET failed", err);
-    }
-  }
-
-  /** Toggle a unit's reviewed state. Updates compareState.reviewed
-   *  immediately for snappy UI, then POSTs to the server (parent mode
-   *  only — head mode is in-memory). On success the server response
-   *  is the new authoritative state; we fold it back in. */
-  async function toggleUnitReviewed(unitId, reviewed) {
-    const prior = compareState.reviewed.get(unitId);
-    compareState.reviewed.set(unitId, {
-      reviewed: !!reviewed,
-      at: prior ? prior.at : "",
-      by: prior ? prior.by : "",
-    });
-    rerenderSourceForReview();
-
-    if (!compareState.canPersistReview) return;
-    const pair = reviewPair();
-    if (!pair) return;
-    try {
-      const url = "/api/review_state?sha_a=" + encodeURIComponent(pair.sha_a) +
-        "&sha_b=" + encodeURIComponent(pair.sha_b);
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          unit_id: unitId,
-          reviewed: !!reviewed,
-          by: "",
-        }),
-      });
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      const j = await r.json();
-      const units = (j && j.units) || {};
-      compareState.reviewed = new Map();
-      for (const id of Object.keys(units)) {
-        compareState.reviewed.set(id, units[id]);
-      }
-      rerenderSourceForReview();
-    } catch (err) {
-      console.error("/api/review_state POST failed", err);
-      // Roll back the optimistic update.
-      if (prior) compareState.reviewed.set(unitId, prior);
-      else compareState.reviewed.delete(unitId);
-      rerenderSourceForReview();
-    }
-  }
-
-  /** Re-render the currently-displayed source so checkbox state in the
-   *  gutter reflects the latest reviewed map. Cheaper to refetch the
-   *  same source than to traverse and patch checkboxes in place. Also
-   *  refreshes the review tracker so its progress counters and group
-   *  rollups reflect the toggle. */
-  function rerenderSourceForReview() {
+    compareState.review.loading = true;
+    compareState.review.sha = sha;
+    compareState.review.error = null;
     if (typeof updateChangesPanel === "function") updateChangesPanel();
-    if (!els.infoSource || els.infoSource.children.length === 0) return;
-    if (!lastFetchedSource.file) return;
-    fetchSource(lastFetchedSource.file, 1, 10000000, lastFetchedSource.line || 1);
+    try {
+      const r = await fetch("/api/review/open?sha=" + encodeURIComponent(sha) +
+        "&channel=http");
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error("HTTP " + r.status + ": " + txt.slice(0, 200));
+      }
+      const j = await r.json();
+      // Stale-response guard: user may have switched commits while
+      // this fetch was in flight. Drop the result if so.
+      if (compareState.review.sha !== sha) return;
+      const ch = (j.channels && j.channels.http) || null;
+      compareState.review = {
+        sha: sha,
+        status: ch ? ch.status : null,
+        items: ch ? (ch.items || []) : [],
+        draftSummary: ch && ch.summary ? ch.summary : "",
+        loading: false,
+        error: null,
+      };
+    } catch (err) {
+      if (compareState.review.sha !== sha) return;
+      compareState.review.loading = false;
+      compareState.review.error = String(err);
+    }
+    if (typeof updateChangesPanel === "function") updateChangesPanel();
+  }
+
+  /** Toggle a per-symbol item. Optimistic update for snappy UI;
+   *  rolls back on failure. The server enforces no gate for the http
+   *  channel (humans don't have to call review_deps first), so this
+   *  is a simple set-and-forget. */
+  async function toggleItem(itemId, checked) {
+    const sha = compareState.review.sha;
+    if (!sha) return;
+    const item = compareState.review.items.find(function (it) {
+      return it.id === itemId;
+    });
+    if (!item) return;
+    const prior = item.checked_off;
+    item.checked_off = !!checked;
+    if (typeof updateChangesPanel === "function") updateChangesPanel();
+    try {
+      const url = "/api/review/checkoff?sha=" + encodeURIComponent(sha) +
+        "&item_id=" + encodeURIComponent(itemId) +
+        "&channel=http&state=" + (checked ? "on" : "off");
+      const r = await fetch(url, { method: "POST" });
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error("HTTP " + r.status + ": " + txt.slice(0, 200));
+      }
+      const j = await r.json();
+      if (compareState.review.sha !== sha) return;
+      const ch = (j.channels && j.channels.http) || null;
+      if (ch) {
+        compareState.review.items = ch.items || [];
+        compareState.review.status = ch.status;
+      }
+    } catch (err) {
+      if (compareState.review.sha === sha && item) item.checked_off = prior;
+      console.error("checkoff failed:", err);
+    }
+    if (typeof updateChangesPanel === "function") updateChangesPanel();
+  }
+
+  /** Finalize the http-channel review: writes <sha>.http.md to the
+   *  store. Fails (server-side) if any item is still unchecked. On
+   *  success, refreshes the commit list so the dropdown badge appears
+   *  and reloads the review state to show 'complete'. */
+  async function completeHttpReview() {
+    const sha = compareState.review.sha;
+    if (!sha) return;
+    const summary = compareState.review.draftSummary || "";
+    compareState.review.error = null;
+    if (typeof updateChangesPanel === "function") updateChangesPanel();
+    try {
+      const url = "/api/review/complete?sha=" + encodeURIComponent(sha) +
+        "&channel=http&summary=" + encodeURIComponent(summary);
+      const r = await fetch(url, { method: "POST" });
+      if (!r.ok) {
+        const txt = await r.text();
+        compareState.review.error = "Complete failed (" + r.status + "): " +
+          txt.slice(0, 400);
+        if (typeof updateChangesPanel === "function") updateChangesPanel();
+        return;
+      }
+      // Reload review state to pick up the new 'complete' status, and
+      // refresh the commit list so the [·H] badge appears immediately.
+      await loadHttpReview(sha);
+      await fetchCommitsList();
+      populateCommitDropdown();
+      // Restore selection (populateCommitDropdown rebuilds <option>s).
+      if (els.compareCommit) els.compareCommit.value = compareState.selectedSha || "";
+    } catch (err) {
+      compareState.review.error = String(err);
+      if (typeof updateChangesPanel === "function") updateChangesPanel();
+    }
   }
 
   /** Push the updated isChangedFn predicate into traceMode and force a
@@ -2990,18 +2931,18 @@
     updateChangesPanel();
   }
 
-  /** Render the review tracker above the primary trace pane. Lists
-   *  every reviewable Unit (diff hunk) reachable from the current entry,
-   *  grouped file → containing fn → unit. Each unit row carries a
-   *  checkbox bound to compareState.reviewed (server-persisted in parent
-   *  mode) plus a click-to-jump that scrolls the source pane to the
-   *  hunk's start line. File and fn group headers carry rollup
-   *  counters and a "mark all" button. The panel header shows overall
-   *  progress as "X of Y reviewed" plus a thin progress bar.
+  /** Render the review tracker. Lists every per-symbol item the
+   *  classifier produced for the selected commit's http channel,
+   *  grouped by file. Each row carries a checkbox bound to the
+   *  per-channel store (POSTs /api/review/checkoff?channel=http) plus
+   *  a click-to-jump that scrolls the source pane to the item's
+   *  starting line. The summary textarea + "Mark Reviewed" button at
+   *  the bottom finalize the channel via /api/review/complete (which
+   *  writes <sha>.http.md — that's what flips the dropdown badge to
+   *  show this commit as human-reviewed).
    *
-   *  Rendering is recomputed in full on every call — cheap relative to
-   *  the rest of the diff path, and lets the source-gutter checkbox
-   *  toggles re-call this and stay in sync without per-row patching. */
+   *  Rendering is recomputed in full on every call — cheap, and lets
+   *  toggle/load handlers re-call this without per-row patching. */
   function updateChangesPanel() {
     if (!els.diffChangesPanel) return;
     const show = function (visible) {
@@ -3009,261 +2950,93 @@
         els.reviewTrackerCol.style.display = visible ? "" : "none";
       }
     };
-    if (compareState.mode === "off" || compareState.changedFnIds.size === 0) {
+    // Per-symbol review is parent-compare-mode only — head mode has no
+    // stable sha to attest against, and "compare off" has nothing to
+    // review.
+    if (compareState.mode !== "parent" || !compareState.review.sha) {
       show(false);
       return;
     }
-    if (currentEntryFnId == null) {
-      show(false);
-      return;
-    }
-
-    // BFS from currentEntryFnId over direct/dispatch callees, collecting
-    // any fn that's in changedFnIds.
-    const root = currentEntryFnId;
-    const visited = new Set([root]);
-    const queue = [root];
-    const found = [];
-    if (compareState.changedFnIds.has(root)) {
-      const f = fnById.get(root);
-      if (f) found.push(f);
-    }
-    while (queue.length > 0) {
-      const id = queue.shift();
-      const fn = fnById.get(id);
-      if (!fn) continue;
-      for (const c of (fn.callees || [])) {
-        const to = c.to;
-        if (to == null) continue;
-        if (visited.has(to)) continue;
-        visited.add(to);
-        queue.push(to);
-        if (compareState.changedFnIds.has(to)) {
-          const tfn = fnById.get(to);
-          if (tfn) found.push(tfn);
-        }
-      }
-    }
-    // De-duplicate by qualified name; the IR can emit one Function per
-    // generic instantiation (same name, same def_loc) which would clutter
-    // the list.
-    const seenFn = new Set();
-    const reachableFns = [];
-    for (const f of found) {
-      const key = f.name || f.mangled || ("id:" + f.id);
-      if (seenFn.has(key)) continue;
-      seenFn.add(key);
-      reachableFns.push(f);
-    }
-
-    // Build per-file fn line ranges via next-fn-start-1, used both for
-    // "own-body unit" matching and for inferring a unit's containing fn
-    // when grouping.
-    const fnEndLineByFnId = new Map();
-    const fnsByPath = new Map();
-    for (const f of (graph.functions || [])) {
-      const rel = defLocToRepoRel(f.def_loc && f.def_loc.file);
-      if (!rel) continue;
-      if (!fnsByPath.has(rel)) fnsByPath.set(rel, []);
-      fnsByPath.get(rel).push(f);
-    }
-    for (const list of fnsByPath.values()) {
-      list.sort(function (a, b) {
-        return (a.def_loc.line || 0) - (b.def_loc.line || 0);
-      });
-      for (let i = 0; i < list.length; i += 1) {
-        const startLine = list[i].def_loc.line || 0;
-        const endLine = i + 1 < list.length
-          ? Math.max(startLine, (list[i + 1].def_loc.line || 0) - 1)
-          : Number.MAX_SAFE_INTEGER;
-        fnEndLineByFnId.set(list[i].id, endLine);
-      }
-    }
-
-    // defId → Definition record (line range + name) for resolving
-    // dep-def units back to their source label.
-    const defById = new Map();
-    for (const def of (graph.definitions || [])) defById.set(def.id, def);
-
-    // Walk reachable fns and collect every contributing unit. We attach
-    // unit → contributingFn pairs so the renderer can group under the
-    // fn each contribution is "for". A given unit can appear under
-    // multiple fns (e.g. a struct edit flags every dependent fn) — we
-    // record each (unit, fn) pair separately.
-    //
-    // Each contribution: { unit, kind, file, line, fn, dep } where
-    //   - unit is the unit record (may be null for synthetic "no unit
-    //     overlaps the def" fallbacks),
-    //   - kind ∈ {"added", "removed", "dep"},
-    //   - dep is the Definition record when kind === "dep".
-    const contribs = [];
-    for (const fn of reachableFns) {
-      const fnFileRel = defLocToRepoRel(fn.def_loc && fn.def_loc.file);
-      const fnStart = fn.def_loc ? (fn.def_loc.line || 0) : 0;
-      const fnEnd = fnEndLineByFnId.get(fn.id) || fnStart;
-
-      // Own-body units. Match by repo-relative path; fnStart/fnEnd are
-      // LIVE-side line numbers, so we test against the unit's new_start
-      // (the position in the new file). For removed-only hunks
-      // new_start is the position where the deletion sits in the new
-      // file — close enough to belong to the same fn for grouping
-      // purposes.
-      if (fnFileRel) {
-        for (const u of (compareState.units || [])) {
-          if (u.file !== fnFileRel) continue;
-          const matchLine = u.new_start || u.old_start || 0;
-          if (matchLine < fnStart || matchLine > fnEnd) continue;
-          contribs.push(makeContrib(u, "own", fn, null));
-        }
-      }
-
-      // Dep-def units. Iterate fn.def_deps ∩ changedDefIds. Definition
-      // records store absolute paths (`/home/alec/Zag/...`); units use
-      // repo-relative (`kernel/...`). Normalize before matching.
-      for (const did of (fn.def_deps || [])) {
-        if (!compareState.changedDefIds.has(did)) continue;
-        const def = defById.get(did);
-        if (!def) continue;
-        const defFileRel = defLocToRepoRel(def.file) || def.file;
-        const defStart = def.line_start || 0;
-        const defEnd = def.line_end || defStart;
-        let matched = 0;
-        for (const u of (compareState.units || [])) {
-          if (u.file !== defFileRel) continue;
-          const matchLine = u.new_start || u.old_start || 0;
-          if (matchLine < defStart || matchLine > defEnd) continue;
-          contribs.push(makeContrib(u, "dep", fn, def));
-          matched += 1;
-        }
-        if (matched === 0) {
-          // Fallback row when no unit cleanly overlaps the def — give
-          // the user a jump target on the def's first line in both
-          // sides.
-          contribs.push({
-            unit: null,
-            relation: "dep",
-            file: defFileRel,
-            unitKind: "dep",
-            displayLine: defStart,
-            displaySide: "live",
-            liveLine: defStart,
-            olderLine: defStart,
-            fn: fn,
-            dep: def,
-          });
-        }
-      }
-    }
-
-    /** Build a contribution record from a real unit. The unit's kind
-     *  ("added" | "removed") drives which side's line number we
-     *  surface — for a removed hunk the "removed text" actually sits
-     *  on the OLDER side at old_start; new_start is just the position
-     *  in the post-edit file where the deletion happened, which is
-     *  confusing as a label. Click handlers also pass both lines so
-     *  each pane scrolls to where the change is on its own side. */
-    function makeContrib(u, relation, fn, def) {
-      const liveLine = u.new_start || 0;
-      const olderLine = u.old_start || 0;
-      const isAdd = u.kind === "added";
-      return {
-        unit: u,
-        relation: relation, // "own" | "dep"
-        unitKind: u.kind,   // "added" | "removed"
-        file: u.file,
-        liveLine: liveLine,
-        olderLine: olderLine,
-        displayLine: isAdd ? liveLine : olderLine,
-        displaySide: isAdd ? "live" : "older",
-        fn: fn,
-        dep: def,
-      };
-    }
-
-    if (contribs.length === 0) {
-      show(true);
-      els.diffChangesList.innerHTML = "";
-      const empty = document.createElement("div");
-      empty.className = "diff_changes_empty";
-      empty.textContent = "No reviewable hunks reachable from this entry.";
-      els.diffChangesList.appendChild(empty);
-      if (els.diffChangesCount) els.diffChangesCount.textContent = "0 of 0";
-      if (els.reviewProgressBar) els.reviewProgressBar.style.display = "none";
-      return;
-    }
-
-    // Group by file → fn (under each contribution's fn, since the same
-    // dep unit can appear under multiple fns). Within fn, sort by line.
-    const grouped = new Map(); // file → Map(fnKey → { fn, contribs[] })
-    for (const c of contribs) {
-      if (!grouped.has(c.file)) grouped.set(c.file, new Map());
-      const fnMap = grouped.get(c.file);
-      const fnKey = c.fn.name || c.fn.mangled || ("id:" + c.fn.id);
-      if (!fnMap.has(fnKey)) fnMap.set(fnKey, { fn: c.fn, contribs: [] });
-      fnMap.get(fnKey).contribs.push(c);
-    }
-    // Compute total unique-unit count for the panel-level progress bar.
-    // A single unit shared across multiple fns counts once for the
-    // overall denominator; each row still has its own checkbox but they
-    // all bind to the same compareState.reviewed entry.
-    const allUnitIds = new Set();
-    for (const c of contribs) {
-      if (c.unit) allUnitIds.add(c.unit.id);
-    }
-    const totalUnique = allUnitIds.size;
-    let reviewedUnique = 0;
-    for (const id of allUnitIds) {
-      const r = compareState.reviewed.get(id);
-      if (r && r.reviewed) reviewedUnique += 1;
-    }
-
     show(true);
+
+    const review = compareState.review;
+    const items = review.items || [];
+    const total = items.length;
+    let done = 0;
+    for (const it of items) if (it.checked_off) done += 1;
+    const isComplete = review.status === "complete";
+
     if (els.diffChangesCount) {
-      els.diffChangesCount.textContent = reviewedUnique + " of " + totalUnique +
-        (totalUnique > 0
-          ? "  (" + Math.round(100 * reviewedUnique / totalUnique) + "%)"
-          : "");
+      let txt;
+      if (review.loading) txt = "loading…";
+      else if (review.error) txt = "error";
+      else if (total === 0) txt = "0 of 0";
+      else txt = done + " of " + total +
+        "  (" + Math.round(100 * done / total) + "%)";
+      els.diffChangesCount.textContent = txt;
     }
     if (els.reviewProgressBar) {
-      els.reviewProgressBar.style.display = totalUnique > 0 ? "" : "none";
+      els.reviewProgressBar.style.display = (total > 0 ? "" : "none");
     }
     if (els.reviewProgressFill) {
-      const pct = totalUnique > 0 ? (100 * reviewedUnique / totalUnique) : 0;
+      const pct = total > 0 ? (100 * done / total) : 0;
       els.reviewProgressFill.style.width = pct.toFixed(1) + "%";
     }
+
     els.diffChangesList.innerHTML = "";
 
-    // Render: file groups in alphabetical order, fn groups in line
-    // order within file, contribs in line order within fn.
+    if (review.error) {
+      const err = document.createElement("div");
+      err.className = "diff_changes_empty";
+      err.style.color = "var(--indirect)";
+      err.textContent = review.error;
+      els.diffChangesList.appendChild(err);
+      return;
+    }
+    if (review.loading) {
+      const loading = document.createElement("div");
+      loading.className = "diff_changes_empty";
+      loading.textContent = "loading review…";
+      els.diffChangesList.appendChild(loading);
+      return;
+    }
+    if (total === 0) {
+      const empty = document.createElement("div");
+      empty.className = "diff_changes_empty";
+      empty.textContent = "No reviewable items for this commit.";
+      els.diffChangesList.appendChild(empty);
+      return;
+    }
+
+    // Group items by file. Within file, sort by start line (parsed
+    // from loc "L<start>-L<end>"). Each row is one symbol/orphan
+    // hunk; checking it off POSTs to /api/review/checkoff?channel=http.
+    const grouped = new Map();
+    for (const it of items) {
+      const f = it.file || "(unknown)";
+      if (!grouped.has(f)) grouped.set(f, []);
+      grouped.get(f).push(it);
+    }
     const sortedFiles = Array.from(grouped.keys()).sort();
+
     for (const file of sortedFiles) {
-      const fnMap = grouped.get(file);
-      const fnEntries = Array.from(fnMap.values());
-      fnEntries.sort(function (a, b) {
-        return (a.fn.def_loc.line || 0) - (b.fn.def_loc.line || 0);
+      const list = grouped.get(file);
+      list.sort(function (a, b) {
+        const la = parseInt((a.loc || "").replace(/^L/, ""), 10) || 0;
+        const lb = parseInt((b.loc || "").replace(/^L/, ""), 10) || 0;
+        return la - lb;
       });
 
-      // File-group rollup: count of unique units in this file group +
-      // how many are reviewed.
-      const fileUnitIds = new Set();
-      for (const fnEntry of fnEntries) {
-        for (const c of fnEntry.contribs) {
-          if (c.unit) fileUnitIds.add(c.unit.id);
-        }
-      }
-      let fileReviewed = 0;
-      for (const id of fileUnitIds) {
-        const r = compareState.reviewed.get(id);
-        if (r && r.reviewed) fileReviewed += 1;
-      }
-      const fileTotal = fileUnitIds.size;
+      const fileTotal = list.length;
+      let fileDone = 0;
+      for (const it of list) if (it.checked_off) fileDone += 1;
 
       const fileGroup = document.createElement("div");
       fileGroup.className = "review_file_group";
 
       const fileHeader = document.createElement("div");
       fileHeader.className = "review_file_header";
-      if (fileTotal > 0 && fileReviewed === fileTotal) {
+      if (fileDone === fileTotal && fileTotal > 0) {
         fileHeader.classList.add("fully_reviewed");
       }
       const fileName = document.createElement("span");
@@ -3273,230 +3046,142 @@
 
       const fileProgress = document.createElement("span");
       fileProgress.className = "file_progress";
-      fileProgress.textContent = fileReviewed + " of " + fileTotal;
+      fileProgress.textContent = fileDone + " of " + fileTotal;
       fileHeader.appendChild(fileProgress);
 
-      const fileMarkBtn = document.createElement("button");
-      fileMarkBtn.className = "review_group_action";
-      fileMarkBtn.type = "button";
-      fileMarkBtn.textContent = (fileReviewed === fileTotal && fileTotal > 0)
-        ? "unmark file"
-        : "mark file";
-      fileMarkBtn.addEventListener("click", function (ev) {
-        ev.stopPropagation();
-        // Toggle direction: if any unit in the file is unreviewed, mark
-        // the rest reviewed; otherwise unmark all.
-        const targetState = !(fileTotal > 0 && fileReviewed === fileTotal);
-        for (const id of fileUnitIds) {
-          const cur = compareState.reviewed.get(id);
-          const isReviewed = !!(cur && cur.reviewed);
-          if (isReviewed !== targetState) toggleUnitReviewed(id, targetState);
-        }
-      });
-      fileHeader.appendChild(fileMarkBtn);
-
       fileHeader.addEventListener("click", function () {
-        // Click on file header opens the file in both panes (live +
-        // older) at line 1 — handy for browsing context.
         els.info.classList.add("visible");
         fetchSource(file, 1, 10000000, 1, { secondaryByFile: file });
       });
       fileGroup.appendChild(fileHeader);
 
-      for (const fnEntry of fnEntries) {
-        const fn = fnEntry.fn;
-        const cs = fnEntry.contribs.slice();
-        cs.sort(function (a, b) {
-          // Own units first, then dep, then by display line so the
-          // visual order tracks where the user will see the hunk.
-          if (a.relation === "dep" && b.relation !== "dep") return 1;
-          if (a.relation !== "dep" && b.relation === "dep") return -1;
-          return a.displayLine - b.displayLine;
+      for (const it of list) {
+        const row = document.createElement("div");
+        row.className = "review_unit_row";
+        if (it.checked_off) row.classList.add("unit_reviewed");
+
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.className = "unit_checkbox";
+        cb.dataset.itemId = it.id;
+        cb.checked = !!it.checked_off;
+        cb.disabled = isComplete;
+        cb.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          toggleItem(it.id, cb.checked);
+        });
+        row.appendChild(cb);
+
+        // Glyph follows item kind. Symbol additions/removals get the
+        // diff-tinted +/− glyph; in-place body edits get Δ; type
+        // changes get T (purple, like dep edits in the old UI);
+        // orphan hunks get a centered dot.
+        const glyph = document.createElement("span");
+        let glyphClass, glyphText;
+        switch (it.kind) {
+          case "symbol_added":     glyphClass = "added";   glyphText = "+"; break;
+          case "symbol_removed":   glyphClass = "removed"; glyphText = "−"; break;
+          case "symbol_signature": glyphClass = "added";   glyphText = "Δ"; break;
+          case "symbol_body":      glyphClass = "added";   glyphText = "Δ"; break;
+          case "type_changed":     glyphClass = "dep";     glyphText = "T"; break;
+          case "orphan_hunk":
+          default:                 glyphClass = "dep";     glyphText = "·"; break;
+        }
+        glyph.className = "unit_glyph " + glyphClass;
+        glyph.textContent = glyphText;
+        row.appendChild(glyph);
+
+        const label = document.createElement("span");
+        label.className = "unit_label";
+        label.textContent = it.qualified_name
+          ? it.qualified_name + "  " + (it.loc || "")
+          : (it.loc || "(no loc)") + " — orphan";
+        row.appendChild(label);
+
+        if (it.trivial) {
+          const trivial = document.createElement("span");
+          trivial.className = "unit_side_chip side_live";
+          trivial.textContent = "trivial";
+          row.appendChild(trivial);
+        } else if (it.deps_kind && it.deps_kind !== "none") {
+          // Surface deps progress for visibility — humans aren't gated
+          // by it (the http channel skips the deps-viewed check), but
+          // it's a useful "how much context is this change"
+          // signal at a glance.
+          const deps = document.createElement("span");
+          deps.className = "unit_dep_via";
+          const required = it.deps_required ? it.deps_required.length : (it.deps_count || 0);
+          deps.textContent = "deps " + required + " (" + it.deps_kind + ")";
+          row.appendChild(deps);
+        }
+
+        const tooltip = [
+          it.kind,
+          (it.qualified_name || "(orphan)") + "  " +
+            shortenFile(file) + ":" + (it.loc || ""),
+        ];
+        if (it.trivial) tooltip.push("trivial");
+        if (it.notes) tooltip.push("notes: " + it.notes);
+        row.title = tooltip.join(" · ");
+
+        row.addEventListener("click", function () {
+          els.info.classList.add("visible");
+          const m = (it.loc || "").match(/^L(\d+)/);
+          const startLine = m ? parseInt(m[1], 10) : 1;
+          setLastClickedFn(it.qualified_name || null);
+          fetchSource(file, 1, 10000000, startLine, {
+            secondaryByFile: file,
+            secondaryHighlight: startLine,
+          });
         });
 
-        // Per-fn rollup: unique unit count + reviewed.
-        const fnUnitIds = new Set();
-        for (const c of cs) {
-          if (c.unit) fnUnitIds.add(c.unit.id);
-        }
-        let fnReviewed = 0;
-        for (const id of fnUnitIds) {
-          const r = compareState.reviewed.get(id);
-          if (r && r.reviewed) fnReviewed += 1;
-        }
-        const fnTotal = fnUnitIds.size;
-
-        const fnGroup = document.createElement("div");
-        fnGroup.className = "review_fn_group";
-
-        const fnHeader = document.createElement("div");
-        fnHeader.className = "review_fn_header";
-        if (fnTotal > 0 && fnReviewed === fnTotal) {
-          fnHeader.classList.add("fully_reviewed");
-        }
-        const fnName = document.createElement("span");
-        fnName.className = "fn_name";
-        fnName.textContent = fn.name || fn.mangled || ("#" + fn.id);
-        fnHeader.appendChild(fnName);
-
-        const fnProgress = document.createElement("span");
-        fnProgress.className = "fn_progress";
-        fnProgress.textContent = fnReviewed + " of " + fnTotal;
-        fnHeader.appendChild(fnProgress);
-
-        if (fnTotal > 0) {
-          const fnMarkBtn = document.createElement("button");
-          fnMarkBtn.className = "review_group_action";
-          fnMarkBtn.type = "button";
-          fnMarkBtn.textContent = fnReviewed === fnTotal ? "unmark fn" : "mark fn";
-          fnMarkBtn.addEventListener("click", function (ev) {
-            ev.stopPropagation();
-            const targetState = !(fnTotal > 0 && fnReviewed === fnTotal);
-            for (const id of fnUnitIds) {
-              const cur = compareState.reviewed.get(id);
-              const isReviewed = !!(cur && cur.reviewed);
-              if (isReviewed !== targetState) toggleUnitReviewed(id, targetState);
-            }
-          });
-          fnHeader.appendChild(fnMarkBtn);
-        }
-
-        fnHeader.addEventListener("click", function () {
-          // Click on fn header drills the trace and opens the fn's def
-          // line in source pane.
-          if (window.traceMode && window.traceMode.pushDrillByName) {
-            window.traceMode.pushDrillByName(fn.name);
-          }
-          showNodePanel({
-            id: "n" + fn.id,
-            fullName: fn.name,
-            label: fn.name,
-            mangled: fn.mangled,
-            file: fn.def_loc ? fn.def_loc.file : "",
-            line: fn.def_loc ? fn.def_loc.line : 0,
-            col: fn.def_loc ? fn.def_loc.col : 0,
-            isEntry: !!fn.is_entry,
-            entryKind: fn.entry_kind || "",
-            kind: "fn",
-          });
-        });
-        fnGroup.appendChild(fnHeader);
-
-        for (const c of cs) {
-          const row = document.createElement("div");
-          row.className = "review_unit_row";
-          const unitId = c.unit ? c.unit.id : null;
-          const rec = unitId ? compareState.reviewed.get(unitId) : null;
-          const isReviewed = !!(rec && rec.reviewed);
-          if (isReviewed) row.classList.add("unit_reviewed");
-
-          // Checkbox — only for real units. Synthetic dep-fallback rows
-          // (no overlapping unit) get an em-dash placeholder so the row
-          // visually aligns but isn't checkable.
-          if (unitId) {
-            const cb = document.createElement("input");
-            cb.type = "checkbox";
-            cb.className = "unit_checkbox";
-            cb.dataset.unitId = unitId;
-            cb.checked = isReviewed;
-            cb.addEventListener("click", function (ev) {
-              ev.stopPropagation();
-              toggleUnitReviewed(unitId, cb.checked);
-            });
-            row.appendChild(cb);
-          } else {
-            // Synthetic dep-fallback row (no overlapping unit). Use a
-            // distinct class so DOM queries targeting real checkboxes
-            // don't accidentally pick this up.
-            const placeholder = document.createElement("span");
-            placeholder.className = "unit_checkbox_placeholder";
-            row.appendChild(placeholder);
-          }
-
-          // Glyph: "+" for added, "−" for removed. The relation
-          // ("own" vs "dep") drives the *color* — dep-via-def hunks
-          // use the purple "dep" tint regardless of whether the
-          // underlying unit is an addition or deletion. The synthetic
-          // dep-fallback rows have no real unit and use Δ.
-          const glyph = document.createElement("span");
-          const colorClass = c.relation === "dep" ? "dep"
-            : (c.unitKind === "added" ? "added" : "removed");
-          glyph.className = "unit_glyph " + colorClass;
-          glyph.textContent = c.unit
-            ? (c.unitKind === "added" ? "+" : "−")
-            : "Δ";
-          row.appendChild(glyph);
-
-          // Label: show the line on the side where the change actually
-          // exists. For "removed" units, that's old_start in the OLDER
-          // commit; for "added", new_start in LIVE. Without this, a
-          // removed hunk at OLDER:1055 would label as "1053" (its
-          // post-deletion position in the new file), which is the
-          // surprising number the user pointed out.
-          const label = document.createElement("span");
-          label.className = "unit_label";
-          const sideTag = c.displaySide === "older" ? "older" : "live";
-          if (c.relation === "dep") {
-            label.textContent = (c.dep && c.dep.name ? c.dep.name : "<def>") +
-              "  " + shortenFile(c.file) + ":" + c.displayLine;
-          } else {
-            label.textContent = "line " + c.displayLine;
-          }
-          row.appendChild(label);
-
-          // Side tag — small chip telling the user whether the
-          // displayed line lives in the LIVE or OLDER side. Avoids
-          // ambiguity when a fn has both added and removed units (the
-          // line numbers are otherwise indistinguishable).
-          if (c.unit) {
-            const sideChip = document.createElement("span");
-            sideChip.className = "unit_side_chip side_" + sideTag;
-            sideChip.textContent = sideTag;
-            row.appendChild(sideChip);
-          }
-          if (c.relation === "dep") {
-            const via = document.createElement("span");
-            via.className = "unit_dep_via";
-            via.textContent = "[dep]";
-            row.appendChild(via);
-          }
-
-          const kindStr = c.relation === "dep"
-            ? "dep-def hunk via " + (c.dep && c.dep.name ? c.dep.name : "?")
-            : (c.unitKind === "added" ? "added hunk" : "removed hunk");
-          const tooltipParts = [
-            kindStr,
-            shortenFile(c.file) + ":" + c.displayLine + " (" + sideTag + ")",
-          ];
-          if (rec && rec.at) {
-            tooltipParts.push("reviewed at " + rec.at);
-          }
-          row.title = tooltipParts.join(" · ");
-
-          row.addEventListener("click", function () {
-            // Show the SAME repo-relative file on both sides; each pane
-            // scrolls to where the change exists on its own side
-            // (LIVE → liveLine, OLDER → olderLine). For an "added"
-            // hunk those are the same line in two timelines; for
-            // "removed" they differ — old_start sits in the OLDER pane
-            // where the deleted text actually appears, and liveLine
-            // (= new_start) is the corresponding position in the
-            // post-edit file (so the user lands at the deletion site).
-            els.info.classList.add("visible");
-            setLastClickedFn(c.fn.name || c.fn.mangled || null);
-            fetchSource(c.file, 1, 10000000, c.liveLine || 1, {
-              secondaryByFile: c.file,
-              secondaryHighlight: c.olderLine || 1,
-            });
-          });
-
-          fnGroup.appendChild(row);
-        }
-        fileGroup.appendChild(fnGroup);
+        fileGroup.appendChild(row);
       }
       els.diffChangesList.appendChild(fileGroup);
     }
+
+    // Summary form / completion footer.
+    const footer = document.createElement("div");
+    footer.className = "review_footer";
+    if (isComplete) {
+      const completeMsg = document.createElement("div");
+      completeMsg.className = "review_complete_msg";
+      completeMsg.textContent = "✓ Marked reviewed";
+      footer.appendChild(completeMsg);
+      if (review.draftSummary) {
+        const summary = document.createElement("div");
+        summary.className = "review_summary_readonly";
+        summary.textContent = review.draftSummary;
+        footer.appendChild(summary);
+      }
+    } else {
+      const ta = document.createElement("textarea");
+      ta.className = "review_summary_input";
+      ta.rows = 3;
+      ta.placeholder = "Optional summary…";
+      ta.value = review.draftSummary || "";
+      ta.addEventListener("input", function () {
+        // Local-only until the user clicks Mark Reviewed; that POST
+        // commits it to <sha>.http.md.
+        compareState.review.draftSummary = ta.value;
+      });
+      footer.appendChild(ta);
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "review_complete_btn";
+      btn.textContent = (done === total && total > 0)
+        ? "Mark Reviewed"
+        : "Mark Reviewed (" + done + "/" + total + ")";
+      btn.disabled = (done < total);
+      btn.addEventListener("click", function () {
+        completeHttpReview();
+      });
+      footer.appendChild(btn);
+    }
+    els.diffChangesList.appendChild(footer);
   }
+
 
 
   /** Render the secondary trace pane to mirror the primary's current

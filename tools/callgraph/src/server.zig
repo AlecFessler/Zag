@@ -30,6 +30,11 @@ const std = @import("std");
 
 const commits = @import("commits.zig");
 const render = @import("render.zig");
+const review_classifier = @import("review_classifier.zig");
+const review_deps_mod = @import("review_deps.zig");
+const review_diff = @import("review_diff.zig");
+const review_store = @import("review_store.zig");
+const review_witness = @import("review_witness.zig");
 const types = @import("types.zig");
 
 const Function = types.Function;
@@ -259,11 +264,108 @@ fn handleRequest(
     if (std.mem.eql(u8, path, "/api/diff_hunks")) {
         return handleDiffHunks(allocator, request, query, state);
     }
-    if (std.mem.eql(u8, path, "/api/review_state")) {
-        return handleReviewState(allocator, request, query, state);
+    if (std.mem.eql(u8, path, "/api/review/open")) {
+        return handleReviewOpen(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/review/deps")) {
+        return handleReviewDeps(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/review/checkoff")) {
+        return handleReviewCheckoff(allocator, request, query, state);
+    }
+    if (std.mem.eql(u8, path, "/api/review/complete")) {
+        return handleReviewComplete(allocator, request, query, state);
     }
 
     return respondBytes(request, .not_found, "text/plain; charset=utf-8", "not found\n");
+}
+
+// ---- Review witnessing seam ----------------------------------------------
+
+/// Record a successful symbol fetch against any open mcp-channel review's
+/// deps_required. Called by handleFnSource and handleType *after* their
+/// response is built — earlier and a panicking handler (e.g., the
+/// synthetic `__zig_*` openFileAbsolute crash) would leave the gate
+/// thinking the agent viewed something they actually didn't.
+///
+/// Witnessable handlers:
+///   - `callgraph_src`  (function bodies)
+///   - `callgraph_type` (type definitions)
+/// `callgraph_trace` is intentionally NOT witnessed: a trace shows the
+/// call hierarchy, not the actual code. `loc` and `find` are too cheap
+/// to count for similar reasons.
+///
+/// No-op when the request didn't carry `X-Cg-Channel: mcp` (web GUI
+/// requests skip witnessing entirely).
+fn recordReviewWitness(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    state: *const ServerState,
+    qualified_name: []const u8,
+) void {
+    const channel = getHeaderValue(request, "x-cg-channel") orelse return;
+    if (!std.mem.eql(u8, channel, "mcp")) return;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const store = review_store.Store.init(state.git_root);
+    review_witness.recordView(arena.allocator(), &store, qualified_name) catch |err| {
+        std.debug.print("review witness failed (non-fatal): {s}\n", .{@errorName(err)});
+    };
+}
+
+/// Case-insensitive header lookup. Returns the first matching value or
+/// null if absent. Standard header lookup pattern for the daemon.
+fn getHeaderValue(request: *std.http.Server.Request, name: []const u8) ?[]const u8 {
+    var it = request.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
+
+/// Pull a single value from a query string. Returns null when the key
+/// isn't present. Does NOT URL-decode — caller does that if needed.
+fn getQueryValue(query: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+/// Minimal URL decoder for query values: `%XX` hex pairs and `+` → space.
+/// Anything malformed passes through unchanged so we never refuse to
+/// witness on a crafted-but-harmless url.
+fn urlDecode(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c == '+') {
+            try out.append(alloc, ' ');
+            i += 1;
+        } else if (c == '%' and i + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch {
+                try out.append(alloc, c);
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch {
+                try out.append(alloc, c);
+                i += 1;
+                continue;
+            };
+            try out.append(alloc, (hi << 4) | lo);
+            i += 3;
+        } else {
+            try out.append(alloc, c);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 // ---- Arches / graph ------------------------------------------------------
@@ -799,6 +901,11 @@ fn handleFnSource(
         "text/plain; charset=utf-8",
         @errorName(err),
     );
+    // Witness now — we successfully assembled a response. Earlier
+    // (in handleRequest) would mean the gate counts viewing a symbol
+    // that ultimately panicked the daemon (the `__zig_*` synthetic
+    // case before render.printFnSource grew its non-absolute guard).
+    recordReviewWitness(allocator, request, state, fp.name);
     return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
 }
 
@@ -947,6 +1054,15 @@ fn extractSignature(
     f: *const types.Function,
     scratch: []u8,
 ) ?[]const u8 {
+    // Guard against synthetic / IR-only symbols (e.g. `__zig_*` helpers
+    // emitted by the compiler) that have no file location, or non-absolute
+    // paths that would crash openFileAbsolute's assertion. Same guard
+    // pattern as printFnSource — extractSignature was an overlooked
+    // second instance that took down the daemon when handleFind walked a
+    // result set containing one of these symbols.
+    if (f.def_loc.file.len == 0) return null;
+    if (!std.fs.path.isAbsolute(f.def_loc.file)) return null;
+
     const contents = blk: {
         if (cache.get(f.def_loc.file)) |c| break :blk c;
         const file = std.fs.openFileAbsolute(f.def_loc.file, .{}) catch return null;
@@ -1104,7 +1220,13 @@ fn handleType(
 
     // Read just the line range out of the source file. Definitions can be
     // sizeable (full struct bodies), so cap at 64KB to avoid pathological
-    // payload growth.
+    // payload growth. Synthetic / IR-only definitions (no path or
+    // non-absolute path) crash openFileAbsolute's assertion; treat them
+    // as unreadable instead.
+    if (def.file.len == 0 or !std.fs.path.isAbsolute(def.file)) {
+        try aw.writer.print("(no source path for synthetic / IR-only def {s})\n", .{def.qualified_name});
+        return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
+    }
     const file = std.fs.openFileAbsolute(def.file, .{}) catch |err| {
         try aw.writer.print("(open {s}: {s})\n", .{ def.file, @errorName(err) });
         return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
@@ -1140,6 +1262,10 @@ fn handleType(
     if (slice.len == 0 or slice[slice.len - 1] != '\n') try aw.writer.writeAll("\n");
     try aw.writer.writeAll("---\n");
 
+    // Witness for the review-deps gate: agent successfully fetched the
+    // type body (or its alias terminus). Use the *original* requested
+    // name so callers that look up by either alias-or-target match.
+    recordReviewWitness(allocator, request, state, name);
     return respondTextWithFreshness(allocator, state, request, .ok, aw.writer.buffer[0..aw.writer.end]);
 }
 
@@ -1218,6 +1344,7 @@ fn readConstantAliasRhs(
     scratch: []u8,
 ) !?[]const u8 {
     if (def.line_end != def.line_start) return null;
+    if (def.file.len == 0 or !std.fs.path.isAbsolute(def.file)) return null;
     const file = std.fs.openFileAbsolute(def.file, .{}) catch return null;
     defer file.close();
     const contents = try file.readToEndAlloc(allocator, 8 * 1024 * 1024);
@@ -1957,6 +2084,13 @@ const Commit = struct {
     /// this to fade incompatible commits instead of letting the user
     /// pick one and watch it fail with a generic build error.
     cg_compatible: bool,
+    /// Channels with a completion `.md` artifact on disk. Each entry is
+    /// "mcp" (agent review) or "http" (human review); both can be
+    /// present, neither, or just one. The web UI renders a small badge
+    /// per channel so the user can see review coverage at a glance
+    /// without opening the commit. Computed via two stat-only checks
+    /// per commit (cheap; ~50 commits = ~100 stats per /api/commits).
+    reviewed_by: []const []const u8,
 };
 
 const CommitList = struct {
@@ -2061,6 +2195,15 @@ fn handleCommits(
         return respondBytes(request, .ok, "text/plain; charset=utf-8", aw.writer.buffer[0..aw.writer.end]);
     }
 
+    // Arena scoped to this handler for the per-commit `reviewed_by`
+    // slices. Strings inside Commit (sha/short/author/...) point into
+    // result.stdout which is freed at handler exit, so the arena's
+    // lifetime is fine.
+    var rb_arena = std.heap.ArenaAllocator.init(allocator);
+    defer rb_arena.deinit();
+    const rb_alloc = rb_arena.allocator();
+    const review_store_inst = review_store.Store.init(state.git_root);
+
     var commit_list = std.ArrayList(Commit){};
     defer commit_list.deinit(allocator);
     var line_it = std.mem.splitScalar(u8, result.stdout, '\n');
@@ -2072,6 +2215,33 @@ fn handleCommits(
         const author = fields_it.next() orelse continue;
         const date = fields_it.next() orelse continue;
         const subject = fields_it.next() orelse continue;
+
+        // Reviews may be stored under either the full sha or the short
+        // 8-char prefix (agents commonly pass the short form, which is
+        // what we then store). Check both — newer reviews could still
+        // be added under either form depending on what the caller passes.
+        var rb_buf: [2][]const u8 = undefined;
+        var rb_len: usize = 0;
+        const presence_full = review_store_inst.summariesPresent(rb_alloc, sha) catch
+            review_store.SummaryPresence{ .mcp = false, .http = false };
+        const sha_short = if (sha.len > 8) sha[0..8] else sha;
+        const presence_short = if (sha.len > 8)
+            (review_store_inst.summariesPresent(rb_alloc, sha_short) catch
+                review_store.SummaryPresence{ .mcp = false, .http = false })
+        else
+            presence_full;
+        const has_mcp = presence_full.mcp or presence_short.mcp;
+        const has_http = presence_full.http or presence_short.http;
+        if (has_mcp) {
+            rb_buf[rb_len] = "mcp";
+            rb_len += 1;
+        }
+        if (has_http) {
+            rb_buf[rb_len] = "http";
+            rb_len += 1;
+        }
+        const rb_slice = try rb_alloc.dupe([]const u8, rb_buf[0..rb_len]);
+
         try commit_list.append(allocator, .{
             .sha = sha,
             .short = short,
@@ -2079,6 +2249,7 @@ fn handleCommits(
             .date = date,
             .subject = subject,
             .cg_compatible = compat_set.contains(sha),
+            .reviewed_by = rb_slice,
         });
     }
 
@@ -2549,217 +2720,614 @@ fn handleDiffHunks(
     return respondBytes(request, .ok, "application/json; charset=utf-8", blob);
 }
 
-// ---- Review state persistence --------------------------------------------
+// ---- Per-commit channeled review (mcp + http unified) --------------------
 
-/// On-disk schema for `<git_root>/.callgraph/review/<sha_a>..<sha_b>.json`.
-/// Each unit is keyed by a stable id: `<repo-rel-path>:<new_start>:<kind>`
-/// where kind is "a" for added or "r" for removed. Parent mode (X^ vs X)
-/// is the only mode that persists — both endpoints are immutable so unit
-/// ids never shift. Head mode skips the file entirely.
-const ReviewStateFile = struct {
-    schema: u32 = 1,
-    sha_a: []const u8,
-    sha_b: []const u8,
-    units: std.json.ArrayHashMap(ReviewUnit) = .{},
+const ReviewListEntry = struct {
+    sha: []const u8,
+    subject: []const u8,
+    reviewed_by: []const []const u8,
 };
 
-const ReviewUnit = struct {
-    reviewed: bool,
-    at: []const u8 = "",
-    by: []const u8 = "",
+const ReviewListPayload = struct {
+    reviews: []const ReviewListEntry,
 };
 
-/// Body of a POST /api/review_state request: toggle one unit.
-const ReviewToggle = struct {
-    unit_id: []const u8,
-    reviewed: bool,
-    by: []const u8 = "",
-};
-
-fn handleReviewState(
+fn handleReviewOpen(
     allocator: std.mem.Allocator,
     request: *std.http.Server.Request,
     query: []const u8,
     state: *const ServerState,
 ) !void {
-    var sha_a: []const u8 = "";
-    var sha_b: []const u8 = "";
-    var it = std.mem.splitScalar(u8, query, '&');
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        const key = pair[0..eq];
-        const val = pair[eq + 1 ..];
-        if (std.mem.eql(u8, key, "sha_a")) sha_a = val;
-        if (std.mem.eql(u8, key, "sha_b")) sha_b = val;
-    }
-    if (!isValidSha(sha_a) or !isValidSha(sha_b)) {
-        return respondBytes(
-            request,
-            .bad_request,
-            "text/plain; charset=utf-8",
-            "need sha_a and sha_b (parent mode only — full hex shas)\n",
-        );
-    }
-
-    const file_path = try reviewStateFilePath(allocator, state.git_root, sha_a, sha_b);
-    defer allocator.free(file_path);
-
-    if (request.head.method == .GET) {
-        return readReviewState(allocator, request, file_path, sha_a, sha_b);
-    }
-    if (request.head.method == .POST) {
-        return mergeReviewState(allocator, request, file_path, sha_a, sha_b);
-    }
-    return respondBytes(
-        request,
-        .method_not_allowed,
-        "text/plain; charset=utf-8",
-        "GET or POST only\n",
-    );
-}
-
-fn readReviewState(
-    allocator: std.mem.Allocator,
-    request: *std.http.Server.Request,
-    file_path: []const u8,
-    sha_a: []const u8,
-    sha_b: []const u8,
-) !void {
-    const contents = std.fs.cwd().readFileAlloc(allocator, file_path, 16 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => {
-            // No state on disk yet — return an empty payload so the
-            // frontend can still render checkboxes (all unchecked).
-            const empty = ReviewStateFile{
-                .sha_a = sha_a,
-                .sha_b = sha_b,
-            };
-            const blob = try std.json.Stringify.valueAlloc(allocator, empty, .{});
-            defer allocator.free(blob);
-            return respondBytes(request, .ok, "application/json; charset=utf-8", blob);
-        },
-        else => return respondBytes(
-            request,
-            .internal_server_error,
-            "text/plain; charset=utf-8",
-            "failed to read review state\n",
-        ),
-    };
-    defer allocator.free(contents);
-    return respondBytes(request, .ok, "application/json; charset=utf-8", contents);
-}
-
-fn mergeReviewState(
-    allocator: std.mem.Allocator,
-    request: *std.http.Server.Request,
-    file_path: []const u8,
-    sha_a: []const u8,
-    sha_b: []const u8,
-) !void {
-    var read_buf: [16 * 1024]u8 = undefined;
-    var hdr_buf: [4 * 1024]u8 = undefined;
-    const reader = request.readerExpectContinue(&hdr_buf) catch
-        return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "missing body\n");
-    const body_len = reader.readSliceShort(&read_buf) catch
-        return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "failed to read body\n");
-    if (body_len == 0) return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "empty body\n");
-
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const aalloc = arena.allocator();
+    const a = arena.allocator();
 
-    const parsed = std.json.parseFromSliceLeaky(ReviewToggle, aalloc, read_buf[0..body_len], .{
-        .ignore_unknown_fields = true,
-    }) catch
-        return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "invalid JSON body\n");
+    const sha = getQueryValue(query, "sha") orelse "";
+    const channel = parseReviewChannel(query);
+    const agent_model = getQueryValue(query, "agent_model");
+    const fmt = parseReviewFormat(query);
+    const store = review_store.Store.init(state.git_root);
 
-    if (parsed.unit_id.len == 0) {
-        return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "missing unit_id\n");
+    if (sha.len == 0) {
+        return respondReviewList(a, request, &store, fmt);
+    }
+    if (!isValidSha(sha)) {
+        return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "invalid sha\n");
     }
 
-    // Load existing file (if any), merge the toggle, write atomically.
-    var existing = ReviewStateFile{ .sha_a = sha_a, .sha_b = sha_b };
-    const existing_bytes = std.fs.cwd().readFileAlloc(aalloc, file_path, 16 * 1024 * 1024) catch null;
-    if (existing_bytes) |bytes| {
-        existing = std.json.parseFromSliceLeaky(ReviewStateFile, aalloc, bytes, .{
-            .ignore_unknown_fields = true,
-        }) catch existing;
-    }
-
-    // Stamp current time + reviewer.
-    var ts_buf: [32]u8 = undefined;
-    const now = std.time.timestamp();
-    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{now}) catch "";
-
-    const id_owned = try aalloc.dupe(u8, parsed.unit_id);
-    const at_owned = try aalloc.dupe(u8, ts_str);
-    const by_owned = try aalloc.dupe(u8, parsed.by);
-    try existing.units.map.put(aalloc, id_owned, .{
-        .reviewed = parsed.reviewed,
-        .at = at_owned,
-        .by = by_owned,
-    });
-
-    // Ensure parent dir exists, write atomically (write tmp + rename).
-    if (std.fs.path.dirname(file_path)) |dir| {
-        std.fs.cwd().makePath(dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => {
-                std.debug.print("mkdir {s} failed: {s}\n", .{ dir, @errorName(err) });
-                return respondBytes(
-                    request,
-                    .internal_server_error,
-                    "text/plain; charset=utf-8",
-                    "failed to create review dir\n",
-                );
-            },
-        };
-    }
-
-    const new_blob = try std.json.Stringify.valueAlloc(aalloc, existing, .{ .whitespace = .indent_2 });
-    const tmp_path = try std.fmt.allocPrint(aalloc, "{s}.tmp", .{file_path});
-    {
-        const f = std.fs.cwd().createFile(tmp_path, .{ .truncate = true }) catch |err| {
-            std.debug.print("create tmp {s} failed: {s}\n", .{ tmp_path, @errorName(err) });
-            return respondBytes(
-                request,
-                .internal_server_error,
-                "text/plain; charset=utf-8",
-                "failed to write review state\n",
-            );
-        };
-        defer f.close();
-        f.writeAll(new_blob) catch |err| {
-            std.debug.print("write tmp failed: {s}\n", .{@errorName(err)});
-            return respondBytes(
-                request,
-                .internal_server_error,
-                "text/plain; charset=utf-8",
-                "failed to write review state\n",
-            );
-        };
-    }
-    std.fs.cwd().rename(tmp_path, file_path) catch |err| {
-        std.debug.print("rename {s} → {s} failed: {s}\n", .{ tmp_path, file_path, @errorName(err) });
-        return respondBytes(
-            request,
-            .internal_server_error,
-            "text/plain; charset=utf-8",
-            "failed to install review state\n",
-        );
+    // Always ensure the commit graph is loaded — even when persisted
+    // review state already exists. Agents call review_open as the
+    // resume point; if the daemon restarted (e.g., after a crash or
+    // to pick up new code) the in-memory registry is empty even
+    // though the .json state survived. Without this, subsequent
+    // review_deps calls would fail with "commit graph not loaded"
+    // and the agent would have no way out from inside MCP.
+    //
+    // Build can take 1-5 minutes; the daemon's HTTP I/O has no
+    // timeout, and the MCP shim's std.http.Client doesn't either.
+    ensureCommitLoaded(state, sha) catch |err| {
+        const msg = try std.fmt.allocPrint(a, "auto-load failed: {s}\n", .{@errorName(err)});
+        return respondBytes(request, .internal_server_error, "text/plain; charset=utf-8", msg);
     };
 
-    return respondBytes(request, .ok, "application/json; charset=utf-8", new_blob);
+    var review = (try store.load(a, sha)) orelse review_store.ReviewState{
+        .sha = try a.dupe(u8, sha),
+        .subject = getCommitSubject(a, state.git_root, sha) catch try a.dupe(u8, ""),
+        .channels = .{},
+    };
+
+    // Open the requested channel if it doesn't exist yet. Existing
+    // channels (in_progress or complete) are returned as-is — both
+    // channels are independent attestations on the same commit.
+    if (getChannelState(review.channels, channel) == null) {
+        const graph = loadCommitGraphForReview(a, state, sha) catch |err| {
+            const msg = try std.fmt.allocPrint(a, "commit graph load reported success but lookup failed ({s})\n", .{@errorName(err)});
+            return respondBytes(request, .internal_server_error, "text/plain; charset=utf-8", msg);
+        };
+        const files = review_diff.fetchHunksForCommit(a, state.git_root, sha) catch |err| {
+            const msg = try std.fmt.allocPrint(a, "git diff failed: {s}\n", .{@errorName(err)});
+            return respondBytes(request, .internal_server_error, "text/plain; charset=utf-8", msg);
+        };
+        const items = try review_classifier.classify(a, files, graph);
+        // Pre-resolve dep counts so the open response shows planning
+        // info (`callers/12` vs `callers/1`) without forcing the
+        // caller to invoke review_deps on every item just to scope
+        // effort. We don't store the names — that would skip the
+        // "must call review_deps" gate.
+        for (items) |*it| {
+            if (it.trivial or it.deps_kind == .none) continue;
+            const deps = review_deps_mod.computeDeps(a, it, graph) catch continue;
+            it.deps_count = @intCast(deps.len);
+        }
+        const ch_state = review_store.ChannelState{
+            .status = .in_progress,
+            .started_at = std.time.timestamp(),
+            // agent_model is meaningful only for the mcp channel; the
+            // http channel is human-driven and identifies the reviewer
+            // by the .http.md content, not a model id.
+            .agent_model = if (channel == .mcp and agent_model != null)
+                try a.dupe(u8, agent_model.?)
+            else
+                null,
+            .items = items,
+        };
+        setChannelState(&review.channels, channel, ch_state);
+        try store.save(a, &review);
+    }
+
+    return respondReviewState(a, request, &review, channel, fmt);
 }
 
-fn reviewStateFilePath(
+fn handleReviewDeps(
     allocator: std.mem.Allocator,
-    git_root: []const u8,
-    sha_a: []const u8,
-    sha_b: []const u8,
-) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.callgraph/review/{s}..{s}.json", .{
-        git_root, sha_a, sha_b,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sha = getQueryValue(query, "sha") orelse return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "missing sha\n");
+    const item_id_raw = getQueryValue(query, "item_id") orelse return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "missing item_id\n");
+    const item_id = try urlDecode(a, item_id_raw);
+    if (!isValidSha(sha)) return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "invalid sha\n");
+    const channel = parseReviewChannel(query);
+    const fmt = parseReviewFormat(query);
+
+    const store = review_store.Store.init(state.git_root);
+    var review = (try store.load(a, sha)) orelse return respondBytes(request, .not_found, "text/plain; charset=utf-8", "no review open for this commit; call review_open first\n");
+    var ch = getChannelState(review.channels, channel) orelse return respondBytes(request, .conflict, "text/plain; charset=utf-8", "channel not open; call review_open\n");
+    if (ch.status != .in_progress) return respondBytes(request, .conflict, "text/plain; charset=utf-8", "channel already complete; nothing to compute\n");
+
+    var item_idx: ?usize = null;
+    for (ch.items, 0..) |it, i| {
+        if (std.mem.eql(u8, it.id, item_id)) {
+            item_idx = i;
+            break;
+        }
+    }
+    const idx = item_idx orelse return respondBytes(request, .not_found, "text/plain; charset=utf-8", "unknown item_id\n");
+    const item_ptr = &ch.items[idx];
+
+    if (item_ptr.deps_kind == .none or item_ptr.trivial) {
+        return respondBytes(request, .conflict, "text/plain; charset=utf-8", "no deps required for this item; you can call checkoff directly\n");
+    }
+
+    const graph = loadCommitGraphForReview(a, state, sha) catch |err| {
+        const msg = try std.fmt.allocPrint(a, "commit graph not loaded ({s})\n", .{@errorName(err)});
+        return respondBytes(request, .conflict, "text/plain; charset=utf-8", msg);
+    };
+
+    const deps = try review_deps_mod.computeDeps(a, item_ptr, graph);
+
+    // Sticky merge: extend existing deps_required, never shrink.
+    const merged = try mergeStickyNames(a, item_ptr.deps_required, deps);
+    item_ptr.deps_required = merged;
+
+    // Retro-fill deps_viewed from the channel session log. If the
+    // agent already viewed any of these deps under a previously-opened
+    // item, that view counts here too — eliminates the "had to re-call
+    // callgraph_src enqueue 30 seconds later" friction agents reported
+    // when a shared dep gets pulled into a second item's deps_required.
+    if (channel == .mcp and ch.deps_viewed_session.len > 0) {
+        var retro = std.ArrayList([]const u8){};
+        // Seed with whatever was already in deps_viewed (preserve prior).
+        for (item_ptr.deps_viewed) |v| try retro.append(a, v);
+        for (merged) |req| {
+            // Skip if already in retro (i.e. already in deps_viewed).
+            var seen = false;
+            for (retro.items) |r| {
+                if (std.mem.eql(u8, r, req)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            // Counts as viewed iff the channel session log has it.
+            for (ch.deps_viewed_session) |sv| {
+                if (std.mem.eql(u8, sv, req)) {
+                    try retro.append(a, req);
+                    break;
+                }
+            }
+        }
+        item_ptr.deps_viewed = try retro.toOwnedSlice(a);
+    }
+
+    setChannelState(&review.channels, channel, ch);
+    try store.save(a, &review);
+
+    return respondReviewDeps(a, request, item_id, deps, merged, fmt);
+}
+
+fn handleReviewCheckoff(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sha = getQueryValue(query, "sha") orelse return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "missing sha\n");
+    const item_id_raw = getQueryValue(query, "item_id") orelse return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "missing item_id\n");
+    const item_id = try urlDecode(a, item_id_raw);
+    if (!isValidSha(sha)) return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "invalid sha\n");
+    const notes_raw = getQueryValue(query, "notes");
+    const notes: ?[]const u8 = if (notes_raw) |n| try urlDecode(a, n) else null;
+    const channel = parseReviewChannel(query);
+    // Optional `state=on|off`. Default `on` preserves the shipped MCP
+    // shim's contract (it only ever checks items off, never unchecks).
+    // The web GUI sends `off` when the user clicks a checked checkbox
+    // back to unchecked.
+    const state_q = getQueryValue(query, "state") orelse "on";
+    const want_checked = !std.mem.eql(u8, state_q, "off");
+    const fmt = parseReviewFormat(query);
+
+    const store = review_store.Store.init(state.git_root);
+    var review = (try store.load(a, sha)) orelse return respondBytes(request, .not_found, "text/plain; charset=utf-8", "no review open\n");
+    var ch = getChannelState(review.channels, channel) orelse return respondBytes(request, .conflict, "text/plain; charset=utf-8", "channel not open\n");
+    if (ch.status != .in_progress) return respondBytes(request, .conflict, "text/plain; charset=utf-8", "channel already complete\n");
+
+    var item_idx: ?usize = null;
+    for (ch.items, 0..) |it, i| {
+        if (std.mem.eql(u8, it.id, item_id)) {
+            item_idx = i;
+            break;
+        }
+    }
+    const idx = item_idx orelse return respondBytes(request, .not_found, "text/plain; charset=utf-8", "unknown item_id\n");
+    const item_ptr = &ch.items[idx];
+
+    // Gate: only the mcp (agent) channel enforces deps-viewing on
+    // check. The http (human) channel is intentionally ungated — humans
+    // know what they're doing and shouldn't have to call review_deps to
+    // satisfy a paperwork requirement. Unchecking (state=off) skips
+    // the gate either way.
+    if (want_checked and channel == .mcp and !item_ptr.trivial and item_ptr.deps_kind != .none) {
+        const required = item_ptr.deps_required orelse {
+            return respondBytes(request, .conflict, "text/plain; charset=utf-8", "must call review_deps for this item before check-off\n");
+        };
+        var missing = std.ArrayList([]const u8){};
+        outer: for (required) |r| {
+            for (item_ptr.deps_viewed) |v| {
+                if (std.mem.eql(u8, v, r)) continue :outer;
+            }
+            try missing.append(a, r);
+        }
+        if (missing.items.len > 0) {
+            var buf = std.ArrayList(u8){};
+            try buf.appendSlice(a, "must view these deps before check-off (call callgraph_src on each function dep, or callgraph_type on each type dep):");
+            for (missing.items) |m| {
+                try buf.append(a, '\n');
+                try buf.appendSlice(a, "  - ");
+                try buf.appendSlice(a, m);
+            }
+            try buf.append(a, '\n');
+            return respondBytes(request, .conflict, "text/plain; charset=utf-8", buf.items);
+        }
+    }
+
+    item_ptr.checked_off = want_checked;
+    if (notes) |n| item_ptr.notes = n;
+    setChannelState(&review.channels, channel, ch);
+    try store.save(a, &review);
+
+    return respondReviewState(a, request, &review, channel, fmt);
+}
+
+fn handleReviewComplete(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sha = getQueryValue(query, "sha") orelse return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "missing sha\n");
+    const summary_raw = getQueryValue(query, "summary") orelse return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "missing summary\n");
+    if (!isValidSha(sha)) return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "invalid sha\n");
+    const summary = try urlDecode(a, summary_raw);
+    const channel = parseReviewChannel(query);
+
+    const store = review_store.Store.init(state.git_root);
+    var review = (try store.load(a, sha)) orelse return respondBytes(request, .not_found, "text/plain; charset=utf-8", "no review open\n");
+    var ch = getChannelState(review.channels, channel) orelse return respondBytes(request, .conflict, "text/plain; charset=utf-8", "channel not open\n");
+    if (ch.status != .in_progress) return respondBytes(request, .conflict, "text/plain; charset=utf-8", "channel already complete\n");
+
+    var unchecked = std.ArrayList([]const u8){};
+    for (ch.items) |it| {
+        if (!it.checked_off) try unchecked.append(a, it.id);
+    }
+    if (unchecked.items.len > 0) {
+        var buf = std.ArrayList(u8){};
+        try buf.appendSlice(a, "cannot complete: items remain unchecked:");
+        for (unchecked.items) |id| {
+            try buf.append(a, '\n');
+            try buf.appendSlice(a, "  - ");
+            try buf.appendSlice(a, id);
+        }
+        try buf.append(a, '\n');
+        return respondBytes(request, .conflict, "text/plain; charset=utf-8", buf.items);
+    }
+
+    const now = std.time.timestamp();
+    ch.status = .complete;
+    ch.completed_at = now;
+    ch.summary = summary;
+    setChannelState(&review.channels, channel, ch);
+
+    const artifact = try renderReviewArtifact(a, &review, channel, summary);
+    // Write the .md FIRST: presence is the source of truth for
+    // completion. Save the JSON second. If we crash between, next
+    // load sees status=in_progress with a stray .md (harmless — load
+    // ignores it when status != complete). Conversely, if save
+    // happens but writeSummary fails, the channel-reset-on-md-deletion
+    // path in store.load resets the channel and the next _open will
+    // re-classify cleanly. Both crash windows are safe.
+    try store.writeSummary(a, sha, channel, artifact);
+    try store.save(a, &review);
+
+    return respondBytes(request, .ok, "text/markdown; charset=utf-8", artifact);
+}
+
+// ---- Review handler helpers ---------------------------------------------
+
+/// Output format for /api/review/* responses. `compact` is a dense
+/// human-readable text format mirroring the trace tool's compact mode;
+/// `json` is the verbose default for the web GUI. The MCP shim defaults
+/// to compact so agents pay fewer tokens.
+const ReviewFormat = enum { compact, json };
+
+fn parseReviewFormat(query: []const u8) ReviewFormat {
+    const v = getQueryValue(query, "format") orelse return .json;
+    if (std.mem.eql(u8, v, "compact")) return .compact;
+    return .json;
+}
+
+/// Channel selector for /api/review/* endpoints. Defaults to `mcp` so
+/// the shipped MCP shim (which builds URLs without a channel param)
+/// keeps working without a re-ship. The web GUI passes `channel=http`
+/// explicitly.
+fn parseReviewChannel(query: []const u8) review_store.Channel {
+    const v = getQueryValue(query, "channel") orelse return .mcp;
+    if (std.mem.eql(u8, v, "http")) return .http;
+    return .mcp;
+}
+
+fn getChannelState(channels: review_store.Channels, ch: review_store.Channel) ?review_store.ChannelState {
+    return switch (ch) {
+        .mcp => channels.mcp,
+        .http => channels.http,
+    };
+}
+
+fn setChannelState(channels: *review_store.Channels, ch: review_store.Channel, st: ?review_store.ChannelState) void {
+    switch (ch) {
+        .mcp => channels.mcp = st,
+        .http => channels.http = st,
+    }
+}
+
+fn respondReviewList(
+    a: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    store: *const review_store.Store,
+    fmt: ReviewFormat,
+) !void {
+    const shas = try store.listShas(a);
+    var entries = std.ArrayList(ReviewListEntry){};
+    for (shas) |sha| {
+        const review = (store.load(a, sha) catch null) orelse continue;
+        var rb = std.ArrayList([]const u8){};
+        if (review.channels.mcp) |ch| if (ch.status == .complete) try rb.append(a, "mcp");
+        if (review.channels.http) |ch| if (ch.status == .complete) try rb.append(a, "http");
+        try entries.append(a, .{
+            .sha = review.sha,
+            .subject = review.subject,
+            .reviewed_by = try rb.toOwnedSlice(a),
+        });
+    }
+
+    if (fmt == .json) {
+        const payload = ReviewListPayload{ .reviews = entries.items };
+        return respondJsonAlloc(a, request, &payload);
+    }
+
+    var buf = std.ArrayList(u8){};
+    try buf.writer(a).print("L reviews={d}\n", .{entries.items.len});
+    for (entries.items) |e| {
+        var marks = [_]u8{ '-', '-' }; // [mcp][http]
+        for (e.reviewed_by) |r| {
+            if (std.mem.eql(u8, r, "mcp")) marks[0] = 'm';
+            if (std.mem.eql(u8, r, "http")) marks[1] = 'h';
+        }
+        try buf.writer(a).print("{s}{s} {s} {s}\n", .{
+            marks[0..1], marks[1..2], shortSha(e.sha), e.subject,
+        });
+    }
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", buf.items);
+}
+
+fn respondReviewState(
+    a: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    review: *const review_store.ReviewState,
+    channel: review_store.Channel,
+    fmt: ReviewFormat,
+) !void {
+    if (fmt == .json) return respondJsonAlloc(a, request, review);
+
+    var buf = std.ArrayList(u8){};
+    const ch_opt = getChannelState(review.channels, channel);
+    const ch = ch_opt orelse {
+        try buf.writer(a).print("R {s} {s}=<none> subject={s}\n", .{
+            shortSha(review.sha), channel.tag(), review.subject,
+        });
+        return respondBytes(request, .ok, "text/plain; charset=utf-8", buf.items);
+    };
+
+    var done: usize = 0;
+    for (ch.items) |it| if (it.checked_off) {
+        done += 1;
+    };
+    try buf.writer(a).print(
+        "R {s} {s}={s} items={d} done={d} subject={s}\n",
+        .{ shortSha(review.sha), channel.tag(), @tagName(ch.status), ch.items.len, done, review.subject },
+    );
+
+    for (ch.items) |it| {
+        const marker: u8 = if (it.checked_off) '+' else if (it.trivial) '.' else '!';
+        try buf.writer(a).print("{c} {s}", .{ marker, it.id });
+        if (it.trivial) {
+            try buf.writer(a).print(" trivial", .{});
+        } else if (it.deps_kind != .none) {
+            try buf.writer(a).print(" {s} deps={d}", .{ @tagName(it.deps_kind), it.deps_count });
+            if (it.deps_required) |required| {
+                try buf.writer(a).print(" viewed={d}/{d}", .{ it.deps_viewed.len, required.len });
+            }
+        }
+        try buf.writer(a).print(" {s}:{s}\n", .{ it.file, it.loc });
+        if (it.notes) |n| if (n.len > 0) {
+            try buf.writer(a).print("    -- {s}\n", .{n});
+        };
+    }
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", buf.items);
+}
+
+fn respondReviewDeps(
+    a: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    item_id: []const u8,
+    deps: []const review_deps_mod.DepEntry,
+    required: []const []const u8,
+    fmt: ReviewFormat,
+) !void {
+    if (fmt == .json) {
+        const payload = struct {
+            item_id: []const u8,
+            deps: []const review_deps_mod.DepEntry,
+            required: []const []const u8,
+        }{ .item_id = item_id, .deps = deps, .required = required };
+        return respondJsonAlloc(a, request, &payload);
+    }
+
+    var buf = std.ArrayList(u8){};
+    try buf.writer(a).print("D {s} required={d}\n", .{ item_id, required.len });
+    for (deps, 1..) |d, i| {
+        try buf.writer(a).print(
+            "  [{d}] {s}\n      @ {s}:{d}\n      -- {s}\n",
+            .{ i, d.qualified_name, d.file, d.line, d.summary },
+        );
+    }
+    return respondBytes(request, .ok, "text/plain; charset=utf-8", buf.items);
+}
+
+fn shortSha(sha: []const u8) []const u8 {
+    return sha[0..@min(sha.len, 12)];
+}
+
+fn respondJsonAlloc(
+    a: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    value: anytype,
+) !void {
+    const blob = try std.json.Stringify.valueAlloc(a, value.*, .{ .whitespace = .indent_2 });
+    return respondBytes(request, .ok, "application/json; charset=utf-8", blob);
+}
+
+/// Trigger a registry load for `sha` if not already in flight, then
+/// block (with a poll loop) until the entry transitions to `ready` or
+/// `errored`. No timeout — the MCP transport doesn't impose one and
+/// kernel builds legitimately take 1-5 minutes. Errors propagate the
+/// registry's recorded error_msg if present.
+fn ensureCommitLoaded(state: *const ServerState, sha: []const u8) !void {
+    const reg = state.registry;
+    const entry = try reg.requestLoad(sha);
+
+    // Snapshot status under the mutex each tick. We don't subscribe
+    // (no condition variable in the registry today); polling at 200ms
+    // keeps per-call overhead negligible while still completing within
+    // a fraction of a second of the worker finishing.
+    while (true) {
+        reg.lockShared();
+        const status = entry.status;
+        reg.unlockShared();
+        switch (status) {
+            .ready => return,
+            .errored => return error.CommitBuildFailed,
+            .building, .not_loaded => std.Thread.sleep(200 * std.time.ns_per_ms),
+        }
+    }
+}
+
+/// Pull the per-commit Graph out of the registry and JSON-decode it
+/// back into a `types.Graph` so the classifier and deps computer can
+/// walk it. The registry stores a serialized blob per arch; we pick
+/// the entry's default arch and parse on demand.
+fn loadCommitGraphForReview(
+    a: std.mem.Allocator,
+    state: *const ServerState,
+    sha: []const u8,
+) !*const types.Graph {
+    const reg = state.registry;
+    reg.lockShared();
+    defer reg.unlockShared();
+    const entry = reg.entries.get(sha) orelse return error.CommitNotLoaded;
+    if (entry.status != .ready) return error.CommitNotReady;
+    const blob = entry.arch_blobs.get(entry.default_arch) orelse return error.NoArchBlob;
+
+    const parsed = try std.json.parseFromSliceLeaky(types.Graph, a, blob, .{
+        .ignore_unknown_fields = true,
     });
+    const out = try a.create(types.Graph);
+    out.* = parsed;
+    return out;
+}
+
+fn getCommitSubject(
+    a: std.mem.Allocator,
+    git_root: []const u8,
+    sha: []const u8,
+) ![]const u8 {
+    const argv = [_][]const u8{ "git", "log", "-1", "--format=%s", sha };
+    const result = try std.process.Child.run(.{
+        .allocator = a,
+        .argv = &argv,
+        .cwd = git_root,
+        .max_output_bytes = 16 * 1024,
+    });
+    if (result.term != .Exited or result.term.Exited != 0) return error.GitLogFailed;
+    return std.mem.trim(u8, result.stdout, "\n\r \t");
+}
+
+/// Sticky merge: result = dedup(prior ∪ fresh.qname). Order = prior
+/// first (preserved), then any new entries in fresh's order.
+fn mergeStickyNames(
+    a: std.mem.Allocator,
+    prior_opt: ?[]const []const u8,
+    fresh: []const review_deps_mod.DepEntry,
+) ![]const []const u8 {
+    var out = std.ArrayList([]const u8){};
+    var seen = std.StringHashMap(void).init(a);
+    if (prior_opt) |prior| {
+        for (prior) |p| {
+            if (seen.contains(p)) continue;
+            try seen.put(p, {});
+            try out.append(a, p);
+        }
+    }
+    for (fresh) |f| {
+        if (seen.contains(f.qualified_name)) continue;
+        try seen.put(f.qualified_name, {});
+        try out.append(a, f.qualified_name);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// Build a channel's `.md` artifact. Sections: header (sha, subject,
+/// timestamps; agent_model only for mcp), free-text summary supplied
+/// by the caller, then per-item bullet list with notes. Title varies
+/// by channel ("Agent" for mcp, "Human" for http) so a glance at the
+/// file tells you which attestation it is.
+fn renderReviewArtifact(
+    a: std.mem.Allocator,
+    review: *const review_store.ReviewState,
+    channel: review_store.Channel,
+    summary: []const u8,
+) ![]u8 {
+    var buf = std.ArrayList(u8){};
+    const ch = getChannelState(review.channels, channel).?;
+
+    const heading = switch (channel) {
+        .mcp => "Agent",
+        .http => "Human",
+    };
+    try buf.writer(a).print("# {s} review of {s}\n\n", .{ heading, review.sha });
+    try buf.writer(a).print("**Subject:** {s}\n", .{review.subject});
+    if (ch.agent_model) |m| try buf.writer(a).print("**Agent:** {s}\n", .{m});
+    try buf.writer(a).print("**Started:** {d}\n", .{ch.started_at});
+    if (ch.completed_at) |c| try buf.writer(a).print("**Completed:** {d}\n", .{c});
+
+    try buf.appendSlice(a, "\n## Summary\n\n");
+    try buf.appendSlice(a, summary);
+    if (summary.len == 0 or summary[summary.len - 1] != '\n') try buf.append(a, '\n');
+
+    try buf.appendSlice(a, "\n## Items reviewed\n\n");
+    for (ch.items) |it| {
+        try buf.writer(a).print("- `{s}` — {s} @ {s}:{s}", .{
+            it.id, @tagName(it.kind), it.file, it.loc,
+        });
+        if (it.trivial) try buf.appendSlice(a, " (trivial)");
+        try buf.append(a, '\n');
+        if (it.notes) |n| if (n.len > 0) try buf.writer(a).print("  - {s}\n", .{n});
+    }
+
+    return buf.toOwnedSlice(a);
 }
 
 // ---- Helpers --------------------------------------------------------------

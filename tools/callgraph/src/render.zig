@@ -350,9 +350,141 @@ fn compactFn(
     // sibling-repeat `~` lines emit a forward reference back to the line
     // where this body lives.
     try rendered.put(f.id, depth);
-    for (f.intra) |atom| {
-        try compactAtom(out, ctx, atom, depth + 1, max_depth, visited, rendered);
+    try compactSeq(out, ctx, f.intra, depth + 1, max_depth, visited, rendered);
+}
+
+/// Render a flat atom sequence (a fn body, branch arm, or loop body) with
+/// adjacent-line dedup. When two or more consecutive call atoms collapse
+/// to the same single-line tag (e.g. five `@arg` extractions in a row, or
+/// three `^X.Y` capped leaves under a switch arm), emit one line with a
+/// `×N` multiplier. Strict adjacency: any branch/loop/recursing call in
+/// between breaks a run, so call-order semantics are preserved. Atoms
+/// that produce no output (filtered assertions, hidden ref captures) are
+/// transparent — they don't break adjacency, since the agent never sees
+/// them in the rendered trace.
+fn compactSeq(
+    out: *std.io.Writer,
+    ctx: Ctx,
+    atoms: []const Atom,
+    depth: u32,
+    max_depth: u32,
+    visited: *std.AutoHashMap(FnId, u32),
+    rendered: *std.AutoHashMap(FnId, u32),
+) RenderError!void {
+    var i: usize = 0;
+    while (i < atoms.len) {
+        const atom = atoms[i];
+        switch (atom) {
+            .call => |c| {
+                const shape = classifyCall(ctx, c, depth, max_depth, visited, rendered);
+                switch (shape) {
+                    .skip => {
+                        i += 1;
+                    },
+                    .single => |line| {
+                        var j = i + 1;
+                        var count: u32 = 1;
+                        while (j < atoms.len) : (j += 1) {
+                            const next = atoms[j];
+                            if (next != .call) break;
+                            const next_shape = classifyCall(ctx, next.call, depth, max_depth, visited, rendered);
+                            switch (next_shape) {
+                                .skip => continue,
+                                .single => |nl| {
+                                    if (!callLineEql(line, nl)) break;
+                                    count += 1;
+                                },
+                                .multi => break,
+                            }
+                        }
+                        try emitCallLine(out, depth, line, count);
+                        i = j;
+                    },
+                    .multi => {
+                        try compactCall(out, ctx, c, depth, max_depth, visited, rendered);
+                        i += 1;
+                    },
+                }
+            },
+            .branch, .loop => {
+                try compactAtom(out, ctx, atom, depth, max_depth, visited, rendered);
+                i += 1;
+            },
+        }
     }
+}
+
+const CallLine = struct {
+    tag: u8,
+    body_depth: u32,
+    name: []const u8,
+};
+
+const CallShape = union(enum) {
+    skip,
+    single: CallLine,
+    multi,
+};
+
+fn callLineEql(a: CallLine, b: CallLine) bool {
+    if (a.tag != b.tag) return false;
+    if (a.tag == '~' and a.body_depth != b.body_depth) return false;
+    return std.mem.eql(u8, a.name, b.name);
+}
+
+/// Mirror of `compactCall`'s decision tree, returning what shape the
+/// emission would take without actually writing. Must stay in lockstep
+/// with `compactCall`; any new fold rule added there must be reflected
+/// here or dedup will misclassify.
+fn classifyCall(
+    ctx: Ctx,
+    c: Callee,
+    depth: u32,
+    max_depth: u32,
+    visited: *std.AutoHashMap(FnId, u32),
+    rendered: *std.AutoHashMap(FnId, u32),
+) CallShape {
+    if (ctx.hide_assertions and isAssertionName(c.name)) return .skip;
+    if (ctx.hide_debug and isDebugName(c.name)) {
+        return .{ .single = .{ .tag = '%', .body_depth = 0, .name = c.name } };
+    }
+    var fp: ?*const Function = null;
+    if (c.to) |id| fp = ctx.by_id.get(id);
+    if (fp == null) fp = ctx.by_name.get(c.name);
+    if (fp == null) {
+        if (c.kind == .indirect and ctx.hide_ref_captures and isTrivialRefCapture(c.name)) return .skip;
+        const tag: u8 = if (c.kind == .indirect) '&' else '!';
+        return .{ .single = .{ .tag = tag, .body_depth = 0, .name = c.name } };
+    }
+    const f = fp.?;
+    if (ctx.excludes.len > 0 and matchExclude(f.name, ctx.excludes)) {
+        return .{ .single = .{ .tag = '-', .body_depth = 0, .name = f.name } };
+    }
+    if (ctx.hide_library and isLibrary(f.name)) {
+        return .{ .single = .{ .tag = '=', .body_depth = 0, .name = f.name } };
+    }
+    if (visited.get(f.id)) |body_depth| {
+        return .{ .single = .{ .tag = '~', .body_depth = body_depth, .name = f.name } };
+    }
+    if (rendered.get(f.id)) |body_depth| {
+        return .{ .single = .{ .tag = '~', .body_depth = body_depth, .name = f.name } };
+    }
+    if (f.intra.len == 0) {
+        return .{ .single = .{ .tag = '@', .body_depth = 0, .name = f.name } };
+    }
+    if (depth + 1 >= max_depth) {
+        return .{ .single = .{ .tag = '^', .body_depth = 0, .name = f.name } };
+    }
+    return .multi;
+}
+
+fn emitCallLine(out: *std.io.Writer, depth: u32, line: CallLine, count: u32) !void {
+    try compactDepth(out, depth);
+    try out.writeByte(line.tag);
+    if (line.tag == '~') try compactDepth(out, line.body_depth);
+    try out.writeAll(line.name);
+    if (count > 1) try out.print(" ×{d}", .{count});
+    try out.writeAll("\n");
 }
 
 fn compactAtom(
@@ -460,7 +592,7 @@ fn compactBranch(
     try compactTagLine(out, depth, '?', kind);
     for (b.arms) |arm| {
         try compactTagLine(out, depth + 1, '>', shorten(arm.label, 80));
-        for (arm.seq) |a| try compactAtom(out, ctx, a, depth + 2, max_depth, visited, rendered);
+        try compactSeq(out, ctx, arm.seq, depth + 2, max_depth, visited, rendered);
     }
 }
 
@@ -474,7 +606,7 @@ fn compactLoop(
     rendered: *std.AutoHashMap(FnId, u32),
 ) RenderError!void {
     try compactTagLine(out, depth, '*', "");
-    for (l.body) |a| try compactAtom(out, ctx, a, depth + 1, max_depth, visited, rendered);
+    try compactSeq(out, ctx, l.body, depth + 1, max_depth, visited, rendered);
 }
 
 /// Quick stats from a stats-only walk over the trace tree, mirroring the
@@ -1145,6 +1277,21 @@ fn internModule(
 /// with a header showing the path:line. Body extends from the def line
 /// through the matching closing brace.
 pub fn printFnSource(gpa: std.mem.Allocator, out: *std.io.Writer, f: *const Function) !void {
+    // Compiler-synthesized symbols (`__zig_is_named_enum_value_*` etc.)
+    // and IR-only fns the AST walk never matched have either an empty or
+    // a non-absolute def_loc.file. openFileAbsolute *asserts* on
+    // non-absolute paths and would crash the whole daemon — guard early.
+    if (f.def_loc.file.len == 0) {
+        try out.print("no source location for {s} (synthetic / IR-only fn)\n", .{f.name});
+        return;
+    }
+    if (!std.fs.path.isAbsolute(f.def_loc.file)) {
+        try out.print(
+            "source path is not absolute for {s}: {s}\n",
+            .{ f.name, f.def_loc.file },
+        );
+        return;
+    }
     const file = std.fs.openFileAbsolute(f.def_loc.file, .{}) catch |err| {
         try out.print("open {s}: {s}\n", .{ f.def_loc.file, @errorName(err) });
         return;

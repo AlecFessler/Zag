@@ -43,8 +43,8 @@ const TOOLS_JSON =
     \\  },
     \\  {
     \\    "name": "callgraph_trace",
-    \\    "description": "PREFER THIS over reading kernel source files when you need to understand control flow in the Zag kernel. Renders the full call hierarchy from one function as a compact indented tree, including if/else, switch, and loop control-flow blocks. One trace replaces dozens of Read calls and uses a fraction of the tokens. Use this any time the question is 'what does X do', 'what gets called when X happens', or 'how does control flow reach Y'. Drill in by re-tracing the callee whose behavior matters; expand depth gradually rather than reading source. The output mirrors the visual call-graph the user reviews in the web UI, so your understanding will line up with theirs.",
-    \\    "inputSchema": {"type":"object","properties":{"entry":{"type":"string","description":"Qualified function name to root the trace at (e.g. `main.kEntry`, `proc.process.start`). Use callgraph_find or callgraph_entries to discover names."},"arch":{"type":"string","description":"CPU architecture tag — x86_64 (default) or aarch64."},"depth":{"type":"integer","minimum":1,"maximum":36,"description":"Max traversal depth. Default 6. Increase only when the leaves you care about are still capped at the previous depth."},"hide_debug":{"type":"boolean","description":"Fold `debug.*` calls into one-line leaves. Default true. Pass false for full fidelity (e.g. when investigating panic/assert sites)."},"hide_library":{"type":"boolean","description":"Fold `std.*`/`builtin.*` calls into one-line leaves. Default true. Pass false to see stdlib internals."},"hide_assertions":{"type":"boolean","description":"Drop `debug.assert` / `debug.FullPanic.*` / `builtin.returnError` lines entirely. Default true — these are 0-signal noise in most traces. Pass false to keep them (e.g. when investigating which calls can fail)."},"hide_ref_captures":{"type":"boolean","description":"Drop `&<bare_ident>` lines (e.g. `&self`, `&buckets`) that are usually argument captures the IR analyzer flagged as indirect calls. Default true. Pass false to see them all."},"exclude":{"type":"string","description":"Comma-separated list of patterns to fold as `-` leaves in the trace. Each pattern is either a `module.*` prefix glob (matches qualified names starting with the prefix) or a bare substring. Use this to prune known-uninteresting subtrees per question (e.g. `exclude=memory.allocators.*,utils.elf.*` when investigating spawn flow but not the ELF parser internals)."},"format":{"type":"string","enum":["compact","text"],"description":"Output format. Default `compact` — pure-control-flow line format optimized for LLM token efficiency (~3-5× smaller than `text`). Each line: `<depth><payload>` for a descended fn, `<depth><tag><payload>` for a tagged node. `<depth>` is one base-36 char (`0`-`9`, then `a`-`z`). The full tag legend (`^@~&!%=?>*-` plus header format) lives in the MCP server `instructions` field — read it once at session start. Use `format=text` for the indented human-readable tree."}},"required":["entry"],"additionalProperties":false}
+    \\    "description": "PREFER THIS over reading kernel source files when you need to understand control flow in the Zag kernel. Renders the full call hierarchy from one function as a compact indented tree, including if/else, switch, and loop control-flow blocks. One trace replaces dozens of Read calls and uses a fraction of the tokens. Use this any time the question is 'what does X do', 'what gets called when X happens', or 'how does control flow reach Y'. Drill in by re-tracing the callee whose behavior matters; expand depth gradually rather than reading source. The output mirrors the visual call-graph the user reviews in the web UI, so your understanding will line up with theirs.\n\n## Compact format (default `format=compact`)\n\nHeader (always first line): `T fns=N cap=N d=N [top=<name>/<count>] [cap_top=<n1>/<c1>,...]`. `cap` is the count of nodes that hit the depth limit; `cap_top` lists up to 3 of them by call-site count (suppressed when every capped fn has only one call site).\n\nBody line shape: `<depth><tag><payload>[ ×N]`. `<depth>` is one base-36 char (`0`-`9` for 0-9, `a`-`z` for 10-35). When the second char is a letter or `_`, the line is a descended fn (no tag, payload = name).\n\nTrailing ` ×N` means N immediately adjacent calls under the same parent collapsed to the same single-line tag (e.g. `4@arg ×5` = five `@arg` extractions in a row, `4^syscall.X.Y ×3` = three capped calls to the same fn back-to-back). Strict adjacency: any branch, loop, or recursing call between two would-be duplicates breaks the run, so call-order semantics are preserved.\n\nTags:\n  • `^` capped — fn HAS callees but hit `depth` (deepen to expand)\n  • `@` no-body leaf — typically a compiler-inlined helper; deepening will NOT expand it\n  • `~` body shown elsewhere — followed by ANOTHER base-36 depth char then the name (`<this_depth>~<body_depth><name>`). Scan upward for a line whose leading char matches `<body_depth>` and whose payload is the same name\n  • `&` indirect call — fn pointer / vtable / unresolved ref\n  • `!` unresolved direct call — name has no body in this graph\n  • `%` folded `debug.*` call\n  • `=` folded `std.*` / `builtin.*` call\n  • `?` branch (payload: `if_else` or `switch`)\n  • `>` branch arm label (payload truncated at 80 chars)\n  • `*` loop (no payload; siblings under the same parent at deeper depth are inside the loop body)\n  • `-` excluded by an `exclude` pattern\n\nNo file:line in the trace — use `callgraph_loc <name>` for source location, or `callgraph_src <name>` to read a body. Use `format=text` for an indented human-readable tree.",
+    \\    "inputSchema": {"type":"object","properties":{"entry":{"type":"string","description":"Qualified function name to root the trace at (e.g. `main.kEntry`, `proc.process.start`). Use callgraph_find or callgraph_entries to discover names."},"arch":{"type":"string","description":"CPU architecture tag — x86_64 (default) or aarch64."},"depth":{"type":"integer","minimum":1,"maximum":36,"description":"Max traversal depth. Default 6. Increase only when the leaves you care about are still capped at the previous depth."},"hide_debug":{"type":"boolean","description":"Fold `debug.*` calls into one-line leaves. Default true. Pass false for full fidelity (e.g. when investigating panic/assert sites)."},"hide_library":{"type":"boolean","description":"Fold `std.*`/`builtin.*` calls into one-line leaves. Default true. Pass false to see stdlib internals."},"hide_assertions":{"type":"boolean","description":"Drop `debug.assert` / `debug.FullPanic.*` / `builtin.returnError` lines entirely. Default true — these are 0-signal noise in most traces. Pass false to keep them (e.g. when investigating which calls can fail)."},"hide_ref_captures":{"type":"boolean","description":"Drop `&<bare_ident>` lines (e.g. `&self`, `&buckets`) that are usually argument captures the IR analyzer flagged as indirect calls. Default true. Pass false to see them all."},"exclude":{"type":"string","description":"Comma-separated list of patterns to fold as `-` leaves in the trace. Each pattern is either a `module.*` prefix glob (matches qualified names starting with the prefix) or a bare substring. Use this to prune known-uninteresting subtrees per question (e.g. `exclude=memory.allocators.*,utils.elf.*` when investigating spawn flow but not the ELF parser internals)."},"format":{"type":"string","enum":["compact","text"],"description":"Output format. Default `compact` — pure-control-flow line format optimized for LLM token efficiency (~3-5× smaller than `text`). Full legend in this tool's description. Use `format=text` for an indented human-readable tree."}},"required":["entry"],"additionalProperties":false}
     \\  },
     \\  {
     \\    "name": "callgraph_src",
@@ -58,8 +58,8 @@ const TOOLS_JSON =
     \\  },
     \\  {
     \\    "name": "callgraph_modules",
-    \\    "description": "Returns the static module-to-module call graph aggregated from all function-level edges. PREFER THIS when you need the kernel's layering at a glance — which top-level module depends on which — before investigating any specific function path. One call replaces dozens of `callgraph_trace`s when the question is structural ('does memory call into sched?', 'what depends on caps?') rather than behavioral. Output groups outgoing edges per source module, sorted by edge count. Module identity is derived from each function's source file path; `level=1` (default) is the top-level directory (`syscall`, `capdom`, `arch`...), `level=2` keeps one more component (`arch.x64`, `arch.dispatch`), `level=0` returns the full file path so the most fine-grained layering is visible. At `level=2` and finer, single-edge connections dominate the output — pass `min_edges=2` (or higher) to suppress them. Pass `exclude_external=true` to drop the synthetic `std`/`external` buckets so kernel layering isn't buried under stdlib noise. Pass `direction=in` to flip the view to inbound edges (per-dst, with `<- src (count)` lines) — useful for blast-radius questions like 'who depends on caps?'. `direction=both` emits both views in one call.",
-    \\    "inputSchema": {"type":"object","properties":{"arch":{"type":"string","description":"CPU architecture tag. Default x86_64."},"level":{"type":"integer","minimum":0,"maximum":8,"description":"Path-component depth for the module identifier. 1=top dir (default), 2=top dir + subdir, 0=full file path."},"intra":{"type":"boolean","description":"Include intra-module edges (src module == dst module). Default false — at the layering granularity, intra edges are noise."},"min_edges":{"type":"integer","minimum":1,"description":"Suppress (src,dst) pairs with fewer than this many edges. Default 1 (no filter). Bump to 2-3 at level=2+ to drop trivial cross-module noise."},"exclude_external":{"type":"boolean","description":"Drop edges to/from the synthetic `std` and `external` modules so kernel-internal layering isn't buried by stdlib noise. Default false."},"direction":{"type":"string","enum":["out","in","both"],"description":"Edge direction to render. `out` (default) groups by src module and lists outgoing edges. `in` groups by dst module and lists inbound edges (`<- src (count)`); use this for blast-radius questions like 'who depends on caps?'. `both` emits both views."}},"additionalProperties":false}
+    \\    "description": "Returns the static module-to-module call graph aggregated from all function-level edges. PREFER THIS when you need the kernel's layering at a glance — which top-level module depends on which — before investigating any specific function path. One call replaces dozens of `callgraph_trace`s when the question is structural ('does memory call into sched?', 'what depends on caps?') rather than behavioral. Output groups outgoing edges per source module, sorted by edge count. Module identity is derived from each function's source file path; `level=1` (default) is the top-level directory (`syscall`, `capdom`, `arch`...), `level=2` keeps one more component (`arch.x64`, `arch.dispatch`), `level=0` returns the full file path so the most fine-grained layering is visible. Defaults are tuned for kernel layering questions: `min_edges=2` (drops trivial single-edge crossings) and `exclude_external=true` (drops the synthetic `std`/`external` buckets). Pass `min_edges=1` to keep every edge and `exclude_external=false` to keep stdlib edges when you want the unfiltered picture. Pass `direction=in` to flip the view to inbound edges (per-dst, with `<- src (count)` lines) — useful for blast-radius questions like 'who depends on caps?'. `direction=both` emits both views in one call.",
+    \\    "inputSchema": {"type":"object","properties":{"arch":{"type":"string","description":"CPU architecture tag. Default x86_64."},"level":{"type":"integer","minimum":0,"maximum":8,"description":"Path-component depth for the module identifier. 1=top dir (default), 2=top dir + subdir, 0=full file path."},"intra":{"type":"boolean","description":"Include intra-module edges (src module == dst module). Default false — at the layering granularity, intra edges are noise."},"min_edges":{"type":"integer","minimum":1,"description":"Suppress (src,dst) pairs with fewer than this many edges. Default 2 (drops trivial single-edge crossings). Pass 1 to keep every edge; bump higher at level=2+ for even tighter views."},"exclude_external":{"type":"boolean","description":"Drop edges to/from the synthetic `std` and `external` modules so kernel-internal layering isn't buried by stdlib noise. Default true. Pass false to keep them."},"direction":{"type":"string","enum":["out","in","both"],"description":"Edge direction to render. `out` (default) groups by src module and lists outgoing edges. `in` groups by dst module and lists inbound edges (`<- src (count)`); use this for blast-radius questions like 'who depends on caps?'. `both` emits both views."}},"additionalProperties":false}
     \\  },
     \\  {
     \\    "name": "callgraph_type",
@@ -90,6 +90,26 @@ const TOOLS_JSON =
     \\    "name": "callgraph_commits",
     \\    "description": "Use this to see recent commits in the Zag kernel repo when orienting yourself in the project's history. Output: one commit per line — `<short_sha>  <iso8601_date>  <subject>` with a trailing `  [stale]` marker on commits that predate the `-Demit_ir` build option (those commits can't be loaded by the callgraph tool — older than the scaffold).",
     \\    "inputSchema": {"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":500,"description":"Number of recent commits. Default 30."}},"additionalProperties":false}
+    \\  },
+    \\  {
+    \\    "name": "callgraph_review_open",
+    \\    "description": "ONLY USE THIS TOOL IF YOU HAVE BEEN DIRECTLY ASSIGNED TO PERFORM A CODE REVIEW OF A SPECIFIC COMMIT. Do not use review tools for ad-hoc exploration; the regular callgraph_* tools are for that. Starting a review writes persistent state to the repo (`.callgraph/review/<sha>.json`).\n\nStart or resume a per-commit code review. Without `sha` returns the repo-wide list of reviews and their channel completion state. With `sha` opens the review: classifies the commit's diff into per-symbol items, returns the full state. If the commit's graph isn't loaded yet, this call will trigger the build and block until it completes — kernel builds take 1-5 minutes for a cold commit, so be patient on the first open. Idempotent: a second open of the same commit returns existing state without reclassifying. Each item carries a `deps_kind` that drives the deps gate; `none` items (orphan hunks, trivial changes) bypass the gate. Use the returned items list to decide what to call review_deps on, in what order.",
+    \\    "inputSchema": {"type":"object","properties":{"sha":{"type":"string","description":"Full or short commit SHA. Omit to list all reviews in the repo."},"agent_model":{"type":"string","description":"Your model identifier (e.g. `claude-opus-4-7`). Recorded in the review file for the artifact header. Optional."}},"additionalProperties":false}
+    \\  },
+    \\  {
+    \\    "name": "callgraph_review_deps",
+    \\    "description": "ONLY USE THIS TOOL IF YOU HAVE BEEN DIRECTLY ASSIGNED TO PERFORM A CODE REVIEW OF A SPECIFIC COMMIT. Compute the canonical dep set for one review item — the symbols whose context you must view before checking the item off. The dep set comes from the same logic the human web view uses to highlight ripple effects (def_deps + caller/callee walk), so the agent and the human see the same picture.\n\nReturns rich entries (qualified_name + file:line + 1-line context summary) and writes the names into the item's `deps_required`. After this call you MUST view EACH of the returned deps with `callgraph_src` (function deps — read the body) or `callgraph_type` (type deps — read the definition) before you can call `review_checkoff` on the item. `callgraph_trace` does NOT count for the gate — a trace shows control flow, not the code you need to verify ripple. The deps list is sticky: re-calling deps only adds, never shrinks, so refreshing won't dodge an existing requirement.",
+    \\    "inputSchema": {"type":"object","properties":{"sha":{"type":"string","description":"Commit SHA the review is open for."},"item_id":{"type":"string","description":"Item id from review_open's items list (e.g. `sym:proc.process.start`)."}},"required":["sha","item_id"],"additionalProperties":false}
+    \\  },
+    \\  {
+    \\    "name": "callgraph_review_checkoff",
+    \\    "description": "ONLY USE THIS TOOL IF YOU HAVE BEEN DIRECTLY ASSIGNED TO PERFORM A CODE REVIEW OF A SPECIFIC COMMIT. Mark one item as reviewed. Gated: for non-trivial items (those whose `deps_kind` is not `none`), you must have called `review_deps` AND viewed every returned dep via `callgraph_src` or `callgraph_trace` before this call will succeed. The error message lists exactly which deps are still outstanding. Notes are optional but encouraged for non-trivial items — they go into the final review artifact.",
+    \\    "inputSchema": {"type":"object","properties":{"sha":{"type":"string","description":"Commit SHA the review is open for."},"item_id":{"type":"string","description":"Item id from review_open's items list."},"notes":{"type":"string","description":"Free-text reviewer notes for this item. Optional but encouraged for non-trivial changes."}},"required":["sha","item_id"],"additionalProperties":false}
+    \\  },
+    \\  {
+    \\    "name": "callgraph_review_complete",
+    \\    "description": "ONLY USE THIS TOOL IF YOU HAVE BEEN DIRECTLY ASSIGNED TO PERFORM A CODE REVIEW OF A SPECIFIC COMMIT. Finalize the review. Gated: every item must be checked off first; the error lists any that aren't. Writes a markdown artifact to `.callgraph/review/<sha>.mcp.md` containing your summary plus per-item notes — that file's presence is what flips the channel to really-complete in the web GUI's badge view. Returns the artifact text.",
+    \\    "inputSchema": {"type":"object","properties":{"sha":{"type":"string","description":"Commit SHA the review is open for."},"summary":{"type":"string","description":"Free-text overall summary of the review. Becomes the body of the markdown artifact and is what a human reading the badge will see."}},"required":["sha","summary"],"additionalProperties":false}
     \\  }
     \\]
 ;
@@ -129,33 +149,8 @@ const INSTRUCTIONS =
     "and they reflect the same call-graph the user reviews in the web UI, so your " ++
     "understanding stays aligned with theirs. Use them for anything kernel-related " ++
     "before falling back to filesystem tools.\n\n" ++
-    "## callgraph_trace compact format\n\n" ++
-    "Default `format=compact` is a terse single-line-per-node form (~3-5× smaller than " ++
-    "`text`). Lines are self-describing — first char = depth, second = tag or start of " ++
-    "a function name.\n\n" ++
-    "Header (always first line):\n" ++
-    "  `T fns=N cap=N d=N [top=<name>/<count>] [cap_top=<n1>/<c1>,...]`\n" ++
-    "  `cap` is the count of nodes that hit the depth limit; `cap_top` lists up to 3 of them " ++
-    "by call-site count. Use `cap_top` to deepen surgically instead of cranking `depth` blindly. " ++
-    "Suppressed when every capped fn has only one call site (the `^` markers locate them and `/1` adds noise).\n\n" ++
-    "Body line shapes:\n" ++
-    "  `<depth><name>`         — descended function (the default; `name` starts with a letter or `_`)\n" ++
-    "  `<depth><tag><payload>` — tagged node (`tag` is one of the symbols below)\n\n" ++
-    "Depth is a single base-36 char: `0`-`9` for 0-9, then `a`-`z` for 10-35.\n\n" ++
-    "Tags:\n" ++
-    "  `^` capped — fn HAS callees but hit `depth` (deepen to expand)\n" ++
-    "  `@` no-body leaf — typically a compiler-inlined helper. Deepening will NOT expand it.\n" ++
-    "  `~` body shown elsewhere — followed by ANOTHER base-36 depth char then the name. Shape: `<this_depth>~<body_depth><name>`. The body was rendered earlier in the trace at line depth `<body_depth>` — either an ancestor on the call path (recursion) or a sibling-repeat. Scan upward for a line whose leading char matches `<body_depth>` and whose payload is the same name.\n" ++
-    "  `&` indirect call — fn pointer / vtable / unresolved ref\n" ++
-    "  `!` unresolved direct call — name has no body in this graph\n" ++
-    "  `%` folded `debug.*` call\n" ++
-    "  `=` folded `std.*` / `builtin.*` call\n" ++
-    "  `?` branch (payload: `if_else` or `switch`)\n" ++
-    "  `*` loop (no payload)\n" ++
-    "  `>` branch arm label (payload truncated at 80 chars)\n" ++
-    "  `-` excluded by an `exclude` pattern\n\n" ++
-    "No file:line in the trace — use `callgraph_loc <name>` for source location, or " ++
-    "`callgraph_src <name>` to read a body.";
+    "The full compact-format legend (header layout + tag table) lives in `callgraph_trace`'s " ++
+    "tool description — consult it there when you need to parse a trace.";
 
 const SERVER_INFO_JSON =
     \\{"name":"callgraph","version":"0.1.0"}
@@ -425,18 +420,63 @@ fn buildUrl(
             try out.writer(al).print("{s}intra=1", .{if (first) "?" else "&"});
             first = false;
         }
-        if (jsonInt(args, "min_edges")) |n| {
-            try out.writer(al).print("{s}min_edges={d}", .{ if (first) "?" else "&", n });
-            first = false;
-        }
-        if (jsonBool(args, "exclude_external")) {
-            try out.writer(al).print("{s}exclude_external=1", .{if (first) "?" else "&"});
-            first = false;
-        }
+        // MCP default `min_edges=2` (vs server default 1): at the layering
+        // granularity agents care about, single-edge crossings dominate
+        // and rarely teach you anything. Caller can still override.
+        const min_edges_val: i64 = jsonInt(args, "min_edges") orelse 2;
+        try out.writer(al).print("{s}min_edges={d}", .{ if (first) "?" else "&", min_edges_val });
+        first = false;
+        // MCP default `exclude_external=true` (vs server default false):
+        // kernel-internal layering is the question almost every time;
+        // std/external buckets are noise. `jsonBoolOpt` lets an explicit
+        // `false` from the caller still pass through as `0`.
+        const ext_param: u8 = if (jsonBoolOpt(args, "exclude_external")) |b| (if (b) '1' else '0') else '1';
+        try out.writer(al).print("{s}exclude_external={c}", .{ if (first) "?" else "&", ext_param });
+        first = false;
         if (jsonString(args, "direction")) |d| {
             try out.writer(al).print("{s}direction={s}", .{ if (first) "?" else "&", d });
             first = false;
         }
+        return;
+    }
+    if (std.mem.eql(u8, tool, "callgraph_review_open")) {
+        // MCP defaults to format=compact (matches trace) — agents pay
+        // ~5x fewer tokens vs the verbose JSON the web GUI uses. Agent
+        // can still pass format=json if they want the full record.
+        try out.appendSlice(al, "/api/review/open?format=");
+        try out.appendSlice(al, jsonString(args, "format") orelse "compact");
+        if (jsonString(args, "sha")) |s| {
+            try out.writer(al).print("&sha={s}", .{s});
+        }
+        if (jsonString(args, "agent_model")) |m| {
+            try out.writer(al).print("&agent_model={s}", .{percentEncode(al, m) catch m});
+        }
+        return;
+    }
+    if (std.mem.eql(u8, tool, "callgraph_review_deps")) {
+        try out.appendSlice(al, "/api/review/deps?format=");
+        try out.appendSlice(al, jsonString(args, "format") orelse "compact");
+        const sha = jsonString(args, "sha") orelse return error.MissingSha;
+        const item_id = jsonString(args, "item_id") orelse return error.MissingItemId;
+        try out.writer(al).print("&sha={s}&item_id={s}", .{ sha, percentEncode(al, item_id) catch item_id });
+        return;
+    }
+    if (std.mem.eql(u8, tool, "callgraph_review_checkoff")) {
+        try out.appendSlice(al, "/api/review/checkoff?format=");
+        try out.appendSlice(al, jsonString(args, "format") orelse "compact");
+        const sha = jsonString(args, "sha") orelse return error.MissingSha;
+        const item_id = jsonString(args, "item_id") orelse return error.MissingItemId;
+        try out.writer(al).print("&sha={s}&item_id={s}", .{ sha, percentEncode(al, item_id) catch item_id });
+        if (jsonString(args, "notes")) |n| {
+            try out.writer(al).print("&notes={s}", .{percentEncode(al, n) catch n});
+        }
+        return;
+    }
+    if (std.mem.eql(u8, tool, "callgraph_review_complete")) {
+        try out.appendSlice(al, "/api/review/complete?");
+        const sha = jsonString(args, "sha") orelse return error.MissingSha;
+        const summary = jsonString(args, "summary") orelse return error.MissingSummary;
+        try out.writer(al).print("sha={s}&summary={s}", .{ sha, percentEncode(al, summary) catch summary });
         return;
     }
     out.clearRetainingCapacity();
@@ -569,10 +609,23 @@ fn httpGet(gpa: std.mem.Allocator, url: []const u8) ![]u8 {
     var aw = std.io.Writer.Allocating.init(gpa);
     defer aw.deinit();
 
+    // X-Cg-Channel tells the daemon this request is from the agent (MCP)
+    // channel rather than the human web GUI. The daemon uses it to drive
+    // the review-deps witnessing seam: when a fn_source or type call
+    // targets a symbol in some open mcp-channel review's deps_required,
+    // it gets recorded as viewed. Web GUI requests don't send this
+    // header and are not witnessed. (callgraph_trace is intentionally
+    // NOT a witnessable endpoint — a trace shows control flow, not the
+    // actual code an agent needs to verify ripple.)
+    const channel_header = [_]std.http.Header{
+        .{ .name = "X-Cg-Channel", .value = "mcp" },
+    };
+
     const result = try client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
         .response_writer = &aw.writer,
+        .extra_headers = &channel_header,
     });
     if (result.status != .ok and result.status != .not_found and result.status != .bad_request) {
         std.debug.print("http {d} from {s}\n", .{ @intFromEnum(result.status), url });
