@@ -833,7 +833,7 @@ fn allocVar(
 
 /// Final teardown — unmaps all installations, releases device/snapshot
 /// refs, removes from `domain.vars[]`, frees VA range, frees slab slot.
-fn destroyVar(v: *VAR) void {
+pub fn destroyVar(v: *VAR) void {
     const domain = v.domain;
     const gen = v._gen_lock.currentGen();
     if (v.map == .page_frame or v.map == .demand) {

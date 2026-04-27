@@ -287,10 +287,6 @@ fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
 
     _ = syscall.mapPf(var_handle, &.{ 0, pf_handle });
 
-    // KNOWN BUG (step 7g, INCOMPLETE FIX): the user write below does
-    // not always reach the page_frame's physical page. See the v0
-    // primary.zig comment in git history for the diagnosis. Left
-    // here unchanged because the fix is in another agent's lane.
     const dst: [*]volatile u8 = @ptrFromInt(var_base);
     var i: usize = 0;
     while (i < bytes.len) {

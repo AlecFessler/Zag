@@ -648,13 +648,17 @@ fn fireRouted(
 }
 
 /// Fire a memory_fault event for `ec`. Looks up `ec.event_routes[0]`;
-/// if bound, suspends `ec` on the port; else applies no-route fallback
-/// (restart domain or destroy). Spec §[event_route].
+/// if bound, suspends `ec` on the port; else applies the no-route
+/// fallback. Spec §[event_route] specifies restart-domain or release-
+/// self semantics here; until those are wired we fall back to
+/// terminating the faulting EC (mirrors `fireThreadFault`'s no-route
+/// path). Without this, a single faulting child anywhere in the system
+/// brings down the kernel before the runner can even drain results
+/// from the result port — a stub-vs-spec mismatch that turns every
+/// userland bug into an unrecoverable kernel panic.
 pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void {
     if (fireRouted(ec, .memory_fault, subcode, fault_addr)) return;
-
-    arch.boot.printRaw("[fault] memory_fault no-route fallback (panic)\n");
-    @panic("memory_fault with no event_route — restartDomain/releaseSelf are stubbed; cannot recover");
+    _ = execution_context.terminate(ec, 0);
 }
 
 /// Fire a thread_fault event. Fallback on no route: park the EC so the

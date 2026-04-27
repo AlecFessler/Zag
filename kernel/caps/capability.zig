@@ -455,11 +455,16 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
             page_frame.releaseHandle(ref.ptr);
         },
         .virtual_address_range => {
-            // VAR is capability-domain lifetime: the range, its
-            // installations, and its address-space mapping all die with
-            // the owning domain. Per-handle delete is a slot clear only
-            // (handled by `clearAndFreeSlot`); no module-level release
-            // hook is needed here.
+            // Spec §[capabilities].delete (virtual_address_range row):
+            // "Delete unmaps everything installed, frees the address
+            // range, releases the handle." VAR holds exactly one handle
+            // by construction (non-transferable), so the per-handle
+            // delete is the same teardown that fires when the owning
+            // capability domain dies — `destroyVar` unmaps every
+            // installed page, removes the VAR from `domain.vars[]` so
+            // the address range is reusable, and frees the slab slot.
+            const ref = typedRef(VAR, entry.*) orelse return;
+            var_range.destroyVar(ref.ptr);
         },
         .device_region => {
             const ref = typedRef(DeviceRegion, entry.*) orelse return;
