@@ -117,7 +117,14 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const ec = scheduler.currentEc() orelse
         @panic("user page fault with no current EC");
 
-    arch.boot.print("[fault] USER PF at 0x{x} rip=0x{x} write={} exec={}\n", .{ faulting_virt.addr, fault.rip, is_write, is_exec });
+    // Per-PF debug print intentionally elided. Every demand-page
+    // operation hits this path; the in-kernel-parallel test runner
+    // spawns hundreds of tests whose initial ELF load each triggers
+    // many PFs, and the resulting print storm (a) inflates each PF
+    // handler's kernel-stack frame by the bufPrint formatter buffer
+    // and (b) serialised the runner against print_lock under load
+    // hard enough to mask real errors. If userland PF tracing is
+    // wanted, gate it on a runtime flag rather than a default-on log.
 
     const dom_ref = ec.domain;
     const dom = dom_ref.lock(@src()) catch {
