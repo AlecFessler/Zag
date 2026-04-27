@@ -575,7 +575,7 @@ pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
     const sender = sender_ref.lock(@src()) catch return errors.E_TERM;
     defer sender_ref.unlock();
 
-    consumeReply(entry, sender);
+    consumeReply(entry, caller, sender);
     return 0;
 }
 
@@ -1077,12 +1077,21 @@ fn mintReply(receiver_domain: *CapabilityDomain, sender: *ExecutionContext, xfer
 /// Resume the sender via the reply path, applying receiver's GPR
 /// modifications (gated by originating EC handle's `write` cap).
 /// Spec §[reply] tests 05/06.
-fn consumeReply(holder: *KernelHandle, sender: *ExecutionContext) void {
+fn consumeReply(holder: *KernelHandle, receiver: *ExecutionContext, sender: *ExecutionContext) void {
     _ = holder;
     // The write-cap snapshot was stamped onto `sender` at suspend time
     // (see `suspendOnPort`); any receiver-side modifications to the
     // event-state vregs commit to the sender's saved iret frame iff
-    // that bit was set.
+    // that bit was set. The receiver's in-flight syscall frame holds
+    // the post-recv, pre-reply GPR values per §[event_state] (vregs
+    // 1..13 are 1:1 with hardware registers during handler execution),
+    // so we copy from the receiver's current ctx into the sender's
+    // saved frame.
+    if (sender.originating_write_cap) {
+        const sender_frame = sender.iret_frame orelse sender.ctx;
+        const receiver_frame = receiver.iret_frame orelse receiver.ctx;
+        arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
+    }
     execution_context.resumeFromReply(sender, sender.originating_write_cap);
 }
 

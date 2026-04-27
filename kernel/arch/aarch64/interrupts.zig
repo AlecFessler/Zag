@@ -461,6 +461,15 @@ pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
     @as(*u64, @ptrFromInt(ctx.sp_el0 + 8)).* = value;
 }
 
+/// Copy the §[event_state] GPR-backed vregs (vregs 1..31 on aarch64:
+/// x0..x30) from `src` to `dst`. Companion to x86-64's `copyEventStateGprs`;
+/// used by `reply` (Spec §[reply] test 05) to apply the receiver's vreg
+/// modifications onto the suspended EC's saved iret frame when the
+/// originating EC handle held the `write` cap.
+pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void {
+    dst.regs = src.regs;
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.x5;
 }

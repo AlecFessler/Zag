@@ -778,6 +778,30 @@ pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
     cpu.clac();
 }
 
+/// Copy the §[event_state] GPR-backed vregs (vregs 1..13 on x86-64:
+/// rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15) from
+/// `src` to `dst`. Used by `reply` (Spec §[reply] test 05) to apply the
+/// receiver's vreg modifications onto the suspended EC's saved iret
+/// frame when the originating EC handle held the `write` cap. rcx and
+/// r11 are intentionally excluded — they carry user RIP and RFLAGS on
+/// SYSCALL return per the SysV/AMD64 SYSCALL ABI and are not part of the
+/// vreg-1..13 set.
+pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void {
+    dst.regs.rax = src.regs.rax;
+    dst.regs.rbx = src.regs.rbx;
+    dst.regs.rdx = src.regs.rdx;
+    dst.regs.rbp = src.regs.rbp;
+    dst.regs.rsi = src.regs.rsi;
+    dst.regs.rdi = src.regs.rdi;
+    dst.regs.r8 = src.regs.r8;
+    dst.regs.r9 = src.regs.r9;
+    dst.regs.r10 = src.regs.r10;
+    dst.regs.r12 = src.regs.r12;
+    dst.regs.r13 = src.regs.r13;
+    dst.regs.r14 = src.regs.r14;
+    dst.regs.r15 = src.regs.r15;
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.r13;
 }

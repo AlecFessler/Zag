@@ -193,6 +193,21 @@ pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
     }
 }
 
+/// Copy the §[event_state] GPR-backed vregs from `src` (the receiver's
+/// in-flight syscall frame) to `dst` (the suspended sender's saved
+/// frame). Used by `reply` (Spec §[reply] test 05) to commit receiver-
+/// side vreg writes back to the resumed EC's user state when the
+/// originating EC handle had the `write` cap. x86-64: vregs 1..13 =
+/// rax/rbx/rdx/rbp/rsi/rdi/r8/r9/r10/r12/r13/r14/r15. aarch64: vregs
+/// 1..31 = x0..x30.
+pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.copyEventStateGprs(dst, src),
+        .aarch64 => aarch64.interrupts.copyEventStateGprs(dst, src),
+        else => unreachable,
+    }
+}
+
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.interrupts.getIpcHandle(ctx),

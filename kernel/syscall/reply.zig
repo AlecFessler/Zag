@@ -5,6 +5,7 @@ const device_region = zag.devices.device_region;
 const errors = zag.syscall.errors;
 const port = zag.sched.port;
 
+const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
 const DeviceRegion = device_region.DeviceRegion;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const HANDLE_ARG_MASK = capability.HANDLE_ARG_MASK;
@@ -115,10 +116,23 @@ pub fn replyTransfer(caller: *anyopaque, reply_handle: u64, pair_entries: []cons
         const reply_caps: ReplyCaps = @bitCast(caps_word);
         has_xfer = reply_caps.xfer;
     }
-    cd_ref.unlock();
+    if (!reply_present) {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    }
+    if (!has_xfer) {
+        cd_ref.unlock();
+        return errors.E_PERM;
+    }
 
-    if (!reply_present) return errors.E_BADCAP;
-    if (!has_xfer) return errors.E_PERM;
+    // Spec §[reply].reply_transfer per-entry gates (tests 05/06/07/08).
+    // Resolved under the same domain lock so the check is atomic against
+    // concurrent revoke/delete on the source handles.
+    if (validatePairEntrySources(cd, pair_entries)) |err| {
+        cd_ref.unlock();
+        return err;
+    }
+    cd_ref.unlock();
 
     const n: u8 = @intCast(pair_entries.len);
     return port.replyTransfer(ec, reply_handle, n);
@@ -129,6 +143,41 @@ pub fn replyTransfer(caller: *anyopaque, reply_handle: u64, pair_entries: []cons
 fn validatePairEntryBits(entries: []const u64) ?i64 {
     for (entries) |entry| {
         if (entry & ~PAIR_VALID_MASK != 0) return errors.E_INVAL;
+    }
+    return null;
+}
+
+/// Per-entry source-id resolution + caps subset + move/copy authority
+/// for `reply_transfer`. Spec §[reply].reply_transfer tests 05/06/07/08.
+/// Caller holds `cd._gen_lock`. Returns `null` on full pass; otherwise
+/// the first failing test's error code.
+fn validatePairEntrySources(cd: *CapabilityDomain, entries: []const u64) ?i64 {
+    for (entries) |entry| {
+        const slot: u12 = @truncate(entry & PAIR_SOURCE_MASK);
+        const entry_caps: u16 = @truncate((entry >> 16) & 0xFFFF);
+        const move_flag: bool = (entry & PAIR_MOVE_BIT) != 0;
+
+        // Test 05: source handle must resolve in the caller's domain.
+        const src = capability.resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
+        _ = src;
+
+        const src_caps: u16 = @truncate(Word0.caps(cd.user_table[slot].word0));
+
+        // Test 06: requested caps must be a subset of the source
+        // handle's current caps. Bitwise subset is correct for every
+        // transferable handle type (none of them carry `restrict`'s
+        // restart_policy enum special-case).
+        if (entry_caps & ~src_caps != 0) return errors.E_PERM;
+
+        // Tests 07/08: move/copy authority. Bit 0 = `move`, bit 1 =
+        // `copy` in the cap layout shared by transferable handle types.
+        const has_move = (src_caps & 0x1) != 0;
+        const has_copy = (src_caps & 0x2) != 0;
+        if (move_flag) {
+            if (!has_move) return errors.E_PERM;
+        } else {
+            if (!has_copy) return errors.E_PERM;
+        }
     }
     return null;
 }
