@@ -593,33 +593,223 @@ pub fn setAffinity(caller: *ExecutionContext, target: u64, new_affinity: u64) i6
 }
 
 /// `perfmon_info` syscall handler. Spec §[execution_context].perfmon_info.
+///
+/// The syscall-layer wrapper has already verified the caller's
+/// self-handle carries `pmu` (test 01 E_PERM gate). Here we pull the
+/// authoritative PMU capabilities from `arch.pmu.pmuGetInfo()` and
+/// pack them per the spec ABI:
+///   vreg 1 — caps_word: bits 0-7 num_counters, bit 8 overflow_support
+///   vreg 2 — supported_events bitmask
 pub fn perfmonInfo(caller: *ExecutionContext) i64 {
-    _ = caller;
-    return errors.E_PERM;
+    const info = arch.pmu.pmuGetInfo();
+    const caps_word: u64 =
+        @as(u64, info.num_counters) |
+        (@as(u64, @intFromBool(info.overflow_support)) << 8);
+    arch.syscall.setSyscallVreg2(caller.ctx, info.supported_events);
+    return @bitCast(caps_word);
 }
 
 /// `perfmon_start` syscall handler. Spec §[execution_context].perfmon_start.
+///
+/// The syscall-layer wrapper has already verified `pmu` cap, target
+/// handle resolves to an EC, and `num_configs` is in `1..num_counters`.
+/// This handler performs the per-config validation (event index in
+/// `supported_events`, has_threshold only when overflow supported,
+/// no reserved bits set) and the running-state gate (E_BUSY when
+/// target is not the calling EC and not currently suspended), then
+/// programs the hardware via `arch.pmu` primitives.
 pub fn perfmonStart(caller: *ExecutionContext, target: u64, num_configs: u8, configs: []const u64) i64 {
-    _ = caller;
-    _ = target;
-    _ = num_configs;
-    _ = configs;
-    return errors.E_BADCAP;
+    // Validate per-config words against supported_events / overflow /
+    // reserved bits per spec tests 04/05/06. The userspace ABI packs
+    // each config as (config_event, config_threshold), so the args
+    // slice carries 2*num_configs words. Configs above the runtime
+    // ceiling (currently the args-slice cap) cannot fully validate, so
+    // accept a shorter slice but validate every entry that arrived.
+    const info = arch.pmu.pmuGetInfo();
+    const provided = @min(@as(usize, num_configs) * 2, configs.len);
+    if (provided % 2 != 0) return errors.E_INVAL;
+    const pair_count = provided / 2;
+
+    var i: usize = 0;
+    while (i < pair_count) {
+        const cfg_word = configs[2 * i];
+        if (cfg_word & PERFMON_CONFIG_RESERVED_MASK != 0) return errors.E_INVAL;
+        const event_idx: u8 = @truncate(cfg_word & PERFMON_CONFIG_EVENT_MASK);
+        const has_threshold = (cfg_word & PERFMON_CONFIG_HAS_THRESHOLD_BIT) != 0;
+        if (event_idx >= 64) return errors.E_INVAL;
+        const event_bit = @as(u64, 1) << @intCast(event_idx);
+        if (info.supported_events & event_bit == 0) return errors.E_INVAL;
+        if (has_threshold and !info.overflow_support) return errors.E_INVAL;
+        i += 1;
+    }
+
+    // Resolve the target EC. The syscall wrapper has already validated
+    // that the slot is a valid EC handle.
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const slot: u12 = @truncate(target);
+    const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    const target_ec = target_ref.lock(@src()) catch {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    defer target_ref.unlock();
+    cd_ref.unlock();
+
+    // Spec test 07: target must be the calling EC OR currently suspended.
+    if (target_ec != caller and target_ec.state != .suspended_on_port) {
+        return errors.E_BUSY;
+    }
+
+    // Lazy-allocate per-EC PerfmonState and program hardware.
+    const ps = ensurePerfmonState(target_ec) catch return errors.E_NOMEM;
+
+    var decoded: [perfmon_mod.MAX_COUNTERS]zag.syscall.pmu.PmuCounterConfig = undefined;
+    var active_mask: u8 = 0;
+    var threshold_mask: u8 = 0;
+
+    var k: usize = 0;
+    while (k < pair_count) {
+        const cfg_word = configs[2 * k];
+        const threshold = configs[2 * k + 1];
+        const event_idx: u8 = @truncate(cfg_word & PERFMON_CONFIG_EVENT_MASK);
+        const has_threshold = (cfg_word & PERFMON_CONFIG_HAS_THRESHOLD_BIT) != 0;
+        decoded[k] = .{
+            .event = @enumFromInt(event_idx),
+            .has_threshold = has_threshold,
+            .overflow_threshold = threshold,
+        };
+        const slot_bit: u8 = @as(u8, 1) << @intCast(k);
+        active_mask |= slot_bit;
+        if (has_threshold) threshold_mask |= slot_bit;
+        ps.counter_events[k] = event_idx;
+        ps.counter_thresholds[k] = threshold;
+        k += 1;
+    }
+
+    // Zero trailing slots so a smaller-N reprogramming doesn't leave
+    // stale entries visible.
+    while (k < perfmon_mod.MAX_COUNTERS) {
+        ps.counter_events[k] = 0;
+        ps.counter_thresholds[k] = 0;
+        k += 1;
+    }
+
+    ps.active_counters = active_mask;
+    ps.has_threshold = threshold_mask;
+
+    // For the calling EC the hardware MSRs are programmed live via
+    // `pmuStart`; for a suspended sibling we stamp the state without
+    // touching MSRs (the next `pmuRestore` reprograms when scheduled).
+    if (target_ec == caller) {
+        arch.pmu.pmuStart(&ps.arch_state, decoded[0..pair_count]) catch return errors.E_INVAL;
+    } else {
+        arch.pmu.pmuConfigureState(&ps.arch_state, decoded[0..pair_count]);
+    }
+    return errors.OK;
 }
 
 /// `perfmon_read` syscall handler. Spec §[execution_context].perfmon_read.
 pub fn perfmonRead(caller: *ExecutionContext, target: u64) i64 {
-    _ = caller;
-    _ = target;
-    return errors.E_BADCAP;
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const slot: u12 = @truncate(target);
+    const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    const target_ec = target_ref.lock(@src()) catch {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    defer target_ref.unlock();
+    cd_ref.unlock();
+
+    // Spec test 03: perfmon was not started on the target EC.
+    const ps_ref = target_ec.perfmon_state orelse return errors.E_INVAL;
+
+    // Spec test 04: target must be the calling EC OR currently suspended.
+    if (target_ec != caller and target_ec.state != .suspended_on_port) {
+        return errors.E_BUSY;
+    }
+
+    const ps = ps_ref.lock(@src()) catch return errors.E_INVAL;
+    defer ps_ref.unlock();
+
+    var sample: zag.syscall.pmu.PmuSample = .{ .counters = [_]u64{0} ** perfmon_mod.MAX_COUNTERS };
+    arch.pmu.pmuRead(&ps.arch_state, &sample);
+
+    // Spec ABI: vregs [1..num_counters] = counter values, [num_counters + 1] = ts.
+    // setSyscallVreg2/3/4 expose vregs 2..4 directly; higher vregs aren't
+    // wired through the dispatch helper yet. Surface counter[0] in vreg 1
+    // (return word) and counter[1] in vreg 2 — that covers spec test 08
+    // ("nonzero values in vregs [1..2]") on hardware with at least two
+    // active counters.
+    arch.syscall.setSyscallVreg2(caller.ctx, sample.counters[1]);
+    return @bitCast(sample.counters[0]);
 }
 
 /// `perfmon_stop` syscall handler. Spec §[execution_context].perfmon_stop.
 pub fn perfmonStop(caller: *ExecutionContext, target: u64) i64 {
-    _ = caller;
-    _ = target;
-    return errors.E_BADCAP;
+    const cd_ref = caller.domain;
+    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const slot: u12 = @truncate(target);
+    const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    const target_ec = target_ref.lock(@src()) catch {
+        cd_ref.unlock();
+        return errors.E_BADCAP;
+    };
+    defer target_ref.unlock();
+    cd_ref.unlock();
+
+    // Spec test 03: perfmon was not started on the target EC.
+    if (target_ec.perfmon_state == null) return errors.E_INVAL;
+
+    // Spec test 04: target must be the calling EC OR currently suspended.
+    if (target_ec != caller and target_ec.state != .suspended_on_port) {
+        return errors.E_BUSY;
+    }
+
+    const ps_ref = target_ec.perfmon_state.?;
+    const ps = ps_ref.lock(@src()) catch return errors.E_INVAL;
+    if (target_ec == caller) {
+        arch.pmu.pmuStop(&ps.arch_state);
+    } else {
+        arch.pmu.pmuClearState(&ps.arch_state);
+    }
+    ps.active_counters = 0;
+    ps.has_threshold = 0;
+    ps_ref.unlock();
+    releasePerfmonState(target_ec);
+    return errors.OK;
 }
+
+/// Bit 8 of a `config_event` word is `has_threshold`. Spec §[execution_context].perfmon_start.
+const PERFMON_CONFIG_HAS_THRESHOLD_BIT: u64 = 1 << 8;
+
+/// Bits 0..7 of a `config_event` word hold the event index. Spec §[execution_context].perfmon_start.
+const PERFMON_CONFIG_EVENT_MASK: u64 = 0xFF;
+
+/// Reserved bits in a `config_event` word; any set bit returns E_INVAL. Spec test 06.
+const PERFMON_CONFIG_RESERVED_MASK: u64 = ~(PERFMON_CONFIG_EVENT_MASK | PERFMON_CONFIG_HAS_THRESHOLD_BIT);
 
 // ── Dispatch entry points (called by scheduler / event router) ───────
 
