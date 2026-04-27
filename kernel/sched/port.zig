@@ -54,6 +54,20 @@ var timed_recv_waiters: [MAX_TIMED_RECV_WAITERS]?*ExecutionContext = blk: {
 };
 var timed_recv_lock: SpinLock = .{ .class = "port.timed_recv_lock" };
 
+/// Per-core BSS scratch for `expireTimedRecvWaiters` Phase 1 → Phase 2
+/// hand-off. At 256 × 16 = 4 KiB the snapshot used to live on the IRQ
+/// timer-tick stack frame, sitting on top of whatever kernel/user stack
+/// the tick interrupted. That 4 KiB plus the 1 KiB futex-tick snapshot
+/// plus the rest of the scheduler chain pushed cumulative IRQ-context
+/// stack usage past the point where adjacent frames' saved-RIP slots
+/// were getting clobbered (cf. d1948fbd lockdep visited[] fix). One
+/// scratch per core is safe because `schedTimerHandler` runs to
+/// completion in IRQ context with IRQs masked, never recurses, and
+/// each core has its own timer. Spec §[port] / kernel/arch/x64/irq.zig
+/// `schedTimerHandler`.
+const RecvSnapshot = struct { ec: *ExecutionContext, deadline: u64 };
+var expire_recv_scratch: [scheduler.MAX_CORES][MAX_TIMED_RECV_WAITERS]RecvSnapshot = undefined;
+
 fn addTimedRecvWaiter(ec: *ExecutionContext) bool {
     const irq = timed_recv_lock.lockIrqSave(@src());
     defer timed_recv_lock.unlockIrqRestore(irq);
@@ -88,8 +102,8 @@ fn removeTimedRecvWaiter(ec: *ExecutionContext) void {
 pub fn expireTimedRecvWaiters() void {
     const now_ns = arch.time.getMonotonicClock().now();
 
-    const Snapshot = struct { ec: *ExecutionContext, deadline: u64 };
-    var expired: [MAX_TIMED_RECV_WAITERS]Snapshot = undefined;
+    const core_id = arch.smp.coreID();
+    const expired = &expire_recv_scratch[@intCast(core_id)];
     var expired_count: usize = 0;
     {
         const irq = timed_recv_lock.lockIrqSave(@src());

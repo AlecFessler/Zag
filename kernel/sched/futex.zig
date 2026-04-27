@@ -69,6 +69,19 @@ var buckets: [BUCKET_COUNT]Bucket = [_]Bucket{.{}} ** BUCKET_COUNT;
 var timed_lock: SpinLock = .{ .class = "futex.timed_lock" };
 var timed_waiters: [MAX_TIMED_WAITERS]?*ExecutionContext = [_]?*ExecutionContext{null} ** MAX_TIMED_WAITERS;
 
+/// Per-core BSS scratch for `expireTimedWaiters` Phase 1 → Phase 2
+/// hand-off. At 64 × 16 = 1 KiB the snapshot used to live on the IRQ
+/// timer-tick stack frame, sitting on top of whatever kernel/user stack
+/// the tick interrupted. Combined with the recv-waiter snapshot
+/// (`port.expire_recv_scratch`, 4 KiB) and the rest of the scheduler
+/// chain, IRQ-context stack usage was clobbering adjacent frames'
+/// saved-RIP slots (cf. d1948fbd lockdep visited[] fix). One scratch
+/// per core is safe: `schedTimerHandler` runs to completion in IRQ
+/// context with IRQs masked, never recurses, and each core has its
+/// own timer.
+const Snapshot = struct { ec: *ExecutionContext, deadline: u64 };
+var expire_timed_scratch: [sched.MAX_CORES][MAX_TIMED_WAITERS]Snapshot = undefined;
+
 /// `timed_lock` ordered_group. The wait paths take a bucket.lock first
 /// then call `addTimedWaiter` (which acquires `timed_lock`); the timer
 /// IRQ path takes `timed_lock` then per-EC bucket.locks. Tagging the
@@ -632,8 +645,8 @@ pub fn expireTimedWaiters() void {
     // The split is required by lock-order: wait() and wake() acquire
     // bucket.lock then timed_lock; if we held timed_lock here while
     // taking bucket.lock, that would form an AB-BA cycle.
-    const Snapshot = struct { ec: *ExecutionContext, deadline: u64 };
-    var expired: [MAX_TIMED_WAITERS]Snapshot = undefined;
+    const core_id = arch.smp.coreID();
+    const expired = &expire_timed_scratch[@intCast(core_id)];
     var expired_count: usize = 0;
     {
         const irq = timed_lock.lockIrqSaveOrdered(@src(), FUTEX_TIMED_GROUP);
