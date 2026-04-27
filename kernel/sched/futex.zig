@@ -609,13 +609,17 @@ fn sortByBucket(indices: []u8, addrs: []const PAddr) void {
 }
 
 /// Acquire bucket locks in sorted order, skipping duplicates.
+///
+/// Pointer-index `buckets[]` to avoid Debug-mode codegen copying the
+/// entire bucket array onto the multi-bucket lock-helper stack frame.
+/// See the matching note in sched.scheduler on `core_states[]`.
 fn acquireBucketLocks(sorted: []const u8, addrs: []const PAddr) BucketLockState {
     var state = BucketLockState{};
     var prev_idx: usize = std.math.maxInt(usize);
     for (sorted) |si| {
         const idx = bucketIdx(addrs[si]);
         if (idx == prev_idx) continue;
-        const irq = buckets[idx].lock.lockIrqSaveOrdered(@src(), FUTEX_BUCKET_GROUP);
+        const irq = (&buckets[idx]).lock.lockIrqSaveOrdered(@src(), FUTEX_BUCKET_GROUP);
         state.unique_indices[state.count] = idx;
         state.irq_states[state.count] = irq;
         state.count += 1;
@@ -624,12 +628,13 @@ fn acquireBucketLocks(sorted: []const u8, addrs: []const PAddr) BucketLockState 
     return state;
 }
 
-/// Release bucket locks in reverse order.
+/// Release bucket locks in reverse order. Pointer-index `buckets[]`:
+/// see the matching note in `acquireBucketLocks`.
 fn releaseBucketLocks(lock_state: *const BucketLockState) void {
     var i: usize = lock_state.count;
     while (i > 0) {
         i -= 1;
-        buckets[lock_state.unique_indices[i]].lock.unlockIrqRestore(lock_state.irq_states[i]);
+        (&buckets[lock_state.unique_indices[i]]).lock.unlockIrqRestore(lock_state.irq_states[i]);
     }
 }
 

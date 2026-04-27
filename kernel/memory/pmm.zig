@@ -194,9 +194,14 @@ pub fn freePageCount() u64 {
     // Per-core cache pages were allocated from the buddy (via
     // `splitAllocation`) and are observably free to userspace. Each
     // cache node is a 4 KiB page; `count` is the number of nodes.
+    //
+    // Pointer-index `page_caches[]` to avoid Debug-mode codegen
+    // copying the entire array onto the sys_info stack frame each
+    // iteration. See the matching note in sched.scheduler on
+    // `core_states[]`.
     var i: usize = 0;
     while (i < MAX_CORES) {
-        total += page_caches[i].count;
+        total += (&page_caches[i]).count;
         i += 1;
     }
     return total;

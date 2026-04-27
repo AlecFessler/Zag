@@ -210,8 +210,13 @@ pub fn initSyscallScratch(core_id: u64) void {
 
 /// Update per-CPU scratch kernel_rsp. Called from switchTo on every
 /// context switch, mirroring the TSS.RSP0 update.
+///
+/// Pointer-index `per_cpu_scratch[]` to avoid Debug-mode codegen
+/// copying the entire [64]SyscallScratch array (256 KiB) onto the
+/// kernel stack on every context switch. See the matching note in
+/// sched.scheduler on `core_states[]`.
 pub fn updateScratchKernelRsp(core_id: u64, kernel_rsp: u64) void {
-    per_cpu_scratch[core_id].kernel_rsp = kernel_rsp;
+    (&per_cpu_scratch[core_id]).kernel_rsp = kernel_rsp;
 }
 
 /// Syscall dispatch — exported so the SYSCALL asm entry can call it.
@@ -518,8 +523,12 @@ pub fn switchTo(ec: *ExecutionContext) void {
 
     const cid: u8 = @truncate(core_id);
     (&scheduler.core_states[cid]).current_ec = ec;
-    per_cpu_scratch[cid].current_ec = @intFromPtr(ec);
-    per_cpu_scratch[cid].current_domain = @intFromPtr(dom);
+    // Pointer-index `per_cpu_scratch[]`: see `updateScratchKernelRsp`.
+    // Each direct `per_cpu_scratch[i].field` write would otherwise
+    // memcpy the full 256 KiB array onto the dispatch stack frame.
+    const scratch = &per_cpu_scratch[cid];
+    scratch.current_ec = @intFromPtr(ec);
+    scratch.current_domain = @intFromPtr(dom);
 
     // Lazy FPU: TS should be clear iff `ec` is the current owner on
     // this core, set otherwise. Track the desired state and only touch

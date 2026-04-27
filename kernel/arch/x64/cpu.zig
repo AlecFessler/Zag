@@ -210,10 +210,16 @@ pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{
 /// target via the per-core mailbox. Spins on the mailbox's done flag
 /// until the receiver finishes saving `thread`'s state. Receiver is
 /// `fpuFlushIpiHandler` registered in `irq.zig`.
+///
+/// Pointer-index `fpu_flush_mailbox[]` to avoid Debug-mode codegen
+/// copying the entire [64]FpuFlushMailbox array onto the lazy-FPU
+/// IPI stack frame on every cross-core flush. See the matching note
+/// in sched.scheduler on `core_states[]`.
 pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
-    fpu_flush_mailbox[target_core].requestThread(thread);
+    const slot = &fpu_flush_mailbox[target_core];
+    slot.requestThread(thread);
     apic.sendIpiToCore(target_core, @intFromEnum(interrupts.IntVecs.fpu_flush));
-    fpu_flush_mailbox[target_core].waitDone();
+    slot.waitDone();
 }
 
 /// Spec-v3 EC variant of `fpuFlushIpi`. Identical wire protocol but the

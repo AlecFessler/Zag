@@ -324,10 +324,15 @@ pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{
 
 /// Flush a thread's FP regs from a remote core via SGI 2.
 /// See `kernel/arch/aarch64/exceptions.zig` for the receiver.
+///
+/// Pointer-index `fpu_flush_mailbox[]` to avoid Debug-mode codegen
+/// copying the entire array onto the IPI stack. See the matching
+/// note in sched.scheduler on `core_states[]`.
 pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
-    fpu_flush_mailbox[target_core].requestThread(thread);
+    const slot = &fpu_flush_mailbox[target_core];
+    slot.requestThread(thread);
     gic.sendIpiToCore(target_core, 2);
-    fpu_flush_mailbox[target_core].waitDone();
+    slot.waitDone();
 }
 
 /// Spec-v3 EC variant of `fpuFlushIpi`. Identical wire protocol (SGI 2)

@@ -160,7 +160,10 @@ pub fn sysInfoPerCoreInit() void {
 
     const tt = cpu.rdmsr(MSR_TEMPERATURE_TARGET);
     const tjmax: u8 = @truncate((tt >> 16) & 0xFF);
-    core_cache[core_id].tjmax_c = tjmax;
+    // Pointer-index `core_cache[]` to avoid Debug-mode codegen
+    // copying the array onto the per-core init stack frame. See
+    // the matching note in sched.scheduler on `core_states[]`.
+    (&core_cache[core_id]).tjmax_c = tjmax;
 
     sampleCoreHwState();
 }
