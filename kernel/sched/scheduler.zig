@@ -12,6 +12,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const port_mod = zag.sched.port;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const Priority = zag.sched.execution_context.Priority;
@@ -136,6 +137,36 @@ pub fn dequeue() ?*ExecutionContext {
 /// `coreRunning`) take an inherent snapshot semantics and re-check on
 /// the target.
 pub fn switchTo(ec: *ExecutionContext) void {
+    // vCPU dispatch: spec-v3 §[create_vcpu] requires that every time the
+    // vCPU EC becomes runnable (initial creation, reply-induced resume),
+    // the kernel re-enters guest mode and on the subsequent guest exit
+    // delivers a vm_exit event on its `exit_port`. Real VMX/SVM guest
+    // re-entry (loadGuestState → VMLAUNCH/VMRESUME → exit decode) is
+    // still a TODO in `arch/x64/kvm/vcpu.zig` — until that lands, fire a
+    // synthetic exit immediately so the recv/reply lifecycle remains
+    // observable end-to-end. The vCPU re-suspends on its exit_port via
+    // `fireVmExit` and we drop currency so the run loop dispatches the
+    // next ready EC. iretq'ing into a vCPU EC's zeroed user ctx would
+    // #GP into the kernel and starve the receiving VMM forever.
+    if (ec.vm != null) {
+        const core: u8 = @truncate(arch.smp.coreID());
+        core_states[core].current_ec = null;
+        // Spec §[vm_exit_state]: vregs 1..13 carry the guest GPR state
+        // at exit time. With real VMX/SVM guest re-entry still TODO,
+        // no actual guest code runs between reply and the next exit;
+        // zero the vCPU.ctx GPRs so `suspendOnPort`'s
+        // `getEventStateGprs(ec.ctx)` snapshot delivers zeros to the
+        // VMM on the synthetic exit. Otherwise `consumeReply` from
+        // the prior reply leaves the test EC's reply-time GPRs
+        // (notably rax=reply_handle_id) on `ec.ctx`, and the next
+        // event delivery would echo those back into the receiver's
+        // rax — turning vreg 1 (= "OK on success") into a stale
+        // handle id and tripping `errors.isError`.
+        @memset(std.mem.asBytes(&ec.ctx.regs), 0);
+        port_mod.fireVmExit(ec, 0, [3]u64{ 0, 0, 0 });
+        return;
+    }
+
     const core: u8 = @truncate(arch.smp.coreID());
     core_states[core].current_ec = ec;
     ec.state = .running;
