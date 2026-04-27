@@ -165,11 +165,22 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             );
         },
         .map_mmio => var_.mapMmio(caller, arg(args, 0), arg(args, 1)),
-        .unmap => var_.unmap(
-            caller,
-            arg(args, 0),
-            if (args.len > 1) args[1..] else &.{},
-        ),
+        .unmap => blk: {
+            // Spec §[var].unmap: syscall word bits 12-19 carry N, the
+            // number of selectors (0 = unmap everything). The selectors
+            // occupy vregs 2..1+N — args[1..1+N]. Without this slice the
+            // handler sees uninitialized vregs above the user's payload
+            // as junk selectors (e.g. a `&.{}` call would gate into the
+            // map=1/3 selector arms and trip E_BADCAP / E_INVAL on
+            // garbage values, breaking the N=0 "unmap everything" path).
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const end_idx: usize = @min(1 + @as(usize, @intCast(n)), args.len);
+            break :blk var_.unmap(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
         .remap => var_.remap(caller, arg(args, 0), arg(args, 1)),
         .snapshot => var_.snapshot(caller, arg(args, 0), arg(args, 1)),
         .idc_read => blk: {
