@@ -177,12 +177,22 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             arg(args, 1),
             @truncate(arg(args, 2)),
         ),
-        .idc_write => var_.idcWrite(
-            caller,
-            arg(args, 0),
-            arg(args, 1),
-            if (args.len > 2) args[2..] else &.{},
-        ),
+        .idc_write => blk: {
+            // Spec §[var].idc_write: syscall word bits 12-19 carry count
+            // (number of qwords, max 125). Qwords occupy vregs 3..2+count
+            // — args[2..2+count]. Without this slice the handler would
+            // see uninitialized vregs above the user's payload as junk
+            // qwords and (a) overcount, or (b) write garbage into the
+            // VAR on the success path.
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const end_idx: usize = @min(2 + @as(usize, @intCast(n)), args.len);
+            break :blk var_.idcWrite(
+                caller,
+                arg(args, 0),
+                arg(args, 1),
+                if (end_idx > 2) args[2..end_idx] else &.{},
+            );
+        },
 
         .create_page_frame => page_frame.createPageFrame(
             caller,
@@ -226,16 +236,30 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         ),
         .timer_cancel => timer.timerCancel(caller, arg(args, 0)),
 
-        .futex_wait_val => futex.futexWaitVal(
-            caller,
-            arg(args, 0),
-            if (args.len > 1) args[1..] else &.{},
-        ),
-        .futex_wait_change => futex.futexWaitChange(
-            caller,
-            arg(args, 0),
-            if (args.len > 1) args[1..] else &.{},
-        ),
+        .futex_wait_val => blk: {
+            // Spec §[futex_wait_val]: syscall word bits 12-19 carry N
+            // (number of (addr, expected) pairs, 1..63). The pairs
+            // occupy vregs 2..1+2N — args[1..1+2N]. Without this slice
+            // the handler sees uninitialized vregs as junk pairs.
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const pair_words: usize = @intCast(n * 2);
+            const end_idx: usize = @min(1 + pair_words, args.len);
+            break :blk futex.futexWaitVal(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
+        .futex_wait_change => blk: {
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const pair_words: usize = @intCast(n * 2);
+            const end_idx: usize = @min(1 + pair_words, args.len);
+            break :blk futex.futexWaitChange(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
         .futex_wake => futex.futexWake(caller, arg(args, 0), arg(args, 1)),
 
         .create_virtual_machine => virtual_machine.createVirtualMachine(
