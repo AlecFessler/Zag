@@ -200,22 +200,26 @@ fn suspendWithTwoAttachments(
     var rax_out: u64 = undefined;
 
     // The asm block:
-    //   1. sub rsp, 920            — reserve the full vreg pad
-    //   2. zero-fill [rsp + 0 .. rsp + 904) via a rep stosq counted in
-    //      qwords (113 qwords = word slot + vregs 14..125). rdi/rcx are
-    //      both clobbered by stosq; we list them in the clobber set.
-    //   3. write entry_a at [rsp + 904] (vreg 126)
-    //   4. write entry_b at [rsp + 912] (vreg 127)
-    //   5. write the syscall word at [rsp + 0]
-    //   6. load rax/rbx/rcx with v1/v2/word
-    //   7. syscall
-    //   8. add rsp, 920            — collapse the pad
+    //   1. pre-load all inputs into call-clobbered scratch registers
+    //      (r8/r9/r10/r12/r13) so they survive the stack-pointer move
+    //   2. sub rsp, 920            — reserve the full vreg pad
+    //   3. zero-fill [rsp + 0 .. rsp + 904) via a rep stosq counted in
+    //      qwords (113 qwords = word slot + vregs 14..125). rdi/rcx/rax
+    //      are all clobbered by stosq.
+    //   4. write entry_a at [rsp + 904] (vreg 126)
+    //   5. write entry_b at [rsp + 912] (vreg 127)
+    //   6. write the syscall word at [rsp + 0]
+    //   7. load rax/rbx/rcx with v1/v2/word
+    //   8. syscall
+    //   9. add rsp, 920            — collapse the pad
     //
-    // Inputs are passed via memory operands rather than register
-    // constraints — the kernel-side ABI consumes rax/rbx/rcx directly
-    // and we stage rsi/rdi for the rep stosq, leaving the constraint
-    // solver no register slack to satisfy five additional `r` inputs.
-    // Memory operands sidestep that pressure.
+    // Inputs are passed via register constraints rather than memory
+    // operands — `subq $920, %%rsp` would otherwise invalidate any
+    // RSP-relative memory operand the compiler chose to back the local
+    // input variables with. Pinning each input to a specific
+    // call-clobbered register that is NOT consumed by the syscall ABI
+    // (rax/rbx/rcx are reserved for v1/v2/word) keeps the values intact
+    // across the RSP move.
     //
     // rax holds the suspend's status on resume (vreg 1).
     asm volatile (
@@ -224,23 +228,21 @@ fn suspendWithTwoAttachments(
         \\ xorl %%eax, %%eax
         \\ movq $113, %%rcx
         \\ rep stosq
-        \\ movq %[ea], %%rax
-        \\ movq %%rax, 904(%%rsp)
-        \\ movq %[eb], %%rax
-        \\ movq %%rax, 912(%%rsp)
-        \\ movq %[w], %%rcx
-        \\ movq %%rcx, (%%rsp)
-        \\ movq %[iv1], %%rax
-        \\ movq %[iv2], %%rbx
+        \\ movq %%r8, 904(%%rsp)
+        \\ movq %%r9, 912(%%rsp)
+        \\ movq %%r10, (%%rsp)
+        \\ movq %%r12, %%rax
+        \\ movq %%r13, %%rbx
+        \\ movq %%r10, %%rcx
         \\ syscall
         \\ addq $920, %%rsp
         : [out_rax] "={rax}" (rax_out),
-        : [w] "m" (word),
-          [iv1] "m" (v1),
-          [iv2] "m" (v2),
-          [ea] "m" (entry_a),
-          [eb] "m" (entry_b),
-        : .{ .rbx = true, .rcx = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true, .cc = true });
+        : [w] "{r10}" (word),
+          [iv1] "{r12}" (v1),
+          [iv2] "{r13}" (v2),
+          [ea] "{r8}" (entry_a),
+          [eb] "{r9}" (entry_b),
+        : .{ .rbx = true, .rcx = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r11 = true, .r14 = true, .r15 = true, .memory = true, .cc = true });
 
     return rax_out;
 }
