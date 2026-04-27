@@ -47,11 +47,24 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Bit layout of `ceilings_inner` (= self-handle field0). See
-// §[capability_domain] Self handle and §[create_capability_domain].
+// Bit layouts. The self-handle field0 and the [2] ceilings_inner
+// argument are NOT the same shape: field0 inserts `idc_rx` at bits
+// 32-39 and shifts pf/vm/port up by 8 bits, while ceilings_inner
+// packs pf/vm/port at bits 32-55 with no idc_rx slot. See
+// §[capability_domain] Self handle vs §[create_capability_domain] [2].
+// `ec_inner`, `var_inner`, and `cridc_ceiling` (bits 0-31) are the
+// only sub-fields that share an offset between the two.
 const CRIDC_SHIFT: u6 = 24;
-const CRIDC_MASK: u64 = 0xFF << CRIDC_SHIFT;
-const CRIDC_VALID_MASK: u8 = 0x3F; // bits 0-5 of the 8-bit field.
+
+// Self-handle field0 sub-field offsets (per §[capability_domain]).
+const FIELD0_PF_SHIFT: u6 = 40;
+const FIELD0_VM_SHIFT: u6 = 48;
+const FIELD0_PORT_SHIFT: u6 = 56;
+
+// ceilings_inner sub-field offsets (per §[create_capability_domain] [2]).
+const INNER_PF_SHIFT: u6 = 32;
+const INNER_VM_SHIFT: u6 = 40;
+const INNER_PORT_SHIFT: u6 = 48;
 
 pub fn main(cap_table_base: u64) void {
     // Read the caller's self-handle. cridc_ceiling lives at field0
@@ -59,10 +72,22 @@ pub fn main(cap_table_base: u64) void {
     const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);
     const caller_cridc: u8 = @truncate((self_cap.field0 >> CRIDC_SHIFT) & 0xFF);
 
-    // Mirror the runner's other ceilings so only `cridc_ceiling`
-    // varies between the caller and the request — any E_PERM the
-    // kernel returns can only be attributable to the cridc field.
-    const base_inner: u64 = self_cap.field0 & ~CRIDC_MASK;
+    // Translate the caller's field0 sub-fields into the ceilings_inner
+    // packing so the request mirrors the caller exactly on every
+    // sub-field except `cridc_ceiling`. Without this translation,
+    // pf/vm/port sub-fields land at the wrong offsets and trip
+    // tests 10/11/12 before the test 09 cridc check fires.
+    const caller_ec_inner: u64 = self_cap.field0 & 0xFF;
+    const caller_var_inner: u64 = (self_cap.field0 >> 8) & 0xFFFF;
+    const caller_pf: u64 = (self_cap.field0 >> FIELD0_PF_SHIFT) & 0xFF;
+    const caller_vm: u64 = (self_cap.field0 >> FIELD0_VM_SHIFT) & 0xFF;
+    const caller_port: u64 = (self_cap.field0 >> FIELD0_PORT_SHIFT) & 0xFF;
+    const base_inner: u64 =
+        caller_ec_inner |
+        (caller_var_inner << 8) |
+        (caller_pf << INNER_PF_SHIFT) |
+        (caller_vm << INNER_VM_SHIFT) |
+        (caller_port << INNER_PORT_SHIFT);
     const ceilings_outer: u64 = self_cap.field1;
 
     // self_caps and elf_page_frame don't influence the cridc check;
