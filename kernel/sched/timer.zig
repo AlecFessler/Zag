@@ -683,11 +683,17 @@ fn checkRestartPolicyCeiling(cd: *CapabilityDomain, requested: u16) bool {
 }
 
 fn resolveTimerHandle(cd: *CapabilityDomain, handle: u64, expected: CapabilityType) ?TimerLookup {
+    // Spec §[capabilities]: a handle syscall arg is bits 0-11 (12-bit
+    // slot id). The type tag is read from the user table's word0, not
+    // from the syscall arg.
     const slot_id = capability.Word0.id(handle);
-    const t_tag = capability.Word0.typeTag(handle);
-    if (t_tag != expected) return null;
 
     const kernel_entry = &cd.kernel_table[slot_id];
+    if (kernel_entry.ref.ptr == null) return null;
+
+    const t_tag = capability.Word0.typeTag(cd.user_table[slot_id].word0);
+    if (t_tag != expected) return null;
+
     const typed = capability.typedRef(Timer, kernel_entry.*) orelse return null;
     const ptr = typed.lock(@src()) catch return null;
     typed.unlock();
