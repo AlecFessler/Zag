@@ -215,6 +215,24 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             }
             cpu.enableInterrupts();
             scheduler.yieldTo(null);
+            // If `yieldTo` dispatched a fresh EC it would never return
+            // here (`loadEcContextAndReturn` is noreturn). Reaching this
+            // line means the run queue was empty — the no-route fallback
+            // (`parkSelfFaulted` for thread_fault, `markReady` of the
+            // resumed EC was the last work) drained `current_ec` to null.
+            // We CANNOT iretq back to the kernel-stack iret frame: that
+            // frame still holds the now-stale faulting user context, and
+            // returning there would re-fault on the same RIP and re-enter
+            // this handler with `currentEc() == null`, hitting the
+            // user-exception-with-no-current-EC panic.
+            //
+            // Instead jump into the scheduler's main loop (noreturn). It
+            // will idle (`sti+hlt`) until any IRQ delivers more work, at
+            // which point it dispatches via `loadEcContextAndReturn`
+            // (which resets `rsp` to the new EC's saved context) — the
+            // current kernel-stack frame is abandoned, which is the same
+            // discipline the preempt-driven path uses.
+            if (scheduler.currentEc() == null) scheduler.run();
             return;
         }
     }
@@ -345,6 +363,14 @@ fn emulateVirtualBar(
         port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
         cpu.enableInterrupts();
         scheduler.yieldTo(null);
+        // `fireThreadFault`'s no-route fallback (`parkSelfFaulted`)
+        // cleared `current_ec`; if `yieldTo` couldn't dispatch fresh
+        // work, returning would iretq back to the now-stale faulting
+        // user RIP. Hand off to `scheduler.run()` (noreturn) — it idles
+        // until an IRQ delivers more work, at which point dispatch via
+        // `loadEcContextAndReturn` resets `rsp` and abandons this
+        // kernel-stack frame.
+        if (scheduler.currentEc() == null) scheduler.run();
         unreachable;
     };
 
@@ -358,6 +384,11 @@ fn emulateVirtualBar(
         port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
         cpu.enableInterrupts();
         scheduler.yieldTo(null);
+        // See the rip_page-resolve fallback above: if the run queue is
+        // empty after firing the no-route park, return into
+        // `scheduler.run()` rather than letting iretq return to a stale
+        // user frame.
+        if (scheduler.currentEc() == null) scheduler.run();
         unreachable;
     };
 
@@ -371,6 +402,7 @@ fn emulateVirtualBar(
         port.fireMemoryFault(ec, subcode, faulting_addr);
         cpu.enableInterrupts();
         scheduler.yieldTo(null);
+        if (scheduler.currentEc() == null) scheduler.run();
         return;
     }
 
@@ -390,6 +422,7 @@ fn emulateVirtualBar(
                 port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
                 cpu.enableInterrupts();
                 scheduler.yieldTo(null);
+                if (scheduler.currentEc() == null) scheduler.run();
                 return;
             },
         }
@@ -402,6 +435,7 @@ fn emulateVirtualBar(
                 port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
                 cpu.enableInterrupts();
                 scheduler.yieldTo(null);
+                if (scheduler.currentEc() == null) scheduler.run();
                 unreachable;
             },
         };

@@ -82,6 +82,15 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         port.fireMemoryFault(ec, @intFromEnum(accessSubcode(is_write, is_exec)), faulting_virt.addr);
         arch.cpu.enableInterrupts();
         scheduler.yieldTo(null);
+        // `fireMemoryFault`'s no-route fallback terminates `ec` and
+        // clears `current_ec`; if the run queue is empty, returning
+        // would iretq back into the now-stale faulting frame and re-
+        // enter exception handling with `currentEc() == null`. Hand
+        // control to `scheduler.run()` — it idles until an IRQ delivers
+        // more work, at which point dispatch via
+        // `loadEcContextAndReturn` resets `rsp` and abandons this
+        // kernel-stack frame.
+        if (scheduler.currentEc() == null) scheduler.run();
         return;
     }
 
@@ -117,6 +126,10 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         port.fireMemoryFault(ec, @intFromEnum(MemoryFaultSubcode.unmapped), faulting_virt.addr);
         arch.cpu.enableInterrupts();
         scheduler.yieldTo(null);
+        // See the kernel-on-user-VA branch above: the no-route fallback
+        // drains `current_ec`; if no other EC is ready we MUST not iretq
+        // back to the stale faulting frame.
+        if (scheduler.currentEc() == null) scheduler.run();
         return;
     };
 
@@ -139,5 +152,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         port.fireMemoryFault(ec, @intFromEnum(subcode), faulting_virt.addr);
         arch.cpu.enableInterrupts();
         scheduler.yieldTo(null);
+        // Same rationale as the kernel-on-user-VA branch.
+        if (scheduler.currentEc() == null) scheduler.run();
     }
 }

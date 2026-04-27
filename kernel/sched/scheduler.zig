@@ -145,10 +145,22 @@ pub fn switchTo(ec: *ExecutionContext) void {
     // still a TODO in `arch/x64/kvm/vcpu.zig` — until that lands, fire a
     // synthetic exit immediately so the recv/reply lifecycle remains
     // observable end-to-end. The vCPU re-suspends on its exit_port via
-    // `fireVmExit` and we drop currency so the run loop dispatches the
-    // next ready EC. iretq'ing into a vCPU EC's zeroed user ctx would
-    // #GP into the kernel and starve the receiving VMM forever.
-    if (ec.vm != null) {
+    // `fireVmExit` (which may rendezvous with a parked VMM receiver and
+    // mark it ready) and we keep dispatching. We MUST NOT return here
+    // with `current_ec == null` — the caller (yieldTo / dispatchInterrupt)
+    // would iretq back to whatever interrupted-user RIP sits on the
+    // kernel stack, and that EC has typically already been suspended
+    // (e.g. fault path called fireThreadFault before yieldTo). The next
+    // user fault on that stale RIP would re-enter `exceptionHandler`
+    // with `currentEc() == null` and panic on the no-current-EC guard.
+    // Loop instead: pick the next ready EC; if it's another vCPU, fire
+    // its synthetic exit too; eventually we either dispatch a real EC
+    // via `loadEcContextAndReturn` (noreturn) or run dry and fall
+    // through to the empty-queue return path that leaves `current_ec`
+    // null but is safe because `run()`'s outer `arch.cpu.idle()` and
+    // `yieldTo`'s no-next branch are both designed for that.
+    var current = ec;
+    while (current.vm != null) {
         const core: u8 = @truncate(arch.smp.coreID());
         core_states[core].current_ec = null;
         // Spec §[vm_exit_state]: vregs 1..13 carry the guest GPR state
@@ -162,27 +174,26 @@ pub fn switchTo(ec: *ExecutionContext) void {
         // event delivery would echo those back into the receiver's
         // rax — turning vreg 1 (= "OK on success") into a stale
         // handle id and tripping `errors.isError`.
-        @memset(std.mem.asBytes(&ec.ctx.regs), 0);
-        // lockdep IRQ-mode mix: `scheduler.run` re-enters this branch
-        // after `arch.cpu.idle()` returns with IF=1 (sti+hlt's iretq
-        // restored the pre-hlt IF). `fireVmExit` then takes the exit
-        // port's `_gen_lock` — the same SecureSlab(Port) class that the
-        // timer IRQ's `expireTimedRecvWaiters` takes from async-IRQ
-        // context. A class taken in both async-IRQ context (state 1)
-        // and process-with-IRQs-enabled context (state 3) is the
-        // textbook same-core deadlock vector. Disable IRQs across the
-        // synthetic-exit dispatch so the lock acquisition classifies
-        // as state 2 (process + IRQs disabled, the silent-safe path).
-        const irq = arch.cpu.saveAndDisableInterrupts();
-        port_mod.fireVmExit(ec, 0, [3]u64{ 0, 0, 0 });
-        arch.cpu.restoreInterrupts(irq);
-        return;
+        @memset(std.mem.asBytes(&current.ctx.regs), 0);
+        port_mod.fireVmExit(current, 0, [3]u64{ 0, 0, 0 });
+
+        // The synthetic-exit path above may have rendezvoused with a
+        // parked VMM receiver, putting it in this core's run queue.
+        // Pull it (or anything else ready) and dispatch. Dropping out
+        // when nothing is ready is safe: callers are written to handle
+        // `switchTo` returning with `current_ec == null` via their own
+        // idle paths (run() loops to `arch.cpu.idle()`; yieldTo()'s no-
+        // next branch leaves `current_ec` null and lets the iretq fall
+        // back to the interrupted context, which is only reached when
+        // there genuinely is no other work).
+        const next = dequeueOrIdle() orelse return;
+        current = next;
     }
 
     const core: u8 = @truncate(arch.smp.coreID());
-    core_states[core].current_ec = ec;
-    ec.state = .running;
-    arch.cpu.loadEcContextAndReturn(ec);
+    core_states[core].current_ec = current;
+    current.state = .running;
+    arch.cpu.loadEcContextAndReturn(current);
 }
 
 /// Voluntary yield — current EC drops back into ready, scheduler
