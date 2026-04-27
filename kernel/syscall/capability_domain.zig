@@ -164,6 +164,17 @@ pub fn createCapabilityDomain(
         return errors.E_PERM;
     }
 
+    // Spec §[create_capability_domain] test 02: requested self_caps
+    // (bits 0-15 of [1]) must be a bitwise subset of the caller's
+    // current self-handle caps. Otherwise the call would let a domain
+    // mint a child with rights it doesn't itself hold, breaking the
+    // monotonic-rights invariant.
+    const requested_self_caps: u16 = @truncate(caps & 0xFFFF);
+    if (requested_self_caps & ~self_caps_word != 0) {
+        cd_ref.unlock();
+        return errors.E_PERM;
+    }
+
     const elf_slot: u12 = @truncate(elf_pf_slot);
     if (capability.resolveHandleOnDomain(cd, elf_slot, .page_frame) == null) {
         cd_ref.unlock();
