@@ -459,13 +459,13 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
 
     for (0..count) |i| {
         const idx = bucketIdx(addrs[i]);
-        buckets[idx].pq.enqueue(&nodes[i]);
+        (&buckets[idx]).pq.enqueue(&nodes[i]);
     }
 
     if (ec.futex_deadline_ns != 0) {
         if (!addTimedWaiter(ec)) {
             for (0..count) |i| {
-                _ = buckets[bucketIdx(addrs[i])].pq.remove(&nodes[i]);
+                _ = (&buckets[bucketIdx(addrs[i])]).pq.remove(&nodes[i]);
             }
             releaseBucketLocks(&lock_state);
             ec.state = .running;
@@ -554,13 +554,13 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
     ec.state = .futex_wait;
 
     for (0..count) |i| {
-        buckets[bucketIdx(addrs[i])].pq.enqueue(&nodes[i]);
+        (&buckets[bucketIdx(addrs[i])]).pq.enqueue(&nodes[i]);
     }
 
     if (ec.futex_deadline_ns != 0) {
         if (!addTimedWaiter(ec)) {
             for (0..count) |i| {
-                _ = buckets[bucketIdx(addrs[i])].pq.remove(&nodes[i]);
+                _ = (&buckets[bucketIdx(addrs[i])]).pq.remove(&nodes[i]);
             }
             releaseBucketLocks(&lock_state);
             ec.state = .running;

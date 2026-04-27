@@ -937,7 +937,11 @@ pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
 }
 
 export fn dispatchInterrupt(ctx: *cpu.Context) void {
-    const entry = vector_table[ctx.int_num];
+    // Pointer-index `vector_table[]` to avoid Debug-mode codegen
+    // copying the entire [256]VectorEntry array (~4 KiB) onto the IRQ
+    // kernel stack on every interrupt. See the matching note in
+    // sched.scheduler on `core_states[]`.
+    const entry = &vector_table[ctx.int_num];
     if (entry.handler) |h| {
         // lockdep: an `external` vector is an asynchronous device/IPI/timer
         // interrupt — the CPU auto-masked IFLAG on entry (Intel SDM Vol 3A
