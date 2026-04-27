@@ -267,6 +267,19 @@ pub const RecvReturn = struct {
 // stale anyway because we are back in our own RIP), then `addq` and
 // publishes rcx to the `oword` Zig output via the existing
 // `={rcx}`-class output operand.
+//
+// Stack reservation = 144 bytes (not 16). Rationale: §[event_state]
+// vreg 14 is delivered by `recv` at `[user_rsp + 8]` of the syscall-
+// time RSP — the kernel writes the suspended-EC's RIP there during
+// rendezvous. With a 16-byte reservation, [rsp+8] from inside the asm
+// equals (caller_rsp - 16) + 8 = caller_rsp - 8 — squarely inside the
+// SysV AMD64 red zone (caller_rsp - 128 .. caller_rsp - 1) where LLVM
+// is free to spill caller-side locals across the asm. The kernel's
+// vreg-14 write then clobbers a compiler-managed spill (manifested as
+// a USER PF on the next dereference of the spilled value). Reserving
+// 144 bytes pushes the kernel writes (vreg 0 at outer-144, vreg 14 at
+// outer-136) below the red zone, so they cannot collide with any
+// caller-frame spill. 144 is the smallest 16-byte multiple ≥ 128 + 16.
 fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
@@ -283,11 +296,11 @@ fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     var ov13: u64 = undefined;
     var oword: u64 = undefined;
     asm volatile (
-        \\ subq $16, %%rsp
+        \\ subq $144, %%rsp
         \\ movq %%rcx, (%%rsp)
         \\ syscall
         \\ movq (%%rsp), %%rcx
-        \\ addq $16, %%rsp
+        \\ addq $144, %%rsp
         : [v1] "={rax}" (ov1),
           [v2] "={rbx}" (ov2),
           [v3] "={rdx}" (ov3),
