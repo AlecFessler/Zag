@@ -13,6 +13,7 @@ const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const sched = zag.sched.scheduler;
+const serial = zag.arch.x64.serial;
 const stack_mod = zag.memory.stack;
 const timers = zag.arch.x64.timers;
 
@@ -161,5 +162,15 @@ fn coreInit() callconv(.c) noreturn {
     cpu.enableSpeculationBarriers();
     _ = cores_online.fetchAdd(1, .release);
     sched.perCoreInit();
-    cpu.halt();
+
+    // Visual confirmation that this AP reached the scheduler. Printed
+    // from inside the AP — serial driver is multi-core safe via its
+    // print_lock (see arch/x64/serial.zig).
+    serial.print("[ap {}] entering sched.run\n", .{core_id});
+
+    // Drop into the scheduler loop. APs start with empty run queues
+    // and no per-core idle EC, so `sched.run` will fall through to
+    // `sti+hlt` and wait for a cross-core wake / preempt IPI from
+    // `enqueueOnCore`. `sched.run` is `noreturn`.
+    sched.run();
 }

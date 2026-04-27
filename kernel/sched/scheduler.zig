@@ -15,6 +15,7 @@ const arch = zag.arch.dispatch;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const Priority = zag.sched.execution_context.Priority;
+const SpinLock = zag.utils.sync.SpinLock;
 
 /// Intrusive priority queue of ECs, linked through the EC's `next`
 /// field and ordered by `priority`. Shared by per-core run queues and
@@ -70,6 +71,24 @@ pub const PerCore = extern struct {
 /// are populated.
 pub var core_states: [MAX_CORES]PerCore = [_]PerCore{.{}} ** MAX_CORES;
 
+/// Parallel array of per-core spinlocks guarding `core_states[i]`'s
+/// `run_queue` and `current_ec`. Held only across queue ops and a
+/// snapshot of `current_ec`; never held across `loadEcContextAndReturn`.
+/// Kept out of `PerCore` itself so the IPC fast-path's hardcoded field
+/// offsets (72/80) inside `extern struct PerCore` stay pinned.
+///
+/// Lock order: `core_locks[i]` is its own class; cross-core enqueue may
+/// acquire the target core's lock while holding the local core's lock,
+/// so the class is registered as ordered to opt out of pair-edge
+/// cycle detection. Callers must always release before invoking
+/// scheduler dispatch (`switchTo` / `loadEcContextAndReturn`).
+pub var core_locks: [MAX_CORES]SpinLock = [_]SpinLock{.{ .class = "sched.core_lock" }} ** MAX_CORES;
+
+/// Lockdep group tag for `core_locks`. Non-zero so that overlapping
+/// per-core lock holds (e.g. cross-core enqueue grabbing target while
+/// holding local) don't seed a phantom AB-BA cycle in the lock graph.
+const SCHED_CORE_GROUP: u32 = 0x5C00; // arbitrary non-zero tag
+
 /// Set true after `globalInit` returns. Read by the boot path before
 /// enqueueing the root service's initial EC.
 pub var initialized: bool = false;
@@ -94,14 +113,22 @@ pub fn perCoreInit() void {}
 /// when the queue is empty (caller falls back to `idle`).
 pub fn dequeue() ?*ExecutionContext {
     const core: u8 = @truncate(arch.smp.coreID());
-    const state = &core_states[core];
-    return state.run_queue.dequeue();
+    const lock = &core_locks[core];
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+    const ec = core_states[core].run_queue.dequeue();
+    lock.unlockIrqRestore(irq);
+    return ec;
 }
 
 /// Context switch to `ec` on the current core. Saves outgoing EC's
 /// state to its `ctx`, swaps address space (if domain changed),
 /// updates `current_ec`, applies lazy-FPU policy (arm/clear CR0.TS),
 /// loads `ec.ctx` and returns to userspace via iretq/sysretq.
+///
+/// `current_ec` is written without the per-core lock — only this core
+/// ever writes its own `current_ec`, and cross-core readers (FPU flush,
+/// `coreRunning`) take an inherent snapshot semantics and re-check on
+/// the target.
 pub fn switchTo(ec: *ExecutionContext) void {
     const core: u8 = @truncate(arch.smp.coreID());
     core_states[core].current_ec = ec;
@@ -114,18 +141,28 @@ pub fn switchTo(ec: *ExecutionContext) void {
 pub fn yieldTo(target: ?*ExecutionContext) void {
     const core: u8 = @truncate(arch.smp.coreID());
     const state = &core_states[core];
+    const lock = &core_locks[core];
 
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     if (state.current_ec) |cur| {
         cur.state = .ready;
         state.run_queue.enqueue(cur);
     }
-
     const next = if (target) |t| blk: {
         if (t.state == .ready and state.run_queue.remove(t)) break :blk t;
-        break :blk dequeueOrIdle();
-    } else dequeueOrIdle();
+        break :blk dequeueOrIdleLocked(core);
+    } else dequeueOrIdleLocked(core);
+    lock.unlockIrqRestore(irq);
 
-    switchTo(next);
+    if (next) |n| {
+        switchTo(n);
+    } else {
+        // Empty queue and no idle EC. Drop to the idle loop in `run`
+        // by clearing `current_ec` and halting; an IPI / device IRQ
+        // will return us to the dispatch loop.
+        core_states[core].current_ec = null;
+        arch.cpu.idle();
+    }
 }
 
 /// Preemption tick — invoked from the per-core timer interrupt when
@@ -134,38 +171,99 @@ pub fn preempt() void {
     yieldTo(null);
 }
 
-/// Main scheduler loop entry — called from `kMain` once root EC has
-/// been enqueued. Picks the highest-priority ready EC (or falls back
-/// to idle) and dispatches; never returns.
+/// Main scheduler loop entry — called from `kMain` (BSP) and
+/// `arch.x64.smp.coreInit` (APs) once their per-core state is ready.
+/// Picks the highest-priority ready EC (or falls back to per-core idle
+/// EC when set, otherwise `sti+hlt` until an IPI arrives), and
+/// dispatches; never returns.
 pub fn run() noreturn {
     while (true) {
-        const next = dequeueOrIdle();
-        switchTo(next);
-        // switchTo is `noreturn` on the dispatch path. We only reach
-        // here when no EC was found and no idle EC was set up — halt
-        // with interrupts enabled so a wake IPI can break us out.
+        if (dequeueOrIdle()) |next| {
+            switchTo(next);
+        }
+        // Either `dequeueOrIdle` found nothing and no idle EC was set
+        // up for this core, or `switchTo` returned (it's `noreturn` on
+        // the dispatch path, so this is the empty-queue case). Sleep
+        // with interrupts enabled so a wake IPI breaks us out and the
+        // loop re-runs `dequeueOrIdle`.
         arch.cpu.idle();
     }
 }
 
 /// Internal helper — dequeues the highest-priority EC, or returns the
-/// per-core idle EC if the queue is empty. When neither is set, panics.
-fn dequeueOrIdle() *ExecutionContext {
+/// per-core idle EC if the queue is empty. Returns null when both are
+/// empty (caller drops to `sti+hlt` and waits for a wake IPI).
+fn dequeueOrIdle() ?*ExecutionContext {
     const core: u8 = @truncate(arch.smp.coreID());
+    const lock = &core_locks[core];
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+    const result = dequeueOrIdleLocked(core);
+    lock.unlockIrqRestore(irq);
+    return result;
+}
+
+/// Lock-held variant of `dequeueOrIdle` — caller must hold
+/// `core_locks[core]` with IRQs masked.
+fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
     const state = &core_states[core];
     if (state.run_queue.dequeue()) |ec| return ec;
     if (state.idle_ec) |idle| return idle;
-    @panic("scheduler: no ready EC and no idle EC");
+    return null;
 }
 
 // ── Enqueue / current accessors ──────────────────────────────────────
 
 /// Enqueue `ec` on `core`'s run queue. Used by recv → ready transitions,
-/// futex wake, timer fires, and the boot path. v0: no cross-core wake
-/// IPI; the BSP runs the only scheduler loop and APs are halted.
+/// futex wake, timer fires, and the boot path.
+///
+/// Wake / preempt policy after queueing:
+///   - target idle (no `current_ec`) and target != self: send wake IPI
+///     so the parked `hlt` exits and `run` re-runs `dequeueOrIdle`.
+///   - target current EC outranks `ec`: nothing to do — `ec` waits its
+///     turn.
+///   - `ec` outranks target's current EC: send a scheduler IPI to the
+///     target. Self-IPI (when target == self) is LAPIC-ICR-based, so
+///     it's IF-gated and fires once the caller exits its current IRQ /
+///     spinlock-held window. We deliberately do NOT inline-yield: many
+///     callers (e.g. `futex.wake`) hold a bucket lock across this call,
+///     and a context-switch via `loadEcContextAndReturn` would strand
+///     it.
 pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
     ec.state = .ready;
+
+    const lock = &core_locks[core];
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     core_states[core].run_queue.enqueue(ec);
+    // Snapshot the target's current EC before deciding whether to
+    // wake / preempt. Reading the remote core's `current_ec` is a racy
+    // hint — the worst case if it changes after we decide is a spurious
+    // wake or a missed preempt that the next preempt tick covers.
+    const target_current = core_states[core].current_ec;
+    lock.unlockIrqRestore(irq);
+
+    const self_core: u8 = @truncate(arch.smp.coreID());
+
+    if (target_current == null) {
+        // Idle target. Local self-wake is unnecessary — the caller is
+        // running, not halted; the run loop will pick up `ec` on the
+        // next dispatch.
+        if (core != self_core) arch.smp.sendWakeIpi(core);
+        return;
+    }
+
+    // Target is busy. Decide whether `ec` should preempt the running EC.
+    const cur = target_current.?;
+    if (@intFromEnum(ec.priority) <= @intFromEnum(cur.priority)) return;
+
+    // Same-core higher-pri: send a LAPIC self-IPI (deferred until the
+    // caller exits the current critical section / IRQ handler and IF=1
+    // is restored). We can't inline-yield here because callers like
+    // `futex.wake` hold a bucket spinlock across `enqueueOnCore`, and
+    // a context-switch via `loadEcContextAndReturn` would strand it.
+    //
+    // Cross-core higher-pri: same scheduler IPI. The receiver runs
+    // `preempt()` which re-evaluates the queue and switches.
+    arch.smp.triggerSchedulerInterrupt(core);
 }
 
 /// Enqueue `ec` on the kernel's choice of core, honoring `ec.affinity`.
@@ -178,7 +276,11 @@ pub fn enqueue(ec: *ExecutionContext) void {
 pub fn removeFromQueue(ec: *ExecutionContext) void {
     var i: u8 = 0;
     while (i < MAX_CORES) {
-        if (core_states[i].run_queue.remove(ec)) return;
+        const lock = &core_locks[i];
+        const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+        const removed = core_states[i].run_queue.remove(ec);
+        lock.unlockIrqRestore(irq);
+        if (removed) return;
         i += 1;
     }
 }
@@ -209,11 +311,12 @@ pub fn markReady(ec: *ExecutionContext) void {
     enqueue(ec);
 }
 
-/// Pick the right core for `ec` based on its affinity mask. v0 always
-/// returns 0 — only the BSP runs the scheduler loop right now.
+/// Pick the right core for `ec` based on its affinity mask.
+/// `affinity == 0` is the spec-defined "any core" sentinel; we fall
+/// back to the calling core for cache locality.
 fn pickCoreForAffinity(affinity: u64) u8 {
-    _ = affinity;
-    return @truncate(arch.smp.coreID());
+    if (affinity == 0) return @truncate(arch.smp.coreID());
+    return @truncate(@as(u64, @ctz(affinity)));
 }
 
 // ── Lazy FPU coordination ────────────────────────────────────────────
