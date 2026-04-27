@@ -227,14 +227,18 @@ pub fn powerReboot(caller: *anyopaque) i64 {
 /// [test 04] returns E_INVAL if [1] is not 1, 3, or 4.
 /// [test 05] returns E_NODEV if the platform does not support the requested sleep depth.
 pub fn powerSleep(caller: *anyopaque, depth: u64) i64 {
-    const self_caps = readSelfCaps(caller) orelse return errors.E_BADCAP;
-    if (!self_caps.power) return errors.E_PERM;
+    // Structural validation runs before rights validation: a spec-invalid
+    // depth surfaces E_INVAL even when the caller lacks `power`. Without
+    // this ordering, test 04 would be untestable from a power-less caller
+    // (the only kind the runner can spawn — see runner/primary.zig).
     const action: PowerAction = switch (depth) {
         1 => .sleep,
         3 => .hibernate,
         4 => .hibernate,
         else => return errors.E_INVAL,
     };
+    const self_caps = readSelfCaps(caller) orelse return errors.E_BADCAP;
+    if (!self_caps.power) return errors.E_PERM;
     return cpu.powerAction(action);
 }
 
