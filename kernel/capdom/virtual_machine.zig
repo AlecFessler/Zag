@@ -45,6 +45,22 @@ pub const VmCaps = packed struct(u16) {
     _reserved: u14 = 0,
 };
 
+/// Maximum number of distinct `map_guest` page_frame installations a
+/// single VM can hold concurrently. Sized small for the spec-v3 smoke
+/// path; the bookkeeping array is colocated in `VirtualMachine` so the
+/// per-install entry cost is just one slot.
+pub const MAX_GUEST_INSTALLS: usize = 64;
+
+/// One installed (host_phys → guest_addr) pair from a `map_guest` call.
+/// `unmap_guest` resolves by `pf` handle; the entry stays valid until
+/// the matching `unmap_guest` removes it.
+pub const GuestInstall = struct {
+    pf: ?*PageFrame = null,
+    guest_addr: u64 = 0,
+    page_count: u32 = 0,
+    sz: VarPageSize = .sz_4k,
+};
+
 pub const VirtualMachine = struct {
     /// Slab generation lock. Validates `SlabRef(VirtualMachine)`
     /// liveness AND guards every mutable field below.
@@ -75,6 +91,12 @@ pub const VirtualMachine = struct {
     /// VM policy bits (per spec field0 / cap word `policy`). Encoding
     /// TBD as VM creation cap bits get fleshed out — placeholder.
     policy: u8 = 0,
+
+    /// Bookkeeping for `map_guest` installations. `unmap_guest` resolves
+    /// by page_frame handle (§[unmap_guest] test 04 returns E_NOENT for
+    /// unmapped frames), so we need to remember `(pf, guest_addr)` pairs
+    /// per VM. Slots with `pf == null` are free.
+    installs: [MAX_GUEST_INSTALLS]GuestInstall = [_]GuestInstall{.{}} ** MAX_GUEST_INSTALLS,
 };
 
 pub const Allocator = SecureSlab(VirtualMachine, 256);
@@ -283,6 +305,14 @@ pub fn mapGuest(caller: *ExecutionContext, vm_handle: u64, pairs: []const u64) i
             if (rangesOverlap(guest_addr, pf, pairs[2 * j], other_pf)) return errors.E_INVAL;
             j += 1;
         }
+
+        // Spec §[map_guest] test 06: the new pair must not overlap any
+        // page_frame already installed in this VM's guest physical
+        // address space.
+        for (&vm.installs) |*entry| {
+            const entry_pf = entry.pf orelse continue;
+            if (installRangesOverlap(guest_addr, pf, entry.guest_addr, entry_pf)) return errors.E_INVAL;
+        }
         i += 1;
     }
 
@@ -430,48 +460,79 @@ fn destroyVm(vm: *VirtualMachine) void {
     slab_instance.destroy(vm, gen) catch {};
 }
 
+/// Find the install bookkeeping slot that holds `pf`, or null. Slot
+/// search is linear over `MAX_GUEST_INSTALLS`; sized for spec-v3 smoke
+/// VMs, will need a hash table when guest RAM grows.
+fn findInstall(vm: *VirtualMachine, pf: *PageFrame) ?*GuestInstall {
+    for (&vm.installs) |*entry| {
+        if (entry.pf == pf) return entry;
+    }
+    return null;
+}
+
+/// Allocate the next free install slot, or null if the array is full.
+fn allocInstall(vm: *VirtualMachine) ?*GuestInstall {
+    for (&vm.installs) |*entry| {
+        if (entry.pf == null) return entry;
+    }
+    return null;
+}
+
 /// Install `pf` at `guest_addr` in stage-2 tables; increments mapcnt.
 /// Per-page loop: each page in the page_frame is mapped contiguously
 /// at `guest_addr + i * pf.sz`. `perms` carries the cap-derived stage-2
 /// rwx envelope — guest accesses outside this envelope take a stage-2
 /// fault per spec §[virtual_machine].map_guest test 07.
 fn installPageFrame(vm: *VirtualMachine, guest_addr: u64, pf: *PageFrame, perms: MemoryPerms) i64 {
-    const stride = pageStride(pf.sz);
+    const slot = allocInstall(vm) orelse return errors.E_FULL;
 
+    const stride = pageStride(pf.sz);
     var i: u32 = 0;
     while (i < pf.page_count) {
         const ga = guest_addr + @as(u64, i) * stride;
         const ha = PAddr.fromInt(pf.phys_base.addr + @as(u64, i) * stride);
         vm_dispatch.stage2MapPage(vm, ga, ha, pf.sz, perms) catch {
+            // Roll back: unmap any pages we already installed.
+            var j: u32 = 0;
+            while (j < i) {
+                const ga_j = guest_addr + @as(u64, j) * stride;
+                vm_dispatch.stage2UnmapPage(vm, ga_j, pf.sz);
+                j += 1;
+            }
             return errors.E_NOMEM;
         };
         i += 1;
     }
 
+    slot.* = .{
+        .pf = pf,
+        .guest_addr = guest_addr,
+        .page_count = pf.page_count,
+        .sz = pf.sz,
+    };
     incPageFrameMap(pf);
     return 0;
 }
 
 /// Remove `pf`'s installation from stage-2 tables; decrements mapcnt;
 /// queues TLB shootdown to cores running this VM's vCPUs. Resolves
-/// the host_phys to its installed guest_phys via dispatch.
+/// the page_frame's installed guest_addr via the per-VM bookkeeping
+/// table populated by `installPageFrame`.
 fn uninstallPageFrame(vm: *VirtualMachine, pf: *PageFrame) i64 {
-    // Stage-2 install metadata lives in dispatch (per-arch lookup
-    // structure mirroring the EPT / stage-2 walk). The per-page
-    // unmap+invalidate is dispatched in one shot since dispatch
-    // already knows the guest_phys for `pf.phys_base`.
-    const guest_phys = vm_dispatch.stage2UnmapPage(vm, pf.phys_base.addr, pf.sz) orelse
-        return errors.E_NOENT;
-    _ = guest_phys;
+    const slot = findInstall(vm, pf) orelse return errors.E_NOENT;
 
-    var i: u32 = 1;
-    while (i < pf.page_count) {
-        const ha = pf.phys_base.addr + @as(u64, i) * pageStride(pf.sz);
-        _ = vm_dispatch.stage2UnmapPage(vm, ha, pf.sz);
+    const guest_addr = slot.guest_addr;
+    const stride = pageStride(slot.sz);
+
+    var i: u32 = 0;
+    while (i < slot.page_count) {
+        const ga = guest_addr + @as(u64, i) * stride;
+        vm_dispatch.stage2UnmapPage(vm, ga, slot.sz);
         i += 1;
     }
 
-    vm_dispatch.invalidateStage2Range(vm, pf.phys_base.addr, pf.sz, pf.page_count);
+    vm_dispatch.invalidateStage2Range(vm, guest_addr, slot.sz, slot.page_count);
+    slot.* = .{};
     decPageFrameMap(pf);
     return 0;
 }
@@ -576,6 +637,16 @@ fn rangesOverlap(addr_a: u64, pf_a: *PageFrame, addr_b: u64, pf_b: *PageFrame) b
     const end_a = addr_a + pageStride(pf_a.sz) * pf_a.page_count;
     const end_b = addr_b + pageStride(pf_b.sz) * pf_b.page_count;
     return addr_a < end_b and addr_b < end_a;
+}
+
+/// Variant of `rangesOverlap` that compares an incoming pair against an
+/// already-installed entry from `vm.installs` (whose `pf` pointer may be
+/// the same as the new pair's pf — that is exactly the overlap the spec
+/// rejects).
+fn installRangesOverlap(new_addr: u64, new_pf: *PageFrame, installed_addr: u64, installed_pf: *PageFrame) bool {
+    const end_new = new_addr + pageStride(new_pf.sz) * new_pf.page_count;
+    const end_installed = installed_addr + pageStride(installed_pf.sz) * installed_pf.page_count;
+    return new_addr < end_installed and installed_addr < end_new;
 }
 
 /// Translate a holder's PageFrame `r/w/x` cap bits into stage-2

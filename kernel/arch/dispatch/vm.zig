@@ -172,15 +172,14 @@ pub fn stage2MapPage(
     };
 }
 
-/// Unmap a single guest page from stage-2. Returns the previously
-/// bound host physical address if any.
+/// Unmap a single guest page from stage-2 at `guest_phys`.
 /// Spec §[virtual_machine].unmap_guest.
-pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) ?PAddr {
-    return switch (builtin.cpu.arch) {
+pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) void {
+    switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.stage2UnmapPage(vm, guest_phys, sz),
         .aarch64 => aarch64.kvm.vm.stage2UnmapPage(vm, guest_phys, sz),
         else => unreachable,
-    };
+    }
 }
 
 /// Stage-2 TLB shootdown across cores currently running this VM's

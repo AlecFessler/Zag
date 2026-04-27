@@ -236,7 +236,7 @@ pub fn stage2MapPage(
     @panic("step 6: rewrite for spec-v3");
 }
 
-pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) ?PAddr {
+pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) void {
     _ = vm;
     _ = guest_phys;
     _ = sz;

@@ -424,11 +424,21 @@ comptime {
     std.debug.assert(@alignOf(CtrlStateCell) == paging.PAGE4K);
 }
 
-// SPEC AMBIGUITY: x64 KVM stage-2 paging / policy / IRQ injection
-// not yet implemented. allocStage2Root above returns OutOfMemory so
-// no VM ever exists on x64 in the first place; these noop variants
-// exist only to satisfy the dispatch table — they are never reached
-// from the syscall layer because every preceding alloc fails.
+// Stage-2 paging: routes to the existing low-level VMX/SVM EPT/NPT
+// primitives. The dispatch contract takes a `*VirtualMachine` so the
+// arch backend can fetch the per-VM control state (VMCS/VMCB) from
+// `vm.arch_state`'s CtrlStateCell — `mapEptPage`/`unmapEptPage` then
+// VMPTRLD that PAddr to read the EPTP and walk the EPT. Spec
+// §[virtual_machine].map_guest / unmap_guest. The `sz` parameter is
+// currently honored only for 4K (the only encoding the underlying
+// EPT walker installs as a leaf today); larger page sizes will need
+// 2M/1G leaf support before they can be passed through.
+
+fn ctrlPhysFor(vm: *VirtualMachine) ?PAddr {
+    const erased = vm.arch_state orelse return null;
+    const cell: *CtrlStateCell = @ptrCast(@alignCast(erased));
+    return cell.ctrl_phys;
+}
 
 pub fn stage2MapPage(
     vm: *VirtualMachine,
@@ -437,19 +447,16 @@ pub fn stage2MapPage(
     sz: VarPageSize,
     perms: MemoryPerms,
 ) !void {
-    _ = vm;
-    _ = guest_phys;
-    _ = host_phys;
     _ = sz;
-    _ = perms;
-    return error.OutOfMemory;
+    const ctrl_phys = ctrlPhysFor(vm) orelse return error.NoDevice;
+    const rights: u8 = @bitCast(perms);
+    try vm_hw.mapGuestPage(ctrl_phys, guest_phys, host_phys, rights);
 }
 
-pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) ?PAddr {
-    _ = vm;
-    _ = guest_phys;
+pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) void {
     _ = sz;
-    return null;
+    const ctrl_phys = ctrlPhysFor(vm) orelse return;
+    vm_hw.unmapGuestPage(ctrl_phys, guest_phys);
 }
 
 pub fn invalidateStage2Range(
@@ -458,6 +465,9 @@ pub fn invalidateStage2Range(
     sz: VarPageSize,
     page_count: u32,
 ) void {
+    // `unmapGuestPage` already invokes INVEPT/INVNPT on the current core
+    // for each leaf removed; cross-core shootdown lives in a future TLB
+    // shootdown machinery (no live vCPUs in the spec-v3 smoke path).
     _ = vm;
     _ = guest_phys;
     _ = sz;
