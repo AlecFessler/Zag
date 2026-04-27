@@ -300,7 +300,11 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .time_monotonic => system.timeMonotonic(caller),
         .time_getwall => system.timeGetwall(caller),
         .time_setwall => system.timeSetwall(caller, arg(args, 0)),
-        .random => system.random(caller),
+        .random => blk: {
+            // Spec §[rng] random: count packed in syscall word bits 12-19.
+            const count: u8 = @truncate((syscall_word >> 12) & 0xFF);
+            break :blk system.random(caller, count);
+        },
         .info_system => system.infoSystem(caller),
         .info_cores => system.infoCores(caller, arg(args, 0)),
         .power_shutdown => system.powerShutdown(caller),

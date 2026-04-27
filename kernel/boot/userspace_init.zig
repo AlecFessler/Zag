@@ -185,10 +185,43 @@ pub fn init(root_service_elf: []const u8) !void {
     const layout = try resolveDomainLayout(root_service_elf);
     const slid_entry = VAddr.fromInt(parsed.entry.addr + layout.elf_slide);
 
+    // Spec §[capability_domain] root domain: ceilings_inner / ceilings_outer
+    // are absolute upper bounds — root must be allowed to mint handles
+    // with full caps in every type, otherwise the runner's own
+    // createPageFrame / createVar / createCapabilityDomain calls fail
+    // E_PERM against zero ceilings before the first test ever runs.
+    //
+    // ceilings_inner (field0):
+    //   bits  0-7   ec_inner_ceiling          = 0xFF
+    //   bits  8-23  var_inner_ceiling         = 0xFFFF
+    //   bits 24-31  cridc_ceiling             = 0xFF
+    //   bits 32-39  idc_rx                    = 0xFF
+    //   bits 40-47  pf_ceiling                = 0x1F  (max_rwx=7, max_sz=3)
+    //   bits 48-55  vm_ceiling                = 0xFF
+    //   bits 56-63  port_ceiling              = 0xFF
+    const root_field0_ceilings: u64 =
+        @as(u64, 0xFF) |
+        (@as(u64, 0xFFFF) << 8) |
+        (@as(u64, 0xFF) << 24) |
+        (@as(u64, 0xFF) << 32) |
+        (@as(u64, 0x1F) << 40) |
+        (@as(u64, 0xFF) << 48) |
+        (@as(u64, 0xFF) << 56);
+    // ceilings_outer (field1):
+    //   bits  0-7   ec_outer_ceiling           = 0xFF
+    //   bits  8-15  var_outer_ceiling          = 0xFF
+    //   bits 16-31  restart_policy_ceiling     = 0xFFFF
+    //   bits 32-37  fut_wait_max               = 63
+    const root_field1_ceilings: u64 =
+        @as(u64, 0xFF) |
+        (@as(u64, 0xFF) << 8) |
+        (@as(u64, 0xFFFF) << 16) |
+        (@as(u64, 63) << 32);
+
     const root_cd = try capdom.allocCapabilityDomain(
         @bitCast(ROOT_SELF_CAPS),
-        0,
-        0,
+        root_field0_ceilings,
+        root_field1_ceilings,
         slid_entry,
     );
 

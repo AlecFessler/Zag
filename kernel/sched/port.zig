@@ -143,18 +143,22 @@ pub fn createPort(caller: *ExecutionContext, caps: u64) i64 {
         .ptr = port,
         .gen = @intCast(port._gen_lock.currentGen()),
     };
+    const port_caps_word: u16 = @bitCast(port_caps);
     const slot = capability_domain.mintHandle(
         cd,
         obj_ref,
         .port,
-        @bitCast(port_caps),
+        port_caps_word,
         0,
         0,
     ) catch {
         _ = onHandleRelease(port, @bitCast(port_caps));
         return errors.E_FULL;
     };
-    return @intCast(slot);
+    // Spec §[error_codes] / §[capabilities]: pack Word0 so the
+    // returned value carries the type tag in bits 12..15 and never
+    // collides with the small-positive error range 1..15.
+    return @intCast(Word0.pack(slot, .port, port_caps_word));
 }
 
 /// `suspend` syscall handler. Spec §[port].suspend.

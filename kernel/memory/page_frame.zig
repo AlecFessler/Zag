@@ -127,11 +127,12 @@ pub fn createPageFrame(caller: *anyopaque, caps: u64, props: u64, pages: u64) i6
     };
     const field0: u64 = packField0(page_count, sz);
     const field1: u64 = 0;
+    const handle_caps: u16 = @bitCast(caps_bits);
     const slot = capability_domain.mintHandle(
         cd,
         erased,
         CapabilityType.page_frame,
-        @as(u16, @bitCast(caps_bits)),
+        handle_caps,
         field0,
         field1,
     ) catch {
@@ -141,7 +142,10 @@ pub fn createPageFrame(caller: *anyopaque, caps: u64, props: u64, pages: u64) i6
         return errors.E_FULL;
     };
 
-    return @as(i64, slot);
+    // Spec §[error_codes] / §[capabilities]: success returns the
+    // packed Word0 so the type tag in bits 12..15 always disambiguates
+    // a real handle word from the error range 1..15.
+    return @intCast(capability.Word0.pack(slot, .page_frame, handle_caps));
 }
 
 // ── Internal API ─────────────────────────────────────────────────────
@@ -292,27 +296,37 @@ fn callerDomain(ec: *ExecutionContext) *CapabilityDomain {
     return ec.domain.ptr;
 }
 
-/// Self-handle `crpf` predicate (test 01). The capability-domain
-/// helpers needed to read the self-handle's cap bits aren't present
-/// yet; this returns `false` (cap present) until they land so the
-/// rest of the path can be exercised.
+/// Spec §[create_page_frame] test 01: returns E_PERM if the caller's
+/// self-handle lacks `crpf`. The self-handle's caps live in the
+/// capability domain's user_table[0].word0 caps field.
 fn selfHandleLacksCrpf(ec: *ExecutionContext) bool {
-    _ = ec;
-    return false;
+    const cd = callerDomain(ec);
+    const self_caps_word: u16 = capability.Word0.caps(cd.user_table[0].word0);
+    const self_caps: capability_domain.CapabilityDomainCaps = @bitCast(self_caps_word);
+    return !self_caps.crpf;
 }
 
-/// `caps.r/w/x` ⊆ `pf_ceiling.max_rwx` predicate (test 02). See
-/// `selfHandleLacksCrpf` re: deferred ceiling lookup.
+/// Spec §[create_page_frame] test 02: returns E_PERM if caps' r/w/x
+/// bits are not a subset of the caller's `pf_ceiling.max_rwx`. The
+/// pf_ceiling lives in the self-handle's field0 at bits 32..47, with
+/// `max_rwx` in bits 40..42 and `max_sz` in bits 43..44 per
+/// spec §[capability_domain] field0 layout.
 fn rwxIsSubsetOfCeiling(ec: *ExecutionContext, caps_bits: PageFrameCaps) bool {
-    _ = ec;
-    _ = caps_bits;
-    return true;
+    const cd = callerDomain(ec);
+    const self_field0 = cd.user_table[0].field0;
+    const max_rwx: u3 = @truncate((self_field0 >> 40) & 0b111);
+    const requested_rwx: u3 = (@as(u3, @intFromBool(caps_bits.r))) |
+        (@as(u3, @intFromBool(caps_bits.w)) << 1) |
+        (@as(u3, @intFromBool(caps_bits.x)) << 2);
+    return (requested_rwx & ~max_rwx) == 0;
 }
 
-/// `caps.max_sz` ≤ `pf_ceiling.max_sz` predicate (test 03). See
-/// `selfHandleLacksCrpf` re: deferred ceiling lookup.
+/// Spec §[create_page_frame] test 03: returns E_PERM if `caps.max_sz`
+/// exceeds the caller's `pf_ceiling.max_sz`. Stored in self-handle
+/// field0 bits 43..44.
 fn maxSzWithinCeiling(ec: *ExecutionContext, caps_bits: PageFrameCaps) bool {
-    _ = ec;
-    _ = caps_bits;
-    return true;
+    const cd = callerDomain(ec);
+    const self_field0 = cd.user_table[0].field0;
+    const ceiling_max_sz: u2 = @truncate((self_field0 >> 43) & 0b11);
+    return caps_bits.max_sz <= ceiling_max_sz;
 }

@@ -177,11 +177,18 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
     //   bits  0-7   ec_inner_ceiling          = 0xFF
     //   bits  8-23  var_inner_ceiling         = 0x01FF (bits 0-8 valid)
     //   bits 24-31  cridc_ceiling             = 0x3F  (IDC bits 0-5)
-    //   bits 32-39  pf_ceiling                = 0x1F  (rwx + max_sz)
-    //   bits 40-47  vm_ceiling                = 0x01  (policy)
-    //   bits 48-55  port_ceiling              = 0x1C  (xfer/recv/bind at field-bits 2-4)
-    //   bits 56-63  _reserved                 = 0
-    const ceilings_inner: u64 = 0x001C_011F_3F01_FFFF;
+    //   bits 32-39  idc_rx                    = 0xFF  (mask intersected w/ sent caps)
+    //   bits 40-47  pf_ceiling                = 0x1F  (max_rwx bits 40-42, max_sz 43-44)
+    //   bits 48-55  vm_ceiling                = 0x01  (policy bit 48)
+    //   bits 56-63  port_ceiling              = 0x1C  (xfer 58, recv 59, bind 60)
+    const ceilings_inner: u64 =
+        @as(u64, 0xFF) |
+        (@as(u64, 0x01FF) << 8) |
+        (@as(u64, 0x3F) << 24) |
+        (@as(u64, 0xFF) << 32) |
+        (@as(u64, 0x1F) << 40) |
+        (@as(u64, 0x01) << 48) |
+        (@as(u64, 0x1C) << 56);
 
     // ceilings_outer (field1):
     //   bits  0-7   ec_outer_ceiling          = 0xFF

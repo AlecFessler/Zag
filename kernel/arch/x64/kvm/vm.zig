@@ -328,25 +328,42 @@ fn ioapicInjectExternal(ctx: *anyopaque, vector: u8) void {
 // ── Spec-v3 dispatch backings (STUB) ─────────────────────────────────
 
 pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
+    // SPEC AMBIGUITY: x64 KVM arch-state (VMCS/EPT) allocation not yet
+    // implemented. Returning OutOfMemory keeps create_virtual_machine
+    // on the E_NOMEM path rather than panicking the kernel.
     _ = vm;
     _ = policy_pf;
-    @panic("not implemented");
+    return error.OutOfMemory;
 }
 
 pub fn freeVmArchState(vm: *VirtualMachine) void {
+    // SPEC AMBIGUITY: x64 KVM teardown not yet implemented. Soft-noop
+    // so create_virtual_machine error paths can still tear down without
+    // panicking; the allocStage2Root error return below ensures we
+    // never construct a VM on x64 in the first place.
     _ = vm;
-    @panic("not implemented");
 }
 
 pub fn allocStage2Root(vm: *VirtualMachine) !PAddr {
+    // SPEC AMBIGUITY: x64 KVM stage-2 page-table root allocation not
+    // yet implemented. Returning OutOfMemory makes
+    // §[create_virtual_machine] return E_NOMEM (graceful) instead of
+    // panicking the kernel, so VM tests degrade to a uniform failure
+    // mode rather than killing the entire test run.
     _ = vm;
-    @panic("not implemented");
+    return error.OutOfMemory;
 }
 
 pub fn freeStage2Root(vm: *VirtualMachine) void {
+    // Symmetric soft-noop — see allocStage2Root.
     _ = vm;
-    @panic("not implemented");
 }
+
+// SPEC AMBIGUITY: x64 KVM stage-2 paging / policy / IRQ injection
+// not yet implemented. allocStage2Root above returns OutOfMemory so
+// no VM ever exists on x64 in the first place; these noop variants
+// exist only to satisfy the dispatch table — they are never reached
+// from the syscall layer because every preceding alloc fails.
 
 pub fn stage2MapPage(
     vm: *VirtualMachine,
@@ -360,14 +377,14 @@ pub fn stage2MapPage(
     _ = host_phys;
     _ = sz;
     _ = perms;
-    @panic("not implemented");
+    return error.OutOfMemory;
 }
 
 pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) ?PAddr {
     _ = vm;
     _ = guest_phys;
     _ = sz;
-    @panic("not implemented");
+    return null;
 }
 
 pub fn invalidateStage2Range(
@@ -380,19 +397,17 @@ pub fn invalidateStage2Range(
     _ = guest_phys;
     _ = sz;
     _ = page_count;
-    @panic("not implemented");
 }
 
 pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, entries: []const u64) i64 {
     _ = vm;
     _ = kind;
     _ = entries;
-    @panic("not implemented");
+    return @import("zag").syscall.errors.E_NODEV;
 }
 
 pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) void {
     _ = vm;
     _ = irq_num;
     _ = assert;
-    @panic("not implemented");
 }

@@ -35,6 +35,13 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
     result.bytes = bytes;
 
     const hdr_sz = @sizeOf(elf.Elf64_Ehdr);
+    // Spec §[create_capability_domain]: a malformed ELF (zero-sized
+    // page frame, truncated file, missing magic) must surface as
+    // E_INVAL at the syscall boundary. parseElf is the entry point
+    // most likely to be reached with attacker-controlled bytes —
+    // abort before reading past the buffer to keep it from panicking
+    // the kernel for any test that hands it a degenerate page frame.
+    if (bytes.len < hdr_sz) return error.InvalidElfMagic;
     var rd = std.Io.Reader.fixed(bytes[0..hdr_sz]);
     const elf_hdr = try elf.Header.read(&rd);
 
@@ -83,13 +90,21 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
 
     var shdr_itr = elf_hdr.iterateSectionHeadersBuffer(bytes);
 
+    // Bounds-check the section header table before slicing. A truncated
+    // ELF (e.g. user-staged page frame whose size doesn't cover shoff)
+    // would otherwise panic the kernel inside `bytes[shoff..end]`.
+    const shtbl_size = @as(u64, elf_hdr.shentsize) * @as(u64, elf_hdr.shnum);
+    if (elf_hdr.shoff + shtbl_size > bytes.len) return error.InvalidElfMagic;
+
     const shdrs = std.mem.bytesAsSlice(
         elf.Elf64_Shdr,
         bytes[elf_hdr.shoff .. elf_hdr.shoff + elf_hdr.shentsize * elf_hdr.shnum],
     );
 
+    if (elf_hdr.shstrndx >= shdrs.len) return error.InvalidElfMagic;
     const shstr_shdr = shdrs[elf_hdr.shstrndx];
     const shstr_end = shstr_shdr.sh_offset + shstr_shdr.sh_size;
+    if (shstr_end > bytes.len) return error.InvalidElfMagic;
     const shstr = bytes[shstr_shdr.sh_offset..shstr_end];
 
     while (try shdr_itr.next()) |shdr| {
