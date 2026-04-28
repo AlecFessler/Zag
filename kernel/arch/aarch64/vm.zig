@@ -17,3 +17,7 @@ pub var hyp_stub_installed: bool = false;
 /// not advertise hardware virtualization, so `vmSupported`-style
 /// callers in the dispatch layer naturally short-circuit.
 pub fn vmInit() void {}
+
+/// Per-core hardware-virtualization init. Stub on aarch64 until the
+/// EL2 / stage-2 scaffolding is restored.
+pub fn vmPerCoreInit() void {}

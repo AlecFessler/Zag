@@ -27,6 +27,19 @@ pub fn vmInit() void {
     }
 }
 
+/// Per-core hardware-virtualization init. On x86 this enables VMX/SVM
+/// (VMXON / EFER.SVME) and arms per-core save areas; on aarch64 it
+/// installs the EL2 vector and stage-2 init for cores that came up at
+/// EL2. Called by `sched.scheduler.perCoreInit` after the core's APIC
+/// (or GIC) is online.
+pub fn vmPerCoreInit() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.vmPerCoreInit(),
+        .aarch64 => aarch64.vm.vmPerCoreInit(),
+        else => unreachable,
+    }
+}
+
 /// BSP post-bootloader handoff. On aarch64, when UEFI's firmware drops
 /// us at EL2 (only observable by the bootloader, which signals via
 /// `boot_info.arrived_at_el2`), arm the hyp-stub gate and install the
@@ -92,6 +105,43 @@ pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.allocVcpuArchState(vm, vcpu_ec),
         .aarch64 => aarch64.kvm.vcpu.allocVcpuArchState(vm, vcpu_ec),
+        else => unreachable,
+    };
+}
+
+/// Free per-vCPU arch state pinned on `vcpu_ec.vcpu_arch_state`.
+/// Counterpart to `allocVcpuArchState`; called on EC destruction.
+pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vcpu.freeVcpuArchState(vcpu_ec),
+        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        else => unreachable,
+    }
+}
+
+/// Result of `enterGuest`: which sub-code + 3-vreg payload the kernel
+/// should attach to the vm_exit event delivered on the vCPU's
+/// `exit_port`. Layout follows spec §[vm_exit_state] x86-64 / aarch64
+/// sub-codes; the surrounding code is responsible for routing through
+/// `sched.port.fireVmExit`.
+pub const VmExitDelivery = struct {
+    subcode: u8,
+    payload: [3]u64,
+};
+
+/// Enter the guest bound to `vcpu_ec` via VMLAUNCH/VMRESUME (Intel) or
+/// VMRUN (AMD), running the guest until the next VM exit. On exit the
+/// guest's GPR / sregs / MSRs are saved back into the vCPU's GuestState
+/// and the exit reason is decoded into a `VmExitDelivery` describing
+/// which §[vm_exit_state] sub-code to surface and which 3-vreg payload
+/// to attach.
+///
+/// Returns `null` on platforms without hardware virtualization support;
+/// the caller must surface the synthetic-exit fallback in that case.
+pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm_runloop.enterGuest(vcpu_ec),
+        .aarch64 => null,
         else => unreachable,
     };
 }

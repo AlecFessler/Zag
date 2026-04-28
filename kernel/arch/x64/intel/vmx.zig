@@ -10,9 +10,14 @@ const cpu = zag.arch.x64.cpu;
 const gdt = zag.arch.x64.gdt;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
+const vm_mod = zag.arch.x64.vm;
 
+const GuestException = vm_mod.GuestException;
+const GuestInterrupt = vm_mod.GuestInterrupt;
+const GuestState = vm_mod.GuestState;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
+const VmExitInfo = vm_mod.VmExitInfo;
 
 // ---------------------------------------------------------------------------
 // MSR addresses (SDM Vol 3C, Appendix A.1 — VMX Capability Reporting MSRs)
@@ -287,6 +292,10 @@ var vmx_available: bool = false;
 /// Whether IA32_VMX_BASIC bit 55 is set (use TRUE controls MSRs).
 var use_true_ctls: bool = false;
 
+/// Per-core VMXON region physical addresses.
+const MAX_CORES = 64;
+var vmxon_regions: [MAX_CORES]PAddr = [_]PAddr{PAddr.fromInt(0)} ** MAX_CORES;
+
 // ---------------------------------------------------------------------------
 // Low-level VMCS read/write
 // ---------------------------------------------------------------------------
@@ -373,6 +382,50 @@ pub fn init() bool {
 /// Entering VMX Operation"). Locks IA32_FEATURE_CONTROL with VMX-outside-SMX
 /// enabled, sets CR4.VMXE[bit 13], allocates the VMXON region with the
 /// revision ID in the first 4 bytes, and executes VMXON.
+pub fn perCoreInit() void {
+    if (!vmx_available) return;
+
+    // Ensure IA32_FEATURE_CONTROL is locked with VMX-outside-SMX enabled.
+    var feature_ctl = cpu.rdmsr(IA32_FEATURE_CONTROL);
+    const LOCK_BIT: u64 = 1 << 0;
+    const VMX_OUTSIDE_SMX: u64 = 1 << 2;
+    if (feature_ctl & LOCK_BIT == 0) {
+        feature_ctl |= VMX_OUTSIDE_SMX | LOCK_BIT;
+        cpu.wrmsr(IA32_FEATURE_CONTROL, feature_ctl);
+    } else if (feature_ctl & VMX_OUTSIDE_SMX == 0) {
+        // Locked without VMX — cannot enable.
+        return;
+    }
+
+    // Set CR4.VMXE (bit 13)
+    var cr4: u64 = 0;
+    asm volatile ("mov %%cr4, %[out]"
+        : [out] "=r" (cr4),
+    );
+    cr4 |= (1 << 13);
+    asm volatile ("mov %[val], %%cr4"
+        :
+        : [val] "r" (cr4),
+    );
+
+    // Allocate VMXON region (4KB aligned, zeroed).
+    const page = allocPage() orelse return;
+    @memset(&page.mem, 0);
+
+    // Write revision ID into first 4 bytes (SDM Vol 3C, Table 25-1).
+    const rev_ptr: *u32 = @ptrCast(@alignCast(&page.mem));
+    rev_ptr.* = vmx_revision_id;
+
+    const phys = pageToPhys(page);
+    const core_id = zag.arch.x64.apic.coreID();
+    vmxon_regions[core_id] = phys;
+
+    asm volatile (
+        \\vmxon (%[addr])
+        :
+        : [addr] "r" (&phys.addr),
+        : .{ .memory = true, .cc = true });
+}
 
 // ---------------------------------------------------------------------------
 // VMCS and EPT allocation
@@ -664,12 +717,432 @@ fn initVmcs(ept_root_phys: PAddr) void {
 // ---------------------------------------------------------------------------
 
 /// Write guest register state from GuestState into the active VMCS.
+fn writeGuestState(gs: *const GuestState) void {
+    vmcsWrite(GUEST_RIP, gs.rip);
+    vmcsWrite(GUEST_RSP, gs.rsp);
+    vmcsWrite(GUEST_RFLAGS, gs.rflags);
+    vmcsWrite(GUEST_CR0, gs.cr0);
+    vmcsWrite(GUEST_CR3, gs.cr3);
+    vmcsWrite(GUEST_CR4, gs.cr4);
+
+    // Segments
+    vmcsWrite(GUEST_CS_SELECTOR, gs.cs.selector);
+    vmcsWrite(GUEST_CS_BASE, gs.cs.base);
+    vmcsWrite(GUEST_CS_LIMIT, gs.cs.limit);
+    vmcsWrite(GUEST_CS_ACCESS, gs.cs.access_rights);
+    vmcsWrite(GUEST_DS_SELECTOR, gs.ds.selector);
+    vmcsWrite(GUEST_DS_BASE, gs.ds.base);
+    vmcsWrite(GUEST_DS_LIMIT, gs.ds.limit);
+    vmcsWrite(GUEST_DS_ACCESS, gs.ds.access_rights);
+    vmcsWrite(GUEST_ES_SELECTOR, gs.es.selector);
+    vmcsWrite(GUEST_ES_BASE, gs.es.base);
+    vmcsWrite(GUEST_ES_LIMIT, gs.es.limit);
+    vmcsWrite(GUEST_ES_ACCESS, gs.es.access_rights);
+    vmcsWrite(GUEST_FS_SELECTOR, gs.fs.selector);
+    vmcsWrite(GUEST_FS_BASE, gs.fs.base);
+    vmcsWrite(GUEST_FS_LIMIT, gs.fs.limit);
+    vmcsWrite(GUEST_FS_ACCESS, gs.fs.access_rights);
+    vmcsWrite(GUEST_GS_SELECTOR, gs.gs.selector);
+    vmcsWrite(GUEST_GS_BASE, gs.gs.base);
+    vmcsWrite(GUEST_GS_LIMIT, gs.gs.limit);
+    vmcsWrite(GUEST_GS_ACCESS, gs.gs.access_rights);
+    vmcsWrite(GUEST_SS_SELECTOR, gs.ss.selector);
+    vmcsWrite(GUEST_SS_BASE, gs.ss.base);
+    vmcsWrite(GUEST_SS_LIMIT, gs.ss.limit);
+    vmcsWrite(GUEST_SS_ACCESS, gs.ss.access_rights);
+    vmcsWrite(GUEST_TR_SELECTOR, gs.tr.selector);
+    vmcsWrite(GUEST_TR_BASE, gs.tr.base);
+    vmcsWrite(GUEST_TR_LIMIT, gs.tr.limit);
+    vmcsWrite(GUEST_TR_ACCESS, gs.tr.access_rights);
+    vmcsWrite(GUEST_LDTR_SELECTOR, gs.ldtr.selector);
+    vmcsWrite(GUEST_LDTR_BASE, gs.ldtr.base);
+    vmcsWrite(GUEST_LDTR_LIMIT, gs.ldtr.limit);
+    vmcsWrite(GUEST_LDTR_ACCESS, gs.ldtr.access_rights);
+
+    // Descriptor tables
+    vmcsWrite(GUEST_GDTR_BASE, gs.gdtr_base);
+    vmcsWrite(GUEST_GDTR_LIMIT, gs.gdtr_limit);
+    vmcsWrite(GUEST_IDTR_BASE, gs.idtr_base);
+    vmcsWrite(GUEST_IDTR_LIMIT, gs.idtr_limit);
+
+    // MSRs
+    vmcsWrite(GUEST_EFER, gs.efer);
+    vmcsWrite(GUEST_SYSENTER_CS, gs.sysenter_cs);
+    vmcsWrite(GUEST_SYSENTER_ESP, gs.sysenter_esp);
+    vmcsWrite(GUEST_SYSENTER_EIP, gs.sysenter_eip);
+}
 
 /// Read guest register state from the active VMCS back into GuestState.
+fn readGuestState(gs: *GuestState) void {
+    gs.rip = vmcsRead(GUEST_RIP);
+    gs.rsp = vmcsRead(GUEST_RSP);
+    gs.rflags = vmcsRead(GUEST_RFLAGS);
+    gs.cr0 = vmcsRead(GUEST_CR0);
+    gs.cr3 = vmcsRead(GUEST_CR3);
+    gs.cr4 = vmcsRead(GUEST_CR4);
+
+    // Segments
+    gs.cs.selector = @truncate(vmcsRead(GUEST_CS_SELECTOR));
+    gs.cs.base = vmcsRead(GUEST_CS_BASE);
+    gs.cs.limit = @truncate(vmcsRead(GUEST_CS_LIMIT));
+    gs.cs.access_rights = @truncate(vmcsRead(GUEST_CS_ACCESS));
+    gs.ds.selector = @truncate(vmcsRead(GUEST_DS_SELECTOR));
+    gs.ds.base = vmcsRead(GUEST_DS_BASE);
+    gs.ds.limit = @truncate(vmcsRead(GUEST_DS_LIMIT));
+    gs.ds.access_rights = @truncate(vmcsRead(GUEST_DS_ACCESS));
+    gs.es.selector = @truncate(vmcsRead(GUEST_ES_SELECTOR));
+    gs.es.base = vmcsRead(GUEST_ES_BASE);
+    gs.es.limit = @truncate(vmcsRead(GUEST_ES_LIMIT));
+    gs.es.access_rights = @truncate(vmcsRead(GUEST_ES_ACCESS));
+    gs.fs.selector = @truncate(vmcsRead(GUEST_FS_SELECTOR));
+    gs.fs.base = vmcsRead(GUEST_FS_BASE);
+    gs.fs.limit = @truncate(vmcsRead(GUEST_FS_LIMIT));
+    gs.fs.access_rights = @truncate(vmcsRead(GUEST_FS_ACCESS));
+    gs.gs.selector = @truncate(vmcsRead(GUEST_GS_SELECTOR));
+    gs.gs.base = vmcsRead(GUEST_GS_BASE);
+    gs.gs.limit = @truncate(vmcsRead(GUEST_GS_LIMIT));
+    gs.gs.access_rights = @truncate(vmcsRead(GUEST_GS_ACCESS));
+    gs.ss.selector = @truncate(vmcsRead(GUEST_SS_SELECTOR));
+    gs.ss.base = vmcsRead(GUEST_SS_BASE);
+    gs.ss.limit = @truncate(vmcsRead(GUEST_SS_LIMIT));
+    gs.ss.access_rights = @truncate(vmcsRead(GUEST_SS_ACCESS));
+    gs.tr.selector = @truncate(vmcsRead(GUEST_TR_SELECTOR));
+    gs.tr.base = vmcsRead(GUEST_TR_BASE);
+    gs.tr.limit = @truncate(vmcsRead(GUEST_TR_LIMIT));
+    gs.tr.access_rights = @truncate(vmcsRead(GUEST_TR_ACCESS));
+    gs.ldtr.selector = @truncate(vmcsRead(GUEST_LDTR_SELECTOR));
+    gs.ldtr.base = vmcsRead(GUEST_LDTR_BASE);
+    gs.ldtr.limit = @truncate(vmcsRead(GUEST_LDTR_LIMIT));
+    gs.ldtr.access_rights = @truncate(vmcsRead(GUEST_LDTR_ACCESS));
+
+    // Descriptor tables
+    gs.gdtr_base = vmcsRead(GUEST_GDTR_BASE);
+    gs.gdtr_limit = @truncate(vmcsRead(GUEST_GDTR_LIMIT));
+    gs.idtr_base = vmcsRead(GUEST_IDTR_BASE);
+    gs.idtr_limit = @truncate(vmcsRead(GUEST_IDTR_LIMIT));
+
+    // MSRs
+    gs.efer = vmcsRead(GUEST_EFER);
+    gs.sysenter_cs = vmcsRead(GUEST_SYSENTER_CS);
+    gs.sysenter_esp = vmcsRead(GUEST_SYSENTER_ESP);
+    gs.sysenter_eip = vmcsRead(GUEST_SYSENTER_EIP);
+}
+
+/// Enter the guest via VMLAUNCH/VMRESUME (SDM Vol 3C, Section 27.2-27.4
+/// for VM-entry checks and loading guest state; Section 31.3 for the
+/// VMLAUNCH/VMRESUME instruction semantics). Returns exit info on VM exit.
+///
+/// The assembly sequence:
+///   1. VMPTRLD the VMCS
+///   2. Write guest VMCS state from GuestState
+///   3. Write HOST_RSP and HOST_RIP
+///   4. Save host callee-saved registers
+///   5. Load guest GP registers from GuestState
+///   6. VMLAUNCH or VMRESUME
+///   7. On VM exit: save guest GP registers to GuestState
+///   8. Restore host callee-saved registers
+///   9. Read VMCS exit fields and decode into VmExitInfo
+pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr) VmExitInfo {
+    // Load this VMCS as current
+    asm volatile (
+        \\vmptrld (%[addr])
+        :
+        : [addr] "r" (&vmcs_paddr.addr),
+        : .{ .memory = true, .cc = true });
+
+    // Write guest architectural state into VMCS fields
+    writeGuestState(guest_state);
+
+    const gs_ptr = @intFromPtr(guest_state);
+
+    asm volatile (
+    // Save host callee-saved registers
+        \\pushq %%rbx
+        \\pushq %%rbp
+        \\pushq %%r12
+        \\pushq %%r13
+        \\pushq %%r14
+        \\pushq %%r15
+        //
+        // Write HOST_RSP = current RSP (after pushes)
+        // VMWRITE field HOST_RSP (0x6C14), value = RSP
+        \\movq %%rsp, %%rax
+        \\movq $0x6C14, %%rdx
+        \\vmwrite %%rax, %%rdx
+        //
+        // Write HOST_RIP = address of .Lvm_exit_point
+        \\leaq .Lvm_exit_point(%%rip), %%rax
+        \\movq $0x6C16, %%rdx
+        \\vmwrite %%rax, %%rdx
+        //
+        // Load guest GP registers from GuestState.
+        // GuestState layout (extern struct, 8 bytes each):
+        // offset 0x00: rax, 0x08: rbx, 0x10: rcx, 0x18: rdx
+        // offset 0x20: rsi, 0x28: rdi, 0x30: rbp, 0x38: rsp (not used here)
+        // offset 0x40: r8,  0x48: r9,  0x50: r10, 0x58: r11
+        // offset 0x60: r12, 0x68: r13, 0x70: r14, 0x78: r15
+        \\movq %[gs], %%rax
+        \\movq 0x08(%%rax), %%rbx
+        \\movq 0x10(%%rax), %%rcx
+        \\movq 0x18(%%rax), %%rdx
+        \\movq 0x20(%%rax), %%rsi
+        \\movq 0x28(%%rax), %%rdi
+        \\movq 0x30(%%rax), %%rbp
+        \\movq 0x40(%%rax), %%r8
+        \\movq 0x48(%%rax), %%r9
+        \\movq 0x50(%%rax), %%r10
+        \\movq 0x58(%%rax), %%r11
+        \\movq 0x60(%%rax), %%r12
+        \\movq 0x68(%%rax), %%r13
+        \\movq 0x70(%%rax), %%r14
+        \\movq 0x78(%%rax), %%r15
+        // Load RAX last (clobbers our pointer)
+        \\movq 0x00(%%rax), %%rax
+        //
+        // Try VMRESUME first; if it fails (CF=1 => not launched), use VMLAUNCH.
+        \\vmresume
+        // If VMRESUME succeeds, we never reach here — VM exit goes to HOST_RIP.
+        // If VMRESUME fails (CF=1, VMCS never launched), try VMLAUNCH.
+        \\jbe .Lvm_launch
+        \\jmp .Lvm_exit_point
+        //
+        \\.Lvm_launch:
+        \\vmlaunch
+        // If VMLAUNCH succeeds, VM exit goes to HOST_RIP.
+        // If it fails, we fall through to the exit point with an error.
+        //
+        \\.Lvm_exit_point:
+        // We arrive here on VM exit. The processor has:
+        //   - Restored host segment registers, CR0/CR3/CR4, RSP, RIP
+        //   - Guest GP registers still hold guest values
+        //
+        // Save guest GP registers back into GuestState.
+        \\pushq %%rax
+        \\movq %[gs], %%rax
+        \\popq 0x00(%%rax)
+        \\movq %%rbx, 0x08(%%rax)
+        \\movq %%rcx, 0x10(%%rax)
+        \\movq %%rdx, 0x18(%%rax)
+        \\movq %%rsi, 0x20(%%rax)
+        \\movq %%rdi, 0x28(%%rax)
+        \\movq %%rbp, 0x30(%%rax)
+        \\movq %%r8,  0x40(%%rax)
+        \\movq %%r9,  0x48(%%rax)
+        \\movq %%r10, 0x50(%%rax)
+        \\movq %%r11, 0x58(%%rax)
+        \\movq %%r12, 0x60(%%rax)
+        \\movq %%r13, 0x68(%%rax)
+        \\movq %%r14, 0x70(%%rax)
+        \\movq %%r15, 0x78(%%rax)
+        //
+        // Restore host callee-saved registers
+        \\popq %%r15
+        \\popq %%r14
+        \\popq %%r13
+        \\popq %%r12
+        \\popq %%rbp
+        \\popq %%rbx
+        :
+        : [gs] "r" (gs_ptr),
+        : .{
+            // rbx, rbp, r12-r15 are NOT clobber-listed: the asm manually
+            // pushes/pops them on entry/exit. Listing a manually-saved
+            // callee-saved register as a clobber forces LLVM to allocate a
+            // scratch register for it — and with `omit_frame_pointer = false`
+            // plus the guest-GPR constraints, register pressure aborts the
+            // compile. See the matching comment on the SVM VMRUN asm.
+            .rax = true,
+            .rcx = true,
+            .rdx = true,
+            .rsi = true,
+            .rdi = true,
+            .r8 = true,
+            .r9 = true,
+            .r10 = true,
+            .r11 = true,
+            .memory = true,
+            .cc = true,
+        });
+
+    // Read guest architectural state back from VMCS into GuestState
+    readGuestState(guest_state);
+
+    // Decode exit reason
+    return decodeExitReason(guest_state);
+}
 
 // ---------------------------------------------------------------------------
 // Exit reason decoding
 // ---------------------------------------------------------------------------
+
+/// Decode the VM-exit reason from VMCS fields (SDM Vol 3C, Section 28.2.1
+/// "Basic VM-Exit Information"; Appendix C, Table C-1 for exit reason numbers).
+fn decodeExitReason(guest_state: *const GuestState) VmExitInfo {
+    const exit_reason_raw = vmcsRead(EXIT_REASON);
+    const exit_reason: u16 = @truncate(exit_reason_raw & 0xFFFF);
+    const qualification = vmcsRead(EXIT_QUALIFICATION);
+
+    switch (exit_reason) {
+        EXIT_REASON_CPUID => {
+            return .{ .cpuid = .{
+                .leaf = @truncate(guest_state.rax),
+                .subleaf = @truncate(guest_state.rcx),
+            } };
+        },
+        EXIT_REASON_IO => {
+            // Exit qualification for I/O (SDM Vol 3C, Table 28-5):
+            // Bit 3: direction (0=out, 1=in)
+            // Bits 2:0: size (0=1, 1=2, 3=4 bytes)
+            // Bits 31:16: port number
+            const size_bits: u8 = @truncate(qualification & 0x7);
+            const size: u8 = switch (size_bits) {
+                0 => 1,
+                1 => 2,
+                3 => 4,
+                else => 1,
+            };
+            const is_in = (qualification & (1 << 3)) != 0;
+            const port: u16 = @truncate((qualification >> 16) & 0xFFFF);
+            const instr_len = vmcsRead(VM_EXIT_INSTRUCTION_LEN);
+            return .{ .io = .{
+                .port = port,
+                .size = size,
+                .is_write = !is_in,
+                .value = @truncate(guest_state.rax),
+                .next_rip = guest_state.rip + instr_len,
+            } };
+        },
+        EXIT_REASON_CR_ACCESS => {
+            // Qualification (SDM Vol 3C, Table 28-3): bits 3:0 = CR number,
+            // bits 5:4 = access type (0=mov to CR, 1=mov from CR), bits 11:8 = GPR.
+            const cr_num: u4 = @truncate(qualification & 0xF);
+            const access_type: u2 = @truncate((qualification >> 4) & 0x3);
+            const gpr: u4 = @truncate((qualification >> 8) & 0xF);
+            const is_write = (access_type == 0);
+            const value = readGprFromGuest(guest_state, gpr);
+            return .{ .cr_access = .{
+                .cr_num = cr_num,
+                .is_write = is_write,
+                .gpr = gpr,
+                .value = value,
+            } };
+        },
+        EXIT_REASON_MSR_READ => {
+            return .{ .msr_read = .{
+                .msr = @truncate(guest_state.rcx),
+                .value = 0,
+            } };
+        },
+        EXIT_REASON_MSR_WRITE => {
+            const value = (guest_state.rdx << 32) | (guest_state.rax & 0xFFFF_FFFF);
+            return .{ .msr_write = .{
+                .msr = @truncate(guest_state.rcx),
+                .value = value,
+            } };
+        },
+        EXIT_REASON_EPT_VIOLATION => {
+            const guest_phys = vmcsRead(GUEST_PHYSICAL_ADDR);
+            return .{ .ept_violation = .{
+                .guest_phys = guest_phys,
+                .is_read = (qualification & (1 << 0)) != 0,
+                .is_write = (qualification & (1 << 1)) != 0,
+                .is_exec = (qualification & (1 << 2)) != 0,
+            } };
+        },
+        EXIT_REASON_HLT => {
+            return .hlt;
+        },
+        EXIT_REASON_TRIPLE_FAULT => {
+            return .triple_fault;
+        },
+        EXIT_REASON_EXTERNAL_INT => {
+            return .{ .interrupt_window = {} };
+        },
+        else => {
+            return .{ .unknown = exit_reason_raw };
+        },
+    }
+}
+
+fn readGprFromGuest(gs: *const GuestState, gpr: u4) u64 {
+    return switch (gpr) {
+        0 => gs.rax,
+        1 => gs.rcx,
+        2 => gs.rdx,
+        3 => gs.rbx,
+        4 => gs.rsp,
+        5 => gs.rbp,
+        6 => gs.rsi,
+        7 => gs.rdi,
+        8 => gs.r8,
+        9 => gs.r9,
+        10 => gs.r10,
+        11 => gs.r11,
+        12 => gs.r12,
+        13 => gs.r13,
+        14 => gs.r14,
+        15 => gs.r15,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Interrupt / exception injection
+// ---------------------------------------------------------------------------
+
+/// Inject a virtual interrupt into the guest via VMCS VM-entry
+/// interruption-information field (SDM Vol 3C, Section 25.8.3 "VM-Entry
+/// Controls for Event Injection", Table 25-17 for field format).
+pub fn injectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
+    _ = guest_state;
+
+    // VM-entry interruption-information field (0x4016):
+    // Bits 7:0   = vector
+    // Bits 10:8  = type (0=external interrupt, 2=NMI, 3=hardware exception,
+    //              4=software interrupt, 5=privileged sw exception, 6=software exception)
+    // Bit 11     = error code valid
+    // Bit 31     = valid
+    var info: u32 = @as(u32, interrupt.vector);
+    info |= @as(u32, interrupt.interrupt_type) << 8;
+    if (interrupt.error_code_valid) {
+        info |= (1 << 11);
+        vmcsWrite(VM_ENTRY_EXCEPTION_ERROR_CODE, interrupt.error_code);
+    }
+    info |= (1 << 31); // valid bit
+    vmcsWrite(VM_ENTRY_INTR_INFO, info);
+
+    // For software interrupts, also set instruction length
+    if (interrupt.interrupt_type == 4 or interrupt.interrupt_type == 6) {
+        vmcsWrite(VM_ENTRY_INSTRUCTION_LEN, 0);
+    }
+}
+
+/// Inject an exception into the guest via VMCS interrupt-info field (SDM
+/// Vol 3C, Section 25.8.3 "VM-Entry Controls for Event Injection"). Uses
+/// type 3 (hardware exception) and delivers error codes for #DF, #TS, #NP,
+/// #SS, #GP, #PF, and #AC per SDM Vol 3A, Table 6-1.
+pub fn injectException(guest_state: *GuestState, exception: GuestException) void {
+    // For #PF (vector 14), also set CR2 in guest state
+    if (exception.vector == 14) {
+        guest_state.cr2 = exception.fault_addr;
+    }
+
+    // Type 3 = hardware exception
+    var info: u32 = @as(u32, exception.vector);
+    info |= (3 << 8); // hardware exception type
+
+    // Exceptions that deliver an error code: #DF(8), #TS(10), #NP(11),
+    // #SS(12), #GP(13), #PF(14), #AC(17)
+    const has_error_code = switch (exception.vector) {
+        8, 10, 11, 12, 13, 14, 17 => true,
+        else => false,
+    };
+    if (has_error_code) {
+        info |= (1 << 11);
+        vmcsWrite(VM_ENTRY_EXCEPTION_ERROR_CODE, exception.error_code);
+    }
+    info |= (1 << 31); // valid bit
+    vmcsWrite(VM_ENTRY_INTR_INFO, info);
+}
 
 // ---------------------------------------------------------------------------
 // EPT management

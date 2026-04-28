@@ -428,6 +428,13 @@ pub const ExecutionContext = struct {
     /// ECs.
     exit_port: ?SlabRef(Port) = null,
 
+    /// Per-vCPU arch state cell allocated by `allocVcpuArchState`. On
+    /// x86-64 this points at a `vcpu.VcpuArchState` (GuestState + 16-byte-
+    /// aligned FxsaveArea + last VmExitInfo); on aarch64 the analogous
+    /// per-vCPU register bank. `null` on regular ECs and on vCPU ECs
+    /// before `create_vcpu` finishes wiring. Freed on EC destruction.
+    vcpu_arch_state: ?*anyopaque = null,
+
     // ── PMU ───────────────────────────────────────────────────────────
 
     /// Lazy-allocated PMU counter state. Allocated on first
@@ -1416,6 +1423,12 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
 
     if (ec.perfmon_state != null) releasePerfmonState(ec);
 
+    // vCPU EC: free per-vCPU arch state (GuestState + FxsaveArea page).
+    // No-op for regular ECs (vcpu_arch_state stays null).
+    if (ec.vm != null and ec.vcpu_arch_state != null) {
+        arch.vm.freeVcpuArchState(ec);
+    }
+
     // Step-10 leak-budget tradeoff: kstack pages stay mapped (and the
     // backing PMM pages stay live) for the full kernel run. A future
     // patch can move kstack reclaim into a deferred per-core "to-free"
@@ -1452,6 +1465,10 @@ pub fn destroyExecutionContext(ec: *ExecutionContext) void {
     for (&ec.event_routes) |*slot| slot.* = null;
 
     if (ec.perfmon_state != null) releasePerfmonState(ec);
+
+    if (ec.vm != null and ec.vcpu_arch_state != null) {
+        arch.vm.freeVcpuArchState(ec);
+    }
 
     const dom_root = blk: {
         const d = ec.domain.lock(@src()) catch break :blk null;

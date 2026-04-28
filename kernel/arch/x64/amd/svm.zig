@@ -5,12 +5,18 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
+const vm_mod = zag.arch.x64.vm;
 
+const GuestException = vm_mod.GuestException;
+const GuestInterrupt = vm_mod.GuestInterrupt;
+const GuestState = vm_mod.GuestState;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
+const VmExitInfo = vm_mod.VmExitInfo;
 
 // ---------------------------------------------------------------------------
 // MSR addresses — AMD APM Vol 2, Section 15.28, Table 15-9
@@ -155,6 +161,8 @@ var next_asid: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 /// addressed by RAX to save/restore FS/GS/TR/LDTR bases, KernelGsBase,
 /// STAR, LSTAR, CSTAR, SFMASK, and SYSENTER MSRs. This is separate from
 /// VM_HSAVE_PA (Section 15.5.1) which has implementation-specific format.
+const MAX_CORES = 64;
+var host_vmcb_pa: [MAX_CORES]u64 = .{0} ** MAX_CORES;
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
@@ -180,6 +188,33 @@ pub fn init() bool {
 
 /// Per-core SVM initialization.
 /// AMD APM Vol 2, Section 15.4: set EFER.SVME, allocate host save area.
+pub fn perCoreInit() void {
+    if (!svm_supported_flag) return;
+
+    // Set EFER.SVME (bit 12) to enable SVM instructions.
+    var efer = cpu.rdmsr(IA32_EFER);
+    efer |= EFER_SVME;
+    cpu.wrmsr(IA32_EFER, efer);
+
+    // Allocate host state-save area (4KB aligned page).
+    // AMD APM Vol 2, Section 15.28: VM_HSAVE_PA MSR holds the physical
+    // address of the host save area used by VMRUN/#VMEXIT.
+    const pmm_mgr = &pmm.global_pmm.?;
+    const hsa_page = pmm_mgr.create(paging.PageMem(.page4k)) catch return;
+    @memset(std.mem.asBytes(hsa_page), 0);
+    const hsa_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(hsa_page)), null);
+    cpu.wrmsr(VM_HSAVE_PA, hsa_phys.addr);
+
+    // Allocate per-core host VMCB page for VMSAVE/VMLOAD (Section 15.14).
+    // VMSAVE/VMLOAD use a standard VMCB-format page (unlike VM_HSAVE_PA
+    // which is implementation-specific). Holds host FS/GS bases, TR/LDTR
+    // hidden state, KernelGsBase, STAR/LSTAR/CSTAR/SFMASK, and SYSENTER
+    // CS/ESP/EIP across guest entry/exit.
+    const host_vmcb_page = pmm_mgr.create(paging.PageMem(.page4k)) catch return;
+    @memset(std.mem.asBytes(host_vmcb_page), 0);
+    const core_id = apic.coreID();
+    host_vmcb_pa[core_id] = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(host_vmcb_page)), null).addr;
+}
 
 /// Allocate and zero a 4K page to serve as the NPT PML4 root.
 /// Spec-v3 split: caller (`arch.x64.kvm.vm.allocStage2Root`) holds this
@@ -340,6 +375,208 @@ pub fn freeVmcbOnly(vmcb_phys: PAddr) void {
 /// AMD APM Vol 2, Section 15.5.1: VMRUN takes VMCB physical address in RAX.
 /// On #VMEXIT, processor writes exit info to VMCB control area and resumes
 /// host at the instruction following VMRUN.
+pub fn vmResume(guest_state: *GuestState, vmcb_phys: PAddr, guest_fxsave: *align(16) [512]u8) VmExitInfo {
+    const vmcb_vaddr = VAddr.fromPAddr(vmcb_phys, null).addr;
+    const vmcb: [*]u8 = @ptrFromInt(vmcb_vaddr);
+
+    // Write guest state into VMCB state save area.
+    // AMD APM Vol 2, Appendix B, Table B-2.
+    writeGuestToVmcb(vmcb, guest_state);
+
+    // Clear VMCB clean bits to force the processor to reload all fields
+    // from the VMCB. Required after modifying guest state, and essential
+    // under nested virtualization (KVM) where cached state may be stale.
+    // AMD APM Vol 2, Section 15.15.3.
+    writeVmcb32(vmcb, Vmcb.VMCB_CLEAN, 0);
+
+    // Event injection and virtual interrupt management.
+    // AMD APM Vol 2, Section 15.20: EVENTINJ at offset 0x0A8.
+    // Section 15.21.1: V_IRQ/V_INTR for interrupt window notification.
+    if (guest_state.pending_eventinj != 0) {
+        // Check if the pending event is an external interrupt (type bits 10:8 == 0)
+        const event_type = (guest_state.pending_eventinj >> 8) & 0x7;
+        const guest_if = guest_state.rflags & (1 << 9);
+        if (event_type == 0 and guest_if == 0) {
+            // External interrupt but guest has IF=0 — can't deliver now.
+            // Arm V_IRQ to get VMEXIT_VINTR when guest enables IF.
+            // Keep pending_eventinj for later delivery.
+            writeVmcb64(vmcb, Vmcb.V_INTR, (@as(u64, 1) << 24) | (@as(u64, 1) << 8) | (@as(u64, 1) << 16) | (@as(u64, 0xF) << 12));
+        } else {
+            // Can deliver: either IF=1 or non-external-interrupt event.
+            writeVmcb64(vmcb, Vmcb.EVENTINJ, guest_state.pending_eventinj);
+            guest_state.pending_eventinj = 0;
+            writeVmcb64(vmcb, Vmcb.V_INTR, @as(u64, 1) << 24);
+        }
+    } else {
+        writeVmcb64(vmcb, Vmcb.V_INTR, @as(u64, 1) << 24);
+    }
+
+    // Save host FPU/SSE state and load guest FPU/SSE state.
+    // FXSAVE/FXRSTOR are always available on x86-64 (required by AMD64 spec).
+    var host_fxsave: [512]u8 align(16) = undefined;
+    asm volatile ("fxsave (%[addr])"
+        :
+        : [addr] "r" (&host_fxsave),
+        : .{ .memory = true });
+    asm volatile ("fxrstor (%[addr])"
+        :
+        : [addr] "r" (guest_fxsave),
+        : .{ .memory = true });
+
+    // Look up per-core host VMCB physical address for VMSAVE/VMLOAD.
+    const host_pa = host_vmcb_pa[apic.coreID()];
+
+    // Execute VMRUN with full SVM entry/exit sequence per AMD APM Vol 2.
+    //
+    // Section 15.5.1: VMRUN only saves/restores minimal host state.
+    // Section 15.14: VMSAVE/VMLOAD save/restore FS/GS bases (GS base is
+    //   per-CPU data), TR/LDTR hidden state, KernelGsBase, STAR, LSTAR,
+    //   CSTAR, SFMASK, and SYSENTER_CS/ESP/EIP — none of which VMRUN
+    //   handles.
+    // Section 15.5.1, 15.16: CLGI/STGI disable/enable global interrupts
+    //   to ensure atomic state switch. Without CLGI, physical interrupts
+    //   can corrupt the VMCB state load under nested KVM.
+    //
+    // Sequence:
+    //   CLGI                        — disable global interrupts
+    //   VMSAVE [host_vmcb_pa]       — save host FS/GS/TR/LDTR/syscall MSRs
+    //   VMLOAD [guest_vmcb_pa]      — load guest FS/GS/TR/LDTR/syscall MSRs
+    //   VMRUN  [guest_vmcb_pa]      — enter guest
+    //   ; ... #VMEXIT returns here ...
+    //   VMSAVE [guest_vmcb_pa]      — save guest FS/GS/TR/LDTR/syscall MSRs
+    //   VMLOAD [host_vmcb_pa]       — restore host FS/GS/TR/LDTR/syscall MSRs
+    //   STGI                        — re-enable global interrupts
+    //
+    // VMRUN clobbers all GPRs except RAX, so both PAs are pushed onto the
+    // stack before entry and recovered via RSP-relative addressing after
+    // VMEXIT.
+    const gs_ptr = @intFromPtr(guest_state);
+
+    asm volatile (
+    // Save host callee-saved registers (VMRUN clobbers them per AMD spec)
+        \\pushq %%rbx
+        \\pushq %%r12
+        \\pushq %%r13
+        \\pushq %%r14
+        \\pushq %%r15
+        \\pushq %%rbp
+        // Push host_pa, guest_pa, and GuestState pointer for recovery after
+        // VMEXIT. Stack layout: [rsp]=gs_ptr, [rsp+8]=guest_pa, [rsp+16]=host_pa
+        \\pushq %%rdi
+        \\pushq %%rsi
+        \\pushq %%rdx
+        //
+        // AMD APM Vol 2, Section 15.16: CLGI clears GIF, preventing
+        // physical interrupts from arriving during the state switch.
+        \\clgi
+        //
+        // AMD APM Vol 2, Section 15.14: VMSAVE saves host FS/GS/TR/LDTR
+        // bases and syscall MSRs to the VMCB-format page in RAX.
+        \\movq 16(%%rsp), %%rax
+        \\vmsave %%rax
+        //
+        // VMLOAD loads guest FS/GS/TR/LDTR bases and syscall MSRs from
+        // the guest VMCB.
+        \\movq 8(%%rsp), %%rax
+        \\vmload %%rax
+        //
+        // Load guest GPRs from GuestState before VMRUN.
+        // GuestState layout (extern struct, 8 bytes each):
+        //   0x00=rax, 0x08=rbx, 0x10=rcx, 0x18=rdx, 0x20=rsi, 0x28=rdi,
+        //   0x30=rbp, 0x38=rsp(unused), 0x40=r8..0x78=r15
+        // RAX is loaded from VMCB by VMRUN, so we skip it here.
+        \\movq (%%rsp), %%rax
+        \\movq 0x08(%%rax), %%rbx
+        \\movq 0x10(%%rax), %%rcx
+        \\movq 0x18(%%rax), %%rdx
+        \\movq 0x20(%%rax), %%rsi
+        \\movq 0x28(%%rax), %%rdi
+        \\movq 0x30(%%rax), %%rbp
+        \\movq 0x40(%%rax), %%r8
+        \\movq 0x48(%%rax), %%r9
+        \\movq 0x50(%%rax), %%r10
+        \\movq 0x58(%%rax), %%r11
+        \\movq 0x60(%%rax), %%r12
+        \\movq 0x68(%%rax), %%r13
+        \\movq 0x70(%%rax), %%r14
+        \\movq 0x78(%%rax), %%r15
+        //
+        // VMRUN: RAX = VMCB physical address.
+        // AMD APM Vol 2, Section 15.5: VMRUN saves host state, loads guest
+        // state from VMCB, enters guest. On #VMEXIT, host state is restored
+        // and execution continues at the next instruction.
+        \\movq 8(%%rsp), %%rax
+        \\vmrun %%rax
+        //
+        // #VMEXIT returns here. RSP is restored by the processor.
+        // Save guest GPRs back to GuestState. Recover GuestState pointer
+        // from the stack (push rax first since we need rax as the base).
+        \\pushq %%rax
+        \\movq 8(%%rsp), %%rax
+        \\popq 0x00(%%rax)
+        \\movq %%rbx, 0x08(%%rax)
+        \\movq %%rcx, 0x10(%%rax)
+        \\movq %%rdx, 0x18(%%rax)
+        \\movq %%rsi, 0x20(%%rax)
+        \\movq %%rdi, 0x28(%%rax)
+        \\movq %%rbp, 0x30(%%rax)
+        \\movq %%r8,  0x40(%%rax)
+        \\movq %%r9,  0x48(%%rax)
+        \\movq %%r10, 0x50(%%rax)
+        \\movq %%r11, 0x58(%%rax)
+        \\movq %%r12, 0x60(%%rax)
+        \\movq %%r13, 0x68(%%rax)
+        \\movq %%r14, 0x70(%%rax)
+        \\movq %%r15, 0x78(%%rax)
+        //
+        // Save guest FS/GS/TR/LDTR/syscall MSRs back to the guest VMCB.
+        \\movq 8(%%rsp), %%rax
+        \\vmsave %%rax
+        //
+        // Restore host FS/GS/TR/LDTR/syscall MSRs from host VMCB.
+        \\movq 16(%%rsp), %%rax
+        \\vmload %%rax
+        //
+        // AMD APM Vol 2, Section 15.16: STGI sets GIF, re-enabling
+        // physical interrupt delivery.
+        \\stgi
+        //
+        // Pop gs_ptr, guest_pa, host_pa and restore callee-saved registers.
+        \\addq $24, %%rsp
+        \\popq %%rbp
+        \\popq %%r15
+        \\popq %%r14
+        \\popq %%r13
+        \\popq %%r12
+        \\popq %%rbx
+        :
+        : [guest_pa] "{rsi}" (vmcb_phys.addr),
+          [host_pa] "{rdi}" (host_pa),
+          [gs_ptr] "{rdx}" (gs_ptr),
+        : .{ .memory = true, .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true });
+
+    // Save guest FPU/SSE state and restore host FPU/SSE state.
+    asm volatile ("fxsave (%[addr])"
+        :
+        : [addr] "r" (guest_fxsave),
+        : .{ .memory = true });
+    asm volatile ("fxrstor (%[addr])"
+        :
+        : [addr] "r" (&host_fxsave),
+        : .{ .memory = true });
+
+    // RAX is saved/restored by VMRUN/#VMEXIT in the VMCB state save area
+    // (AMD APM Vol 2, Section 15.5.1 and 15.6). Read it from VMCB for the
+    // canonical copy.
+    guest_state.rax = readVmcb64(vmcb, Vmcb.RAX);
+
+    // Read back guest architectural state from VMCB.
+    readGuestFromVmcb(vmcb, guest_state);
+
+    // Decode exit reason from VMCB control area.
+    // AMD APM Vol 2, Section 15.9: EXITCODE at offset 0x070.
+    return decodeExitReason(vmcb, guest_state);
+}
 
 /// Map a guest physical page in NPT (Nested Page Tables).
 /// AMD APM Vol 2, Section 15.24.5: NPT uses the same page table format
@@ -435,12 +672,82 @@ pub fn unmapNptPage(vmcb_phys: PAddr, guest_phys: u64) void {
 
 /// Inject a virtual interrupt into the guest.
 /// AMD APM Vol 2, Section 15.20, Figure 15-4: EVENTINJ field at VMCB offset 0x0A8.
+pub fn injectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
+    // Build EVENTINJ value per AMD APM Vol 2, Section 15.20, Figure 15-4:
+    //   bits 7:0   = vector
+    //   bits 10:8  = type (0=INTR, 2=NMI, 3=exception, 4=software interrupt)
+    //   bit 11     = error code valid
+    //   bit 31     = valid
+    //   bits 63:32 = error code
+    var eventinj: u64 = @as(u64, interrupt.vector);
+    eventinj |= @as(u64, interrupt.interrupt_type) << 8;
+    if (interrupt.error_code_valid) {
+        eventinj |= (1 << 11);
+        eventinj |= @as(u64, interrupt.error_code) << 32;
+    }
+    eventinj |= (1 << 31); // valid bit
+    guest_state.pending_eventinj = eventinj;
+}
 
 /// Inject an exception into the guest.
 /// AMD APM Vol 2, Section 15.20, Figure 15-4: EVENTINJ with TYPE=3 (exception).
+pub fn injectException(guest_state: *GuestState, exception: GuestException) void {
+    if (exception.vector == 14) {
+        guest_state.cr2 = exception.fault_addr;
+    }
+
+    var eventinj: u64 = @as(u64, exception.vector);
+    eventinj |= (3 << 8); // exception type
+
+    // Exceptions that deliver an error code: #DF(8), #TS(10), #NP(11),
+    // #SS(12), #GP(13), #PF(14), #AC(17).
+    const has_error_code = switch (exception.vector) {
+        8, 10, 11, 12, 13, 14, 17 => true,
+        else => false,
+    };
+    if (has_error_code) {
+        eventinj |= (1 << 11);
+        eventinj |= @as(u64, exception.error_code) << 32;
+    }
+    eventinj |= (1 << 31); // valid bit
+    guest_state.pending_eventinj = eventinj;
+}
+
 /// Modify MSR passthrough bits in the VM's MSRPM.
 /// AMD APM Vol 2, Section 15.10: MSRPM format.
+pub fn msrPassthrough(vmcb_phys: PAddr, msr_num: u32, allow_read: bool, allow_write: bool) void {
+    const vmcb_vaddr = VAddr.fromPAddr(vmcb_phys, null).addr;
+    const vmcb: [*]const u8 = @ptrFromInt(vmcb_vaddr);
+    const msrpm_phys_addr = readVmcb64(vmcb, Vmcb.MSRPM_BASE_PA);
+    if (msrpm_phys_addr == 0) return;
+    const msrpm_vaddr = VAddr.fromPAddr(PAddr.fromInt(msrpm_phys_addr), null).addr;
+    const msrpm: [*]u8 = @ptrFromInt(msrpm_vaddr);
 
+    var base_offset: usize = 0;
+    var msr_offset: u32 = msr_num;
+    if (msr_num >= 0xC0000000 and msr_num <= 0xC0001FFF) {
+        base_offset = 0x0800;
+        msr_offset = msr_num - 0xC0000000;
+    } else if (msr_num > 0x1FFF) {
+        return;
+    }
+    const bit_pos = @as(usize, msr_offset) * 2;
+    const byte_idx = base_offset + bit_pos / 8;
+    const bit_idx: u3 = @truncate(bit_pos % 8);
+
+    if (allow_read) {
+        msrpm[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+    } else {
+        msrpm[byte_idx] |= @as(u8, 1) << bit_idx;
+    }
+    const write_bit: u3 = @truncate((@as(usize, bit_idx) + 1) % 8);
+    const write_byte = byte_idx + (@as(usize, bit_idx) + 1) / 8;
+    if (allow_write) {
+        msrpm[write_byte] &= ~(@as(u8, 1) << write_bit);
+    } else {
+        msrpm[write_byte] |= @as(u8, 1) << write_bit;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -452,13 +759,271 @@ pub fn unmapNptPage(vmcb_phys: PAddr, guest_phys: u64) void {
 /// Applies fixups for fields that require specific values per the AMD spec
 /// but which GuestState may leave at zero/default. These are essential for
 /// nested KVM (L0) VMCB consistency checks.
+fn writeGuestToVmcb(vmcb: [*]u8, gs: *const GuestState) void {
+    writeVmcb64(vmcb, Vmcb.RIP, gs.rip);
+    writeVmcb64(vmcb, Vmcb.RSP, gs.rsp);
+    // RFLAGS bit 1 is reserved-set per x86 spec.
+    writeVmcb64(vmcb, Vmcb.RFLAGS, gs.rflags | 0x2);
+    writeVmcb64(vmcb, Vmcb.RAX, gs.rax);
+
+    // CR0: ET (bit 4) is hardwired to 1 on all x86 processors.
+    writeVmcb64(vmcb, Vmcb.CR0, gs.cr0 | 0x10);
+    writeVmcb64(vmcb, Vmcb.CR3, gs.cr3);
+    writeVmcb64(vmcb, Vmcb.CR4, gs.cr4);
+
+    // Segment registers — AMD APM Vol 2, Appendix B, Table B-2.
+    writeSegment(vmcb, Vmcb.CS, gs.cs);
+    writeSegment(vmcb, Vmcb.DS, gs.ds);
+    writeSegment(vmcb, Vmcb.ES, gs.es);
+    writeSegment(vmcb, Vmcb.FS, gs.fs);
+    writeSegment(vmcb, Vmcb.GS, gs.gs);
+    writeSegment(vmcb, Vmcb.SS, gs.ss);
+
+    // TR: must have a valid busy-TSS type or the processor may reject the
+    // VMCB. Default to a 32-bit busy TSS when the guest hasn't configured one.
+    if (gs.tr.access_rights == 0) {
+        writeSegment(vmcb, Vmcb.TR, .{
+            .selector = 0,
+            .access_rights = 0x008B,
+            .limit = 0xFFFF,
+            .base = 0,
+        });
+    } else {
+        writeSegment(vmcb, Vmcb.TR, gs.tr);
+    }
+
+    // LDTR: an all-zero LDTR may fail consistency checks under KVM.
+    if (gs.ldtr.access_rights == 0) {
+        writeSegment(vmcb, Vmcb.LDTR, .{
+            .selector = 0,
+            .access_rights = 0x0082,
+            .limit = 0,
+            .base = 0,
+        });
+    } else {
+        writeSegment(vmcb, Vmcb.LDTR, gs.ldtr);
+    }
+
+    // GDTR/IDTR — same layout but selector/attrib are reserved.
+    writeVmcb32(vmcb, Vmcb.GDTR + 4, gs.gdtr_limit);
+    writeVmcb64(vmcb, Vmcb.GDTR + 8, gs.gdtr_base);
+    writeVmcb32(vmcb, Vmcb.IDTR + 4, gs.idtr_limit);
+    writeVmcb64(vmcb, Vmcb.IDTR + 8, gs.idtr_base);
+
+    // CPL is a 1-byte field at VMCB offset 0x4CB. Writing it as a u64 would
+    // clobber the EFER field at 0x4D0; write a single byte instead.
+    vmcb[Vmcb.CPL] = 0;
+
+    // EFER.SVME (bit 12) must be set in VMCB or VMRUN exits with VMEXIT_INVALID.
+    writeVmcb64(vmcb, Vmcb.EFER, gs.efer | EFER_SVME);
+
+    writeVmcb64(vmcb, Vmcb.STAR, gs.star);
+    writeVmcb64(vmcb, Vmcb.LSTAR, gs.lstar);
+    writeVmcb64(vmcb, Vmcb.CSTAR, gs.cstar);
+    writeVmcb64(vmcb, Vmcb.SFMASK, gs.sfmask);
+    writeVmcb64(vmcb, Vmcb.KERNEL_GS_BASE, gs.kernel_gs_base);
+    writeVmcb64(vmcb, Vmcb.SYSENTER_CS, gs.sysenter_cs);
+    writeVmcb64(vmcb, Vmcb.SYSENTER_ESP, gs.sysenter_esp);
+    writeVmcb64(vmcb, Vmcb.SYSENTER_EIP, gs.sysenter_eip);
+
+    // PAT: must be a valid PAT value. Zero is invalid (all UC entries with
+    // reserved encoding). Use the hardware default if not set.
+    const pat_val = if (gs.pat == 0) DEFAULT_PAT else gs.pat;
+    writeVmcb64(vmcb, Vmcb.PAT, pat_val);
+
+    writeVmcb64(vmcb, Vmcb.CR2, gs.cr2);
+    writeVmcb64(vmcb, Vmcb.DR6, gs.dr6);
+    // DR7 bit 10 is reserved-set per x86 spec.
+    writeVmcb64(vmcb, Vmcb.DR7, gs.dr7 | 0x400);
+}
 
 /// Read guest state from VMCB state save area back into GuestState.
+fn readGuestFromVmcb(vmcb: [*]const u8, gs: *GuestState) void {
+    gs.rip = readVmcb64(vmcb, Vmcb.RIP);
+    gs.rsp = readVmcb64(vmcb, Vmcb.RSP);
+    gs.rflags = readVmcb64(vmcb, Vmcb.RFLAGS);
+    // RAX already read separately (from VMCB after VMRUN).
+    gs.cr0 = readVmcb64(vmcb, Vmcb.CR0);
+    gs.cr3 = readVmcb64(vmcb, Vmcb.CR3);
+    gs.cr4 = readVmcb64(vmcb, Vmcb.CR4);
+    gs.efer = readVmcb64(vmcb, Vmcb.EFER);
+
+    gs.cs = readSegment(vmcb, Vmcb.CS);
+    gs.ds = readSegment(vmcb, Vmcb.DS);
+    gs.es = readSegment(vmcb, Vmcb.ES);
+    gs.fs = readSegment(vmcb, Vmcb.FS);
+    gs.gs = readSegment(vmcb, Vmcb.GS);
+    gs.ss = readSegment(vmcb, Vmcb.SS);
+    gs.tr = readSegment(vmcb, Vmcb.TR);
+    gs.ldtr = readSegment(vmcb, Vmcb.LDTR);
+
+    gs.gdtr_limit = readVmcb32(vmcb, Vmcb.GDTR + 4);
+    gs.gdtr_base = readVmcb64(vmcb, Vmcb.GDTR + 8);
+    gs.idtr_limit = readVmcb32(vmcb, Vmcb.IDTR + 4);
+    gs.idtr_base = readVmcb64(vmcb, Vmcb.IDTR + 8);
+
+    gs.star = readVmcb64(vmcb, Vmcb.STAR);
+    gs.lstar = readVmcb64(vmcb, Vmcb.LSTAR);
+    gs.cstar = readVmcb64(vmcb, Vmcb.CSTAR);
+    gs.sfmask = readVmcb64(vmcb, Vmcb.SFMASK);
+    gs.kernel_gs_base = readVmcb64(vmcb, Vmcb.KERNEL_GS_BASE);
+    gs.sysenter_cs = readVmcb64(vmcb, Vmcb.SYSENTER_CS);
+    gs.sysenter_esp = readVmcb64(vmcb, Vmcb.SYSENTER_ESP);
+    gs.sysenter_eip = readVmcb64(vmcb, Vmcb.SYSENTER_EIP);
+    gs.pat = readVmcb64(vmcb, Vmcb.PAT);
+    gs.cr2 = readVmcb64(vmcb, Vmcb.CR2);
+    gs.dr6 = readVmcb64(vmcb, Vmcb.DR6);
+    gs.dr7 = readVmcb64(vmcb, Vmcb.DR7);
+}
 
 /// Decode #VMEXIT reason from VMCB control area.
 /// AMD APM Vol 2, Section 15.9: EXITCODE at offset 0x070,
 /// EXITINFO1 at 0x078, EXITINFO2 at 0x080.
+fn decodeExitReason(vmcb: [*]const u8, guest_state: *const GuestState) VmExitInfo {
+    const exitcode = readVmcb64(vmcb, Vmcb.EXITCODE);
+    const exitinfo1 = readVmcb64(vmcb, Vmcb.EXITINFO1);
+    const exitinfo2 = readVmcb64(vmcb, Vmcb.EXITINFO2);
 
+    if (exitcode == VMEXIT_CPUID) {
+        return .{ .cpuid = .{
+            .leaf = @truncate(guest_state.rax),
+            .subleaf = @truncate(guest_state.rcx),
+        } };
+    }
+
+    if (exitcode == VMEXIT_IOIO) {
+        // AMD APM Vol 2, Section 15.10.2, Figure 15-2: EXITINFO1 format.
+        const port: u16 = @truncate(exitinfo1 >> 16);
+        const is_write = (exitinfo1 & 1) == 0; // TYPE bit: 0 = OUT, 1 = IN
+        var size: u8 = 1;
+        if ((exitinfo1 & (1 << 5)) != 0) size = 2;
+        if ((exitinfo1 & (1 << 6)) != 0) size = 4;
+        return .{ .io = .{
+            .port = port,
+            .size = size,
+            .is_write = is_write,
+            .value = @truncate(guest_state.rax),
+            .next_rip = exitinfo2,
+        } };
+    }
+
+    if (exitcode == VMEXIT_HLT) {
+        return .hlt;
+    }
+
+    if (exitcode == VMEXIT_NPF) {
+        return .{ .ept_violation = .{
+            .guest_phys = exitinfo2,
+            .is_read = (exitinfo1 & 1) == 0,
+            .is_write = (exitinfo1 & 2) != 0,
+            .is_exec = (exitinfo1 & 4) != 0,
+        } };
+    }
+
+    if (exitcode == VMEXIT_MSR) {
+        const msr_index: u32 = @truncate(guest_state.rcx);
+        const msr_value: u64 = (@as(u64, @truncate(guest_state.rdx)) << 32) | @as(u64, @as(u32, @truncate(guest_state.rax)));
+        if (exitinfo1 != 0) {
+            return .{ .msr_write = .{ .msr = msr_index, .value = msr_value } };
+        } else {
+            return .{ .msr_read = .{ .msr = msr_index, .value = msr_value } };
+        }
+    }
+
+    if (exitcode >= VMEXIT_CR0_READ and exitcode < VMEXIT_CR0_READ + 16) {
+        const gpr_num: u4 = @truncate(exitinfo1);
+        return .{ .cr_access = .{
+            .cr_num = @truncate(exitcode - VMEXIT_CR0_READ),
+            .is_write = false,
+            .gpr = gpr_num,
+            .value = readGpr(guest_state, gpr_num),
+        } };
+    }
+
+    if (exitcode >= VMEXIT_CR0_WRITE and exitcode < VMEXIT_CR0_WRITE + 16) {
+        const gpr_num: u4 = @truncate(exitinfo1);
+        return .{ .cr_access = .{
+            .cr_num = @truncate(exitcode - VMEXIT_CR0_WRITE),
+            .is_write = true,
+            .gpr = gpr_num,
+            .value = readGpr(guest_state, gpr_num),
+        } };
+    }
+
+    if (exitcode == VMEXIT_SHUTDOWN) {
+        return .triple_fault;
+    }
+
+    if (exitcode == VMEXIT_INTR) {
+        return .{ .unknown = VMEXIT_INTR };
+    }
+
+    // VMEXIT_VINTR: guest became interruptible (IF went 0 → 1). Report as
+    // interrupt_window so the VMM can inject pending interrupts.
+    if (exitcode == VMEXIT_VINTR) {
+        return .{ .interrupt_window = {} };
+    }
+
+    if (exitcode == VMEXIT_NMI) {
+        return .{ .unknown = VMEXIT_NMI };
+    }
+
+    // Exception intercepts are exit codes 0x040-0x05F (EXCP_BASE + vector).
+    if (exitcode >= VMEXIT_EXCP_BASE and exitcode < VMEXIT_EXCP_BASE + 0x20) {
+        return .{ .exception = .{
+            .vector = @truncate(exitcode - VMEXIT_EXCP_BASE),
+            .error_code = exitinfo1,
+        } };
+    }
+
+    if (exitcode == VMEXIT_INVALID) {
+        return .{ .unknown = VMEXIT_INVALID };
+    }
+
+    return .{ .unknown = exitcode };
+}
+
+/// Read a GPR value from GuestState by register number (0=RAX..15=R15).
+/// Used to decode CR access exits where EXITINFO1 encodes the GPR number.
+fn readGpr(gs: *const GuestState, gpr_num: u4) u64 {
+    return switch (gpr_num) {
+        0 => gs.rax,
+        1 => gs.rcx,
+        2 => gs.rdx,
+        3 => gs.rbx,
+        4 => gs.rsp,
+        5 => gs.rbp,
+        6 => gs.rsi,
+        7 => gs.rdi,
+        8 => gs.r8,
+        9 => gs.r9,
+        10 => gs.r10,
+        11 => gs.r11,
+        12 => gs.r12,
+        13 => gs.r13,
+        14 => gs.r14,
+        15 => gs.r15,
+    };
+}
+
+/// Write a segment register to VMCB state save area.
+/// AMD APM Vol 2, Appendix B, Table B-2: selector(u16) + attrib(u16) + limit(u32) + base(u64).
+fn writeSegment(vmcb: [*]u8, offset: usize, seg: GuestState.SegmentReg) void {
+    writeVmcb16(vmcb, offset + 0, seg.selector);
+    writeVmcb16(vmcb, offset + 2, seg.access_rights);
+    writeVmcb32(vmcb, offset + 4, seg.limit);
+    writeVmcb64(vmcb, offset + 8, seg.base);
+}
+
+/// Read a segment register from VMCB state save area.
+fn readSegment(vmcb: [*]const u8, offset: usize) GuestState.SegmentReg {
+    return .{
+        .selector = readVmcb16(vmcb, offset + 0),
+        .access_rights = readVmcb16(vmcb, offset + 2),
+        .limit = readVmcb32(vmcb, offset + 4),
+        .base = readVmcb64(vmcb, offset + 8),
+    };
+}
 
 /// Clear read and write intercept bits for an MSR in the MSRPM.
 /// AMD APM Vol 2, Section 15.10: MSRPM format.
@@ -481,6 +1046,16 @@ fn clearMsrpmBits(msrpm: [*]u8, msr: u32) void {
 }
 
 // VMCB read/write helpers — little-endian memory-mapped access.
+
+fn writeVmcb16(vmcb: [*]u8, offset: usize, value: u16) void {
+    const ptr: *align(1) volatile u16 = @ptrCast(vmcb + offset);
+    ptr.* = value;
+}
+
+fn readVmcb16(vmcb: [*]const u8, offset: usize) u16 {
+    const ptr: *align(1) const volatile u16 = @ptrCast(vmcb + offset);
+    return ptr.*;
+}
 
 fn writeVmcb32(vmcb: [*]u8, offset: usize, value: u32) void {
     const ptr: *align(1) volatile u32 = @ptrCast(vmcb + offset);

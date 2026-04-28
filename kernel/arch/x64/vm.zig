@@ -71,6 +71,11 @@ pub const GuestState = extern struct {
     dr6: u64 = 0,
     dr7: u64 = 0x400, // bit 10 always set per x86 spec
 
+    // Pending event injection for SVM (VMCB EVENTINJ format).
+    // Written by svm.injectInterrupt/injectException, consumed by svm.vmResume.
+    // Not used by VMX (which writes directly to the VMCS).
+    pending_eventinj: u64 = 0,
+
     pub const SegmentReg = extern struct {
         base: u64 = 0,
         limit: u32 = 0,
@@ -140,6 +145,40 @@ pub const VmExitInfo = union(enum) {
     };
 };
 
+/// FXSAVE area (512 bytes, 16-byte aligned) for guest FP/SIMD save/restore.
+pub const FxsaveArea = [512]u8;
+
+/// Return an FxsaveArea initialized with default x87/SSE state:
+/// FCW=0x037F (x87 default), MXCSR=0x1F80 (SSE default, all exceptions masked).
+pub fn fxsaveInit() FxsaveArea {
+    var area: FxsaveArea = .{0} ** 512;
+    // FCW at offset 0 (2 bytes, little-endian)
+    area[0] = 0x7F;
+    area[1] = 0x03;
+    // MXCSR at offset 24 (4 bytes, little-endian)
+    area[24] = 0x80;
+    area[25] = 0x1F;
+    return area;
+}
+
+/// Interrupt to inject into a guest vCPU.
+pub const GuestInterrupt = extern struct {
+    vector: u8,
+    interrupt_type: u8, // 0=external, 4=NMI, 5=exception, 6=software
+    error_code_valid: bool,
+    _pad: [5]u8 = .{0} ** 5,
+    error_code: u32 = 0,
+    _pad2: [4]u8 = .{0} ** 4,
+};
+
+/// Exception to inject into a guest vCPU.
+pub const GuestException = extern struct {
+    vector: u8,
+    _pad: [3]u8 = .{0} ** 3,
+    error_code: u32 = 0,
+    fault_addr: u64 = 0,
+};
+
 /// Static policy table for inline exit handling.
 /// Set at vm_create time and never changes.
 pub const VmPolicy = extern struct {
@@ -202,9 +241,58 @@ pub fn vmInit() void {
     }
 }
 
+/// Per-core VM initialization. Called from sched.perCoreInit().
+pub fn vmPerCoreInit() void {
+    switch (active_backend) {
+        .intel_vmx => vmx.perCoreInit(),
+        .amd_svm => svm.perCoreInit(),
+        .none => {},
+    }
+}
+
 /// Returns whether hardware virtualization is available.
 pub fn vmSupported() bool {
     return active_backend != .none;
+}
+
+/// Enter the guest. Called from the vCPU thread entry point.
+/// Returns the exit info when the guest exits.
+pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr, guest_fxsave: *align(16) FxsaveArea) VmExitInfo {
+    return switch (active_backend) {
+        .intel_vmx => vmx.vmResume(guest_state, vmcs_paddr),
+        .amd_svm => svm.vmResume(guest_state, vmcs_paddr, guest_fxsave),
+        .none => .{ .unknown = 0 },
+    };
+}
+
+/// Inject a virtual interrupt into the guest.
+pub fn injectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
+    switch (active_backend) {
+        .intel_vmx => vmx.injectInterrupt(guest_state, interrupt),
+        .amd_svm => svm.injectInterrupt(guest_state, interrupt),
+        .none => {},
+    }
+}
+
+/// Inject an exception into the guest.
+pub fn injectException(guest_state: *GuestState, exception: GuestException) void {
+    switch (active_backend) {
+        .intel_vmx => vmx.injectException(guest_state, exception),
+        .amd_svm => svm.injectException(guest_state, exception),
+        .none => {},
+    }
+}
+
+/// Modify system-register passthrough bits in the VM's MSRPM. On x86 a
+/// "sysreg" is an MSR; `sysreg_id` is the 32-bit MSR address.
+pub fn sysregPassthrough(vm_structures: PAddr, sysreg_id: u32, allow_read: bool, allow_write: bool) void {
+    switch (active_backend) {
+        .amd_svm => svm.msrPassthrough(vm_structures, sysreg_id, allow_read, allow_write),
+        // Intel VMX MSR bitmap support is configured via VMCS bits at
+        // initVmcs time; per-MSR runtime mutation is not yet wired here.
+        .intel_vmx => {},
+        .none => {},
+    }
 }
 
 /// Free arch-specific per-VM structures.

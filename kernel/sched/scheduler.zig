@@ -114,6 +114,11 @@ pub fn globalInit() !void {
 /// it voluntarily yields.
 pub fn perCoreInit() void {
     arch.time.getPreemptionTimer().armInterruptTimer(TIMESLICE_NS);
+    // Enable hardware virtualization on this core (VMXON / EFER.SVME +
+    // host save area). Required before any vCPU on this core can
+    // VMLAUNCH/VMRUN; safe no-op when the platform doesn't support
+    // hardware virt.
+    arch.vm.vmPerCoreInit();
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────
@@ -153,42 +158,37 @@ pub fn switchTo(ec: *ExecutionContext) void {
     var current = ec;
     while (current.vm != null) {
         const core: u8 = @truncate(arch.smp.coreID());
+
+        // Real VMX/SVM dispatch: load guest state, VMLAUNCH/VMRESUME,
+        // save guest state on exit, decode the exit reason. Returns the
+        // §[vm_exit_state] sub-code + 3-vreg payload for the event we
+        // need to deliver. Falls back to a synthetic "unknown" exit on
+        // platforms without hardware-virt support so the recv/reply
+        // lifecycle still progresses.
+        //
+        // IRQs are disabled across the entry+exit window for two
+        // reasons: (1) lockdep IRQ-mode consistency on the exit_port's
+        // gen-lock (same class taken from async-IRQ context by
+        // `expireTimedRecvWaiters`); (2) AMD VMRUN's required atomic
+        // CLGI/STGI bracket — if a physical IRQ slipped in between
+        // VMLOAD-host and VMRUN, host state would be inconsistent.
         clearCurrentEc(core);
-        // Spec §[vm_exit_state]: vregs 1..13 carry the guest GPR state
-        // at exit time. With real VMX/SVM guest re-entry still TODO,
-        // no actual guest code runs between reply and the next exit;
-        // zero the vCPU.ctx GPRs so `suspendOnPort`'s
-        // `getEventStateGprs(ec.ctx)` snapshot delivers zeros to the
-        // VMM on the synthetic exit. Otherwise `consumeReply` from
-        // the prior reply leaves the test EC's reply-time GPRs
-        // (notably rax=reply_handle_id) on `ec.ctx`, and the next
-        // event delivery would echo those back into the receiver's
-        // rax — turning vreg 1 (= "OK on success") into a stale
-        // handle id and tripping `errors.isError`.
-        @memset(std.mem.asBytes(&current.ctx.regs), 0);
-        // lockdep IRQ-mode mix: `scheduler.run` re-enters this branch
-        // after `arch.cpu.idle()` returns with IF=1 (sti+hlt's iretq
-        // restored the pre-hlt IF). `fireVmExit` then takes the exit
-        // port's `_gen_lock` — the same SecureSlab(Port) class that
-        // the timer IRQ's `expireTimedRecvWaiters` takes from async-IRQ
-        // context. A class taken in both async-IRQ context (state 1)
-        // and process-with-IRQs-enabled context (state 3) is the
-        // textbook same-core deadlock vector. Disable IRQs across the
-        // synthetic-exit dispatch so the lock acquisition classifies
-        // as state 2 (process + IRQs disabled).
         const irq = arch.cpu.saveAndDisableInterrupts();
-        port_mod.fireVmExit(current, 0, [3]u64{ 0, 0, 0 });
+        const delivery = arch.vm.enterGuest(current) orelse blk: {
+            // Synthetic-exit fallback — preserves the spec-test smoke
+            // contract (recv/reply on exit_port works) on platforms
+            // without VMX/SVM. Zero out ec.ctx.regs so the receiver
+            // observes a clean "guest not running" snapshot rather
+            // than the prior `consumeReply`'s reply-time GPRs.
+            @memset(std.mem.asBytes(&current.ctx.regs), 0);
+            break :blk arch.vm.VmExitDelivery{ .subcode = 0, .payload = .{ 0, 0, 0 } };
+        };
+        port_mod.fireVmExit(current, delivery.subcode, delivery.payload);
         arch.cpu.restoreInterrupts(irq);
 
-        // The synthetic-exit path above may have rendezvoused with a
-        // parked VMM receiver, putting it in this core's run queue.
-        // Pull it (or anything else ready) and dispatch. Dropping out
-        // when nothing is ready is safe: callers are written to handle
-        // `switchTo` returning with `current_ec == null` via their own
-        // idle paths (run() loops to `arch.cpu.idle()`; yieldTo()'s no-
-        // next branch leaves `current_ec` null and lets the iretq fall
-        // back to the interrupted context, which is only reached when
-        // there genuinely is no other work).
+        // The exit dispatch above may have rendezvoused with a parked
+        // VMM receiver, putting it in this core's run queue. Pull it
+        // (or anything else ready) and dispatch.
         const next = dequeueOrIdle() orelse return;
         current = next;
     }

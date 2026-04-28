@@ -248,9 +248,13 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
 /// and must be rejected with E_INVAL per Spec §[vm_inject_irq] test 02.
 /// Returns 0 on success.
 pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
-    _ = vm;
-    _ = assert;
     if (irq_num >= ioapic_mod.NUM_REDIR_ENTRIES)
         return zag.syscall.errors.E_INVAL;
+    const irq_pin: u5 = @intCast(irq_num);
+    if (assert) {
+        vm.ioapic.assertIrq(irq_pin);
+    } else {
+        vm.ioapic.deassertIrq(irq_pin);
+    }
     return 0;
 }
