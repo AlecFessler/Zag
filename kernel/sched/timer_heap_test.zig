@@ -19,12 +19,16 @@ const zag = @import("zag");
 const timer = zag.sched.timer;
 const Timer = timer.Timer;
 const TimerHeap = timer.TimerHeap;
-const HeapEntry = struct { deadline_ns: u64, timer: *Timer };
 const WHEEL_NOT_QUEUED: u32 = timer.WHEEL_NOT_QUEUED;
 const MAX_TIMERS_PER_CORE: u32 = timer.MAX_TIMERS_PER_CORE;
 
 fn freshTimer(deadline: u64) Timer {
     var t: Timer = .{};
+    // Mark slot live (odd gen) so `SlabRef(Timer).init` (called inside
+    // `TimerHeap.insert`) accepts it. Real allocs go through the slab
+    // which sets this; the unit-test driver builds Timers in-line so
+    // we have to seed the gen by hand.
+    t._gen_lock.setGenRelease(1);
     t.deadline_ns = deadline;
     return t;
 }
@@ -38,7 +42,7 @@ fn assertHeapInvariant(heap: *const TimerHeap) !void {
             try std.testing.expect(heap.entries[i].deadline_ns <= heap.entries[left].deadline_ns);
         if (right < heap.len)
             try std.testing.expect(heap.entries[i].deadline_ns <= heap.entries[right].deadline_ns);
-        try std.testing.expectEqual(i, heap.entries[i].timer.wheel_idx);
+        try std.testing.expectEqual(i, heap.entries[i].timer.ptr.wheel_idx); // self-alive
     }
 }
 
@@ -74,7 +78,7 @@ test "pop returns min then re-heapifies" {
     for (sorted) |expected| {
         const popped = heap.popMin() orelse return error.UnexpectedEmpty;
         try std.testing.expectEqual(expected, popped.deadline_ns);
-        try std.testing.expectEqual(WHEEL_NOT_QUEUED, popped.timer.wheel_idx);
+        try std.testing.expectEqual(WHEEL_NOT_QUEUED, popped.timer.ptr.wheel_idx); // self-alive
         try assertHeapInvariant(&heap);
     }
 

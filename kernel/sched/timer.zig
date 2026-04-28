@@ -140,7 +140,18 @@ pub const WHEEL_NO_CORE: u8 = 0xFF;
 
 pub const HeapEntry = struct {
     deadline_ns: u64,
-    timer: *Timer,
+    /// Wheel-pinned reference to the entry's Timer. Carried as a
+    /// `SlabRef` so the type-system invariant "no bare `*Timer` in
+    /// kernel storage" holds (per analyzer/spec). The Timer is
+    /// wheel-pinned for the duration of heap residency: refcount ≥ 1
+    /// while a handle exists, and `destroyTimer` always calls
+    /// `wheelRemove` before freeing the slab slot. Heap operations
+    /// (siftUp/siftDown/swap) update `wheel_idx`/`wheel_core` directly
+    /// through `.ptr` because the wheel-pin invariant guarantees the
+    /// slot is alive — locking the per-Timer gen-lock here would
+    /// invert the established `t._gen_lock → wheel_locks[core]` order
+    /// (see `onFire` / `wheelInsert`) and seed an AB-BA cycle.
+    timer: SlabRef(Timer),
 };
 
 /// Per-core min-heap of pending timer fires, ordered by absolute
@@ -157,10 +168,17 @@ pub const TimerHeap = struct {
     /// timer's `wheel_idx` is updated to the placed index. The timer's
     /// `wheel_core` is *not* touched here — callers set it before/after
     /// to encode which heap owns this entry.
+    ///
+    /// Caller must hold `wheel_locks[core]`. `timer` is wheel-pinned
+    /// across this call (refcount ≥ 1 + insert/remove bracketed by the
+    /// caller). The constructed SlabRef captures the timer's current
+    /// gen so heap residency carries it back out for any caller that
+    /// pops the entry (peekMin/popMin).
     pub fn insert(self: *TimerHeap, timer: *Timer, deadline_ns: u64) ?u32 {
         if (self.len >= MAX_TIMERS_PER_CORE) return null;
         const idx = self.len;
-        self.entries[idx] = .{ .deadline_ns = deadline_ns, .timer = timer };
+        const ref = SlabRef(Timer).init(timer, timer._gen_lock.currentGen());
+        self.entries[idx] = .{ .deadline_ns = deadline_ns, .timer = ref };
         timer.wheel_idx = idx;
         self.len += 1;
         return self.siftUp(idx);
@@ -173,7 +191,9 @@ pub const TimerHeap = struct {
     /// swapped into its place.
     pub fn removeAt(self: *TimerHeap, idx: u32) void {
         if (idx >= self.len) return;
-        const removed_timer = self.entries[idx].timer;
+        // self-alive: heap entries' Timers are wheel-pinned for the
+        // duration of residency (see `HeapEntry.timer` doc comment).
+        const removed_timer = self.entries[idx].timer.ptr;
         removed_timer.wheel_idx = WHEEL_NOT_QUEUED;
         removed_timer.wheel_core = WHEEL_NO_CORE;
 
@@ -183,7 +203,8 @@ pub const TimerHeap = struct {
 
         // Move the last entry into the hole; restore heap property.
         self.entries[idx] = self.entries[last_idx];
-        self.entries[idx].timer.wheel_idx = idx;
+        // self-alive: see above.
+        self.entries[idx].timer.ptr.wheel_idx = idx;
 
         // Either sift up or sift down, depending on parent comparison.
         // Sifting both ways is safe — only one will move the element.
@@ -197,14 +218,17 @@ pub const TimerHeap = struct {
     pub fn popMin(self: *TimerHeap) ?HeapEntry {
         if (self.len == 0) return null;
         const top = self.entries[0];
-        top.timer.wheel_idx = WHEEL_NOT_QUEUED;
-        top.timer.wheel_core = WHEEL_NO_CORE;
+        // self-alive: heap entries' Timers are wheel-pinned for the
+        // duration of residency (see `HeapEntry.timer` doc comment).
+        top.timer.ptr.wheel_idx = WHEEL_NOT_QUEUED;
+        top.timer.ptr.wheel_core = WHEEL_NO_CORE; // self-alive
 
         const last_idx = self.len - 1;
         self.len = last_idx;
         if (last_idx > 0) {
             self.entries[0] = self.entries[last_idx];
-            self.entries[0].timer.wheel_idx = 0;
+            // self-alive: see above.
+            self.entries[0].timer.ptr.wheel_idx = 0;
             _ = self.siftDown(0);
         }
         return top;
@@ -255,8 +279,11 @@ pub const TimerHeap = struct {
         const tmp = self.entries[a];
         self.entries[a] = self.entries[b];
         self.entries[b] = tmp;
-        self.entries[a].timer.wheel_idx = a;
-        self.entries[b].timer.wheel_idx = b;
+        // self-alive: heap entries' Timers are wheel-pinned for the
+        // duration of residency (see `HeapEntry.timer` doc comment).
+        self.entries[a].timer.ptr.wheel_idx = a;
+        // self-alive: see above.
+        self.entries[b].timer.ptr.wheel_idx = b;
     }
 };
 
@@ -444,7 +471,9 @@ fn wheelInsert(t: *Timer, deadline_ns: u64) void {
     // is sooner than the running preempt slice. Otherwise we would
     // push out the next preempt tick.
     if (heap.peekMin()) |top| {
-        if (top.timer == t) {
+        // Identity compare: SlabRef.ptr matches the freshly-inserted
+        // Timer when the new entry happens to be the heap minimum.
+        if (top.timer.ptr == t) {
             const now_ns = currentNs();
             const preempt_deadline = now_ns +| scheduler.TIMESLICE_NS;
             if (top.deadline_ns < preempt_deadline) {
@@ -507,7 +536,13 @@ pub fn wheelExpireDue() void {
             const top = heap.peekMin() orelse break;
             if (top.deadline_ns > now_ns) break;
             const popped = heap.popMin().?;
-            fire_target = popped.timer;
+            // self-alive: popped Timer was wheel-pinned until `popMin`
+            // cleared its `wheel_idx`/`wheel_core` under `wheel_locks`.
+            // The slab refcount still holds it (handles outlive wheel
+            // residency); we hand the raw `*Timer` to `onFire` which
+            // takes `t._gen_lock` for the fire-side mutation under the
+            // canonical `t._gen_lock → wheel_locks` order.
+            fire_target = popped.timer.ptr;
         }
         onFire(fire_target.?);
     }
@@ -614,6 +649,11 @@ const PropagateCtx = struct {
 
 fn propagateField0Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) bool {
     _ = gen;
+    // self-alive: caller (`propagateAndWake`) holds a live SlabRef — the
+    // Timer is wheel-pinned + refcount-pinned for the duration of the
+    // visitor walk. We only consume the raw ptr/gen for identity match
+    // against `entry.ref` below; we never deref the timer through
+    // `timer_ptr`.
     const timer_ptr: *anyopaque = @ptrCast(ctx.timer_ref.ptr);
     const timer_gen: u32 = ctx.timer_ref.gen;
     var slot: u16 = 0;
@@ -641,6 +681,9 @@ fn propagateField0Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) b
 
 fn propagateField1Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) bool {
     _ = gen;
+    // self-alive: same rationale as `propagateField0Visitor` — caller
+    // pins the Timer via the wheel + refcount; raw ptr/gen are only
+    // consumed for identity match against `entry.ref`.
     const timer_ptr: *anyopaque = @ptrCast(ctx.timer_ref.ptr);
     const timer_gen: u32 = ctx.timer_ref.gen;
     var slot: u16 = 0;

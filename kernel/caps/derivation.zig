@@ -259,10 +259,13 @@ fn detachForDelete(
 // ── Internal helpers ─────────────────────────────────────────────────
 
 /// Pair of `(*CapabilityDomain, *KernelHandle)` returned by
-/// `lockEntry` so callers can unlock symmetrically.
+/// `lockEntry` so callers can unlock symmetrically. `dom_ref` is the
+/// erased ref the caller used to acquire the typed lock — kept so
+/// `unlockEntrySkip` can release the same lock + apply the same
+/// `held` skip rule. The actual `*CapabilityDomain` stays internal to
+/// `lockEntrySkip`'s walk; callers reach the entry through `.entry`.
 const LockedEntry = struct {
     dom_ref: ErasedSlabRef,
-    dom: *CapabilityDomain,
     entry: *KernelHandle,
 };
 
@@ -291,7 +294,7 @@ fn lockEntrySkip(link: HandleLink, held: ?*CapabilityDomain) ?LockedEntry {
         if (!same_held) link.domain.unlockTyped(CapabilityDomain);
         return null;
     }
-    return .{ .dom_ref = link.domain, .dom = dom, .entry = entry };
+    return .{ .dom_ref = link.domain, .entry = entry };
 }
 
 fn unlockEntrySkip(le: LockedEntry, held: ?*CapabilityDomain) void {
