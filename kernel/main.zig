@@ -6,7 +6,6 @@ const debug_info = zag.utils.debug_info;
 const kprof_log = zag.kprof.log;
 const memory = zag.memory.init;
 const sched = zag.sched.scheduler;
-const syscall = zag.syscall;
 const userspace_init = zag.boot.userspace_init;
 
 const BootInfo = zag.boot.protocol.BootInfo;

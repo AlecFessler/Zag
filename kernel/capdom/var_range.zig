@@ -1123,33 +1123,6 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
     }
 }
 
-/// Per-VAR restart cleanup, dispatched by `caps.restart_policy`:
-/// 0=free, 1=decommit, 2=preserve, 3=snapshot. Spec §[restart_semantics].
-fn restartCleanup(v: *VAR, policy: u2) i64 {
-    const p: RestartPolicy = @enumFromInt(policy);
-    switch (p) {
-        .free => {
-            destroyVar(v);
-            return 0;
-        },
-        .decommit => {
-            // self-alive: VAR's domain owns it.
-            unmapAll(v, v.domain.ptr);
-            v.map = .unmapped;
-            return 0;
-        },
-        .preserve => return 0,
-        .snapshot => {
-            // self-alive: snapshot source ref is under v's gen-lock
-            // and cross-domain UAF is mediated by source._gen_lock if
-            // we needed to read from it (current `copySnapshot` is a
-            // stub).
-            const src_ref = v.snapshot_source orelse return errors.E_TERM;
-            return copySnapshot(v, src_ref.ptr);
-        },
-    }
-}
-
 fn incMapCntShim(pf: *PageFrame) void {
     _ = @atomicRmw(u32, &pf.mapcnt, .Add, 1, .seq_cst);
 }
@@ -1267,11 +1240,3 @@ fn decodePortIoFault(
     return errors.E_INVAL;
 }
 
-/// Copy snapshot source contents into `target` at restart. Verifies the
-/// source's stability constraints (mapcnt and effective-write) per spec
-/// §[var].snapshot before committing.
-fn copySnapshot(target: *VAR, source: *VAR) i64 {
-    _ = target;
-    _ = source;
-    return 0;
-}

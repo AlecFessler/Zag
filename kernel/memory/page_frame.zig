@@ -227,44 +227,6 @@ pub fn releaseHandle(pf: *PageFrame) void {
     decHandleRef(pf);
 }
 
-/// VAR install: increment mapcnt under `_gen_lock`, saturating at
-/// `u32::MAX`. Spec §[page_frame] field1.
-fn incMapCnt(pf: *PageFrame) void {
-    pf._gen_lock.lock(@src());
-    defer pf._gen_lock.unlock();
-    if (pf.mapcnt != std.math.maxInt(u32)) pf.mapcnt += 1;
-}
-
-/// VAR unmap: decrement mapcnt under `_gen_lock`; if both refcount and
-/// mapcnt are zero, calls `destroyPageFrame`.
-fn decMapCnt(pf: *PageFrame) void {
-    pf._gen_lock.lock(@src());
-    if (pf.mapcnt > 0) pf.mapcnt -= 1;
-    const reached_zero = pf.refcount == 0 and pf.mapcnt == 0;
-    if (!reached_zero) {
-        pf._gen_lock.unlock();
-        return;
-    }
-    destroyPageFrame(pf);
-}
-
-/// Snapshot stability predicate (called at restart for snapshot-bound
-/// VARs). Returns true iff `mapcnt == 1` AND no live writable
-/// installation. Spec §[var] snapshot.
-fn snapshotStable(pf: *PageFrame, var_eff_w: bool) bool {
-    pf._gen_lock.lock(@src());
-    defer pf._gen_lock.unlock();
-    // mapcnt > 1 means another VAR / IOMMU domain holds an active
-    // installation; snapshot binding cannot prove the source page is
-    // immutable. mapcnt == 0 is also unstable (the source isn't
-    // installed anywhere right now).
-    if (pf.mapcnt != 1) return false;
-    // `var_eff_w` is the source VAR's effective write bit; if it can
-    // write to this page, the snapshot would race against the writer.
-    if (var_eff_w) return false;
-    return true;
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────
 
 inline fn pageSizeBytes(sz: PageSize) u64 {

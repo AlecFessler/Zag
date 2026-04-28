@@ -12,22 +12,3 @@
 //! to the generic layer.
 
 pub fn sysInfoInit() void {}
-
-pub fn sysInfoPerCoreInit() void {}
-
-pub fn sampleCoreHwState() void {}
-
-pub fn getCoreFreq(core_id: u64) u64 {
-    _ = core_id;
-    return 0;
-}
-
-pub fn getCoreTemp(core_id: u64) u32 {
-    _ = core_id;
-    return 0;
-}
-
-pub fn getCoreState(core_id: u64) u8 {
-    _ = core_id;
-    return 0;
-}

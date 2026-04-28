@@ -118,18 +118,6 @@ pub fn perCoreInit() void {
 
 // ── Dispatch ─────────────────────────────────────────────────────────
 
-/// Pick the next EC to run on the current core: highest-priority
-/// non-empty bucket in `run_queue`, FIFO within priority. Returns null
-/// when the queue is empty (caller falls back to `idle`).
-pub fn dequeue() ?*ExecutionContext {
-    const core: u8 = @truncate(arch.smp.coreID());
-    const lock = &core_locks[core];
-    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-    const ec = (&core_states[core]).run_queue.dequeue();
-    lock.unlockIrqRestore(irq);
-    return ec;
-}
-
 /// Context switch to `ec` on the current core. Saves outgoing EC's
 /// state to its `ctx`, swaps address space (if domain changed),
 /// updates `current_ec`, applies lazy-FPU policy (arm/clear CR0.TS),
@@ -404,22 +392,6 @@ pub fn currentEc() ?*ExecutionContext {
     return ref.ptr;
 }
 
-/// Find which core (if any) is currently running `ec`. Returns null
-/// when `ec` is in a queue or blocked.
-pub fn coreRunning(ec: *ExecutionContext) ?u8 {
-    const count = arch.smp.coreCount();
-    var i: u8 = 0;
-    while (i < count) {
-        // self-alive: identity compare against caller-supplied `*EC`;
-        // worst-case stale read returns `null` and caller re-checks.
-        if ((&core_states[i]).current_ec) |ref| {
-            if (ref.ptr == ec) return i;
-        }
-        i += 1;
-    }
-    return null;
-}
-
 /// True if this core's `current_ec` slot names `ec`. Identity-compare
 /// helper used by suspend / terminate / fault paths to clear the
 /// dispatch slot when the running EC parks itself.
@@ -475,8 +447,3 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
     _ = ec;
 }
 
-/// Update the trap-armed flag on the current core to match `desired`,
-/// emitting a CR0.TS / FPEN write only on transitions.
-pub fn updateFpuTrap(desired_armed: bool) void {
-    _ = desired_armed;
-}

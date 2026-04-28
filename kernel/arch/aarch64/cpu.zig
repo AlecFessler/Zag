@@ -24,7 +24,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zag = @import("zag");
 
-const gic = zag.arch.aarch64.gic;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const VAddr = zag.memory.address.VAddr;
@@ -275,26 +274,6 @@ pub fn fpuClearTrap() void {
     asm volatile ("isb" ::: .{ .memory = true });
 }
 
-/// Set CPACR_EL1.FPEN bits [21:20] = 0b01 — trap EL0 FP/SIMD only.
-/// EL1 (kernel) FP access still doesn't trap, but the kernel doesn't
-/// emit any FP instructions so this is irrelevant. Called from
-/// switchTo when the new thread isn't the current FPU owner.
-/// ARM ARM D13.2.30.
-pub fn fpuArmTrap() void {
-    var cpacr: u64 = undefined;
-    asm volatile ("mrs %[v], cpacr_el1"
-        : [v] "=r" (cpacr),
-    );
-    // Clear bits [21:20] then set bit 20 (= 0b01).
-    cpacr &= ~(@as(u64, 0b11) << 20);
-    cpacr |= (@as(u64, 0b01) << 20);
-    asm volatile ("msr cpacr_el1, %[v]"
-        :
-        : [v] "r" (cpacr),
-    );
-    asm volatile ("isb" ::: .{ .memory = true });
-}
-
 /// Per-core mailbox for the lazy-FPU cross-core flush IPI (SGI 2).
 /// Mirrors the x64 layout in `arch/x64/interrupts.zig`'s mailbox — one
 /// slot per *target* core. Requester writes the thread, sends the SGI,
@@ -304,45 +283,12 @@ pub const FpuFlushMailbox = struct {
     requested_thread: ?*anyopaque align(64) = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
-    pub fn requestThread(self: *FpuFlushMailbox, thread: anytype) void {
-        @atomicStore(?*anyopaque, &self.requested_thread, @ptrCast(thread), .release);
-        self.done.store(false, .release);
-    }
-
-    pub fn waitDone(self: *FpuFlushMailbox) void {
-        while (!self.done.load(.acquire)) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
     pub fn ackDone(self: *FpuFlushMailbox) void {
         self.done.store(true, .release);
     }
 };
 
 pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
-
-/// Flush a thread's FP regs from a remote core via SGI 2.
-/// See `kernel/arch/aarch64/exceptions.zig` for the receiver.
-///
-/// Pointer-index `fpu_flush_mailbox[]` to avoid Debug-mode codegen
-/// copying the entire array onto the IPI stack. See the matching
-/// note in sched.scheduler on `core_states[]`.
-pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
-    const slot = &fpu_flush_mailbox[target_core];
-    slot.requestThread(thread);
-    gic.sendIpiToCore(target_core, 2);
-    slot.waitDone();
-}
-
-/// Spec-v3 EC variant of `fpuFlushIpi`. Identical wire protocol (SGI 2)
-/// but the mailbox payload names an `*ExecutionContext`. Spec
-/// §[execution_context] lazy FPU.
-pub fn fpuFlushIpiEc(target_core: u8, ec: *ExecutionContext) void {
-    _ = target_core;
-    _ = ec;
-    @panic("not implemented");
-}
 
 /// DC ZVA block size in bytes. Captured at boot from DCZID_EL0.BS. When
 /// `DCZID_EL0.DZP` is set the instruction is disabled at EL1 (or the

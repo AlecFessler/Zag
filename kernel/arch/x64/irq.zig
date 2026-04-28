@@ -16,7 +16,6 @@ const sched = zag.sched.scheduler;
 const time = zag.arch.dispatch.time;
 const timer_wheel = zag.sched.timer;
 
-const DeviceRegion = zag.devices.device_region.DeviceRegion;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GateType = zag.arch.x64.idt.GateType;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;

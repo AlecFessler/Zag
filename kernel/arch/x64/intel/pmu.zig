@@ -21,14 +21,11 @@
 
 const zag = @import("zag");
 
-const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const pmu_facade = zag.arch.x64.pmu;
 const pmu_sched = zag.syscall.pmu;
-const port = zag.sched.port;
-const sched = zag.sched.scheduler;
 
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuEvent = pmu_sched.PmuEvent;
@@ -62,12 +59,6 @@ const PERFEVTSEL_INT: u64 = 1 << 20;
 const PERFEVTSEL_EN: u64 = 1 << 22;
 
 const PMI_VECTOR: u8 = @intFromEnum(interrupts.IntVecs.pmu);
-
-/// IDT vector used by the PMU overflow PMI on Intel. Exposed for the
-/// arch-dispatch layer (`pmuOverflowVector`) so generic code can wire
-/// userspace overflow delivery without reaching into the vendor
-/// backend's private constants.
-pub const OVERFLOW_VECTOR: u8 = PMI_VECTOR;
 
 /// Architectural event index (CPUID.0AH:EBX bits [6:0], 1 bit per
 /// architectural event; bit set means event is NOT available).
@@ -172,29 +163,11 @@ pub fn init() void {
     );
 }
 
-pub fn perCoreInit() void {
-    if (cached_info.num_counters == 0) return;
-    if (apic.x2_apic) {
-        const lvt_val: u64 = PMI_VECTOR;
-        cpu.wrmsr(
-            @intFromEnum(apic.X2ApicMsr.local_vector_table_performance_monitor_register),
-            lvt_val,
-        );
-    } else {
-        apic.writeReg(.lvt_perf_monitoring_counters_reg, PMI_VECTOR);
-    }
-}
-
 pub fn getInfo() PmuInfo {
     return cached_info;
 }
 
 pub fn start(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    programCounters(state, configs);
-}
-
-pub fn reset(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    clearAllOverflowStatus(state.num_counters);
     programCounters(state, configs);
 }
 
@@ -338,14 +311,6 @@ fn clearAllOverflowStatus(num_counters: u8) void {
     cpu.wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, mask);
 }
 
-/// kprof sample-mode per-core init. Intel backend isn't wired for
-/// sample-mode NMI yet — the kprof.sample.md plan reserves this for
-/// a follow-up once the AMD path proves the shape. No-op for now so
-/// `-Dkernel_profile=sample` still compiles under Intel.
-pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
-    _ = period_cycles;
-}
-
 /// Mirror of the AMD hook. Returns false because Intel sample-mode
 /// wiring isn't done yet; the NMI handler will fall through to its
 /// existing (panic) policy, which is the right thing under Intel
@@ -354,11 +319,6 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
     _ = period_cycles;
     return false;
 }
-
-/// Intel trace-counter stub. Parallel to `kprofSamplePerCoreInit`'s
-/// stub — wire up IA32_PERFEVTSELx programming here when an Intel
-/// test rig exists.
-pub fn kprofTraceCountersPerCoreInit() void {}
 
 /// Intel trace-counter read stub. Zeros the output so trace records
 /// built on Intel at least produce well-defined numbers instead of

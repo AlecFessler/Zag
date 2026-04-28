@@ -507,113 +507,6 @@ pub fn unmapPage(
 /// Intel SDM Vol 3A, §4.5 "4-Level Paging and 5-Level Paging" — the hierarchy
 /// is PML4 → PDPT → PD → PT; each table is a 4-KB page of 512 eight-byte
 /// entries. Only PML4 entries 0–255 cover user space (canonical low half).
-pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
-    const Level = enum { l4, l3, l2, l1 };
-    const Cursor = struct {
-        table: *[page_entry_table_size]PageEntry,
-        idx: usize,
-    };
-
-    const pmm_mgr = &pmm.global_pmm.?;
-    const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    const root: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
-
-    // stack[0] = L4, stack[1] = L3, stack[2] = L2, stack[3] = L1
-    var stack = [4]Cursor{
-        .{ .table = root, .idx = 0 },
-        .{ .table = undefined, .idx = 0 },
-        .{ .table = undefined, .idx = 0 },
-        .{ .table = undefined, .idx = 0 },
-    };
-    var level: Level = .l4;
-
-    while (true) {
-        const depth: usize = @intFromEnum(level);
-        const cur = &stack[depth];
-
-        // Determine how many entries to scan at this level.
-        // L4 only covers the user half (indices 0–255); all others scan all 512.
-        const limit: usize = if (level == .l4) 256 else page_entry_table_size;
-
-        // Exhausted this table — pop back up (freeing non-root tables).
-        if (cur.idx >= limit) {
-            if (level == .l4) break;
-            freeTablePage(cur.table, pmm_mgr);
-            level = @enumFromInt(depth - 1);
-            stack[depth - 1].idx += 1;
-            continue;
-        }
-
-        const entry = &cur.table[cur.idx];
-
-        // Not present — skip this entry.
-        if (!entry.present) {
-            cur.idx += 1;
-            continue;
-        }
-
-        // Leaf level: free the physical page and advance.
-        if (level == .l1) {
-            freePhysPage(entry.getPAddr(), pmm_mgr);
-            cur.idx += 1;
-            continue;
-        }
-
-        // Interior level: descend into the child table.
-        std.debug.assert(!entry.huge_page);
-        const child_table = entryToTable(entry);
-        const next_depth = depth + 1;
-        stack[next_depth] = .{ .table = child_table, .idx = 0 };
-        level = @enumFromInt(next_depth);
-    }
-
-    freeTablePage(root, pmm_mgr);
-}
-
-/// Update permission bits on an existing leaf PTE and invalidate the TLB.
-///
-/// Intel SDM Vol 3A, Section 5.10.4.2 -- after modifying a paging-structure
-/// entry that maps a page, software should execute INVLPG for any linear
-/// address whose translation uses that entry.
-pub fn updatePagePerms(
-    addr_space_root: PAddr,
-    virt: VAddr,
-    new_perms: MemoryPerms,
-    kind: MappingKind,
-) void {
-    const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
-
-    const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
-    for (walk_indices) |idx| {
-        const entry = &table[idx];
-        if (!entry.present) return;
-        const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
-        table = @ptrFromInt(next_virt.addr);
-    }
-
-    const l1_entry = &table[l1Idx(virt)];
-    if (!l1_entry.present) return;
-
-    const attrs = kindAttrs(kind);
-    l1_entry.writable = new_perms.write;
-    l1_entry.not_executable = !new_perms.exec;
-    l1_entry.not_cacheable = attrs.not_cacheable;
-    l1_entry.write_through = attrs.write_through or attrs.write_combining;
-    l1_entry.huge_page = attrs.write_combining;
-    l1_entry.user_accessible = attrs.user_accessible;
-
-    cpu.invlpg(virt.addr);
-
-    // User-space permission changes must be visible on all cores.
-    // Without this, a remote core's stale TLB entry retains the old
-    // permissions (e.g. writable) after they have been revoked.
-    const user_end = zag.memory.address.AddrSpacePartition.user.end;
-    if (virt.addr < user_end) {
-        flushRemoteTlb(virt.addr);
-    }
-}
-
 /// Walk the 4-level paging hierarchy and return the physical address mapped
 /// at the given virtual address, or null if not mapped.
 ///
@@ -638,27 +531,6 @@ pub fn resolveVaddr(
     const l1_entry = &table[l1Idx(virt)];
     if (!l1_entry.present) return null;
     return l1_entry.getPAddr();
-}
-
-/// Extract the physical address from a non-leaf page-table entry and return a
-/// pointer to the next-level table it points to.
-/// Intel SDM Vol 3A, §4.5 — bits 51:12 of a non-leaf entry hold the 4-KB-
-/// aligned physical address of the next paging structure (Tables 4-15 through
-/// 4-18).
-fn entryToTable(entry: *const PageEntry) *[page_entry_table_size]PageEntry {
-    const virt = VAddr.fromPAddr(entry.getPAddr(), null);
-    return @ptrFromInt(virt.addr);
-}
-
-fn freePhysPage(paddr: PAddr, pmm_mgr: *pmm.PhysicalMemoryManager) void {
-    const virt = VAddr.fromPAddr(paddr, null);
-    const page: *paging.PageMem(.page4k) = @ptrFromInt(virt.addr);
-    pmm_mgr.destroy(page);
-}
-
-fn freeTablePage(table: *[page_entry_table_size]PageEntry, pmm_mgr: *pmm.PhysicalMemoryManager) void {
-    const page: *paging.PageMem(.page4k) = @ptrCast(@alignCast(table));
-    pmm_mgr.destroy(page);
 }
 
 pub fn mapPageSized(
@@ -706,21 +578,6 @@ pub fn allocAddrSpaceRoot() !PAddr {
     return PAddr.fromVAddr(new_virt, null);
 }
 
-pub fn invalidateTlbRange(
-    addr_space_root: PAddr,
-    virt: VAddr,
-    sz: VarPageSize,
-    page_count: u32,
-) void {
-    _ = addr_space_root;
-    std.debug.assert(sz == .sz_4k);
-    var i: u32 = 0;
-    while (i < page_count) {
-        cpu.invlpg(virt.addr + @as(u64, i) * paging.PAGE4K);
-        i += 1;
-    }
-}
-
 pub fn shootdownTlbRange(
     addr_space_id: u16,
     virt: VAddr,
@@ -738,15 +595,3 @@ pub fn shootdownTlbRange(
     }
 }
 
-pub fn shootdownTlbAll(addr_space_id: u16) void {
-    _ = addr_space_id;
-    // Coarse: write CR3 back to itself to flush local non-global TLB.
-    // Remote cores remain stale for un-shot down ranges; only used at
-    // teardown where remote stale TLB entries cannot reach freed
-    // physical pages because the slab's gen-bump invalidates handles.
-    cpu.writeCr3(cpu.readCr3());
-}
-
-pub fn invalidatePagingStructureCache(addr_space_root: PAddr) void {
-    _ = addr_space_root;
-}

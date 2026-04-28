@@ -6,34 +6,6 @@ const x64 = zag.arch.x64;
 
 const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 
-pub const SyscallArgs = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.SyscallArgs,
-    .aarch64 => aarch64.interrupts.SyscallArgs,
-    else => unreachable,
-};
-
-pub const IpcPayloadSnapshot = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.IpcPayloadSnapshot,
-    .aarch64 => aarch64.interrupts.IpcPayloadSnapshot,
-    else => unreachable,
-};
-
-pub fn getSyscallArgs(ctx: *const ArchCpuContext) SyscallArgs {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.getSyscallArgs(ctx),
-        .aarch64 => aarch64.interrupts.getSyscallArgs(ctx),
-        else => unreachable,
-    };
-}
-
-pub fn getSyscallReturn(ctx: *const ArchCpuContext) u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.getSyscallReturn(ctx),
-        .aarch64 => aarch64.interrupts.getSyscallReturn(ctx),
-        else => unreachable,
-    };
-}
-
 pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.interrupts.setSyscallReturn(ctx, value),
@@ -48,14 +20,6 @@ pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
 /// lives in the syscall word rather than vreg 1. MUST be called with
 /// the caller's address space active — the syscall epilogue runs in
 /// the caller's CR3 / TTBR0; the resume path must `switchTo` first.
-pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.writeUserSyscallWord(ctx, value),
-        .aarch64 => aarch64.interrupts.writeUserSyscallWord(ctx, value),
-        else => unreachable,
-    }
-}
-
 /// Write syscall-return vreg 2 — used by handle-creating syscalls to
 /// deliver the new handle's field0 snapshot alongside the slot id in
 /// vreg 1. Reuses the same physical reg as `setEventSubcode` (rbx on
@@ -101,60 +65,6 @@ pub fn setEventSubcode(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
-/// Write event-state vreg 3 — the event-type-specific u64 payload
-/// value (faulting address for memory_fault, etc.; Spec §[event_state]).
-/// x86-64: rdx; aarch64: x2.
-pub fn setEventAddr(ctx: *ArchCpuContext, value: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.setEventAddr(ctx, value),
-        .aarch64 => aarch64.interrupts.setEventAddr(ctx, value),
-        else => unreachable,
-    }
-}
-
-/// Read event-state vreg 3 from a suspending EC — used to snapshot
-/// the sender's GPR-backed vreg 3 at suspend time for propagation
-/// through the event delivery (Spec §[event_state] vregs 1..13 = the
-/// suspended EC's GPRs). x86-64: rdx; aarch64: x2.
-pub fn getEventVreg3(ctx: *const ArchCpuContext) u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.getEventVreg3(ctx),
-        .aarch64 => aarch64.interrupts.getEventVreg3(ctx),
-        else => unreachable,
-    };
-}
-
-/// Write event-state vreg 4 — the suspended EC's GPR-backed vreg 4
-/// snapshot delivered to the receiver at recv time per Spec
-/// §[event_state]. x86-64: rbp; aarch64: x3.
-pub fn setEventVreg4(ctx: *ArchCpuContext, value: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.setEventVreg4(ctx, value),
-        .aarch64 => aarch64.interrupts.setEventVreg4(ctx, value),
-        else => unreachable,
-    }
-}
-
-/// Read event-state vreg 4 from a suspending EC — companion to
-/// `getEventVreg3`.
-pub fn getEventVreg4(ctx: *const ArchCpuContext) u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.getEventVreg4(ctx),
-        .aarch64 => aarch64.interrupts.getEventVreg4(ctx),
-        else => unreachable,
-    };
-}
-
-/// Read event-state vreg 5 from a suspending EC — third propagated
-/// GPR (alongside vregs 3 and 4). x86-64: rsi; aarch64: x4.
-pub fn getEventVreg5(ctx: *const ArchCpuContext) u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.getEventVreg5(ctx),
-        .aarch64 => aarch64.interrupts.getEventVreg5(ctx),
-        else => unreachable,
-    };
-}
-
 /// Write event-state vreg 5 on a receiving EC — companion to
 /// `getEventVreg5`.
 pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
@@ -187,20 +97,6 @@ pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.interrupts.setEventRip(ctx, value),
         .aarch64 => aarch64.interrupts.setEventRip(ctx, value),
-        else => unreachable,
-    }
-}
-
-/// Write the event-state vreg 14 (x86-64 `[user_rsp + 8]`) / vreg 32
-/// (aarch64 `[user_sp + 8]`) slot on a receiving EC — the suspended
-/// EC's RIP/PC per Spec §[event_state]. MUST be called with the
-/// receiver's address space active in CR3/TTBR0 (the user-stack write
-/// touches a userspace page that is only mapped in the receiver's
-/// domain). Mirrors `writeUserSyscallWord`'s contract.
-pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.writeUserVreg14(ctx, value),
-        .aarch64 => aarch64.interrupts.writeUserVreg14(ctx, value),
         else => unreachable,
     }
 }
@@ -262,58 +158,3 @@ pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
     }
 }
 
-pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.getIpcHandle(ctx),
-        .aarch64 => aarch64.interrupts.getIpcHandle(ctx),
-        else => unreachable,
-    };
-}
-
-pub fn getIpcMetadata(ctx: *const ArchCpuContext) u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.getIpcMetadata(ctx),
-        .aarch64 => aarch64.interrupts.getIpcMetadata(ctx),
-        else => unreachable,
-    };
-}
-
-pub fn setIpcMetadata(ctx: *ArchCpuContext, value: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.setIpcMetadata(ctx, value),
-        .aarch64 => aarch64.interrupts.setIpcMetadata(ctx, value),
-        else => unreachable,
-    }
-}
-
-pub fn getIpcPayloadWords(ctx: *const ArchCpuContext) [5]u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.getIpcPayloadWords(ctx),
-        .aarch64 => aarch64.interrupts.getIpcPayloadWords(ctx),
-        else => unreachable,
-    };
-}
-
-pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_count: u3) void {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.copyIpcPayload(dst, src, word_count),
-        .aarch64 => aarch64.interrupts.copyIpcPayload(dst, src, word_count),
-        else => unreachable,
-    };
-}
-
-pub fn saveIpcPayload(ctx: *const ArchCpuContext) IpcPayloadSnapshot {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.saveIpcPayload(ctx),
-        .aarch64 => aarch64.interrupts.saveIpcPayload(ctx),
-        else => unreachable,
-    };
-}
-
-pub fn restoreIpcPayload(ctx: *ArchCpuContext, snap: IpcPayloadSnapshot) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.restoreIpcPayload(ctx, snap.words),
-        .aarch64 => aarch64.interrupts.restoreIpcPayload(ctx, snap.words),
-        else => unreachable,
-    }
-}

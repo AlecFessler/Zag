@@ -9,22 +9,6 @@ const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VarPageSize = zag.capdom.var_range.PageSize;
 
-pub fn isDmaRemapAvailable() bool {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.iommu.isAvailable(),
-        .aarch64 => aarch64.iommu.isAvailable(),
-        else => unreachable,
-    };
-}
-
-pub fn enableDmaRemapping() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.iommu.enableTranslation(),
-        .aarch64 => aarch64.iommu.enableTranslation(),
-        else => unreachable,
-    }
-}
-
 /// Map a single page-sized IOVA in `device`'s domain to `phys` with
 /// `perms`. Spec §[var].map_pf (caps.dma=1).
 pub fn iommuMapPage(

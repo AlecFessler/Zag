@@ -116,9 +116,6 @@ pub const Word0 = struct {
             (@as(u64, @intFromEnum(t)) << 12) |
             (@as(u64, c) << 48);
     }
-    /// Mask for the 32 reserved bits (16-47). Set bits in this range
-    /// are an ABI violation and must trip E_INVAL on syscall entry.
-    pub const RESERVED_MASK: u64 = 0x0000_FFFF_FFFF_0000;
 };
 
 /// Mask of the syscall-handle argument bits the caller is allowed to

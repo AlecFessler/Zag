@@ -574,26 +574,6 @@ fn allocVcpu(
     return vcpu_ec;
 }
 
-/// Scheduler-dispatch entry point — load guest state from `vcpu_ec.ctx`
-/// into VMCS/VMCB/sysregs, then world-switch into the guest. Returns
-/// when the guest exits; the caller invokes `handleGuestExit` next to
-/// snapshot exit state and deliver the event on the vCPU's exit_port.
-pub fn enterGuest(vcpu_ec: *ExecutionContext) void {
-    vm_dispatch.loadGuestState(vcpu_ec);
-    vm_dispatch.enterGuest(vcpu_ec);
-}
-
-/// Arch-dispatch VM-exit handler — saves live guest registers into
-/// `vcpu_ec.ctx`, reads the per-arch exit info, and fires a vm_exit
-/// event on the vCPU's bound `exit_port`. Suspension and reply-cap
-/// minting flow through the standard event-delivery path.
-/// Spec §[vm_exit_state].
-pub fn handleGuestExit(vcpu_ec: *ExecutionContext) void {
-    vm_dispatch.saveGuestState(vcpu_ec);
-    const info = vm_dispatch.lastVmExitInfo(vcpu_ec);
-    port_mod.fireVmExit(vcpu_ec, info.subcode, info.payload);
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn readSelfCaps(domain: *CapabilityDomain) u16 {

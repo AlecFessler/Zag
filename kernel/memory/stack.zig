@@ -86,16 +86,3 @@ pub fn destroyKernel(stack: Stack, addr_space_root: PAddr) void {
     recycleSlot(stack.slot);
 }
 
-pub fn createUser(proc_vmm: *zag.memory.vmm.VirtualMemoryManager, num_pages: u32) !Stack {
-    const result = try proc_vmm.reserveStack(num_pages);
-    return .{
-        .top = result.top,
-        .base = result.base,
-        .guard = result.guard,
-        .slot = std.math.maxInt(u64),
-    };
-}
-
-pub fn destroyUser(stack: Stack, proc_vmm: *zag.memory.vmm.VirtualMemoryManager) void {
-    proc_vmm.reclaimStack(stack);
-}

@@ -1,6 +1,5 @@
 pub const arch = @import("arch/arch.zig");
 pub const boot = @import("boot/boot.zig");
-pub const build_options = @import("build_options");
 pub const capdom = @import("capdom/capdom.zig");
 pub const caps = @import("caps/caps.zig");
 pub const devices = @import("devices/devices.zig");

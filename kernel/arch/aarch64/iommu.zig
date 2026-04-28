@@ -32,12 +32,8 @@
 
 const zag = @import("zag");
 
-const dispatch_iommu = zag.arch.dispatch.iommu;
-
-const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
-const PageFrame = zag.memory.page_frame.PageFrame;
 const SpecDeviceRegion = zag.devices.device_region.DeviceRegion;
 const VarPageSize = zag.capdom.var_range.PageSize;
 
@@ -52,29 +48,6 @@ const VarPageSize = zag.capdom.var_range.PageSize;
 // the cursor-race patches stay observable. No hardware page tables are
 // touched, so this is equivalent to the x86 "iommu=off" path that x86
 // routerOS uses under QEMU without VT-d.
-pub fn isAvailable() bool {
-    return true;
-}
-
-pub fn mapDmaPages(device: *DeviceRegion, frame: *PageFrame) !u64 {
-    device._gen_lock.lock(@src());
-    defer device._gen_lock.unlock();
-    frame._gen_lock.lock(@src());
-    defer frame._gen_lock.unlock();
-
-    const base_dma = device.detail.pci.dma_cursor;
-    device.detail.pci.dma_cursor = base_dma + @as(u64, frame.num_pages) * 0x1000;
-    return base_dma;
-}
-
-pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void {
-    _ = device;
-    _ = dma_base;
-    _ = num_pages;
-}
-
-pub fn enableTranslation() void {}
-
 pub fn iommuMapPage(
     device: *SpecDeviceRegion,
     iova: u64,

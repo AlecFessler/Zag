@@ -58,9 +58,6 @@ pub var n_cpus: usize = 0;
 /// Set by `start()`, cleared by `end()`.
 pub var active: bool = false;
 
-/// True once `end()` has begun. Prevents re-entering the dump path.
-pub var ending: bool = false;
-
 /// Global "some CPU filled its log" flag. Set by `emit()` on first overflow
 /// on any CPU; polled from the scheduler timer tick so the next core to tick
 /// kicks off the IPI-coordinated dump in `dump.end(.log_full)`.

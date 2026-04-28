@@ -43,12 +43,10 @@ const capability_domain = zag.capdom.capability_domain;
 const errors = zag.syscall.errors;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
-const CapabilityType = capability.CapabilityType;
 const ErasedSlabRef = capability.ErasedSlabRef;
 const HandleLink = capability.HandleLink;
 const KernelHandle = capability.KernelHandle;
 const SpinLock = zag.utils.sync.SpinLock;
-const Word0 = capability.Word0;
 
 /// Defensive bound on tree-walk depth. Caps both the max depth a single
 /// tree can reach and the sibling-chain length we will scan before
@@ -65,81 +63,6 @@ const MAX_DEPTH: u32 = 1 << 20;
 var tree_mutex: SpinLock = .{ .class = "caps.derivation.tree_mutex" };
 
 // ── External API ─────────────────────────────────────────────────────
-
-/// Mint a child of `parent_handle` in the copy-derivation tree.
-/// Spec §[capabilities] (handle copy via §[handle_attachments] paths).
-///
-/// Allocates a fresh slot in `target_domain`'s tables, mints the typed
-/// kernel handle there with the given caps and field0/field1, and links
-/// it under `(parent_caller_domain, parent_handle)` as the new head of
-/// the parent's child list.
-///
-/// Asserts the parent handle is well-formed and currently in the tree
-/// (used slot, valid `parent` link). The new child is asserted to share
-/// the parent's type tag — cross-type derivation is never legal.
-///
-/// Returns the new slot id on success, or a negative `errors.E_*` code.
-pub fn derive(
-    parent_caller_domain: ErasedSlabRef,
-    parent_handle: u64,
-    target_domain: ErasedSlabRef,
-    caps_word: u16,
-    field0: u64,
-    field1: u64,
-) i64 {
-    if (parent_handle & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
-
-    const parent_slot: u12 = @truncate(parent_handle);
-
-    tree_mutex.lock(@src());
-    defer tree_mutex.unlock();
-
-    const parent_dom = parent_caller_domain.lockTyped(CapabilityDomain) catch
-        return errors.E_BADCAP;
-    defer parent_caller_domain.unlockTyped(CapabilityDomain);
-
-    const parent_entry = capability.resolveHandleOnDomain(parent_dom, parent_slot, null) orelse
-        return errors.E_BADCAP;
-    assertInTree(parent_entry);
-
-    const parent_type = Word0.typeTag(parent_dom.user_table[parent_slot].word0);
-
-    const same_domain = (target_domain.ptr == parent_caller_domain.ptr) and
-        (target_domain.gen == parent_caller_domain.gen);
-
-    const target_dom: *CapabilityDomain = if (same_domain) parent_dom else blk: {
-        const td = target_domain.lockTyped(CapabilityDomain) catch
-            return errors.E_BADCAP;
-        break :blk td;
-    };
-    defer if (!same_domain) target_domain.unlockTyped(CapabilityDomain);
-
-    // Child handle inherits the parent's underlying SlabRef.
-    const child_obj_ref = parent_entry.ref;
-
-    const new_slot = capability_domain.mintHandle(
-        target_dom,
-        child_obj_ref,
-        parent_type,
-        caps_word,
-        field0,
-        field1,
-    ) catch return errors.E_FULL;
-
-    const child_entry = &target_dom.kernel_table[new_slot];
-    linkAsChild(
-        parent_caller_domain,
-        parent_slot,
-        parent_entry,
-        target_domain,
-        new_slot,
-        child_entry,
-        parent_type,
-        target_dom.user_table[new_slot].word0,
-    );
-
-    return @intCast(new_slot);
-}
 
 /// Release `handle`'s subtree in the copy-derivation tree.
 /// Spec §[capabilities].revoke.
@@ -319,34 +242,6 @@ fn lockEntrySkip(link: HandleLink, held: ?*CapabilityDomain) ?LockedEntry {
 fn unlockEntrySkip(le: LockedEntry, held: ?*CapabilityDomain) void {
     if (held != null and le.dom_ref.ptr == @as(*anyopaque, @ptrCast(held.?))) return;
     le.dom_ref.unlockTyped(CapabilityDomain);
-}
-
-/// Install `child_entry` as the new head of `parent_entry.first_child`.
-/// Asserts same `CapabilityType`. Both domains must be locked by caller.
-fn linkAsChild(
-    parent_domain: ErasedSlabRef,
-    parent_slot: u12,
-    parent_entry: *KernelHandle,
-    target_domain: ErasedSlabRef,
-    child_slot: u12,
-    child_entry: *KernelHandle,
-    parent_type: CapabilityType,
-    child_word0: u64,
-) void {
-    std.debug.assert(parent_type == Word0.typeTag(child_word0));
-    std.debug.assert(parent_entry.ref.ptr != null);
-    std.debug.assert(child_entry.ref.ptr != null);
-
-    child_entry.parent = .{
-        .domain = parent_domain,
-        .slot = @as(u16, parent_slot),
-    };
-    child_entry.next_sibling = parent_entry.first_child;
-    child_entry.first_child = .{};
-    parent_entry.first_child = .{
-        .domain = target_domain,
-        .slot = @as(u16, child_slot),
-    };
 }
 
 /// Walk a sibling chain rooted at `head`, releasing each subtree DFS.

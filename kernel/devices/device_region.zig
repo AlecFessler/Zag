@@ -8,12 +8,10 @@ const std = @import("std");
 const zag = @import("zag");
 
 const irq = zag.arch.dispatch.irq;
-const portio = zag.arch.dispatch.portio;
 const secure_slab = zag.memory.allocators.secure_slab;
 const smp = zag.arch.dispatch.smp;
 const userio = zag.arch.dispatch.userio;
 
-const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 const GenLock = secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
 const SecureSlab = secure_slab.SecureSlab;
@@ -206,37 +204,6 @@ pub fn findDeviceByIrqSource(irq_source: u32) ?*DeviceRegion {
     return irq_table[irq_source];
 }
 
-/// Bind `dr` to fire on hardware IRQ source `irq_source`. Subsequent
-/// firings route through `onIrq`. Caller holds `dr._gen_lock`.
-pub fn bindIrqSource(dr: *DeviceRegion, irq_source: u32) !void {
-    if (irq_source >= MAX_IRQ_SOURCES) return error.IrqSourceOutOfRange;
-    const irq_irq = irq_table_lock.lockIrqSave(@src());
-    defer irq_table_lock.unlockIrqRestore(irq_irq);
-    if (irq_table[irq_source] != null) return error.IrqSourceInUse;
-    irq_table[irq_source] = dr;
-    dr.irq_source = irq_source;
-}
-
-/// Append a handle propagation node under `dr._gen_lock`. The handle
-/// table calls this when minting a new KernelHandle to `dr`.
-pub fn linkHandleNode(dr: *DeviceRegion, node: *HandleListNode) void {
-    node.next = dr.handle_list_head;
-    dr.handle_list_head = node;
-}
-
-/// Detach a handle propagation node. Caller holds `dr._gen_lock`.
-pub fn unlinkHandleNode(dr: *DeviceRegion, node: *HandleListNode) void {
-    var cursor: *?*HandleListNode = &dr.handle_list_head;
-    while (cursor.*) |entry| {
-        if (entry == node) {
-            cursor.* = entry.next;
-            entry.next = null;
-            return;
-        }
-        cursor = &entry.next;
-    }
-}
-
 /// Acknowledge accumulated IRQs from `dr`: atomically reads the IRQ
 /// counter on every domain-local copy back to zero, signals EOI to the
 /// interrupt controller, and unmasks the line. Spec §[device_region].ack.
@@ -305,47 +272,12 @@ pub fn propagateIrqAndWake(dr: *DeviceRegion) void {
     }
 }
 
-/// Slow-path port-I/O fault handler. The CPU page-faulted on a load or
-/// store inside a port-io VAR's reserved range; we decode the MOV,
-/// execute the corresponding x86-64 IN/OUT, write the result back into
-/// the GPR (or commit the source value), and advance RIP past the
-/// instruction. Spec §[port_io_virtualization].
-///
-/// `var_base` is the VAR's userspace base virtual address; the offset
-/// into the VAR maps 1:1 onto an offset into the port range.
-///
-/// Returns `false` if the decode rejected the form (IN/OUT/INS/OUTS,
-/// 8-byte width, LOCK prefix). The caller must then deliver
-/// `thread_fault.protection_fault` per Spec §[port_io_virtualization]
-/// tests 09-11.
-pub fn handlePortIoFault(
-    dr: *DeviceRegion,
-    ctx: *ArchCpuContext,
-    fault_vaddr: u64,
-    var_base: u64,
-) bool {
-    std.debug.assert(dr.device_type == .port_io);
-    const range = dr.access.port_io;
-    const decoded = portio.decodePortIoMov(
-        ctx,
-        fault_vaddr,
-        var_base,
-        range.base_port,
-        range.port_count,
-    ) orelse return false;
-    if (decoded.op == .unsupported) return false;
-    portio.executePortIo(ctx, decoded);
-    portio.advanceRipPastInsn(ctx, decoded.insn_len);
-    return true;
-}
-
 /// Stub: futex wake against a device IRQ counter. Returns the set of
 /// idle remote cores whose recv-blocked ECs need a `sendWakeIpi`
 /// follow-up. Real impl lives in `kernel/sched/futex.zig` once the
 /// spec-v3 EC + port wiring lands; calling sites here treat it as
 /// opaque.
 pub const FutexWakeResult = struct {
-    woken: u32 = 0,
     idle_core_mask: u64 = 0,
 };
 

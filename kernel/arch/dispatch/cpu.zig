@@ -11,29 +11,6 @@ const VAddr = zag.memory.address.VAddr;
 
 // --- Fault / context types ---------------------------------------------
 
-/// Size of the register portion of a FaultMessage: ip + flags + sp + GPRs.
-pub const fault_regs_size: usize = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.fault_regs_size,
-    .aarch64 => aarch64.interrupts.fault_regs_size,
-    else => unreachable,
-};
-
-/// Total size of a FaultMessage written to userspace (32-byte header + regs).
-pub const fault_msg_size: usize = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.fault_msg_size,
-    .aarch64 => aarch64.interrupts.fault_msg_size,
-    else => unreachable,
-};
-
-/// Architecture-neutral snapshot of a faulted thread's registers.
-/// Used by fault delivery to serialize register state without the
-/// generic kernel referencing arch-specific register names.
-pub const FaultRegSnapshot = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.FaultRegSnapshot,
-    .aarch64 => aarch64.interrupts.FaultRegSnapshot,
-    else => unreachable,
-};
-
 pub const ArchCpuContext = switch (builtin.cpu.arch) {
     .x86_64 => x64.interrupts.ArchCpuContext,
     .aarch64 => aarch64.interrupts.ArchCpuContext,
@@ -45,25 +22,6 @@ pub const PageFaultContext = switch (builtin.cpu.arch) {
     .aarch64 => aarch64.interrupts.PageFaultContext,
     else => unreachable,
 };
-
-/// Apply a modified register snapshot from userspace to a faulted thread's
-/// saved context. Reverse of serializeFaultRegs. The caller is responsible
-/// for SMAP (userAccessBegin/End) around the buffer read.
-pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.applyFaultRegs(ctx, snapshot),
-        .aarch64 => aarch64.interrupts.applyFaultRegs(ctx, snapshot),
-        else => unreachable,
-    }
-}
-
-pub fn serializeFaultRegs(ctx: *const ArchCpuContext) FaultRegSnapshot {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.serializeFaultRegs(ctx),
-        .aarch64 => aarch64.interrupts.serializeFaultRegs(ctx),
-        else => unreachable,
-    };
-}
 
 // --- Calling convention / entry ----------------------------------------
 
@@ -250,30 +208,6 @@ pub fn syncInstructionCache() void {
 /// repeating instruction-abort exceptions on every ERET.
 ///
 /// ARM ARM B2.4.6 / D5.10.2: data-to-instruction cache coherency.
-pub fn cleanDcacheToPou(start: u64, len: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => {
-            if (len == 0) return;
-            // Conservative 64-byte cache line for Cortex-A72/A76. The
-            // exact line size is in CTR_EL0.DminLine; using 64 bytes
-            // simply over-cleans on cores with smaller lines, which is
-            // safe.
-            const line: u64 = 64;
-            const end = start + len;
-            var addr = start & ~(line - 1);
-            while (addr < end) : (addr += line) {
-                asm volatile ("dc cvau, %[a]"
-                    :
-                    : [a] "r" (addr),
-                    : .{ .memory = true });
-            }
-            asm volatile ("dsb ish" ::: .{ .memory = true });
-        },
-        else => unreachable,
-    }
-}
-
 /// Clean + invalidate the data cache over the given byte range to the
 /// point of coherency. On x86-64 this is a no-op (coherent D-cache). On
 /// aarch64 this is required when memory is reconfigured from Normal
@@ -355,19 +289,6 @@ pub fn fpuClearTrap() void {
     }
 }
 
-/// Cross-core lazy-FPU eviction IPI. Sent by the destination core when
-/// `ec.last_fpu_core` names a different core: the source core saves
-/// `ec`'s live FP regs into `ec.fpu_state`, clears its `last_fpu_owner`
-/// slot, then ACKs. Synchronous — caller spins until the source core
-/// finishes. Spec §[execution_context] lazy FPU.
-pub fn fpuFlushIpiEc(target_core: u8, ec: *ExecutionContext) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.fpuFlushIpiEc(target_core, ec),
-        .aarch64 => aarch64.cpu.fpuFlushIpiEc(target_core, ec),
-        else => unreachable,
-    }
-}
-
 // --- Power / shutdown / entropy ----------------------------------------
 
 pub const PowerAction = switch (builtin.cpu.arch) {
@@ -431,70 +352,9 @@ pub fn sysInfoInit() void {
     }
 }
 
-/// Per-core bring-up. Runs on every core from `sched.perCoreInit`
-/// alongside `pmuPerCoreInit`.
-pub fn sysInfoPerCoreInit() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.sysinfo.sysInfoPerCoreInit(),
-        .aarch64 => aarch64.sysinfo.sysInfoPerCoreInit(),
-        else => unreachable,
-    }
-}
-
-/// Sample this core's frequency / temperature / C-state into its cache
-/// slot. Called from schedTimerHandler on every scheduler tick. Must run
-/// on the target core because the underlying MSR reads are core-local.
-pub fn sampleCoreHwState() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.sysinfo.sampleCoreHwState(),
-        .aarch64 => aarch64.sysinfo.sampleCoreHwState(),
-        else => unreachable,
-    }
-}
-
-/// Read the cached current frequency of `core_id` in hertz. Up to one
-/// scheduler tick stale for remote cores.
-pub fn getCoreFreq(core_id: u64) u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.sysinfo.getCoreFreq(core_id),
-        .aarch64 => aarch64.sysinfo.getCoreFreq(core_id),
-        else => unreachable,
-    };
-}
-
-/// Read the cached current temperature of `core_id` in milli-celsius.
-pub fn getCoreTemp(core_id: u64) u32 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.sysinfo.getCoreTemp(core_id),
-        .aarch64 => aarch64.sysinfo.getCoreTemp(core_id),
-        else => unreachable,
-    };
-}
-
-/// Read the cached current C-state level of `core_id`. 0 means active;
-/// higher values indicate progressively deeper idle states.
-pub fn getCoreState(core_id: u64) u8 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.sysinfo.getCoreState(core_id),
-        .aarch64 => aarch64.sysinfo.getCoreState(core_id),
-        else => unreachable,
-    };
-}
-
 // ── Spec v3 EC dispatch primitives ───────────────────────────────────
 // FPU-trap arming, register-bank load, and TLS-base accessors used by
 // the ExecutionContext dispatch path. Spec §[execution_context].
-
-/// Arm the FPU-disabled trap (CR0.TS on x86-64, CPACR_EL1.FPEN=0 on
-/// aarch64) so the next user FP/SIMD instruction faults into the
-/// scheduler's lazy-FPU eviction path. Spec §[execution_context] lazy FPU.
-pub fn fpuArmTrap() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.fpuArmTrap(),
-        .aarch64 => aarch64.cpu.fpuArmTrap(),
-        else => unreachable,
-    }
-}
 
 /// Restore `ec.ctx` into the live register file and return to userspace
 /// via iretq / eret. Never returns to the caller. Used by the scheduler

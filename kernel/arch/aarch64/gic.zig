@@ -47,7 +47,6 @@
 //! - ARM ARM DDI 0487: D13.2.83 (MPIDR_EL1)
 
 const std = @import("std");
-const zag = @import("zag");
 
 // ── GICD register offsets (IHI 0069H, Section 8.9 / IHI 0048B, Section 4.3) ──
 
@@ -1006,13 +1005,6 @@ const sched_sgi_id: u8 = 0;
 /// so callers don't have to know which id the scheduler listens on.
 pub fn sendSchedulerIpi(core_id: u64) void {
     sendIpiToCore(core_id, sched_sgi_id);
-}
-
-/// Send the scheduler-rearm IPI to the local core. There is no cheaper
-/// path on aarch64 than issuing an SGI to the current core, so this is
-/// a thin wrapper around sendIpiToCore.
-pub fn sendSchedulerIpiSelf() void {
-    sendIpiToCore(coreID(), sched_sgi_id);
 }
 
 /// Dedicated SGI INTID reserved for the BSP-driven scheduler-tick
