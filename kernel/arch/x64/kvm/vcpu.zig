@@ -27,6 +27,11 @@ pub const VcpuArchState = struct {
     /// return so the surrounding run loop / VMM can re-decode without
     /// re-reading VMCS/VMCB fields.
     last_exit: VmExitInfo = .{ .unknown = 0 },
+    /// 3-vreg payload (§[vm_exit_state] vregs 71..73) for the most-
+    /// recent vm_exit; staged here by the run loop so `port.deliverEvent`
+    /// can write it into the receiver's vregs without re-decoding the
+    /// exit reason. Sub-code rides on `ec.event_subcode`.
+    last_exit_payload: [3]u64 = .{ 0, 0, 0 },
     /// True once the VMM has supplied an initial guest state via the
     /// reply path. The first vm_exit delivered after `create_vcpu` is
     /// synthetic (zeroed `GuestState`); the run loop must not actually

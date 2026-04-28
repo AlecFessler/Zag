@@ -1006,14 +1006,20 @@ pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
     // `suspendOnPort` releases the port lock before returning — see its
     // contract. Do NOT add `defer exit_port_ref.unlock()` here.
 
+    // Stash payload[3] on the vCPU's arch state so `port.deliverEvent`
+    // (and the rendezvous resume path) can pick it up at delivery time
+    // without re-threading the [3]u64 through suspendOnPort. payload[0]
+    // also rides in `event_addr` for compatibility with the
+    // event-state addr field, and is mirrored here for vm_exit.
+    if (zag.arch.x64.kvm.vcpu.archStateOf(ec)) |arch_state| {
+        arch_state.last_exit_payload = payload;
+    }
+
     // The originating EC handle for vm_exit is the vCPU EC handle held
-    // by the VMM. Its write-cap snapshot drives whether reply applies
-    // receiver mutations. The lookup that captures that bit per-vCPU
-    // is part of the VMM-owned exit pipeline; until it lands, default
-    // to allowing applies (the common case for VMM resume) so the
-    // exit→reply→resume cycle remains observable end-to-end. `read`
-    // defaults to true so §[event_state] vregs 1..13 carry the vCPU's
-    // GPRs to the VMM at recv time (the dominant exit-pipeline case).
+    // by the VMM. `read`/`write` default to true so §[event_state] /
+    // §[vm_exit_state] vregs are exposed and reply mutations are
+    // committed back; per-vCPU cap-snapshot wiring lands when the
+    // VMM-side handle is captured at create_vcpu time.
     _ = execution_context.suspendOnPort(ec, port_ptr, .vm_exit, subcode, payload[0], true, true);
 }
 
@@ -1285,6 +1291,31 @@ fn deliverEvent(
         .none, .suspension => {},
     }
 
+    // Spec §[vm_exit_state]: project the vCPU's full guest state
+    // (CR0/2/3/4, EFER, segs, GDTR/IDTR, MSRs, DRs) plus the exit
+    // sub-code + 3-vreg payload into the receiver's vreg slots. Only
+    // active for vCPUs whose VMM has supplied initial state — i.e.
+    // post-first-reply (`arch_state.started = true`). The pre-started
+    // synthetic-init exit delivers only sub-code + zeroed GPRs (the
+    // existing minimal projection above) so receivers that haven't
+    // reserved the full §[vm_exit_state] stack window aren't stomped.
+    // x86-64 only — aarch64 vm_exit layout follows §[vm_exit_state]
+    // aarch64 and is wired separately when that arch's run loop lands.
+    if (event_type == .vm_exit and sender.vm != null and sender.originating_read_cap) {
+        if (@import("builtin").cpu.arch == .x86_64) {
+            if (zag.arch.x64.kvm.vcpu.archStateOf(sender)) |arch_state| {
+                if (arch_state.started) {
+                    zag.arch.x64.vm_runloop.populateVmExitVregs(
+                        receiver,
+                        sender,
+                        subcode,
+                        arch_state.last_exit_payload,
+                    );
+                }
+            }
+        }
+    }
+
     // i64 return == OK on success. The composed `ret_word` is delivered
     // out-of-band via `pending_event_word` rather than through
     // syscallDispatch's `r.rax = ret` epilogue; the syscall-result
@@ -1409,6 +1440,15 @@ fn consumeReply(holder: *KernelHandle, receiver: *ExecutionContext, sender: *Exe
         const receiver_frame = receiver.iret_frame orelse receiver.ctx;
         arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
     }
+    // Spec §[vm_exit_state] reply writeback for vCPUs is wired through
+    // `vm_runloop.applyReplyStateToVcpu` once the VMM (hyprvOS) lands
+    // with a recv frame reservation that fits the full vreg window.
+    // The pre-rewrite spec-test runner only reserves 144 bytes on its
+    // recv stack — too small to safely read vregs 14..73 (which extend
+    // to offset 480) — so the broad writeback would stomp the runner's
+    // own stack frames. Until the libz scaffolding upgrades, vCPUs
+    // continue to drive through the synthetic-exit loop in
+    // scheduler.switchTo (gated on `arch_state.started`).
     execution_context.resumeFromReply(sender, sender.originating_write_cap);
 }
 
