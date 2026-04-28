@@ -22,6 +22,7 @@ const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 
 /// Cap bits in `Capability.word0[48..63]` for timer handles.
@@ -317,25 +318,32 @@ pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64)
 
     const caller_domain = callerDomain(caller) orelse return E_PERM;
     const lookup = resolveTimerHandle(caller_domain, handle, .timer) orelse return E_BADCAP;
-    refreshHandleSnapshot(caller_domain, lookup.slot, lookup.timer);
 
     if (deadline_ns == 0) return E_INVAL;
     if (!handleHasArmCap(caller_domain, lookup.slot)) return E_PERM;
 
     const periodic_flag: bool = (flags & 1) != 0;
 
-    lookup.timer._gen_lock.lock(@src());
-    if (lookup.timer.armed) wheelRemove(lookup.timer);
-    lookup.timer.counter = 0;
-    lookup.timer.armed = true;
-    lookup.timer.periodic = periodic_flag;
-    lookup.timer.period_ns = deadline_ns;
-    lookup.timer.deadline_ns = currentNs() +| deadline_ns;
-    lookup.timer._gen_lock.unlock();
+    const t = lookup.timer_ref.lock(@src()) catch return E_BADCAP;
+    if (t.armed) wheelRemove(t);
+    t.counter = 0;
+    t.armed = true;
+    t.periodic = periodic_flag;
+    t.period_ns = deadline_ns;
+    t.deadline_ns = currentNs() +| deadline_ns;
+    const timer_gen = t._gen_lock.currentGen();
+    const fire_deadline = t.deadline_ns;
+    const counter = t.counter;
+    const armed = t.armed;
+    const periodic = t.periodic;
+    lookup.timer_ref.unlock();
 
-    propagateAndWake(lookup.timer, 0);
-    propagateField1(lookup.timer, encodeField1(true, periodic_flag));
-    wheelInsert(lookup.timer, lookup.timer.deadline_ns);
+    caller_domain.user_table[lookup.slot].field0 = counter;
+    caller_domain.user_table[lookup.slot].field1 = encodeField1(armed, periodic);
+
+    propagateAndWake(t, timer_gen, 0);
+    propagateField1(t, timer_gen, encodeField1(true, periodic_flag));
+    wheelInsert(t, fire_deadline);
     return 0;
 }
 
@@ -343,22 +351,23 @@ pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64)
 pub fn timerCancel(caller: *anyopaque, handle: u64) i64 {
     const caller_domain = callerDomain(caller) orelse return E_PERM;
     const lookup = resolveTimerHandle(caller_domain, handle, .timer) orelse return E_BADCAP;
-    refreshHandleSnapshot(caller_domain, lookup.slot, lookup.timer);
 
     if (!handleHasCancelCap(caller_domain, lookup.slot)) return E_PERM;
 
-    lookup.timer._gen_lock.lock(@src());
-    if (!lookup.timer.armed) {
-        lookup.timer._gen_lock.unlock();
+    const t = lookup.timer_ref.lock(@src()) catch return E_BADCAP;
+    if (!t.armed) {
+        lookup.timer_ref.unlock();
         return E_INVAL;
     }
-    wheelRemove(lookup.timer);
-    lookup.timer.armed = false;
-    lookup.timer.counter = CANCELLED;
-    lookup.timer._gen_lock.unlock();
+    wheelRemove(t);
+    t.armed = false;
+    t.counter = CANCELLED;
+    const timer_gen = t._gen_lock.currentGen();
+    const periodic = t.periodic;
+    lookup.timer_ref.unlock();
 
-    propagateAndWake(lookup.timer, CANCELLED);
-    propagateField1(lookup.timer, encodeField1(false, lookup.timer.periodic));
+    propagateAndWake(t, timer_gen, CANCELLED);
+    propagateField1(t, timer_gen, encodeField1(false, periodic));
     return 0;
 }
 
@@ -542,11 +551,12 @@ pub fn onFire(t: *Timer) void {
     } else {
         t.armed = false;
     }
+    const timer_gen = t._gen_lock.currentGen();
     t._gen_lock.unlock();
 
-    propagateAndWake(t, new_count);
+    propagateAndWake(t, timer_gen, new_count);
     if (!periodic) {
-        propagateField1(t, encodeField1(false, false));
+        propagateField1(t, timer_gen, encodeField1(false, false));
     } else {
         wheelInsert(t, next_deadline);
     }
@@ -556,8 +566,11 @@ pub fn onFire(t: *Timer) void {
 /// `value` into each `Capability.field0`, futex-waking the paddr, and
 /// kicking idle remote cores so they re-evaluate the wake. Spec §[timer]
 /// (eager but non-atomic propagation across copies).
-fn propagateAndWake(t: *Timer, value: u64) void {
-    var ctx = PropagateCtx{ .timer = t, .value = value };
+fn propagateAndWake(t: *Timer, gen: u63, value: u64) void {
+    var ctx = PropagateCtx{
+        .timer_ref = SlabRef(Timer).init(t, gen),
+        .value = value,
+    };
     zag.capdom.capability_domain.slab_instance.forEachAlive(
         &ctx,
         propagateField0Visitor,
@@ -567,8 +580,11 @@ fn propagateAndWake(t: *Timer, value: u64) void {
 /// Mirror updated `field1` (arm/pd bits) into every domain-local copy.
 /// No futex wake — userspace observes arm/pd transitions through
 /// `sync` or as a side effect of the field0 wake.
-fn propagateField1(t: *Timer, value: u64) void {
-    var ctx = PropagateCtx{ .timer = t, .value = value };
+fn propagateField1(t: *Timer, gen: u63, value: u64) void {
+    var ctx = PropagateCtx{
+        .timer_ref = SlabRef(Timer).init(t, gen),
+        .value = value,
+    };
     zag.capdom.capability_domain.slab_instance.forEachAlive(
         &ctx,
         propagateField1Visitor,
@@ -578,7 +594,7 @@ fn propagateField1(t: *Timer, value: u64) void {
 // ── Helpers ──────────────────────────────────────────────────────────
 
 const TimerLookup = struct {
-    timer: *Timer,
+    timer_ref: SlabRef(Timer),
     slot: u12,
 };
 
@@ -592,18 +608,23 @@ const HandleField = enum { field0, field1 };
 /// stack frame cannot afford. Spec §[timer] (eager but non-atomic
 /// propagation across copies).
 const PropagateCtx = struct {
-    timer: *Timer,
+    timer_ref: SlabRef(Timer),
     value: u64,
 };
 
 fn propagateField0Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) bool {
     _ = gen;
-    const timer_ptr: *anyopaque = @ptrCast(ctx.timer);
+    const timer_ptr: *anyopaque = @ptrCast(ctx.timer_ref.ptr);
+    const timer_gen: u32 = ctx.timer_ref.gen;
     var slot: u16 = 0;
     while (slot < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) {
         const entry = &cd.kernel_table[slot];
         if (entry.ref.ptr) |obj_ptr| {
-            if (obj_ptr == timer_ptr) {
+            // Identity match requires both ptr and gen — without the
+            // gen check, a recycled slab slot at the same address would
+            // false-match and we'd write the new (different) timer's
+            // data to an unrelated CD's table slot.
+            if (obj_ptr == timer_ptr and entry.ref.gen == timer_gen) {
                 const tag = capability.Word0.typeTag(cd.user_table[slot].word0);
                 if (tag == .timer) {
                     const slot12: u12 = @truncate(slot);
@@ -620,12 +641,13 @@ fn propagateField0Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) b
 
 fn propagateField1Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) bool {
     _ = gen;
-    const timer_ptr: *anyopaque = @ptrCast(ctx.timer);
+    const timer_ptr: *anyopaque = @ptrCast(ctx.timer_ref.ptr);
+    const timer_gen: u32 = ctx.timer_ref.gen;
     var slot: u16 = 0;
     while (slot < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) {
         const entry = &cd.kernel_table[slot];
         if (entry.ref.ptr) |obj_ptr| {
-            if (obj_ptr == timer_ptr) {
+            if (obj_ptr == timer_ptr and entry.ref.gen == timer_gen) {
                 const tag = capability.Word0.typeTag(cd.user_table[slot].word0);
                 if (tag == .timer) {
                     const slot12: u12 = @truncate(slot);
@@ -683,9 +705,11 @@ fn resolveTimerHandle(cd: *CapabilityDomain, handle: u64, expected: CapabilityTy
     if (t_tag != expected) return null;
 
     const typed = capability.typedRef(Timer, kernel_entry.*) orelse return null;
-    const ptr = typed.lock(@src()) catch return null;
+    // Gen-validate by lock+immediately-unlock; real per-op locking
+    // happens in the caller via `timer_ref.lock()` / `unlock()`.
+    _ = typed.lock(@src()) catch return null;
     typed.unlock();
-    return .{ .timer = ptr, .slot = slot_id };
+    return .{ .timer_ref = typed, .slot = slot_id };
 }
 
 fn handleHasArmCap(cd: *CapabilityDomain, slot: u12) bool {
@@ -698,16 +722,6 @@ fn handleHasCancelCap(cd: *CapabilityDomain, slot: u12) bool {
     const caps = capability.Word0.caps(cd.user_table[slot].word0);
     const tc: TimerCaps = @bitCast(caps);
     return tc.cancel;
-}
-
-fn refreshHandleSnapshot(cd: *CapabilityDomain, slot: u12, t: *Timer) void {
-    t._gen_lock.lock(@src());
-    const counter = t.counter;
-    const armed = t.armed;
-    const periodic = t.periodic;
-    t._gen_lock.unlock();
-    cd.user_table[slot].field0 = counter;
-    cd.user_table[slot].field1 = encodeField1(armed, periodic);
 }
 
 fn encodeField1(armed: bool, periodic: bool) u64 {

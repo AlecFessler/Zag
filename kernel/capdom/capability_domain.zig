@@ -227,7 +227,7 @@ pub fn createCapabilityDomain(
 ) i64 {
     if (elf_pf & ~@as(u64, 0xFFF) != 0) return errors.E_INVAL;
 
-    const caller_dom = caller.domain.ptr;
+    const caller_dom = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
 
     // Resolve the ELF page frame in the caller's table. Spec §[14].
     const pf_slot: u12 = @truncate(elf_pf & 0xFFF);

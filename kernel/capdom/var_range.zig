@@ -237,7 +237,7 @@ pub fn createVar(
         }
     }
 
-    const domain = caller.domain.ptr;
+    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
 
     // DMA VARs require a valid device_region handle with the dma cap.
     var dev_ptr: ?*DeviceRegion = null;
@@ -299,7 +299,7 @@ pub fn createVar(
 pub fn mapPf(caller: *ExecutionContext, var_handle: u64, pairs: []const u64) i64 {
     if (pairs.len == 0 or (pairs.len & 1) != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr;
+    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
     const slot: u12 = @truncate(var_handle & 0xFFF);
     const v = resolveVar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -400,7 +400,7 @@ pub fn mapPf(caller: *ExecutionContext, var_handle: u64, pairs: []const u64) i64
 
 /// `map_mmio` syscall handler. Spec §[var].map_mmio.
 pub fn mapMmio(caller: *ExecutionContext, var_handle: u64, device_region: u64) i64 {
-    const domain = caller.domain.ptr;
+    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
     const var_slot: u12 = @truncate(var_handle & 0xFFF);
     const v = resolveVar(domain, var_slot) orelse return errors.E_BADCAP;
 
@@ -463,7 +463,7 @@ pub fn mapMmio(caller: *ExecutionContext, var_handle: u64, device_region: u64) i
 
 /// `unmap` syscall handler. Spec §[var].unmap.
 pub fn unmap(caller: *ExecutionContext, var_handle: u64, selectors: []const u64) i64 {
-    const domain = caller.domain.ptr;
+    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
     const slot: u12 = @truncate(var_handle & 0xFFF);
     const v = resolveVar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -520,7 +520,7 @@ pub fn unmap(caller: *ExecutionContext, var_handle: u64, selectors: []const u64)
 pub fn remap(caller: *ExecutionContext, var_handle: u64, new_cur_rwx: u64) i64 {
     if (new_cur_rwx >> 3 != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr;
+    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
     const slot: u12 = @truncate(var_handle & 0xFFF);
     const v = resolveVar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -601,7 +601,7 @@ pub fn remap(caller: *ExecutionContext, var_handle: u64, new_cur_rwx: u64) i64 {
 
 /// `snapshot` syscall handler. Spec §[var].snapshot.
 pub fn snapshot(caller: *ExecutionContext, target_var: u64, source_var: u64) i64 {
-    const domain = caller.domain.ptr;
+    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
     const t_slot: u12 = @truncate(target_var & 0xFFF);
     const s_slot: u12 = @truncate(source_var & 0xFFF);
 
@@ -629,7 +629,7 @@ pub fn idcRead(caller: *ExecutionContext, var_handle: u64, offset: u64, count: u
     if (count == 0 or count > 125) return errors.E_INVAL;
     if (!std.mem.isAligned(offset, 8)) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr;
+    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
     const slot: u12 = @truncate(var_handle & 0xFFF);
     const v = resolveVar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -699,7 +699,7 @@ pub fn idcWrite(
     if (count == 0 or count > 125) return errors.E_INVAL;
     if (!std.mem.isAligned(offset, 8)) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr;
+    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
     const slot: u12 = @truncate(var_handle & 0xFFF);
     const v = resolveVar(domain, slot) orelse return errors.E_BADCAP;
 

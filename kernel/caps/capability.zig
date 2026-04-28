@@ -331,11 +331,7 @@ pub fn delete(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const caller_dom_ref: ErasedSlabRef = .{
-        .ptr = ec.domain.ptr,
-        .gen = ec.domain.gen,
-        ._pad = ec.domain._pad,
-    };
+    const caller_dom_ref: ErasedSlabRef = @bitCast(ec.domain);
 
     const slot: u12 = @truncate(handle);
     return derivation.deleteAndDetach(caller_dom_ref, slot);
@@ -350,11 +346,7 @@ pub fn revoke(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const caller_dom_ref: ErasedSlabRef = .{
-        .ptr = ec.domain.ptr,
-        .gen = ec.domain.gen,
-        ._pad = ec.domain._pad,
-    };
+    const caller_dom_ref: ErasedSlabRef = @bitCast(ec.domain);
     return derivation.revoke(caller_dom_ref, handle);
 }
 
