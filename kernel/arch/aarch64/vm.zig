@@ -182,10 +182,6 @@ pub const GuestState = extern struct {
 /// ARM ARM B1.2.2 describes V0..V31; FPCR/FPSR are D13.2.48/D13.2.52.
 pub const FxsaveArea = [576]u8;
 
-pub fn fxsaveInit() FxsaveArea {
-    return .{0} ** 576;
-}
-
 // ===========================================================================
 // VM exit reasons (decoded from ESR_EL2)
 // ===========================================================================
@@ -506,10 +502,6 @@ pub fn vmInit() void {
 /// The vector-install step lives in `hyp.zig` and is driven by the
 /// `dispatch/vm.zig` dispatcher directly — keeping vm.zig's init free of
 /// a cross-file call-out to the EL2 machinery.
-pub fn vmPerCoreInit() void {
-    // TODO: set HCR_EL2 defaults for "host running at EL1" state
-}
-
 /// Returns true if hardware virtualization is available AND reachable
 /// from this kernel build. Two conditions must hold:
 ///
@@ -779,55 +771,3 @@ pub fn decodeEsrEl2(esr: u64, far: u64, hpfar: u64) VmExitInfo {
     };
 }
 
-// ===========================================================================
-// Interrupt / exception injection
-// ===========================================================================
-
-/// Inject a synchronous exception into the guest at EL1.
-///
-/// Per ARM ARM K.a D1.11 "Exception entry":
-///   1. SPSR_EL1 receives the current PSTATE.
-///   2. ELR_EL1 receives the faulting PC.
-///   3. ESR_EL1 receives the syndrome the guest will observe.
-///   4. FAR_EL1 receives the fault address (data/instruction aborts).
-///   5. PC is redirected to VBAR_EL1 + vector offset (Table D1-7).
-///   6. PSTATE.{M=EL1h, D=1, A=1, I=1, F=1} per D1.11.3.
-///
-/// Vector offsets (relative to VBAR_EL1), D1.11.2 Table D1-7:
-///   0x000 = Current EL SP0  sync
-///   0x080 = Current EL SP0  irq
-///   0x100 = Current EL SP0  fiq
-///   0x180 = Current EL SP0  serror
-///   0x200 = Current EL SPx  sync
-///   0x280 = Current EL SPx  irq
-///   0x300 = Current EL SPx  fiq
-///   0x380 = Current EL SPx  serror
-///   0x400 = Lower EL A64    sync
-///
-/// `vector_slot` is an index into this table (0..8) so the VMM can
-/// pick the exception kind it wants to inject; 4 (lower-EL sync) is
-/// the most common choice for delivering a synthetic exception that
-/// the guest kernel handles as "my userspace faulted".
-pub fn injectException(guest_state: *GuestState, exception: GuestException) void {
-    guest_state.spsr_el1 = guest_state.pstate;
-    guest_state.elr_el1 = guest_state.pc;
-    guest_state.esr_el1 = exception.esr;
-    guest_state.far_el1 = exception.far;
-
-    const vector_offset: u64 = switch (exception.vector_slot) {
-        0 => 0x000,
-        1 => 0x080,
-        2 => 0x100,
-        3 => 0x180,
-        4 => 0x200,
-        5 => 0x280,
-        6 => 0x300,
-        7 => 0x380,
-        else => 0x400,
-    };
-    guest_state.pc = guest_state.vbar_el1 +% vector_offset;
-
-    // Target PSTATE per D1.11.3: EL1h, DAIF all masked (entering an
-    // exception masks I/F/A/D until the handler explicitly unmasks).
-    guest_state.pstate = 0x3C5; // M=EL1h (0b0101), D=A=I=F=1
-}

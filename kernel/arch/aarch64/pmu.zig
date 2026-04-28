@@ -47,12 +47,6 @@ pub const MAX_COUNTERS: u8 = pmu_sched.MAX_COUNTERS;
 
 /// GIC INTID used by the PMU overflow interrupt on aarch64.
 /// ARM ARM DDI 0487 K.a §D13.3.1: PMU overflow connects as a
-/// per-core, level-sensitive PPI at INTID 23 on GICv3-compatible
-/// implementations. Exposed for the arch-dispatch layer
-/// (`pmuOverflowVector`) so generic code can identify the line
-/// without reaching into this backend's exception wiring.
-pub const OVERFLOW_PPI: u8 = 23;
-
 const default_config: PmuCounterConfig = .{
     .event = .cycles,
     .has_threshold = false,
@@ -315,37 +309,11 @@ pub fn pmuInit() void {
     };
 }
 
-pub fn pmuPerCoreInit() void {
-    if (cached_info.num_counters == 0) return;
-
-    // Reset all counters and enable the PMCR global bit (E). LC=1 makes
-    // PMCCNTR 64-bit even on pre-8.5 implementations (DDI 0487 §D13.3.3).
-    var pmcr = readPMCR();
-    pmcr |= PMCR_E | PMCR_C | PMCR_P | PMCR_LC;
-    writePMCR(pmcr);
-
-    // Disable every event counter slot until `start` programs it, and
-    // clear any stale overflow bits.
-    const all_mask: u64 = counterMask(cached_info.num_counters);
-    writePMCNTENCLR(all_mask);
-    writePMOVSCLR(all_mask);
-
-    // Deny EL0 direct access (PMUSERENR_EL0 = 0); overflow interrupt is
-    // left masked until we wire PMI → GIC.
-    writePMUSERENR(0);
-    writePMINTENCLR(all_mask);
-}
-
 pub fn pmuGetInfo() PmuInfo {
     return cached_info;
 }
 
 pub fn pmuStart(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    programCounters(state, configs);
-}
-
-pub fn pmuReset(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    clearAllOverflowStatus(state.num_counters);
     programCounters(state, configs);
 }
 

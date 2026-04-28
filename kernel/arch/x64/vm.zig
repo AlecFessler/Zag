@@ -88,19 +88,6 @@ pub const GuestState = extern struct {
 /// Used to save/restore FPU/SSE state across VM transitions.
 pub const FxsaveArea = [512]u8;
 
-/// Return an FxsaveArea initialized with default x87/SSE state:
-/// FCW=0x037F (x87 default), MXCSR=0x1F80 (SSE default, all exceptions masked).
-pub fn fxsaveInit() FxsaveArea {
-    var area: FxsaveArea = .{0} ** 512;
-    // FCW at offset 0 (2 bytes, little-endian)
-    area[0] = 0x7F;
-    area[1] = 0x03;
-    // MXCSR at offset 24 (4 bytes, little-endian)
-    area[24] = 0x80;
-    area[25] = 0x1F;
-    return area;
-}
-
 /// Tagged union of x64 VM exit reasons.
 pub const VmExitInfo = union(enum) {
     cpuid: CpuidExit,
@@ -242,37 +229,9 @@ pub fn vmInit() void {
     }
 }
 
-/// Per-core VM initialization. Called from sched.perCoreInit().
-pub fn vmPerCoreInit() void {
-    switch (active_backend) {
-        .intel_vmx => vmx.perCoreInit(),
-        .amd_svm => svm.perCoreInit(),
-        .none => {},
-    }
-}
-
 /// Returns whether hardware virtualization is available.
 pub fn vmSupported() bool {
     return active_backend != .none;
-}
-
-/// Enter the guest. Called from the vCPU thread entry point.
-/// Returns the exit info when the guest exits.
-pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr, guest_fxsave: *align(16) FxsaveArea) VmExitInfo {
-    return switch (active_backend) {
-        .intel_vmx => vmx.vmResume(guest_state, vmcs_paddr),
-        .amd_svm => svm.vmResume(guest_state, vmcs_paddr, guest_fxsave),
-        .none => .{ .unknown = 0 },
-    };
-}
-
-/// Allocate and initialize arch-specific per-VM structures (e.g. VMCS, EPT root).
-pub fn vmAllocStructures() ?PAddr {
-    return switch (active_backend) {
-        .intel_vmx => vmx.allocVmStructures(),
-        .amd_svm => svm.allocVmStructures(),
-        .none => null,
-    };
 }
 
 /// Free arch-specific per-VM structures.
@@ -335,34 +294,6 @@ pub fn unmapGuestPage(vm_structures: PAddr, guest_phys: u64) void {
     switch (active_backend) {
         .intel_vmx => vmx.unmapEptPage(vm_structures, guest_phys),
         .amd_svm => svm.unmapNptPage(vm_structures, guest_phys),
-        .none => {},
-    }
-}
-
-/// Inject a virtual interrupt into the guest.
-pub fn injectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
-    switch (active_backend) {
-        .intel_vmx => vmx.injectInterrupt(guest_state, interrupt),
-        .amd_svm => svm.injectInterrupt(guest_state, interrupt),
-        .none => {},
-    }
-}
-
-/// Inject an exception into the guest.
-pub fn injectException(guest_state: *GuestState, exception: GuestException) void {
-    switch (active_backend) {
-        .intel_vmx => vmx.injectException(guest_state, exception),
-        .amd_svm => svm.injectException(guest_state, exception),
-        .none => {},
-    }
-}
-
-/// Modify system-register passthrough bits in the VM's MSRPM. On x86 a
-/// "sysreg" is an MSR; `sysreg_id` is the 32-bit MSR address.
-pub fn sysregPassthrough(vm_structures: PAddr, sysreg_id: u32, allow_read: bool, allow_write: bool) void {
-    switch (active_backend) {
-        .amd_svm => svm.msrPassthrough(vm_structures, sysreg_id, allow_read, allow_write),
-        .intel_vmx => {}, // TODO: VMX MSR bitmap support
         .none => {},
     }
 }

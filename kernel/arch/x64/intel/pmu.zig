@@ -61,12 +61,6 @@ const PERFEVTSEL_EN: u64 = 1 << 22;
 
 const PMI_VECTOR: u8 = @intFromEnum(interrupts.IntVecs.pmu);
 
-/// IDT vector used by the PMU overflow PMI on Intel. Exposed for the
-/// arch-dispatch layer (`pmuOverflowVector`) so generic code can wire
-/// userspace overflow delivery without reaching into the vendor
-/// backend's private constants.
-pub const OVERFLOW_VECTOR: u8 = PMI_VECTOR;
-
 /// Architectural event index (CPUID.0AH:EBX bits [6:0], 1 bit per
 /// architectural event; bit set means event is NOT available).
 /// Intel SDM Vol 3 §18.2.1.2 and Table 18-1.

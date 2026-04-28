@@ -83,14 +83,6 @@ pub fn pmuInit() void {
     }
 }
 
-pub fn pmuPerCoreInit() void {
-    switch (active_backend) {
-        .intel => intel_pmu.perCoreInit(),
-        .amd => amd_pmu.perCoreInit(),
-        .none => {},
-    }
-}
-
 pub fn pmuGetInfo() PmuInfo {
     return switch (active_backend) {
         .intel => intel_pmu.getInfo(),
@@ -107,14 +99,6 @@ pub fn pmuStart(state: *PmuState, configs: []const PmuCounterConfig) !void {
     switch (active_backend) {
         .intel => try intel_pmu.start(state, configs),
         .amd => try amd_pmu.start(state, configs),
-        .none => return error.NoPmu,
-    }
-}
-
-pub fn pmuReset(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    switch (active_backend) {
-        .intel => try intel_pmu.reset(state, configs),
-        .amd => try amd_pmu.reset(state, configs),
         .none => return error.NoPmu,
     }
 }

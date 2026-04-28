@@ -22,7 +22,6 @@ const execution_context = zag.sched.execution_context;
 const scheduler = zag.sched.scheduler;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
-const CapabilityType = capability.CapabilityType;
 const EcCaps = execution_context.EcCaps;
 const EcQueue = scheduler.EcQueue;
 const ErasedSlabRef = capability.ErasedSlabRef;
