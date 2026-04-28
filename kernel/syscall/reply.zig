@@ -38,25 +38,37 @@ const PAIR_BUF_LEN: usize = MAX_PAIR_COUNT;
 /// events, the vCPU EC handle for vm_exit).
 ///
 /// ```
-/// reply([1] reply) -> void
+/// reply -> void
 ///   syscall_num = 38
-///
-///   [1] reply: reply handle
+///   syscall word bits  0-11: syscall_num
+///   syscall word bits 12-23: reply_handle_id (12 bits)
+///   syscall word bits 24-63: _reserved
 /// ```
 ///
 /// No self-handle cap required — the reply handle itself authorizes the
 /// operation.
 ///
-/// [test 01] returns E_BADCAP if [1] is not a valid reply handle.
-/// [test 02] returns E_INVAL if any reserved bits are set in [1].
-/// [test 03] returns E_TERM if the suspended EC was terminated before reply could deliver; [1] is consumed.
-/// [test 04] on success, [1] is consumed (removed from the caller's table).
+/// The reply handle id rides in the syscall word rather than vreg 1 so
+/// the GPR-backed event-state vregs (1..13 on x86-64) survive intact
+/// across the reply syscall. Receivers handling vm_exits can keep
+/// modified guest GPRs in registers throughout the handler and on into
+/// the syscall, preserving the L4-style IPC fast path.
+///
+/// [test 01] returns E_BADCAP if `reply_handle_id` is not a valid reply handle.
+/// [test 02] returns E_INVAL if any reserved bits are set in the syscall word.
+/// [test 03] returns E_TERM if the suspended EC was terminated before reply could deliver; the reply handle is consumed.
+/// [test 04] on success, the reply handle is consumed (removed from the caller's table).
 /// [test 05] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply.
 /// [test 06] on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
 /// [test 07] on success, the suspended EC is resumed.
-pub fn reply(caller: *anyopaque, reply_handle: u64) i64 {
-    if (reply_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
+pub fn reply(caller: *anyopaque, syscall_word: u64) i64 {
+    // Spec §[reply]: syscall word claims bits 0-11 (syscall_num) and
+    // 12-23 (reply_handle_id). Bits 24-63 are reserved and must be zero
+    // on entry — test 02.
+    const REPLY_RESERVED_MASK: u64 = ~@as(u64, 0xFFFFFF);
+    if (syscall_word & REPLY_RESERVED_MASK != 0) return errors.E_INVAL;
 
+    const reply_handle: u64 = (syscall_word >> 12) & 0xFFF;
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const slot: u12 = @truncate(reply_handle);
 
@@ -76,40 +88,48 @@ pub fn reply(caller: *anyopaque, reply_handle: u64) i64 {
 /// `reply` semantics.
 ///
 /// ```
-/// reply_transfer([1] reply, [128-N..127] pair_entries) -> void
+/// reply_transfer([128-N..127] pair_entries) -> void
 ///   syscall_num = 39
-///
+///   syscall word bits  0-11: syscall_num
 ///   syscall word bits 12-19: N (1..63)
+///   syscall word bits 20-31: reply_handle_id (12 bits)
+///   syscall word bits 32-63: _reserved
 ///
-///   [1] reply: reply handle
 ///   [128-N..127]: pair entries packed per §[handle_attachments]
 /// ```
 ///
-/// Reply cap required on [1]: `xfer`.
+/// Reply cap required on the reply handle: `xfer`.
 ///
-/// [test 01] returns E_BADCAP if [1] is not a valid reply handle.
-/// [test 02] returns E_PERM if [1] does not have the `xfer` cap.
+/// The reply handle id rides in the syscall word rather than vreg 1 for
+/// the same reason as `reply` — see the §[reply] note on the L4-style
+/// IPC fast path.
+///
+/// [test 01] returns E_BADCAP if `reply_handle_id` is not a valid reply handle.
+/// [test 02] returns E_PERM if the reply handle does not have the `xfer` cap.
 /// [test 03] returns E_INVAL if N is 0 or N > 63.
-/// [test 04] returns E_INVAL if any reserved bits are set in [1] or any pair entry.
+/// [test 04] returns E_INVAL if any reserved bits are set in the syscall word or any pair entry.
 /// [test 05] returns E_BADCAP if any pair entry's source handle id is not valid in the caller's domain.
 /// [test 06] returns E_PERM if any pair entry's caps are not a subset of the source handle's current caps.
 /// [test 07] returns E_PERM if any pair entry with `move = 1` references a source handle that lacks the `move` cap.
 /// [test 08] returns E_PERM if any pair entry with `move = 0` references a source handle that lacks the `copy` cap.
 /// [test 09] returns E_INVAL if two pair entries reference the same source handle.
-/// [test 10] returns E_TERM if the suspended EC was terminated before reply could deliver; [1] is consumed and no handle transfer occurs.
-/// [test 11] returns E_FULL if the resumed EC's domain handle table cannot accommodate N contiguous slots; [1] is NOT consumed and the caller's table is unchanged.
-/// [test 12] on success, [1] is consumed; the resumed EC's syscall word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in the resumed EC's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
+/// [test 10] returns E_TERM if the suspended EC was terminated before reply could deliver; the reply handle is consumed and no handle transfer occurs.
+/// [test 11] returns E_FULL if the resumed EC's domain handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
+/// [test 12] on success, the reply handle is consumed; the resumed EC's syscall word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in the resumed EC's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
 /// [test 13] on success, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
 /// [test 14] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
 /// [test 15] on success, the suspended EC is resumed.
-pub fn replyTransfer(caller: *anyopaque, reply_handle: u64, n: u8) i64 {
-    // Spec §[capabilities]: handle ids occupy bits 0-11; upper bits are
-    // _reserved. Test 04a fires here.
-    if (reply_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
+pub fn replyTransfer(caller: *anyopaque, syscall_word: u64, n: u8) i64 {
+    // Spec §[reply_transfer]: syscall word claims bits 0-11 (syscall_num),
+    // 12-19 (N), and 20-31 (reply_handle_id). Bits 32-63 are reserved
+    // and must be zero on entry — test 04a.
+    const RT_RESERVED_MASK: u64 = ~@as(u64, 0xFFFFFFFF);
+    if (syscall_word & RT_RESERVED_MASK != 0) return errors.E_INVAL;
 
     // Spec §[reply].reply_transfer test 03: N range.
     if (@as(usize, n) < MIN_PAIR_COUNT or @as(usize, n) > MAX_PAIR_COUNT) return errors.E_INVAL;
 
+    const reply_handle: u64 = (syscall_word >> 20) & 0xFFF;
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const slot: u12 = @truncate(reply_handle);
 

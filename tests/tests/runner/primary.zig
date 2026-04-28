@@ -202,7 +202,13 @@ pub fn main(cap_table_base: u64) void {
             // accumulated wheel-tick load starved the runner past
             // iter ~416 and produced the cascade-MISS tail in
             // `timer_arm_07..yield_04`.
-            syscall.issueRegDiscard(.reply, 0, .{ .v1 = reply_handle_id });
+            //
+            // Spec §[reply]: reply_handle_id rides in syscall-word bits
+            // 12-23 — pass it through `extraReplyHandle`, leave vregs
+            // 1..13 untouched. (Pre-spec-update this slotted reply_handle
+            // into vreg 1 / rax, which conflicted with the §[vm_exit_state]
+            // GPR layout and broke the L4-style fast path.)
+            syscall.issueRegDiscard(.reply, syscall.extraReplyHandle(reply_handle_id), .{});
 
             collected += 1;
             batch_collected += 1;

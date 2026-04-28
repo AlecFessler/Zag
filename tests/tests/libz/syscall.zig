@@ -124,6 +124,19 @@ pub fn extraVmKind(kind: u1, count: u8) u64 {
     return (@as(u64, kind) << 12) | ((@as(u64, count) & 0xFF) << 13);
 }
 
+/// Spec §[reply]: reply_handle_id rides in syscall-word bits 12-23 so
+/// the GPR-backed event-state vregs survive intact across the syscall
+/// and the L4-style fast path is preserved.
+pub fn extraReplyHandle(handle: u12) u64 {
+    return (@as(u64, handle) & 0xFFF) << 12;
+}
+
+/// Spec §[reply_transfer]: reply_handle_id rides in syscall-word bits
+/// 20-31 (with N at bits 12-19).
+pub fn extraReplyTransferHandle(handle: u12) u64 {
+    return (@as(u64, handle) & 0xFFF) << 20;
+}
+
 // Sole call site of the raw `syscall` instruction. Reserves 16 bytes of
 // stack (avoiding the System V red zone — Zig may have stored locals
 // there) so vreg 0 at [rsp + 0] sits on a stable slot the kernel can
@@ -784,13 +797,110 @@ pub fn clearEventRoute(target: u12, event_type: u64) Regs {
 }
 
 pub fn reply(reply_handle: u12) Regs {
-    return issueReg(.reply, 0, .{ .v1 = reply_handle });
+    // Spec §[reply]: reply_handle_id rides in syscall-word bits 12-23.
+    // Pass empty regs — vregs 1..13 are receiver-side state mods that
+    // survive the syscall as-is when the receiver hasn't modified them.
+    return issueReg(.reply, extraReplyHandle(reply_handle), .{});
 }
 
 pub fn replyTransfer(reply_handle: u12, attachments: []const u64) Regs {
-    _ = reply_handle;
-    _ = attachments;
-    @panic("reply_transfer: high-vreg pair layout not yet wired");
+    // Spec §[handle_attachments]: pair entries occupy vregs `[128-N..127]`
+    // — the *high* end of the vreg space. For N entries, vreg (128-N)
+    // sits at `[rsp + (128-N-13)*8]` and vreg 127 sits at `[rsp + (127-13)*8]
+    // = [rsp + 912]`. We reserve 928 bytes (16-byte aligned, covers
+    // [rsp + 0..920] = vreg 0 + vregs 14..127), populate the high band
+    // with the attachment u64s, drop the syscall word at [rsp+0], and
+    // execute syscall.
+    //
+    // The reply handle id rides in syscall-word bits 20-31; N rides in
+    // bits 12-19; syscall_num in bits 0-11. See §[reply_transfer].
+    const n: u8 = @intCast(attachments.len);
+    if (n == 0 or n > 63) @panic("reply_transfer: N must be 1..63");
+    const word: u64 =
+        (@as(u64, @intFromEnum(SyscallNum.reply_transfer)) & 0xFFF) |
+        (@as(u64, n) << 12) |
+        (@as(u64, reply_handle) << 20);
+
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+    // Reserve 928 bytes — covers vreg 0 at [rsp+0] and vregs 14..127
+    // at [rsp + 8..920]. Aligned to 16.
+        \\ subq $928, %%rsp
+        // Zero-fill the reserved region so vregs the kernel reads but
+        // we don't explicitly set come back as 0 rather than caller-
+        // frame stack garbage.
+        \\ movq %%rsp, %%rax
+        \\ movq $116, %%rcx
+        \\1: movq $0, (%%rax)
+        \\ addq $8, %%rax
+        \\ decq %%rcx
+        \\ jnz 1b
+        // Write attachments into vregs [128-N..127] at offsets
+        // [rsp + (128-N-13)*8 .. rsp + 912]. Loop in a way that handles
+        // arbitrary N (1..63). %rsi = src ptr, %rdi = first vreg offset
+        // = (128-N-13)*8 = (115-N)*8, %rcx = N.
+        \\ movq %[atts_ptr], %%rsi
+        \\ movq %[n], %%rcx
+        \\ movq %%rcx, %%rdi
+        \\ negq %%rdi
+        \\ addq $115, %%rdi
+        \\ shlq $3, %%rdi
+        \\ addq %%rsp, %%rdi
+        \\2: movq (%%rsi), %%rax
+        \\ movq %%rax, (%%rdi)
+        \\ addq $8, %%rsi
+        \\ addq $8, %%rdi
+        \\ decq %%rcx
+        \\ jnz 2b
+        // Syscall word at [rsp+0].
+        \\ movq %[word], %%rax
+        \\ movq %%rax, (%%rsp)
+        \\ syscall
+        \\ addq $928, %%rsp
+        : [v1] "={rax}" (ov1),
+          [v2] "={rbx}" (ov2),
+          [v3] "={rdx}" (ov3),
+          [v4] "={rbp}" (ov4),
+          [v5] "={rsi}" (ov5),
+          [v6] "={rdi}" (ov6),
+          [v7] "={r8}" (ov7),
+          [v8] "={r9}" (ov8),
+          [v9] "={r10}" (ov9),
+          [v10] "={r12}" (ov10),
+          [v11] "={r13}" (ov11),
+          [v12] "={r14}" (ov12),
+          [v13] "={r15}" (ov13),
+        : [word] "r" (word),
+          [atts_ptr] "r" (attachments.ptr),
+          [n] "r" (@as(u64, n)),
+        : .{ .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true, .cc = true });
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
 }
 
 // ---------------------------------------------------------------
