@@ -101,9 +101,12 @@ const testing = lib.testing;
 // rcx is reserved for the syscall word (sysret clobber); r11 is
 // likewise reserved. Memory clobber covers our pad writes.
 fn issueReplyTransferDup(reply_id: u12, entry: u64) u64 {
-    // syscall_num = 39 (reply_transfer), extra count N=2 in bits 12-19.
-    const word: u64 = @as(u64, @intFromEnum(syscall.SyscallNum.reply_transfer)) |
-        (@as(u64, 2) << 12);
+    // syscall_num = 39 (reply_transfer), N=2 in bits 12-19,
+    // reply_handle_id in bits 20-31 (per the new §[reply_transfer] ABI).
+    const word: u64 =
+        @as(u64, @intFromEnum(syscall.SyscallNum.reply_transfer)) |
+        (@as(u64, 2) << 12) |
+        ((@as(u64, reply_id) & 0xFFF) << 20);
 
     var rax_out: u64 = undefined;
     asm volatile (
@@ -122,7 +125,6 @@ fn issueReplyTransferDup(reply_id: u12, entry: u64) u64 {
         : [rax] "={rax}" (rax_out),
         : [word] "{rcx}" (word),
           [entry] "r" (entry),
-          [reply] "{rax}" (@as(u64, reply_id)),
         : .{ .rcx = true, .r11 = true, .memory = true });
     return rax_out;
 }

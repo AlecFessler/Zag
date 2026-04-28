@@ -159,17 +159,18 @@ pub fn main(cap_table_base: u64) void {
     };
     const pair_u64: u64 = pair.toU64();
 
-    // syscall_num = 39 (reply_transfer); N = 1 in bits 12-19. Per
-    // §[reply_transfer] ABI the reply handle id rides in vreg 1; the
-    // sole pair entry rides in vreg 127. Vreg 127 lives at
-    // [rsp + (127-13)*8] = [rsp + 912] when the kernel reads the
-    // stack frame, so we reserve 920 bytes (syscall word at offset 0,
-    // pair entry at offset 912), syscall, then unwind. libz's
-    // replyTransfer panics on N > 0; the open-coded path here is the
-    // documented workaround (sibling reply_transfer_06 uses the same
-    // shape).
-    const word: u64 = 39 | (@as(u64, 1) << 12);
-    const reply_handle_u64: u64 = @as(u64, reply_handle_id);
+    // syscall_num = 39 (reply_transfer); N = 1 in bits 12-19;
+    // reply_handle_id in bits 20-31. Per §[reply_transfer] (new ABI)
+    // the reply handle id rides in the syscall word; the sole pair
+    // entry rides in vreg 127. Vreg 127 lives at [rsp + (127-13)*8] =
+    // [rsp + 912] when the kernel reads the stack frame, so we reserve
+    // 920 bytes (syscall word at offset 0, pair entry at offset 912),
+    // syscall, then unwind. libz's replyTransfer panics on N > 0; the
+    // open-coded path here is the documented workaround (sibling
+    // reply_transfer_06 uses the same shape).
+    const word: u64 = 39 |
+        (@as(u64, 1) << 12) |
+        ((@as(u64, reply_handle_id) & 0xFFF) << 20);
     var rax: u64 = undefined;
     asm volatile (
         \\ subq $920, %%rsp
@@ -180,7 +181,6 @@ pub fn main(cap_table_base: u64) void {
         : [rax] "={rax}" (rax),
         : [word] "{rcx}" (word),
           [entry] "{rdi}" (pair_u64),
-          [v1] "{rax}" (reply_handle_u64),
         : .{ .rcx = true, .r11 = true, .memory = true });
 
     if (rax != @intFromEnum(errors.Error.E_PERM)) {

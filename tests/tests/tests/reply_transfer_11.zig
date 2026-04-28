@@ -1,8 +1,8 @@
 // Spec §[reply_transfer] reply_transfer — test 11.
 //
 // "[test 11] returns E_FULL if the resumed EC's domain handle table
-//  cannot accommodate N contiguous slots; [1] is NOT consumed and the
-//  caller's table is unchanged."
+//  cannot accommodate N contiguous slots; the reply handle is NOT
+//  consumed and the caller's table is unchanged."
 //
 // Strategy
 //   Materialize a reply handle inside the test EC, then trigger the
@@ -41,23 +41,24 @@
 //   return E_FULL because no contiguous run of 1 slot exists for the
 //   transferred handle.
 //
-//   Verification of the "[1] NOT consumed; caller's table unchanged"
-//   half of the assertion uses `sync` — sync returns E_BADCAP on a
-//   stale handle and OK on a live one (sync's own [test 01]). If the
-//   reply handle was wrongly consumed, sync(reply_handle_id) would
-//   return E_BADCAP. If S was wrongly removed from the caller's table
-//   (the move = 0 path mustn't remove anything anyway, but we are
-//   checking the broader "table unchanged" half), sync(s_handle)
-//   would return E_BADCAP.
+//   Verification of the "reply handle NOT consumed; caller's table
+//   unchanged" half of the assertion uses `sync` — sync returns
+//   E_BADCAP on a stale handle and OK on a live one (sync's own
+//   [test 01]). If the reply handle was wrongly consumed,
+//   sync(reply_handle_id) would return E_BADCAP. If S was wrongly
+//   removed from the caller's table (the move = 0 path mustn't remove
+//   anything anyway, but we are checking the broader "table unchanged"
+//   half), sync(s_handle) would return E_BADCAP.
 //
 //   SPEC AMBIGUITY: §[reply_transfer] [test 11] does not pin which
 //   ordering the kernel uses to detect E_FULL relative to the
-//   `[1] is consumed` and `move = 1 source removed` side effects of
-//   the success path. We treat the spec wording at face value — the
-//   kernel must roll back any partial work before returning E_FULL.
-//   Using move = 0 here narrows the test to the [1]-consumption check
-//   plus a sync of the source; a future test exercising move = 1
-//   sources can extend the verification to source removal.
+//   `reply handle is consumed` and `move = 1 source removed` side
+//   effects of the success path. We treat the spec wording at face
+//   value — the kernel must roll back any partial work before
+//   returning E_FULL. Using move = 0 here narrows the test to the
+//   reply-handle-consumption check plus a sync of the source; a future
+//   test exercising move = 1 sources can extend the verification to
+//   source removal.
 //
 //   Inline asm vs libz: libz `replyTransfer` panics on N > 0 because
 //   the high-vreg attachment layout is not yet wired through the
@@ -66,8 +67,10 @@
 //       syscall word slot at [rsp+0]. vreg N >= 14 lives at
 //       [rsp + (N-13)*8].
 //     - vreg 127 (the only attachment for N = 1) lives at [rsp+912].
-//     - Syscall word = syscall_num (39) | (N << 12).
-//     - rax carries vreg 1 (the reply handle id).
+//     - Syscall word = syscall_num (39) | (N << 12) |
+//                      (reply_handle_id << 20)
+//       per the new §[reply_transfer] ABI; vregs 1..13 are not used
+//       for plumbing the handle.
 //
 // Action
 //   1. create_port({bind, recv, xfer})              — must succeed
@@ -95,7 +98,8 @@
 //   5: setup S creation failed
 //   6: handle table did not saturate before HANDLE_TABLE_MAX iterations
 //   7: reply_transfer returned something other than E_FULL
-//   8: sync(reply_handle_id) returned E_BADCAP — [1] was consumed
+//   8: sync(reply_handle_id) returned E_BADCAP — reply handle was
+//      consumed
 //   9: sync(s_handle) returned E_BADCAP — caller's table changed
 
 const lib = @import("lib");
@@ -109,25 +113,27 @@ const testing = lib.testing;
 // 127. See the file-level comment for the stack layout rationale.
 //
 // Stack layout during the syscall:
-//   [rsp+0]        — syscall word (vreg 0)
+//   [rsp+0]        — syscall word (vreg 0); carries reply_handle_id
 //   [rsp+8..904]   — vregs 14..126, unused for N=1 reply_transfer
 //   [rsp+912]      — vreg 127, the single pair entry
 //
 // Register layout:
-//   rax — vreg 1 = reply handle id (only vreg the kernel reads from
-//         registers for reply_transfer; vregs 2..13 are ignored).
-//   rcx — pinned to the syscall word constant; the syscall instruction
-//         clobbers it with the return RIP.
+//   rcx — pinned to the syscall word constant (carries syscall_num,
+//         N, and reply_handle_id per the new ABI); the syscall
+//         instruction clobbers it with the return RIP.
 //   r11 — clobbered by the syscall RFLAGS save.
 //
-// `[pair] "r"` lets Zig pick any free GPR. With rcx and rax pinned, the
+// `[pair] "r"` lets Zig pick any free GPR. With rcx pinned, the
 // compiler will allocate one of the syscall-ignored input vreg slots
 // (rbx/rdx/r8/...); since reply_transfer doesn't read those, the
 // transient stomp is invisible to the kernel.
 fn replyTransferOne(reply_handle: u12, pair_entry: u64) u64 {
+    // Per the new §[reply_transfer] ABI: bits 0-11 = syscall_num,
+    // bits 12-19 = N, bits 20-31 = reply_handle_id.
     const word: u64 =
         (@as(u64, @intFromEnum(syscall.SyscallNum.reply_transfer)) & 0xFFF) |
-        (@as(u64, 1) << 12);
+        (@as(u64, 1) << 12) |
+        ((@as(u64, reply_handle) & 0xFFF) << 20);
 
     var v1_out: u64 = undefined;
     asm volatile (
@@ -139,7 +145,6 @@ fn replyTransferOne(reply_handle: u12, pair_entry: u64) u64 {
         : [v1] "={rax}" (v1_out),
         : [word] "{rcx}" (word),
           [pair] "r" (pair_entry),
-          [iv1] "{rax}" (@as(u64, reply_handle)),
         : .{ .rcx = true, .r11 = true, .memory = true });
     return v1_out;
 }
@@ -267,9 +272,10 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 8: prove [1] was not consumed. sync's only failure path on a
-    // clean handle id (no reserved bits set) is E_BADCAP for an invalid
-    // handle. A live reply handle returns OK from sync.
+    // Step 8: prove the reply handle was not consumed. sync's only
+    // failure path on a clean handle id (no reserved bits set) is
+    // E_BADCAP for an invalid handle. A live reply handle returns OK
+    // from sync.
     const sync_reply = syscall.sync(reply_handle_id);
     if (sync_reply.v1 == @intFromEnum(errors.Error.E_BADCAP)) {
         testing.fail(8);

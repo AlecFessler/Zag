@@ -250,14 +250,19 @@ pub fn main(cap_table_base: u64) void {
     // second is the move=0 donor — matches the assertion-id pairing
     // below.
     const N: u64 = 2;
-    const syscall_word: u64 = (@as(u64, @intFromEnum(syscall.SyscallNum.reply_transfer)) & 0xFFF) | (N << 12);
+    // Per the new §[reply_transfer] ABI: bits 0-11 = syscall_num,
+    // bits 12-19 = N, bits 20-31 = reply_handle_id.
+    const syscall_word: u64 =
+        (@as(u64, @intFromEnum(syscall.SyscallNum.reply_transfer)) & 0xFFF) |
+        (N << 12) |
+        ((@as(u64, reply_handle_id) & 0xFFF) << 20);
 
     // Stash the values the asm needs to write into the high-vreg pad
     // in a small memory-backed buffer keyed by [scratch+offset]. Using
     // a single base register for all loads keeps the asm's register
-    // pressure minimal — `rax` (reply handle, by ABI vreg 1) plus one
-    // scratch (`rdx`, restored from the kernel result anyway) is all
-    // we need.
+    // pressure minimal — one scratch (`rdx`, restored from the kernel
+    // result anyway) is all we need now that the reply_handle_id rides
+    // in the syscall word rather than rax.
     var scratch: [3]u64 = .{ syscall_word, pair_m, pair_c };
 
     var rax_out: u64 = undefined;
@@ -272,8 +277,7 @@ pub fn main(cap_table_base: u64) void {
         \\ syscall
         \\ addq $920, %%rsp
         : [out_rax] "={rax}" (rax_out),
-        : [reply_a] "{rax}" (@as(u64, reply_handle_id)),
-          [base] "{rdx}" (&scratch),
+        : [base] "{rdx}" (&scratch),
         : .{ .rcx = true, .rdx = true, .r11 = true, .memory = true });
 
     if (rax_out != @intFromEnum(errors.Error.OK)) {

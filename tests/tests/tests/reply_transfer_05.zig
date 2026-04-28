@@ -85,9 +85,11 @@ const testing = lib.testing;
 // the libz vreg layout. Returns the kernel's vreg 1 (rax) — the error
 // code or 0 on success.
 fn replyTransferOneEntry(reply_handle_id: u12, pair_entry: u64) u64 {
-    // Spec §[syscall_abi]: syscall_num in bits 0-11; reply_transfer puts
-    // pair_count `N` in bits 12-19. N=1 here.
-    const word: u64 = (@as(u64, 39) & 0xFFF) | ((@as(u64, 1) & 0xFF) << 12);
+    // Spec §[syscall_abi] / §[reply_transfer]: syscall_num in bits 0-11;
+    // pair_count `N` in bits 12-19; reply_handle_id in bits 20-31. N=1.
+    const word: u64 = (@as(u64, 39) & 0xFFF) |
+        ((@as(u64, 1) & 0xFF) << 12) |
+        ((@as(u64, reply_handle_id) & 0xFFF) << 20);
 
     var ov1: u64 = undefined;
     asm volatile (
@@ -98,7 +100,6 @@ fn replyTransferOneEntry(reply_handle_id: u12, pair_entry: u64) u64 {
         \\ addq $920, %%rsp
         : [v1] "={rax}" (ov1),
         : [word] "{rcx}" (word),
-          [iv1] "{rax}" (@as(u64, reply_handle_id)),
           [entry] "{rdi}" (pair_entry),
         : .{ .rcx = true, .r11 = true, .memory = true });
     return ov1;

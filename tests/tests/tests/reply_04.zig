@@ -1,7 +1,7 @@
 // Spec §[reply] reply — test 04.
 //
-// "[test 04] on success, [1] is consumed (removed from the caller's
-//  table)."
+// "[test 04] on success, the reply handle is consumed (removed from
+//  the caller's table)."
 //
 // Strategy
 //   The assertion needs a witness: a reply handle in the caller's

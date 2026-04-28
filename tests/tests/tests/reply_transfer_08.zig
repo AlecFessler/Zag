@@ -97,10 +97,12 @@ fn pairEntry(id: u12, caps_word: u16, move: bool) u64 {
 // (vreg 1) the spec specifies for E_PERM.
 fn replyTransferOnePair(reply_handle: u12, entry: u64) u64 {
     // Syscall word: bits 0-11 = syscall_num (39 = reply_transfer),
-    // bits 12-19 = N (1 entry). Other bits zero per §[syscall_abi].
+    // bits 12-19 = N (1 entry), bits 20-31 = reply_handle_id (per the
+    // new §[reply_transfer] ABI). Other bits zero per §[syscall_abi].
     const word: u64 =
         (@as(u64, @intFromEnum(syscall.SyscallNum.reply_transfer)) & 0xFFF) |
-        ((@as(u64, 1) & 0xFF) << 12);
+        ((@as(u64, 1) & 0xFF) << 12) |
+        ((@as(u64, reply_handle) & 0xFFF) << 20);
 
     var ret: u64 = undefined;
     asm volatile (
@@ -119,7 +121,6 @@ fn replyTransferOnePair(reply_handle: u12, entry: u64) u64 {
         \\ addq $920, %%rsp
         : [ret] "={rax}" (ret),
         : [word] "{rcx}" (word),
-          [v1] "{rax}" (@as(u64, reply_handle)),
           [entry] "r" (entry),
         : .{ .rcx = true, .r11 = true, .memory = true });
     return ret;

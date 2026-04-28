@@ -47,8 +47,9 @@
 //   assertion exercised:
 //     - test 01 (E_BADCAP for invalid reply handle): the reply handle id
 //       is the one the kernel just minted via recv, so it is valid.
-//     - test 02 (E_INVAL for reserved bits): the wrapper masks the
-//       handle to its 12-bit slot id with no upper bits set.
+//     - test 02 (E_INVAL if reserved bits set in the syscall word):
+//       the wrapper builds the syscall word from a u12 handle and the
+//       syscall_num enum, leaving every reserved bit at zero.
 //     - test 03 (E_TERM if W was terminated before reply): the test
 //       does not terminate W between recv and reply.
 //     - test 04 (handle consumed on success): not exercised here, but

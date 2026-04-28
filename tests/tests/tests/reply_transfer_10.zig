@@ -128,8 +128,12 @@ const testing = lib.testing;
 // Syscall word: bits 0-11 = syscall_num (39 = reply_transfer); bits
 // 12-19 = N (1..63 per §[reply_transfer] [test 03]).
 fn replyTransferOneEntry(reply_handle: u12, pair_entry: u64) errors.Error {
-    const word: u64 = (@as(u64, @intFromEnum(syscall.SyscallNum.reply_transfer)) & 0xFFF) |
-        ((@as(u64, 1) & 0xFF) << 12);
+    // Syscall word per the new §[reply_transfer] ABI: bits 0-11 =
+    // syscall_num (39); bits 12-19 = N (1); bits 20-31 = reply_handle_id.
+    const word: u64 =
+        (@as(u64, @intFromEnum(syscall.SyscallNum.reply_transfer)) & 0xFFF) |
+        ((@as(u64, 1) & 0xFF) << 12) |
+        ((@as(u64, reply_handle) & 0xFFF) << 20);
 
     var ov1: u64 = undefined;
     asm volatile (
@@ -150,18 +154,16 @@ fn replyTransferOneEntry(reply_handle: u12, pair_entry: u64) errors.Error {
     \\ jnz 1b
     // Vreg 127 = [rsp+912] = the pair entry.
     \\ movq %[pair], 912(%%rsp)
-    // Vreg 0 = [rsp+0] = syscall word.
+    // Vreg 0 = [rsp+0] = syscall word (carries reply_handle_id).
     \\ movq %[word], (%%rsp)
-    // The kernel ABI requires vreg 1 (rax) to carry the reply
-    // handle id on entry per §[reply_transfer]. After SYSRET the
-    // kernel writes the error code back into rax (vreg 1), which
-    // we capture in ov1.
+    // The kernel reads the reply_handle_id out of the syscall word
+    // (bits 20-31). After SYSRET the kernel writes the error code
+    // back into rax (vreg 1), which we capture in ov1.
     \\ syscall
     \\ addq $920, %%rsp
         : [v1] "={rax}" (ov1),
         : [word] "r" (word),
           [pair] "r" (pair_entry),
-          [iv1] "{rax}" (@as(u64, reply_handle)),
         : .{ .rcx = true, .rdx = true, .r11 = true, .memory = true });
     return @enumFromInt(ov1);
 }

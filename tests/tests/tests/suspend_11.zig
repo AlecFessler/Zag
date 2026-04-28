@@ -47,12 +47,14 @@
 // Why r15 (vreg 13) and not a lower-numbered GPR
 //   libz's `issueReg` puts the syscall input vregs into hardware GPRs
 //   (rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15) so
-//   that *all 13* are loaded at syscall entry. v1 already carries the
-//   reply handle id; v3/v4 are the result-encoding lane the runner
-//   expects when the test EC eventually pass()/fail()s. r15 / vreg 13
-//   is the highest-numbered GPR-backed lane, sits clear of those
-//   conventions, and is the easiest to read out from the worker via a
-//   single `mov %%r15, ...` inline asm.
+//   that *all 13* are loaded at syscall entry. v3/v4 are the result-
+//   encoding lane the runner expects when the test EC eventually
+//   pass()/fail()s. r15 / vreg 13 is the highest-numbered GPR-backed
+//   lane, sits clear of those conventions, and is the easiest to read
+//   out from the worker via a single `mov %%r15, ...` inline asm.
+//   Under the new ABI the reply_handle_id rides in the syscall word
+//   (bits 12-23 per §[reply]) rather than in vreg 1, so vregs 1..13
+//   are all available as receiver state-mod inputs through the syscall.
 //
 // Why target=self for W
 //   `create_execution_context` with [4] = 0 places W in the test's own
@@ -219,9 +221,11 @@ pub fn main(cap_table_base: u64) void {
     // Step 6: reply with vreg 13 (== r15 on x86-64, per §[event_state])
     // loaded with the sentinel. The kernel applies this to W's r15
     // because W's EC handle had the `write` cap. We bypass the libz
-    // `reply` wrapper because that wrapper zeroes vregs 2..13.
-    const r = syscall.issueReg(.reply, 0, .{
-        .v1 = reply_handle_id,
+    // `reply` wrapper because that wrapper zeroes vregs 1..13. Under
+    // the new ABI the reply_handle_id rides in the syscall word
+    // (bits 12-23 per §[reply]).
+    const reply_extra: u64 = (@as(u64, reply_handle_id) & 0xFFF) << 12;
+    const r = syscall.issueReg(.reply, reply_extra, .{
         .v13 = MAGIC,
     });
     if (r.v1 != @intFromEnum(errors.Error.OK)) {

@@ -23,9 +23,10 @@
 //   `target = self`), so W can simply store one of its own registers
 //   into a process-global cell. We pick `rbx` (vreg 2) because:
 //     - it is part of the §[event_state] x86-64 GPR set (vregs 1..13),
-//     - it is not used by the reply syscall ABI (`reply` reads rax for
-//       the reply handle id, leaving rbx free to carry the modified
-//       state),
+//     - the new `reply` ABI carries the reply_handle_id in the syscall
+//       word (bits 12-23) rather than vreg 1, so every register-backed
+//       vreg 1..13 is free to carry receiver state mods through the
+//       syscall — no GPR is wasted on plumbing the handle,
 //     - it is callee-saved in SysV, but W's entry is a naked function
 //       so no prologue clobbers it before the store.
 //
@@ -43,9 +44,11 @@
 //     4. `recv(port)`. recv returns immediately because the test EC
 //        still holds the port's bind cap. The syscall word carries
 //        `reply_handle_id` per §[event_state].
-//     5. Issue `reply` with vreg 2 (rbx) = MAGIC. vreg 1 (rax) carries
-//        the reply handle id per the syscall ABI; the rest of vregs
-//        1..13 are the GPR snapshot the kernel will hand back to W.
+//     5. Issue `reply` with vreg 2 (rbx) = MAGIC. The reply_handle_id
+//        rides in the syscall word (bits 12-23) per §[reply]; vregs
+//        1..13 are the GPR snapshot the kernel will hand back to W,
+//        with vreg 1 (rax) freed up for receiver state modifications
+//        under the new ABI.
 //     6. `yield(W)` to schedule W. W executes the `mov` storing rbx
 //        (now MAGIC) into `observed`, then spins.
 //     7. Poll `observed` (with bounded yields to the scheduler so the
@@ -58,7 +61,9 @@
 //        entry=&observerEntry)
 //   3. suspend(W, port)                   — must return OK
 //   4. recv(port)                         — must return OK
-//   5. issueReg(.reply, ..., {v1=reply_handle_id, v2=MAGIC}) — OK
+//   5. issueReg(.reply, replyExtra(rid), {v2=MAGIC}) — OK
+//      (reply_handle_id rides in syscall-word bits 12-23 under the new
+//       ABI; vreg 2 carries the rbx state mod)
 //   6. yield(W)                           — schedule W
 //   7. poll observed (bounded) until MAGIC or limit hit
 //   8. assert observed == MAGIC
@@ -173,13 +178,15 @@ pub fn main(cap_table_base: u64) void {
     }
     const reply_handle_id: u12 = @truncate((got.word >> 32) & 0xFFF);
 
-    // Step 5: issue reply with rbx (vreg 2) modified to MAGIC. rax
-    // (vreg 1) carries the reply handle id per §[reply]; with the
+    // Step 5: issue reply with rbx (vreg 2) modified to MAGIC. Under
+    // the new ABI the reply_handle_id rides in the syscall word
+    // (bits 12-23) rather than in vreg 1, freeing every register-backed
+    // vreg to carry receiver state mods through the syscall. With the
     // `write` cap on W's originating handle the kernel resumes W with
     // the receiver's current rbx — which is MAGIC by the time the
     // syscall executes.
-    const rep = syscall.issueReg(.reply, 0, .{
-        .v1 = reply_handle_id,
+    const reply_extra: u64 = (@as(u64, reply_handle_id) & 0xFFF) << 12;
+    const rep = syscall.issueReg(.reply, reply_extra, .{
         .v2 = MAGIC,
     });
     if (rep.v1 != @intFromEnum(errors.Error.OK)) {

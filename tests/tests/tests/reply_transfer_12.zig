@@ -1,8 +1,8 @@
 // Spec §[reply_transfer] reply_transfer — test 12.
 //
-// "[test 12] on success, [1] is consumed; the resumed EC's syscall
-//  word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in
-//  the resumed EC's domain contain the inserted handles per
+// "[test 12] on success, the reply handle is consumed; the resumed EC's
+//  syscall word `pair_count = N` and `tstart = S`; the next N slots
+//  [S, S+N) in the resumed EC's domain contain the inserted handles per
 //  §[handle_attachments] (caps intersected with `idc_rx` for IDC
 //  handles, verbatim otherwise)."
 //
@@ -241,7 +241,10 @@ pub fn main(cap_table_base: u64) void {
     //      syscall
     //      add  $920, %rsp            # discard pad + word
     //
-    //    Syscall word: syscall_num=39 (reply_transfer) | (N=1)<<12.
+    //    Syscall word: syscall_num=39 (reply_transfer) | (N=1)<<12 |
+    //    (reply_handle_id<<20). Per the new §[reply_transfer] ABI the
+    //    reply_handle_id rides in syscall-word bits 20-31 rather than
+    //    in vreg 1.
     const pair_entry = caps.PairEntry{
         .id = pf_handle,
         .caps = ATTACH_PF_CAPS.toU16(),
@@ -250,7 +253,8 @@ pub fn main(cap_table_base: u64) void {
     const entry_u64: u64 = pair_entry.toU64();
     const word: u64 =
         @as(u64, @intFromEnum(syscall.SyscallNum.reply_transfer)) |
-        (@as(u64, 1) << 12);
+        (@as(u64, 1) << 12) |
+        ((@as(u64, reply_handle_id) & 0xFFF) << 20);
 
     var rt_v1_out: u64 = undefined;
     asm volatile (
@@ -261,7 +265,6 @@ pub fn main(cap_table_base: u64) void {
         \\ addq $920, %%rsp
         : [v1o] "={rax}" (rt_v1_out),
         : [wi] "{rcx}" (word),
-          [v1i] "{rax}" (@as(u64, reply_handle_id)),
           [entry] "r" (entry_u64),
         : .{
             .rcx = true,

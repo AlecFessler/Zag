@@ -1,6 +1,7 @@
 // Spec §[reply] reply_transfer — test 02.
 //
-// "[test 02] returns E_PERM if [1] does not have the `xfer` cap."
+// "[test 02] returns E_PERM if the reply handle does not have the
+//  `xfer` cap."
 //
 // Strategy
 //   Per §[reply]: "The kernel mints the reply handle at recv time with
@@ -24,13 +25,15 @@
 //
 //   N = 1 is the smallest legal value (§[reply_transfer] test 03
 //   requires 1..63), so the call passes the N-range check trivially.
-//   The cap check on [1] is named at test 02 — earlier than the pair
-//   entry validation (tests 04-09) — so the kernel rejects on the
-//   missing xfer cap before reading any pair-entry vreg. That means
-//   we don't need to populate the high-vreg pair entries; libz's typed
-//   `replyTransfer` wrapper @panics on the unimplemented high-vreg
-//   path, so we dispatch directly via `issueReg` with `extraCount(1)`
-//   placing N in syscall word bits 12-19.
+//   The cap check on the reply handle is named at test 02 — earlier
+//   than the pair entry validation (tests 04-09) — so the kernel
+//   rejects on the missing xfer cap before reading any pair-entry vreg.
+//   That means we don't need to populate the high-vreg pair entries;
+//   libz's typed `replyTransfer` wrapper @panics on the unimplemented
+//   high-vreg path, so we dispatch directly via `issueReg` with
+//   `extraCount(1) | extraTstart(reply_handle_id)` placing N in syscall
+//   word bits 12-19 and the reply handle id in bits 20-31 per the new
+//   ABI.
 //
 // Action
 //   1. create_port(caps = {bind, recv})        — must succeed
@@ -118,14 +121,12 @@ pub fn main(cap_table_base: u64) void {
     // Step 5: probe the reply handle (xfer = 0) with reply_transfer.
     // libz's typed `replyTransfer` wrapper @panics today on the
     // high-vreg pair-entry layout, so dispatch directly via issueReg
-    // with N = 1 in syscall word bits 12-19. The kernel must check the
-    // xfer cap on [1] before reading any pair entry, so the high-vreg
-    // pair-entry slot can be left unpopulated.
-    const r = syscall.issueReg(
-        .reply_transfer,
-        syscall.extraCount(1),
-        .{ .v1 = reply_handle_id },
-    );
+    // with N = 1 in syscall word bits 12-19 and reply_handle_id in
+    // bits 20-31 per the new ABI. The kernel must check the xfer cap
+    // on the reply handle before reading any pair entry, so the high-
+    // vreg pair-entry slot can be left unpopulated.
+    const extra: u64 = syscall.extraCount(1) | syscall.extraTstart(reply_handle_id);
+    const r = syscall.issueReg(.reply_transfer, extra, .{});
     if (r.v1 != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(5);
         return;

@@ -43,6 +43,10 @@
 //       We compare all of these. Picking sentinels for several of
 //       them keeps the test sensitive even if one register happens
 //       to coincide with W's startup value.
+//     - Under the new ABI the reply_handle_id rides in the syscall
+//       word (bits 12-23) rather than in vreg 1, so the entire
+//       register-backed vreg band 1..13 is available for receiver
+//       state mods at reply time — including vreg 1 itself.
 //
 // Action
 //   1. create_port(caps={bind, recv})         — must succeed
@@ -53,9 +57,10 @@
 //   3. suspend(W, port)                        — must return OK
 //   4. recv(port)                              — must return OK;
 //                                                 capture G1 = vregs.
-//   5. issueReg(.reply, 0, .{ v1=rid,
-//        v2=S, v3=S, ..., v13=S })             — must return OK.
-//      (S = a sentinel pattern distinct from 0 and from any plausible
+//   5. issueReg(.reply, replyExtra(rid),
+//        .{ v1=S, v2=S, v3=S, ..., v13=S })    — must return OK.
+//      (rid rides in syscall-word bits 12-23 under the new ABI;
+//       S = a sentinel pattern distinct from 0 and from any plausible
 //       startup value; OR'd with a per-slot tag so each slot is
 //       independently distinguishable.)
 //   6. suspend(W, port) again                  — must return OK
@@ -146,12 +151,15 @@ pub fn main(cap_table_base: u64) void {
     // Step 5: reply with non-zero sentinel values pinned into every
     // register-backed vreg. Each slot gets a distinct tag so that any
     // single leaked write would diverge from G1 in a recognizable way.
-    // libz's `syscall.reply` only sets v1; we issue directly to seed
-    // the rest. With `write` absent, the kernel must discard all
-    // sentinels and leave W's state untouched.
+    // Under the new ABI the reply_handle_id rides in syscall-word bits
+    // 12-23, so vreg 1 is also free to carry a sentinel — we issue
+    // directly via issueReg to seed the full register-backed band.
+    // With `write` absent, the kernel must discard all sentinels and
+    // leave W's state untouched.
     const SENTINEL_BASE: u64 = 0xA1B2C3D4E5F60000;
-    const reply_result = syscall.issueReg(.reply, 0, .{
-        .v1 = rid1,
+    const reply_extra: u64 = (@as(u64, rid1) & 0xFFF) << 12;
+    const reply_result = syscall.issueReg(.reply, reply_extra, .{
+        .v1 = SENTINEL_BASE | 0x01,
         .v2 = SENTINEL_BASE | 0x02,
         .v3 = SENTINEL_BASE | 0x03,
         .v4 = SENTINEL_BASE | 0x04,

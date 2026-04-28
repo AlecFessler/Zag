@@ -195,9 +195,11 @@ fn recvAndReplyTransferWithRipMod(
 
     // §[syscall_abi] / libz/syscall.zig comment: syscall_num lives in
     // bits 0-11 of vreg 0; reply_transfer's `pair_count` lives in bits
-    // 12-19. Both syscall words are inlined as immediates below: recv
-    // = 35 (syscall_num only, extra = 0), reply_transfer with N=1 =
-    // 39 | (1 << 12) = 4135.
+    // 12-19; reply_handle_id (per the new ABI) lives in bits 20-31.
+    // Both syscall words are inlined as immediates below: recv = 35
+    // (syscall_num only, extra = 0). reply_transfer's word is computed
+    // at runtime as (39 | (1 << 12)) | (rid << 20) = 4135 | (rid << 20)
+    // because rid comes out of recv's returned word.
     //
     // Stack-pad layout after `subq $920, %rsp`:
     //   [rsp + 0]   vreg 0  — syscall word (rewritten between phases)
@@ -233,13 +235,21 @@ fn recvAndReplyTransferWithRipMod(
         // vreg 127 = pair entry at [rsp + 912].
         \\ movq asm_io+16(%%rip), %%rax
         \\ movq %%rax, 912(%%rsp)
-        // reply_transfer syscall word: 39 | (1 << 12) = 4135.
-        \\ movq $4135, (%%rsp)
-        // vreg 1 = rax = reply_handle_id, extracted from the saved
-        // recv word (bits 32..43 per §[recv] return layout).
+        // reply_transfer syscall word: build at runtime so the
+        // reply_handle_id ends up in bits 20-31 per the new ABI.
+        // Extract rid from the saved recv word (bits 32..43 per §[recv]
+        // return layout): mask bits 32-43 in place (using a 64-bit
+        // immediate via movabsq because the constant exceeds the
+        // 32-bit-imm sign-extension range), then `shrq $12` to slide
+        // those 12 bits down to occupy bits 20-31. OR in the
+        // syscall_num (39) and pair_count constants (1<<12 = 4096) =
+        // 4135.
         \\ movq %%r11, %%rax
-        \\ shrq $32, %%rax
-        \\ andq $0xFFF, %%rax
+        \\ movabsq $0xFFF00000000, %%rcx
+        \\ andq %%rcx, %%rax
+        \\ shrq $12, %%rax
+        \\ orq $4135, %%rax
+        \\ movq %%rax, (%%rsp)
         \\ syscall
         \\ movq %%rax, asm_io+32(%%rip)
         \\ jmp 2f

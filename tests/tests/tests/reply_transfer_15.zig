@@ -64,8 +64,9 @@
 //        14..127, push the syscall word, then write the single pair
 //        entry at `[rsp + 912]` (the post-push slot of vreg 127),
 //        execute `syscall`, and unwind. The syscall word encodes
-//        `syscall_num = 39 | (N << 12)` per the bits-12-19 pair_count
-//        convention from §[reply_transfer].
+//        `syscall_num | (N << 12) | (reply_handle_id << 20)` per the
+//        new §[reply_transfer] ABI (syscall_num bits 0-11, pair_count
+//        bits 12-19, reply_handle_id bits 20-31).
 //     7. yield(W) — §[yield] [test 03]: "when [1] is a valid handle to
 //        a runnable EC, an observable side effect performed by the
 //        target EC ... is visible to the caller before the caller's
@@ -150,18 +151,21 @@ fn siblingEntry() callconv(.c) noreturn {
 // is on the stack, syscall, then unwind both the word and the pad.
 //
 // Layout during syscall (after `pushq %rcx`):
-//   [rsp +   0] syscall word (vreg 0)
+//   [rsp +   0] syscall word (vreg 0); carries reply_handle_id in
+//               bits 20-31 per the new §[reply_transfer] ABI
 //   [rsp +   8] vreg 14
 //   ...
 //   [rsp + 912] vreg 127 ← pair entry written here
 //   [rsp + 920] caller-frame return ground
 //
-// rax carries vreg 1 (the reply handle); other register-backed vregs
-// are unused by reply_transfer per §[reply_transfer] but are listed as
-// clobbers because the syscall instruction's restore boundary may
-// touch them.
+// Register-backed vregs are unused by reply_transfer per the new ABI
+// (the reply_handle_id rides in the syscall word, not vreg 1) but are
+// listed as clobbers because the syscall instruction's restore
+// boundary may touch them.
 fn replyTransferOne(reply_handle_id: u12, pair_entry: u64) u64 {
-    const word: u64 = (@as(u64, 39) & 0xFFF) | (@as(u64, 1) << 12);
+    const word: u64 = (@as(u64, 39) & 0xFFF) |
+        (@as(u64, 1) << 12) |
+        ((@as(u64, reply_handle_id) & 0xFFF) << 20);
     var v1_out: u64 = undefined;
     asm volatile (
         \\ subq $920, %%rsp
@@ -172,7 +176,6 @@ fn replyTransferOne(reply_handle_id: u12, pair_entry: u64) u64 {
         : [v1] "={rax}" (v1_out),
         : [pair] "{rdi}" (pair_entry),
           [word] "{rcx}" (word),
-          [iv1] "{rax}" (@as(u64, reply_handle_id)),
         : .{ .rcx = true, .r11 = true, .memory = true });
     return v1_out;
 }

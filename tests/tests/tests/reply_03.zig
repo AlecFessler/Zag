@@ -1,7 +1,7 @@
 // Spec §[reply] reply — test 03.
 //
 // "[test 03] returns E_TERM if the suspended EC was terminated before
-//  reply could deliver; [1] is consumed."
+//  reply could deliver; the reply handle is consumed."
 //
 // Strategy
 //   §[reply] resumes the suspended sender referenced by the reply

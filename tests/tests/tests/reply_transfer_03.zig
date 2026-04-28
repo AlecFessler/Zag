@@ -21,8 +21,7 @@
 //
 //     a. N == 0 — issue reply_transfer with `pair_count = 0` in the
 //        syscall word and no pair-entry vregs in the payload. The
-//        kernel's `args` slice carries only the reply-handle arg; the
-//        derived `pair_entries.len` is 0 and the gate fires.
+//        kernel observes N = 0 and the gate fires.
 //
 //     b. N > 63 — would require attaching 64+ pair entries via the
 //        high-vreg layout described in §[handle_attachments] (entries
@@ -37,14 +36,16 @@
 //
 //   Implementation note: libz's `replyTransfer` panics unconditionally,
 //   so this test bypasses it and issues the raw syscall directly via
-//   `syscall.issueReg`. The reply-handle argument is set to 0 — an
-//   invalid handle id — but that is irrelevant: the N-validation gate
-//   precedes handle validation, so the kernel returns E_INVAL based
-//   solely on `pair_entries.len < 1`.
+//   `syscall.issueReg`. Under the new ABI both N and reply_handle_id
+//   live in the syscall word (N at bits 12-19, reply_handle_id at
+//   bits 20-31). The reply-handle argument is set to 0 — an invalid
+//   handle id — but that is irrelevant: the N-validation gate precedes
+//   handle validation, so the kernel returns E_INVAL based solely on
+//   N being out of range.
 //
 // Action
-//   1. Issue reply_transfer with [1] = 0 and no pair-entry vregs. The
-//      derived pair_entries.len is 0; the N-validation gate must
+//   1. Issue reply_transfer with N = 0 in syscall word bits 12-19 and
+//      reply_handle_id = 0 in bits 20-31. The N-validation gate must
 //      return E_INVAL.
 //
 // Assertions
@@ -63,15 +64,14 @@ pub fn main(cap_table_base: u64) void {
     // N == 0: reply_transfer with no pair entries. We pass the raw
     // syscall_num via `issueReg` because libz's `replyTransfer` wrapper
     // `@panic`s on the high-vreg attachment path; for the N == 0 case
-    // we never need the high-vreg plumbing — only the reply-handle arg
-    // in vreg 1, which fits in registers.
+    // we never need the high-vreg plumbing.
     //
-    // [1] = 0 is deliberately not a valid reply handle. The kernel's
-    // gate order in `kernel/syscall/reply.zig::replyTransfer` validates
-    // the pair-count length before resolving [1], so this returns
-    // E_INVAL for the N-violation rather than E_BADCAP for the bogus
-    // handle.
-    const r_zero = syscall.issueReg(.reply_transfer, 0, .{ .v1 = 0 });
+    // Under the new ABI both N and reply_handle_id live in the syscall
+    // word (N at bits 12-19, reply_handle_id at bits 20-31). N = 0 and
+    // reply_handle_id = 0 here. The kernel's gate order validates
+    // N before resolving the reply handle id, so this returns E_INVAL
+    // for the N-violation rather than E_BADCAP for the bogus handle.
+    const r_zero = syscall.issueReg(.reply_transfer, 0, .{});
     if (r_zero.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(1);
         return;
