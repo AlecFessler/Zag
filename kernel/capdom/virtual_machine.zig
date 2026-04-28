@@ -31,6 +31,7 @@ const PageFrameCaps = zag.memory.page_frame.PageFrameCaps;
 const Port = zag.sched.port.Port;
 const Priority = zag.sched.execution_context.Priority;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
 const VarPageSize = zag.capdom.var_range.PageSize;
 const Word0 = zag.caps.capability.Word0;
@@ -55,7 +56,7 @@ pub const MAX_GUEST_INSTALLS: usize = 64;
 /// `unmap_guest` resolves by `pf` handle; the entry stays valid until
 /// the matching `unmap_guest` removes it.
 pub const GuestInstall = struct {
-    pf: ?*PageFrame = null,
+    pf: ?SlabRef(PageFrame) = null,
     guest_addr: u64 = 0,
     page_count: u32 = 0,
     sz: VarPageSize = .sz_4k,
@@ -66,9 +67,9 @@ pub const VirtualMachine = struct {
     /// liveness AND guards every mutable field below.
     _gen_lock: GenLock = .{},
 
-    /// Owning capability domain. VM cannot outlive its owner.
-    /// Set at create_virtual_machine; immutable.
-    domain: *CapabilityDomain,
+    /// Owning capability domain. VM cannot outlive its owner —
+    /// `destroyVm` runs ahead of any domain teardown.
+    domain: SlabRef(CapabilityDomain),
 
     /// Physical address of the guest's second-stage / nested page-
     /// table root (EPT root on Intel, NPT root on AMD, stage-2 root
@@ -86,7 +87,7 @@ pub const VirtualMachine = struct {
     /// retains a reference on this page frame for the VM's lifetime so
     /// the policy backing pages cannot be freed under guest exits that
     /// consult them.
-    policy_pf: ?*PageFrame = null,
+    policy_pf: ?SlabRef(PageFrame) = null,
 
     /// VM policy bits (per spec field0 / cap word `policy`). Encoding
     /// TBD as VM creation cap bits get fleshed out — placeholder.
@@ -310,8 +311,10 @@ pub fn mapGuest(caller: *ExecutionContext, vm_handle: u64, pairs: []const u64) i
         // page_frame already installed in this VM's guest physical
         // address space.
         for (&vm.installs) |*entry| {
-            const entry_pf = entry.pf orelse continue;
-            if (installRangesOverlap(guest_addr, pf, entry.guest_addr, entry_pf)) return errors.E_INVAL;
+            // self-alive: PF refcount kept by VM for its install
+            // bookkeeping; caller holds vm's gen-lock context.
+            const entry_pf_ref = entry.pf orelse continue;
+            if (installRangesOverlap(guest_addr, pf, entry.guest_addr, entry_pf_ref.ptr)) return errors.E_INVAL;
         }
         i += 1;
     }
@@ -423,7 +426,7 @@ fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
     const new_vm = ref.ptr;
     const gen: u63 = @intCast(ref.gen);
 
-    new_vm.domain = domain;
+    new_vm.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
     new_vm.arch_state = null;
     new_vm.policy_pf = null;
     new_vm.policy = 0;
@@ -440,7 +443,7 @@ fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
     };
 
     incPageFrameRef(policy_pf);
-    new_vm.policy_pf = policy_pf;
+    new_vm.policy_pf = SlabRef(PageFrame).init(policy_pf, policy_pf._gen_lock.currentGen());
 
     return new_vm;
 }
@@ -449,13 +452,15 @@ fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
 /// devices, frees arch state and stage-2 root, drops the held
 /// `policy_pf` reference, clears `domain.vm`, returns slab slot.
 fn destroyVm(vm: *VirtualMachine) void {
-    if (vm.policy_pf) |pf| {
-        decPageFrameRef(pf);
+    if (vm.policy_pf) |pf_ref| {
+        // self-alive: PF refcount kept by VM for its lifetime.
+        decPageFrameRef(pf_ref.ptr);
         vm.policy_pf = null;
     }
     vm_dispatch.freeVmArchState(vm);
     vm_dispatch.freeStage2Root(vm);
-    vm.domain.vm = null;
+    // self-alive: VM's domain owns it.
+    vm.domain.ptr.vm = null;
     const gen = vm._gen_lock.currentGen();
     slab_instance.destroy(vm, gen) catch {};
 }
@@ -465,7 +470,10 @@ fn destroyVm(vm: *VirtualMachine) void {
 /// VMs, will need a hash table when guest RAM grows.
 fn findInstall(vm: *VirtualMachine, pf: *PageFrame) ?*GuestInstall {
     for (&vm.installs) |*entry| {
-        if (entry.pf == pf) return entry;
+        if (entry.pf) |pf_ref| {
+            // Identity compare: SlabRef.ptr == raw pointer.
+            if (pf_ref.ptr == pf) return entry;
+        }
     }
     return null;
 }
@@ -505,7 +513,7 @@ fn installPageFrame(vm: *VirtualMachine, guest_addr: u64, pf: *PageFrame, perms:
     }
 
     slot.* = .{
-        .pf = pf,
+        .pf = SlabRef(PageFrame).init(pf, pf._gen_lock.currentGen()),
         .guest_addr = guest_addr,
         .page_count = pf.page_count,
         .sz = pf.sz,
@@ -549,8 +557,10 @@ fn allocVcpu(
 ) !*ExecutionContext {
     _ = creator_domain;
 
+    // self-alive: VM's domain owns the VM and outlives it (destroyVm
+    // runs ahead of any domain teardown).
     const vcpu_ec = try ec_mod.allocExecutionContext(
-        vm.domain,
+        vm.domain.ptr, // self-alive
         VAddr.fromInt(0),
         0,
         affinity,

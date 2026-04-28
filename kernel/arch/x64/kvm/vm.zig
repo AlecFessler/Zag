@@ -508,7 +508,9 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
     // physmap exposes it via VAddr.fromPAddr. policy_pf is held for the
     // VM's lifetime by capdom (§[create_virtual_machine]) so the pointer
     // stays valid for as long as the VM is reachable from the syscall.
-    const pf = vm.policy_pf orelse return errors.E_NODEV;
+    // self-alive: policy_pf refcount is held by the VM for its lifetime.
+    const pf_ref = vm.policy_pf orelse return errors.E_NODEV;
+    const pf = pf_ref.ptr;
     const phys_va = VAddr.fromPAddr(pf.phys_base, null);
     const policy_ptr: *vm_hw.VmPolicy = @ptrFromInt(phys_va.addr);
 
