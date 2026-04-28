@@ -37,17 +37,6 @@ pub fn addAmdAlias(source: u16, alias: u16) void {
     vi.addAlias(source, alias);
 }
 
-/// Call after all setupDevice calls to enable translation.
-/// For Intel VT-d, TE is deferred from init to avoid caching
-/// "not present" entries before context entries are populated.
-pub fn enableTranslation() void {
-    switch (active_type) {
-        .intel_vtd => vtd.enableTranslation(),
-        .amd_vi => vi.enableTranslation(),
-        .none => {},
-    }
-}
-
 pub fn isAvailable() bool {
     return active_type != .none;
 }

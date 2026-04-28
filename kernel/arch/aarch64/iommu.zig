@@ -48,12 +48,6 @@ const VarPageSize = zag.capdom.var_range.PageSize;
 // the cursor-race patches stay observable. No hardware page tables are
 // touched, so this is equivalent to the x86 "iommu=off" path that x86
 // routerOS uses under QEMU without VT-d.
-pub fn isAvailable() bool {
-    return true;
-}
-
-pub fn enableTranslation() void {}
-
 pub fn iommuMapPage(
     device: *SpecDeviceRegion,
     iova: u64,
