@@ -28,6 +28,7 @@ const arch = zag.arch.dispatch;
 const scheduler = zag.sched.scheduler;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 
 /// Build-time switch (`-Dlazy_fpu`). When false, the FP-disable trap is
 /// never armed and the scheduler falls back to unconditional eager
@@ -51,8 +52,11 @@ pub fn handleTrap(current: *ExecutionContext) void {
     arch.cpu.fpuClearTrap();
     per_core.fpu_trap_armed = false;
 
-    const prev = per_core.last_fpu_owner;
-    if (prev) |p| {
+    if (per_core.last_fpu_owner) |prev_ref| {
+        // self-alive: prev FPU owner is either still alive (handle
+        // refcount) or being torn down — `last_fpu_core` clear in
+        // `flushIpiHandler` keeps this slot consistent.
+        const p = prev_ref.ptr;
         if (p == current) {
             // Same EC re-acquiring on the same core. Regs are still
             // valid — no save, no restore, just leave the trap clear.
@@ -63,7 +67,7 @@ pub fn handleTrap(current: *ExecutionContext) void {
     }
 
     arch.cpu.fpuRestore(&current.fpu_state);
-    per_core.last_fpu_owner = current;
+    per_core.last_fpu_owner = SlabRef(ExecutionContext).init(current, current._gen_lock.currentGen());
     current.last_fpu_core = core_id;
 }
 
@@ -80,9 +84,12 @@ pub fn handleTrap(current: *ExecutionContext) void {
 pub fn flushIpiHandler(ec: *ExecutionContext) void {
     const core_id: u8 = @truncate(arch.smp.coreID());
     const per_core = &scheduler.core_states[core_id];
-    if (per_core.last_fpu_owner == ec) {
-        arch.cpu.fpuSave(&ec.fpu_state);
-        per_core.last_fpu_owner = null;
+    if (per_core.last_fpu_owner) |ref| {
+        // self-alive: identity compare on `last_fpu_owner` slot.
+        if (ref.ptr == ec) {
+            arch.cpu.fpuSave(&ec.fpu_state);
+            per_core.last_fpu_owner = null;
+        }
     }
     ec.last_fpu_core = null;
 }
@@ -114,14 +121,18 @@ pub fn arm(incoming: *ExecutionContext) void {
     if (!lazy_enabled) return;
     const core_id: u8 = @truncate(arch.smp.coreID());
     const per_core = &scheduler.core_states[core_id];
-    if (per_core.last_fpu_owner == incoming) {
-        // Regs are still valid; leave trap clear so the EC can use
-        // FP without faulting.
-        if (per_core.fpu_trap_armed) {
-            arch.cpu.fpuClearTrap();
-            per_core.fpu_trap_armed = false;
+    if (per_core.last_fpu_owner) |ref| {
+        // self-alive: identity compare against `incoming` (passed by
+        // dispatch path with the slot pinned).
+        if (ref.ptr == incoming) {
+            // Regs are still valid; leave trap clear so the EC can use
+            // FP without faulting.
+            if (per_core.fpu_trap_armed) {
+                arch.cpu.fpuClearTrap();
+                per_core.fpu_trap_armed = false;
+            }
+            return;
         }
-        return;
     }
     if (!per_core.fpu_trap_armed) {
         arch.cpu.fpuArmTrap();

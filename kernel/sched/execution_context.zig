@@ -573,9 +573,9 @@ pub fn self(caller: *ExecutionContext) i64 {
 /// `current_ec` cleared, `yieldTo` skips the re-enqueue path and
 /// dispatches the next runnable EC.
 pub fn parkSelfFaulted(ec: *ExecutionContext) void {
-    const core_id = arch.smp.coreID();
-    if ((&scheduler.core_states[core_id]).current_ec == ec) {
-        (&scheduler.core_states[core_id]).current_ec = null;
+    const core_id: u8 = @truncate(arch.smp.coreID());
+    if (scheduler.coreCurrentIs(core_id, ec)) {
+        scheduler.clearCurrentEc(core_id);
     }
     // `.exited` is the closest existing state for "will never run again";
     // no `markReady`/`enqueue*` path observes it, and the EC stays in
@@ -1159,9 +1159,9 @@ pub fn suspendOnPort(
     // canonical CD → Port order. On `false` it leaves Port held.
     if (port.waiter_kind == .receivers) {
         if (zag.sched.port.rendezvousWithReceiver(ec, port, event, subcode, addr)) {
-            const core_id = arch.smp.coreID();
-            if ((&scheduler.core_states[core_id]).current_ec == ec) {
-                (&scheduler.core_states[core_id]).current_ec = null;
+            const core_id: u8 = @truncate(arch.smp.coreID());
+            if (scheduler.coreCurrentIs(core_id, ec)) {
+                scheduler.clearCurrentEc(core_id);
             }
             return 0;
         }
@@ -1175,9 +1175,9 @@ pub fn suspendOnPort(
 
     // Drop currency on the local core if `ec` is the running EC; the
     // caller's syscall return path will dispatch the next EC.
-    const core_id = arch.smp.coreID();
-    if ((&scheduler.core_states[core_id]).current_ec == ec) {
-        (&scheduler.core_states[core_id]).current_ec = null;
+    const core_id: u8 = @truncate(arch.smp.coreID());
+    if (scheduler.coreCurrentIs(core_id, ec)) {
+        scheduler.clearCurrentEc(core_id);
     }
     port._gen_lock.unlock();
     return 0;

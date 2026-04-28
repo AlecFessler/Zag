@@ -272,7 +272,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
             // `core_states` array onto the syscall path's stack frame
             // — three such snapshots in this function consume ~18 KiB
             // and overflow the 48 KiB kernel stack on faulting paths.
-            if ((&scheduler.core_states[apic.coreID()]).current_ec == null) {
+            if (scheduler.coreIsIdle(@truncate(apic.coreID()))) {
                 scheduler.run();
             }
             return;
@@ -294,7 +294,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // core when dispatch returned without suspending us, and we are
     // still in the caller's CR3, so the user-page write is safe here.
     if (caller.pending_event_word_valid and
-        (&scheduler.core_states[apic.coreID()]).current_ec == caller)
+        scheduler.coreCurrentIs(@truncate(apic.coreID()), caller))
     {
         writeUserSyscallWord(ctx, caller.pending_event_word);
         caller.pending_event_word = 0;
@@ -321,7 +321,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // run the suspended EC. Switch to whatever's next (or idle); the
     // saved register restore in the asm trampoline never executes
     // because switchTo's `loadEcContextAndReturn` is `noreturn`.
-    if ((&scheduler.core_states[apic.coreID()]).current_ec == null) {
+    if (scheduler.coreIsIdle(@truncate(apic.coreID()))) {
         scheduler.run();
     }
 }
@@ -522,7 +522,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
     }
 
     const cid: u8 = @truncate(core_id);
-    (&scheduler.core_states[cid]).current_ec = ec;
+    scheduler.setCurrentEc(cid, ec);
     // Pointer-index `per_cpu_scratch[]`: see `updateScratchKernelRsp`.
     // Each direct `per_cpu_scratch[i].field` write would otherwise
     // memcpy the full 256 KiB array onto the dispatch stack frame.
@@ -544,7 +544,12 @@ pub fn switchTo(ec: *ExecutionContext) void {
     // never armed, so no migration flush is needed either.
     if (comptime fpu.lazy_enabled) {
         scheduler.migrateFlush(ec);
-        const desired_armed = ((&scheduler.core_states[cid]).last_fpu_owner != ec);
+        const last_fpu = (&scheduler.core_states[cid]).last_fpu_owner;
+        const desired_armed = if (last_fpu) |ref|
+            // self-alive: identity compare against just-dispatched `ec`.
+            ref.ptr != ec
+        else
+            true;
         if (desired_armed != (&scheduler.core_states[cid]).fpu_trap_armed) {
             if (desired_armed) cpu.fpuArmTrap() else cpu.fpuClearTrap();
             (&scheduler.core_states[cid]).fpu_trap_armed = desired_armed;

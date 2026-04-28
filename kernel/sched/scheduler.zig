@@ -16,6 +16,7 @@ const port_mod = zag.sched.port;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const Priority = zag.sched.execution_context.Priority;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 
 /// Intrusive priority queue of ECs, linked through the EC's `next`
@@ -38,24 +39,26 @@ pub const TIMESLICE_NS: u64 = 2_000_000;
 
 /// Per-core scheduler state. One entry per active core in `core_states[]`.
 ///
-/// `extern struct` pins field declaration order so the Phase-5 IPC
-/// fast-path asm in `arch/x64/interrupts.zig` can keep its hardcoded
-/// immediate displacements (`72(%%rcx)` for `last_fpu_owner`,
-/// `80(%%rcx)` for `fpu_trap_armed`) regardless of Zig's auto-reorder
-/// rules across versions.
-pub const PerCore = extern struct {
+/// `?SlabRef(EC)` requires a tagged-union layout that's not extern-
+/// compatible, so `PerCore` is a regular struct. No current asm path
+/// references field offsets here — the IPC fast path goes through
+/// `SyscallScratch` (extern) which caches the `*ExecutionContext`
+/// raw value separately.
+pub const PerCore = struct {
     /// Priority-ordered intrusive PQ over EC.next. Drained by
     /// `dequeue` on context switch / yield / preempt.
     run_queue: EcQueue = .{},
 
     /// EC currently dispatched on this core. `null` ⇒ core is idle.
-    current_ec: ?*ExecutionContext = null,
+    /// SlabRef so the cross-core readers (FPU flush / `coreRunning`)
+    /// can detect a freed-then-reallocated slot via gen mismatch.
+    current_ec: ?SlabRef(ExecutionContext) = null,
 
     /// EC whose FP/SIMD state currently lives in this core's CPU
     /// registers. May be a different EC than `current_ec` (lazy FPU —
     /// eviction happens on the next FP-disabled trap, not on context
     /// switch). `null` if no EC has used FP on this core since boot.
-    last_fpu_owner: ?*ExecutionContext = null,
+    last_fpu_owner: ?SlabRef(ExecutionContext) = null,
 
     /// Whether CR0.TS / FPEN is currently armed on this core. Tracked
     /// here so we don't issue redundant CR-writes (each one costs a
@@ -64,7 +67,7 @@ pub const PerCore = extern struct {
 
     /// Per-core idle EC. Allocated at perCoreInit; runs `hlt`/`wfi`
     /// when the run queue is empty. Pinned to this core via affinity.
-    idle_ec: ?*ExecutionContext = null,
+    idle_ec: ?SlabRef(ExecutionContext) = null,
 };
 
 /// Per-core scheduler state. Indexed by core id (APIC ID on x86-64,
@@ -162,7 +165,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
     var current = ec;
     while (current.vm != null) {
         const core: u8 = @truncate(arch.smp.coreID());
-        (&core_states[core]).current_ec = null;
+        clearCurrentEc(core);
         // Spec §[vm_exit_state]: vregs 1..13 carry the guest GPR state
         // at exit time. With real VMX/SVM guest re-entry still TODO,
         // no actual guest code runs between reply and the next exit;
@@ -203,7 +206,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
     }
 
     const core: u8 = @truncate(arch.smp.coreID());
-    (&core_states[core]).current_ec = current;
+    setCurrentEc(core, current);
     current.state = .running;
     arch.cpu.loadEcContextAndReturn(current);
 }
@@ -216,7 +219,10 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     const lock = &core_locks[core];
 
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-    if (state.current_ec) |cur| {
+    if (state.current_ec) |cur_ref| {
+        // self-alive: `current_ec` names the EC running on this core
+        // — caller is in its syscall path so the slot is pinned.
+        const cur = cur_ref.ptr;
         cur.state = .ready;
         state.run_queue.enqueue(cur);
     }
@@ -240,7 +246,7 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     // bit. Halting *here* would leave the timer IRQ never EOI'd —
     // any subsequent same-priority LAPIC tick would be blocked,
     // wedging the scheduler tick on this core.
-    (&core_states[core]).current_ec = null;
+    clearCurrentEc(core);
 }
 
 /// Preemption tick — invoked from the per-core timer interrupt when
@@ -285,7 +291,11 @@ fn dequeueOrIdle() ?*ExecutionContext {
 fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
     const state = &core_states[core];
     if (state.run_queue.dequeue()) |ec| return ec;
-    if (state.idle_ec) |idle| return idle;
+    if (state.idle_ec) |idle_ref| {
+        // self-alive: per-core idle EC is allocated at perCoreInit and
+        // never freed — it's the dispatch-of-last-resort target.
+        return idle_ref.ptr;
+    }
     return null;
 }
 
@@ -321,7 +331,15 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
 
     const self_core: u8 = @truncate(arch.smp.coreID());
 
-    if (target_current == null) {
+    const target_current_ptr: ?*ExecutionContext = if (target_current) |r|
+        // self-alive: read-only snapshot of target core's current_ec
+        // for wake/preempt decision. Worst-case stale ptr just costs
+        // a spurious IPI; real ptr deref is gated below.
+        r.ptr
+    else
+        null;
+
+    if (target_current_ptr == null) {
         // Idle target. Local self-wake is unnecessary — the caller is
         // running, not halted; the run loop will pick up `ec` on the
         // next dispatch.
@@ -330,7 +348,8 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
     }
 
     // Target is busy. Decide whether `ec` should preempt the running EC.
-    const cur = target_current.?;
+    // self-alive: snapshot ptr; race-tolerant priority compare.
+    const cur = target_current_ptr.?;
     if (@intFromEnum(ec.priority) <= @intFromEnum(cur.priority)) return;
 
     // Same-core higher-pri: send a LAPIC self-IPI (deferred until the
@@ -379,7 +398,10 @@ pub fn removeFromQueue(ec: *ExecutionContext) void {
 /// indexing avoids the per-call array snapshot.
 pub fn currentEc() ?*ExecutionContext {
     const core: u8 = @truncate(arch.smp.coreID());
-    return (&core_states[core]).current_ec;
+    const ref = (&core_states[core]).current_ec orelse return null;
+    // self-alive: `current_ec` names the EC actually executing on this
+    // very core; the slot can't be freed under us while this code runs.
+    return ref.ptr;
 }
 
 /// Find which core (if any) is currently running `ec`. Returns null
@@ -388,10 +410,41 @@ pub fn coreRunning(ec: *ExecutionContext) ?u8 {
     const count = arch.smp.coreCount();
     var i: u8 = 0;
     while (i < count) {
-        if ((&core_states[i]).current_ec == ec) return i;
+        // self-alive: identity compare against caller-supplied `*EC`;
+        // worst-case stale read returns `null` and caller re-checks.
+        if ((&core_states[i]).current_ec) |ref| {
+            if (ref.ptr == ec) return i;
+        }
         i += 1;
     }
     return null;
+}
+
+/// True if this core's `current_ec` slot names `ec`. Identity-compare
+/// helper used by suspend / terminate / fault paths to clear the
+/// dispatch slot when the running EC parks itself.
+pub inline fn coreCurrentIs(core: u8, ec: *ExecutionContext) bool {
+    if ((&core_states[core]).current_ec) |ref| {
+        // self-alive: identity compare on `current_ec` slot.
+        return ref.ptr == ec;
+    }
+    return false;
+}
+
+/// Clear this core's `current_ec` slot. Called by suspend / terminate /
+/// idle paths when the running EC stops being runnable.
+pub inline fn clearCurrentEc(core: u8) void {
+    (&core_states[core]).current_ec = null;
+}
+
+/// Set this core's `current_ec` to `ec`, capturing the gen at write time.
+pub inline fn setCurrentEc(core: u8, ec: *ExecutionContext) void {
+    (&core_states[core]).current_ec = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
+}
+
+/// True if this core's `current_ec` is null (idle).
+pub inline fn coreIsIdle(core: u8) bool {
+    return (&core_states[core]).current_ec == null;
 }
 
 // ── State transitions used by other subsystems ───────────────────────

@@ -261,7 +261,11 @@ pub fn switchTo(ec: *ExecutionContext) noreturn {
         fpu.migrateFlush(ec);
         const cid: u8 = @truncate(gic.coreID());
         const per_core = &scheduler.core_states[cid];
-        const desired_armed = (per_core.last_fpu_owner != ec);
+        const desired_armed = if (per_core.last_fpu_owner) |ref|
+            // self-alive: identity compare on `last_fpu_owner` slot.
+            ref.ptr != ec
+        else
+            true;
         if (desired_armed != per_core.fpu_trap_armed) {
             if (desired_armed) cpu.fpuArmTrap() else cpu.fpuClearTrap();
             per_core.fpu_trap_armed = desired_armed;
