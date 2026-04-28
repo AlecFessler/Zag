@@ -468,36 +468,6 @@ pub fn initSlab(
 
 // ── External API (syscall handlers) ──────────────────────────────────
 
-/// `create_execution_context` syscall handler.
-/// Spec §[execution_context].create_execution_context.
-pub fn createExecutionContext(
-    caller: *ExecutionContext,
-    caps: u64,
-    entry: u64,
-    stack_pages: u64,
-    target: u64,
-    affinity: u64,
-) i64 {
-    _ = entry;
-    if ((caps >> 34) != 0) return errors.E_INVAL;
-    if (stack_pages == 0) return errors.E_INVAL;
-
-    const core_count: u64 = @intCast(arch.smp.coreCount());
-    if (core_count < 64) {
-        const valid_mask: u64 = (@as(u64, 1) << @intCast(core_count)) - 1;
-        if (affinity != 0 and (affinity & ~valid_mask) != 0) return errors.E_INVAL;
-    }
-
-    // Awaits handle-table integration: cap ceiling checks against the
-    // caller's self-handle and target IDC handle resolution both go
-    // through caps/capability_domain.zig, which is itself stubbed.
-    // The validation above (reserved bits, stack size, affinity range)
-    // is the portion that's purely on this file's input shape.
-    _ = caller;
-    _ = target;
-    return errors.E_BADCAP;
-}
-
 /// `self` syscall handler — returns the packed handle word for an EC
 /// handle in the caller's domain that references the calling EC. Spec
 /// §[execution_context].self.
@@ -627,28 +597,6 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
 /// its own priority queue, starving the lower-pri target. Surfaces
 /// in recv_14 (parent pri=3 yields to worker pri=0; worker must
 /// self-suspend before the parent's blocking recv can complete).
-pub fn yieldEc(caller: *ExecutionContext, target: u64) i64 {
-    const target_ec = resolveYieldTarget(caller, target);
-    scheduler.yieldTo(target_ec);
-    return 0;
-}
-
-/// Resolve `target` to a `*ExecutionContext` for `yieldEc`. Returns
-/// `null` for target == 0 and for any resolution failure (bad handle,
-/// wrong type, freed slab) — in those cases the caller still yields
-/// and the scheduler picks whatever runs next.
-fn resolveYieldTarget(caller: *ExecutionContext, target: u64) ?*ExecutionContext {
-    if (target == 0) return null;
-
-    const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return null;
-    defer cd_ref.unlock();
-
-    const slot: u12 = @truncate(target);
-    const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse return null;
-    const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse return null;
-    return target_ref.ptr;
-}
 
 /// `priority` syscall handler. Spec §[execution_context].priority.
 ///
@@ -1062,32 +1010,6 @@ const PERFMON_CONFIG_EVENT_MASK: u64 = 0xFF;
 /// Reserved bits in a `config_event` word; any set bit returns E_INVAL. Spec test 06.
 const PERFMON_CONFIG_RESERVED_MASK: u64 = ~(PERFMON_CONFIG_EVENT_MASK | PERFMON_CONFIG_HAS_THRESHOLD_BIT);
 
-// ── Dispatch entry points (called by scheduler / event router) ───────
-
-/// Marks `ec.state = .running`, sets `on_cpu`, refreshes `last_fpu_core`.
-/// Called from the per-core scheduler immediately before resuming `ec`.
-pub fn enterRunning(ec: *ExecutionContext, core: u8) void {
-    std.debug.assert(ec.state == .ready);
-    ec.state = .running;
-    ec.on_cpu.store(true, .release);
-    if (ec.last_fpu_core) |c| {
-        if (c != core) {
-            // Cross-core migration: source core still owns the regs.
-            // Trigger an IPI flush so the destination core's lazy-FPU
-            // restore reads from a fresh `fpu_state` buffer.
-            fpu.migrateFlush(ec);
-        }
-    }
-}
-
-/// Save outgoing path: clears `on_cpu`, transitions running → ready.
-/// Caller has already saved `ec.ctx`.
-pub fn returnToReady(ec: *ExecutionContext) void {
-    std.debug.assert(ec.state == .running);
-    ec.state = .ready;
-    ec.on_cpu.store(false, .release);
-}
-
 /// Suspend `ec` on `port` with the given event metadata. Used by both
 /// the explicit `suspend` syscall and event-route fault delivery.
 /// Rejects vCPUs with E_PERM (spec §[port].suspend test 06).
@@ -1240,56 +1162,6 @@ pub fn abandonPendingReply(ec: *ExecutionContext) void {
 }
 
 /// Re-launch `ec` at its `entry_point` with a fresh user stack —
-/// `restart_at_entry` policy. Spec §[restart_semantics].
-///
-/// Reuses the existing user_stack reservation (the VAR survives the
-/// restart) and re-zeroes its mapped pages so leftover state can't leak
-/// across the restart boundary.
-pub fn restartEntry(ec: *ExecutionContext) void {
-    std.debug.assert(ec.state != .exited);
-
-    // If currently queued, lift it.
-    if (ec.state == .ready) scheduler.removeFromQueue(ec);
-    if (ec.state == .suspended_on_port) {
-        if (ec.suspend_port) |port_ref| {
-            const port_ptr = port_ref.lock(@src()) catch null;
-            if (port_ptr) |p| {
-                _ = p.waiters.remove(ec);
-                if (p.waiters.isEmpty()) p.waiter_kind = .none;
-                port_ref.unlock();
-            }
-            ec.suspend_port = null;
-        }
-    }
-
-    ec.event_type = .none;
-    ec.event_subcode = 0;
-    ec.event_addr = 0;
-    ec.pending_reply_holder = null;
-    ec.pending_reply_domain = null;
-    ec.pending_reply_slot = 0;
-    ec.originating_write_cap = false;
-    ec.pending_pair_count = 0;
-    ec.originating_read_cap = false;
-    ec.iret_frame = null;
-    ec.futex_wait_nodes = null;
-    ec.futex_wait_vaddrs = null;
-    ec.futex_bucket_count = 0;
-    ec.futex_deadline_ns = 0;
-    ec.futex_wake_index = 0;
-
-    // Re-point `ctx` at a fresh iret frame at the top of `kernel_stack`
-    // and reseed RIP / RSP from `entry_point` / `user_stack.top`. The
-    // arch-specific frame initialization is the arch dispatch's job;
-    // until that helper is wired, the `ctx` pointer is repositioned but
-    // the frame contents are not restamped here.
-    const ctx_top: u64 = ec.kernel_stack.top.addr - @sizeOf(ArchCpuContext);
-    ec.ctx = @ptrFromInt(ctx_top);
-
-    ec.state = .ready;
-    scheduler.markReady(ec);
-}
-
 // ── Internal API ─────────────────────────────────────────────────────
 
 /// Allocate an EC bound to `domain`: slab slot, kernel stack, user
@@ -1620,7 +1492,3 @@ fn releasePerfmonState(ec: *ExecutionContext) void {
     perfmon_mod.slab_instance.destroy(ref.ptr, ref.gen) catch {};
 }
 
-/// True iff `ec` is a vCPU (vm != null). Spec §[virtual_machine].
-fn isVcpu(ec: *const ExecutionContext) bool {
-    return ec.vm != null;
-}

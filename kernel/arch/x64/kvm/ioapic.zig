@@ -47,57 +47,6 @@ pub const Ioapic = struct {
         self.host = host;
     }
 
-    /// Handle MMIO read at offset from IOAPIC base 0xFEC00000.
-    /// Only IOREGSEL (offset 0x00) and IOWIN (offset 0x10) are accessible.
-    pub fn mmioRead(self: *const Ioapic, offset: u32) u32 {
-        return switch (offset) {
-            IOREGSEL_OFF => self.ioregsel,
-            IOWIN_OFF => self.readRegister(self.ioregsel),
-            else => 0,
-        };
-    }
-
-    /// Handle MMIO write at offset from IOAPIC base 0xFEC00000.
-    pub fn mmioWrite(self: *Ioapic, offset: u32, value: u32) void {
-        switch (offset) {
-            IOREGSEL_OFF => self.ioregsel = @truncate(value & 0xFF),
-            IOWIN_OFF => self.writeRegister(self.ioregsel, value),
-            else => {},
-        }
-    }
-
-    /// Assert an IRQ line. Routes through the redirection table to the LAPIC.
-    /// Section 3.2.4: Redirection table entry format.
-    pub fn assertIrq(self: *Ioapic, irq: u5) void {
-        if (irq >= NUM_REDIR_ENTRIES) return;
-        const entry = self.redir_table[irq];
-
-        // Bit 16: mask. If masked, ignore.
-        if (entry & (1 << 16) != 0) return;
-
-        const trigger_mode = (entry >> 15) & 1; // 0=edge, 1=level
-        const irq_bit = @as(u32, 1) << irq;
-
-        if (trigger_mode == 0) {
-            // Edge-triggered: deliver on rising edge (transition from 0 to 1).
-            if (self.irq_level & irq_bit != 0) return;
-            self.irq_level |= irq_bit;
-        } else {
-            // Level-triggered: deliver if not already pending (remote IRR = 0).
-            if (entry & (1 << 14) != 0) return;
-            self.irq_level |= irq_bit;
-            self.redir_table[irq] |= (1 << 14);
-        }
-
-        self.deliverInterrupt(entry);
-    }
-
-    /// De-assert an IRQ line.
-    pub fn deassertIrq(self: *Ioapic, irq: u5) void {
-        if (irq >= NUM_REDIR_ENTRIES) return;
-        self.irq_level &= ~(@as(u32, 1) << irq);
-    }
-
     /// Handle EOI from LAPIC for a level-triggered interrupt.
     /// Clears Remote IRR (bit 14) in all redirection-table entries that
     /// map to this vector. Linux shares vectors across GSIs, so we must

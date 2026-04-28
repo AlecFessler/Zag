@@ -13,8 +13,6 @@ const VAddr = zag.memory.address.VAddr;
 const VarPageSize = zag.capdom.var_range.PageSize;
 const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
 
-pub const MAX_VCPUS = 64;
-
 // ── Spec-v3 dispatch backings ────────────────────────────────────────
 //
 // Wire-up is intentionally minimal: it fans out to the existing low-

@@ -9,9 +9,6 @@ const PageFrame = zag.memory.page_frame.PageFrame;
 const VarPageSize = zag.capdom.var_range.PageSize;
 const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
 
-/// Spec §[virtual_machine] cap on vCPUs per VM.
-pub const MAX_VCPUS = 64;
-
 // ── Spec-v3 dispatch backings (STUB) ─────────────────────────────────
 //
 // TODO(step 6): implement the dispatch primitives below. Stage-2

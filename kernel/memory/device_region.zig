@@ -97,106 +97,13 @@ pub fn initSlab(
     slab_initialized = true;
 }
 
-fn allocRegion() !*DeviceRegion {
-    std.debug.assert(slab_initialized);
-    const r = try device_region_slab.create();
-    return r.ptr;
-}
-
-/// Zero the union storage before writing the active variant. Without
-/// this, a recycled slot keeps the previous occupant's Pci tail bytes
-/// (Pci is larger than Display) leaking through the union. Same story
-/// for the outer DeviceRegion `_pad`.
-fn zeroRegionBytes(dr: *DeviceRegion) void {
-    const base: [*]u8 = @ptrCast(dr);
-    const gen_lock_off: usize = @offsetOf(DeviceRegion, "_gen_lock");
-    const gen_lock_size: usize = @sizeOf(@TypeOf(dr._gen_lock));
-    // Zero everything except the gen-lock word — that was just set by
-    // the allocator and must not be clobbered.
-    @memset(base[0..gen_lock_off], 0);
-    @memset(base[gen_lock_off + gen_lock_size .. @sizeOf(DeviceRegion)], 0);
-}
-
-pub fn createMmio(
-    phys_base: PAddr,
-    size: u64,
-    device_class: DeviceClass,
-    pci_vendor: u16,
-    pci_device: u16,
-    pci_class: u8,
-    pci_subclass: u8,
-    pci_bus: u8,
-    pci_dev: u8,
-    pci_func: u8,
-) !*DeviceRegion {
-    const dr = try allocRegion();
-    zeroRegionBytes(dr);
-    dr.access = .{ .mmio = .{ .phys_base = phys_base, .size = size } };
-    dr.detail = .{ .pci = .{
-        .vendor = pci_vendor,
-        .device = pci_device,
-        .class = pci_class,
-        .subclass = pci_subclass,
-        .bus = pci_bus,
-        .dev = pci_dev,
-        .func = pci_func,
-        .dma_page_table_root = PAddr.fromInt(0),
-        .dma_cursor = 0x1000,
-    } };
-    dr.device_type = .mmio;
-    dr.device_class = device_class;
-    return dr;
-}
-
-pub fn createPortIo(
-    base_port: u16,
-    port_count: u16,
-    device_class: DeviceClass,
-    pci_vendor: u16,
-    pci_device: u16,
-    pci_class: u8,
-    pci_subclass: u8,
-    pci_bus: u8,
-    pci_dev: u8,
-    pci_func: u8,
-) !*DeviceRegion {
-    const dr = try allocRegion();
-    zeroRegionBytes(dr);
-    dr.access = .{ .port_io = .{ .base_port = base_port, .port_count = port_count } };
-    dr.detail = .{ .pci = .{
-        .vendor = pci_vendor,
-        .device = pci_device,
-        .class = pci_class,
-        .subclass = pci_subclass,
-        .bus = pci_bus,
-        .dev = pci_dev,
-        .func = pci_func,
-        .dma_page_table_root = PAddr.fromInt(0),
-        .dma_cursor = 0,
-    } };
-    dr.device_type = .port_io;
-    dr.device_class = device_class;
-    return dr;
-}
-
-pub fn createDisplay(
-    phys_base: PAddr,
-    size: u64,
-    fb_width: u16,
-    fb_height: u16,
-    fb_stride: u16,
-    fb_pixel_format: u8,
-) !*DeviceRegion {
-    const dr = try allocRegion();
-    zeroRegionBytes(dr);
-    dr.access = .{ .mmio = .{ .phys_base = phys_base, .size = size } };
-    dr.detail = .{ .display = .{
-        .fb_width = fb_width,
-        .fb_height = fb_height,
-        .fb_stride = fb_stride,
-        .fb_pixel_format = fb_pixel_format,
-    } };
-    dr.device_type = .mmio;
-    dr.device_class = .display;
-    return dr;
-}
+// Slot allocation helpers (allocRegion / zeroRegionBytes) lived here for
+// the old createMmio / createPortIo / createDisplay constructors that
+// have since been removed. They will be reinstated when device_region
+// minting lands on the spec-v3 syscall surface.
+//
+// Reuse cleaner: zero the union storage before writing the active variant.
+// Without this, a recycled slot keeps the previous occupant's Pci tail
+// bytes (Pci is larger than Display) leaking through the union. Same
+// story for the outer DeviceRegion `_pad`. Keep the tail of zeroRegionBytes
+// here as a comment until the constructor flow is rebuilt:

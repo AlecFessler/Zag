@@ -290,39 +290,6 @@ comptime {
 /// The caller treats the returned PAddr as an opaque handle; its
 /// numeric value is also the stage-2 root PA, which keeps
 /// `mapGuestPage` / `unmapGuestPage` / `invalidateStage2Ipa` unchanged.
-pub fn vmAllocStructures() ?PAddr {
-    const pmm_mgr = &pmm.global_pmm.?;
-    const bytes = pmm_mgr.allocBlock(2 * paging.PAGE4K) orelse return null;
-    const va = VAddr.fromInt(@intFromPtr(bytes));
-    return PAddr.fromVAddr(va, null);
-}
-
-/// Tear down the per-VM arch block. Walks the stage-2 root, frees every
-/// allocated level-3 table page, then frees the 2-page root+control
-/// block allocation.
-///
-/// TLB invalidation for the departing VMID is the caller's job (done
-/// inside `Vm.destroy` once VMID management is real). Stage-2 leaks
-/// here would be contained to a single VM and caught on the next
-/// rollover, but we still walk-and-free to keep the PMM honest.
-pub fn vmFreeStructures(p: PAddr) void {
-    if (p.addr == 0) return;
-    const root: *[STAGE2_ENTRIES_PER_TABLE]Stage2Entry =
-        @ptrFromInt(VAddr.fromPAddr(p, null).addr);
-    for (root) |*entry| {
-        if (!entry.valid) continue;
-        // Every non-leaf entry we install is a table descriptor pointing
-        // at a level-3 page. The level-3 page itself contains leaves only,
-        // so freeing it is enough; we do not recurse further.
-        freeTablePage(entry.getPAddr());
-        entry.* = .{};
-    }
-    const pmm_mgr = &pmm.global_pmm.?;
-    const va = VAddr.fromPAddr(p, null);
-    const base: [*]u8 = @ptrFromInt(va.addr);
-    pmm_mgr.freeBlock(base[0 .. 2 * paging.PAGE4K]);
-}
-
 /// Return a mutable pointer to the `VmControlBlock` embedded in the
 /// 8 KiB arch structures allocation at `vm_structures + PAGE4K`.
 pub fn controlBlock(vm_structures: PAddr) *VmControlBlock {

@@ -24,9 +24,7 @@ const arch = zag.arch.dispatch;
 const core = @import("debug_core.zig");
 
 pub const SrcLoc = core.SrcLoc;
-pub const Entry = core.Entry;
 pub const HeldStack = core.HeldStack;
-pub const CheckResult = core.CheckResult;
 pub const CheckOutcome = core.CheckOutcome;
 pub const PairRegistry = core.PairRegistry;
 pub const ClassTable = core.ClassTable;
@@ -34,7 +32,6 @@ pub const acquireOn = core.acquireOn;
 pub const releaseOn = core.releaseOn;
 pub const checkIrqModeOn = core.checkIrqModeOn;
 
-const HELD_STACK_DEPTH = core.HELD_STACK_DEPTH;
 const MAX_CORES = core.MAX_CORES;
 
 const active = builtin.mode == .Debug and !builtin.is_test;
@@ -70,13 +67,6 @@ pub fn exitIrqContext() void {
     if (!active) return;
     if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
     irq_depth.exit(@intCast(arch.smp.coreID()));
-}
-
-/// Returns true if the current core is executing an async-IRQ handler.
-pub fn inIrqContext() bool {
-    if (!active) return false;
-    if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return false;
-    return irq_depth.inIrq(@intCast(arch.smp.coreID()));
 }
 
 /// Reset this core's IRQ-handler depth to 0. Called from arch context-switch
@@ -151,35 +141,6 @@ pub fn release(lock_ptr: *const anyopaque) void {
 /// becomes structurally impossible upstream, which is why `releaseOn` can
 /// safely return false for "lock not on this stack" instead of panicking.
 /// See `releaseOn` in debug_core.zig for the full invariant chain.
-pub fn assertNoLocksHeld(src: SrcLoc) void {
-    if (!active) return;
-    if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
-    const core_id = arch.smp.coreID();
-    if (core_id >= MAX_CORES) return;
-    const stack = &held_stacks[@intCast(core_id)];
-    if (stack.depth == 0) return;
-    const held = stack.entries[0];
-    printDecimal("lockdep: blocking call with locks held core=", core_id);
-    arch.boot.printRaw(" depth=");
-    printDecimal("", stack.depth);
-    arch.boot.printRaw("\n  blocking call at ");
-    printSlice(src.file);
-    arch.boot.printRaw(":");
-    printDecimal("", src.line);
-    arch.boot.printRaw(" in ");
-    printSlice(src.fn_name);
-    arch.boot.printRaw("\n  held lock class=");
-    printClass(held.class);
-    arch.boot.printRaw(" acquired at ");
-    printSlice(held.src.file);
-    arch.boot.printRaw(":");
-    printDecimal("", held.src.line);
-    arch.boot.printRaw(" in ");
-    printSlice(held.src.fn_name);
-    arch.boot.printRaw("\n");
-    @panic("lockdep: blocking call with locks held");
-}
-
 fn handleOutcome(
     outcome: CheckOutcome,
     core_id: u64,

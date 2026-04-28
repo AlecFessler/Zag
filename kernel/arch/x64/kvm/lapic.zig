@@ -85,100 +85,6 @@ pub const Lapic = struct {
         self.host = host;
     }
 
-    /// Handle MMIO read at offset from APIC base 0xFEE00000.
-    /// All APIC registers are 32-bit, 128-bit aligned (Table 13-1).
-    pub fn mmioRead(self: *const Lapic, offset: u32) u32 {
-        return switch (offset) {
-            REG_ID => self.apic_id,
-            REG_VERSION => 0x00050014, // Version 0x14, Max LVT Entry = 5 (6 entries)
-            REG_TPR => self.tpr,
-            REG_APR => 0, // APR not used in xAPIC on modern processors
-            REG_PPR => self.computePPR(),
-            REG_EOI => 0, // EOI is write-only; reads return 0
-            REG_LDR => self.ldr,
-            REG_DFR => self.dfr,
-            REG_SVR => self.svr,
-            // ISR: 8 registers at 0x100-0x170
-            REG_ISR_BASE,
-            REG_ISR_BASE + 0x10,
-            REG_ISR_BASE + 0x20,
-            REG_ISR_BASE + 0x30,
-            REG_ISR_BASE + 0x40,
-            REG_ISR_BASE + 0x50,
-            REG_ISR_BASE + 0x60,
-            REG_ISR_BASE + 0x70,
-            => self.isr[(offset - REG_ISR_BASE) >> 4],
-            // TMR: 8 registers at 0x180-0x1F0
-            REG_TMR_BASE,
-            REG_TMR_BASE + 0x10,
-            REG_TMR_BASE + 0x20,
-            REG_TMR_BASE + 0x30,
-            REG_TMR_BASE + 0x40,
-            REG_TMR_BASE + 0x50,
-            REG_TMR_BASE + 0x60,
-            REG_TMR_BASE + 0x70,
-            => self.tmr[(offset - REG_TMR_BASE) >> 4],
-            // IRR: 8 registers at 0x200-0x270
-            REG_IRR_BASE,
-            REG_IRR_BASE + 0x10,
-            REG_IRR_BASE + 0x20,
-            REG_IRR_BASE + 0x30,
-            REG_IRR_BASE + 0x40,
-            REG_IRR_BASE + 0x50,
-            REG_IRR_BASE + 0x60,
-            REG_IRR_BASE + 0x70,
-            => self.irr[(offset - REG_IRR_BASE) >> 4],
-            REG_ESR => self.esr,
-            REG_ICR_LO => self.icr_lo,
-            REG_ICR_HI => self.icr_hi,
-            REG_LVT_TIMER => self.lvt_timer,
-            REG_LVT_THERMAL => self.lvt_thermal,
-            REG_LVT_PERF => self.lvt_perf,
-            REG_LVT_LINT0 => self.lvt_lint0,
-            REG_LVT_LINT1 => self.lvt_lint1,
-            REG_LVT_ERROR => self.lvt_error,
-            REG_TIMER_ICR => self.timer_initial_count,
-            REG_TIMER_CCR => self.timer_current_count,
-            REG_TIMER_DCR => self.timer_divide_config,
-            else => 0,
-        };
-    }
-
-    /// Handle MMIO write at offset from APIC base 0xFEE00000.
-    pub fn mmioWrite(self: *Lapic, offset: u32, value: u32) void {
-        switch (offset) {
-            REG_ID => self.apic_id = value & 0xFF000000, // Only bits 31:24 writable
-            REG_TPR => self.tpr = value & 0xFF,
-            REG_EOI => self.handleEOI(),
-            REG_LDR => self.ldr = value & 0xFF000000,
-            REG_DFR => self.dfr = value | 0x0FFFFFFF, // Bits 27:0 are all 1s (reserved)
-            REG_SVR => self.svr = value & 0x1FF, // Bits 8:0 writable (enable + vector)
-            REG_ESR => {
-                // Section 13.5.3: Write to ESR clears it and latches accumulated errors.
-                self.esr = self.esr_shadow;
-                self.esr_shadow = 0;
-            },
-            REG_ICR_LO => {
-                self.icr_lo = value;
-                self.handleICR();
-            },
-            REG_ICR_HI => self.icr_hi = value,
-            REG_LVT_TIMER => self.lvt_timer = value,
-            REG_LVT_THERMAL => self.lvt_thermal = value,
-            REG_LVT_PERF => self.lvt_perf = value,
-            REG_LVT_LINT0 => self.lvt_lint0 = value,
-            REG_LVT_LINT1 => self.lvt_lint1 = value,
-            REG_LVT_ERROR => self.lvt_error = value,
-            REG_TIMER_ICR => {
-                self.timer_initial_count = value;
-                self.timer_current_count = value;
-                self.timer_accum_ns = 0;
-            },
-            REG_TIMER_DCR => self.timer_divide_config = value & 0x0B, // Only bits 3, 1:0 used
-            else => {},
-        }
-    }
-
     /// Advance the APIC timer by elapsed_ns nanoseconds.
     /// Called from the vCPU entry loop before VMRUN. If the timer fires,
     /// sets the IRR bit for the vector in the LVT timer register.
@@ -233,32 +139,6 @@ pub const Lapic = struct {
                 self.timer_current_count -= @truncate(ticks_elapsed);
             }
         }
-    }
-
-    /// Return the highest-priority pending interrupt vector that can be
-    /// delivered (IRR set, ISR not set for that vector, priority > TPR).
-    /// Returns null if no deliverable interrupt is pending.
-    pub fn getPendingVector(self: *const Lapic) ?u8 {
-        // APIC must be software-enabled (SVR bit 8)
-        if (self.svr & 0x100 == 0) return null;
-
-        const irr_vec = highestSetBit(&self.irr) orelse return null;
-        const isr_vec = highestSetBit(&self.isr) orelse 0;
-
-        const irr_prio = irr_vec >> 4;
-        const isr_prio = isr_vec >> 4;
-        const tpr_prio: u8 = @truncate((self.tpr >> 4) & 0xF);
-
-        if (irr_prio > isr_prio and irr_prio > tpr_prio) {
-            return irr_vec;
-        }
-        return null;
-    }
-
-    /// Accept an interrupt vector: move from IRR to ISR.
-    pub fn acceptInterrupt(self: *Lapic, vector: u8) void {
-        clearBit(&self.irr, vector);
-        setBit(&self.isr, vector);
     }
 
     /// Set the IRR bit for an external interrupt vector.
