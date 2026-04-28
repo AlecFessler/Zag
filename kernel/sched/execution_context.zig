@@ -1425,10 +1425,144 @@ pub fn allocExecutionContext(
     return ec;
 }
 
+/// Walk the EC slab and destroy every alive EC whose `domain` SlabRef
+/// matches `(cd, cd_gen)`, skipping any EC named in `keep`. Used by
+/// `destroyCapabilityDomain` to reap vCPU ECs and sub-domain helper ECs
+/// that have no other release path. The caller-running EC (the one that
+/// invoked `delete(SLOT_SELF)`) must be passed in `keep` — its kernel
+/// stack is in active use and cannot be unmapped here.
+///
+/// We match BOTH `domain.ptr` and `domain.gen` to avoid grabbing leaked
+/// ECs whose owning CD slot has since been recycled into a different
+/// (currently-alive) CD: a bare-ptr aliasing match would let the new
+/// CD's destroy walk free unrelated leaked ECs from earlier tests, and
+/// while their slab slots can in principle be reclaimed that way, the
+/// kstack unmap uses `cd_addr_space_root` and is only valid for ECs
+/// genuinely bound to *this* CD.
+///
+/// `cd_addr_space_root` is read from the CD by the caller while it
+/// holds `cd._gen_lock`. We MUST NOT re-lock `cd._gen_lock` here:
+/// the caller (`destroyCapabilityDomain` invoked from `releaseSelf`)
+/// already holds it, and SecureSlab gen-locks don't allow recursive
+/// acquire on the same class.
+pub fn destroyEcsInDomain(cd: *CapabilityDomain, cd_gen: u63, cd_addr_space_root: PAddr, keep: ?*ExecutionContext) void {
+    // Visitor packs the four loop-invariant args. The CD ref carries a
+    // verified gen so the visitor can reject ECs whose `domain` ptr
+    // happens to alias a stale (since-recycled) slot. The keep ref
+    // names the caller-running EC; it MUST NOT carry a gen — its slot
+    // is `parkSelfFaulted`'d (state .exited) and will be reaped lazily,
+    // and we identify it by bare-ptr identity to skip it during the
+    // walk. Both refs use `SlabRef` to satisfy the fat-pointer
+    // invariant, but the visitor never `.lock()`s them (we already
+    // hold cd._gen_lock and the keep EC is the very EC executing this
+    // path) — the `.ptr` accesses on the chains below are bracketed by
+    // that outer lock and are explicitly self-alive.
+    const Visitor = struct {
+        cd_ref: SlabRef(CapabilityDomain),
+        cd_addr_space_root: PAddr,
+        keep_ref: ?SlabRef(ExecutionContext),
+    };
+    var ctx = Visitor{
+        .cd_ref = SlabRef(CapabilityDomain).init(cd, cd_gen),
+        .cd_addr_space_root = cd_addr_space_root,
+        .keep_ref = if (keep) |k| SlabRef(ExecutionContext).init(k, k._gen_lock.currentGen()) else null,
+    };
+    slab_instance.forEachAlive(
+        &ctx,
+        struct {
+            fn visit(c: *Visitor, ec: *ExecutionContext, _: u63) bool {
+                if (c.keep_ref) |kr| {
+                    // self-alive: keep_ref names the EC running this code
+                    // path; pointer identity check, no deref.
+                    if (ec == kr.ptr) return true;
+                }
+                // self-alive: cd_ref names the CD whose _gen_lock the
+                // outer caller holds; checking ec.domain alignment
+                // against it is pointer arithmetic only, no deref.
+                if (ec.domain.ptr != c.cd_ref.ptr) return true;
+                if (ec.domain.gen != c.cd_ref.gen) return true;
+                // self-alive: same outer-locked CD, passed through to
+                // the per-EC destroy helper which only uses the bare
+                // pointer for caller_cd identity comparison.
+                destroyExecutionContextLocked(ec, c.cd_addr_space_root, c.cd_ref.ptr);
+                return true;
+            }
+        }.visit,
+    );
+}
+
+/// Same as `destroyExecutionContext`, but tailored for the
+/// `destroyCapabilityDomain` walk: avoids the same-class recursive
+/// acquire on `ec.domain._gen_lock` (the caller already holds that lock
+/// and SecureSlab disallows recursive acquire on the same class), and
+/// deliberately skips kstack reclaim (see comment near the slab destroy
+/// at the bottom of this fn for the rationale).
+///
+/// `dom_root` is reserved for a future kstack-reclaim path; today the
+/// kstack is left mapped because tearing it down inline races against
+/// the dying EC's last cross-core dispatch.
+///
+/// Caller passes its own CD pointer in `caller_cd` — any pending-reply
+/// holder ref pointing at that CD is cleared without re-locking it.
+/// For pending replies pointing at OTHER domains (cross-domain reply
+/// pin), we run the normal `abandonPendingReply` path.
+pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, caller_cd: *CapabilityDomain) void {
+    _ = dom_root;
+
+    if (ec.pending_reply_holder != null) {
+        if (ec.pending_reply_domain) |dom_ref| {
+            if (dom_ref.ptr == caller_cd) {
+                // Same-CD reply pin — the user_table has already been
+                // disarmed by the time we get here (the holder slot
+                // referenced this caller_cd's table). Just drop the
+                // back-pointer; user_table is about to be freed.
+                ec.pending_reply_holder = null;
+                ec.pending_reply_domain = null;
+                ec.pending_reply_slot = 0;
+            } else {
+                abandonPendingReply(ec);
+            }
+        } else {
+            ec.pending_reply_holder = null;
+            ec.pending_reply_slot = 0;
+        }
+    }
+
+    if (ec.state == .ready) {
+        scheduler.removeFromQueue(ec);
+    } else if (ec.state == .suspended_on_port) {
+        if (ec.suspend_port) |port_ref| {
+            const port_ptr = port_ref.lock(@src()) catch null;
+            if (port_ptr) |p| {
+                _ = p.waiters.remove(ec);
+                if (p.waiters.isEmpty()) p.waiter_kind = .none;
+                port_ref.unlock();
+            }
+        }
+    }
+
+    for (&ec.event_routes) |*slot| slot.* = null;
+
+    if (ec.perfmon_state != null) releasePerfmonState(ec);
+
+    // Step-10 leak-budget tradeoff: kstack pages stay mapped (and the
+    // backing PMM pages stay live) for the full kernel run. A future
+    // patch can move kstack reclaim into a deferred per-core "to-free"
+    // queue drained by the scheduler from a stack the EC does not own;
+    // doing it inline here is racy with the EC's last cross-core
+    // dispatch and was observed to corrupt the buddy allocator (its
+    // last frame might still be in some other core's TLB / IRQ stack).
+    // The slab slot freed below is the dominant pressure: it's what
+    // gates a 256-test cumulative run, not the per-EC 48 KiB of stack.
+    ec.state = .exited;
+    const gen = ec._gen_lock.currentGen();
+    slab_instance.destroy(ec, gen) catch {};
+}
+
 /// Final teardown — remove from any queue, clear event_routes, mark
 /// outstanding reply as abandoned, release perfmon state, free stacks,
 /// release slab.
-fn destroyExecutionContext(ec: *ExecutionContext) void {
+pub fn destroyExecutionContext(ec: *ExecutionContext) void {
     abandonPendingReply(ec);
 
     if (ec.state == .ready) {

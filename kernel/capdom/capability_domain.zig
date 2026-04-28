@@ -861,7 +861,7 @@ pub fn allocCapabilityDomain(
 /// + per-VAR unmap + slab destroy). These are smaller per-test than
 /// the table blocks and don't push the full-475-test runner past the
 /// PMM budget on a 1 GB QEMU instance.
-fn destroyCapabilityDomain(cd: *CapabilityDomain) void {
+fn destroyCapabilityDomain(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) void {
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
 
     // Disarm every Timer reachable from this domain's handle table
@@ -876,6 +876,29 @@ fn destroyCapabilityDomain(cd: *CapabilityDomain) void {
     // `cd._gen_lock`, so `cd.kernel_table` / `cd.user_table` are stable
     // for this walk.
     zag.sched.timer.disarmTimerHandlesInDomain(cd);
+
+    // Tear down every EC that was allocated against this domain (vCPU
+    // ECs created by `create_vcpu`, sub-ECs created by
+    // `create_execution_context`). The EC that called `delete(SLOT_SELF)`
+    // is `caller_ec` — its kstack frame is the one we are currently
+    // executing on and gets reaped lazily once the dispatcher iretq's
+    // off it. We pass the CD's addr_space_root directly because we hold
+    // the CD's _gen_lock — the EC destroy path's normal `ec.domain.lock()`
+    // would recurse on the same class and trip lockdep. ECs walked here
+    // include vCPU ECs whose `vm` ref points at `cd.vm` — destroy them
+    // BEFORE the VM tear-down below or vCPU `ec.vm.ptr` is dangling.
+    const cd_gen = cd._gen_lock.currentGen();
+    zag.sched.execution_context.destroyEcsInDomain(cd, cd_gen, cd.addr_space_root, caller_ec);
+
+    // Tear down the optional per-domain VM. `destroyVm` frees the
+    // arch CtrlStateCell, the stage-2 root, and the VM slab slot, and
+    // clears `cd.vm = null`. Without this, every `create_virtual_machine`
+    // test leaks a VM slab slot + a 4 KiB host page — by ~iter 256 the
+    // VM slab is full.
+    if (cd.vm) |vm_ref| {
+        // self-alive: cd holds the VM ref for the VM's lifetime.
+        zag.capdom.virtual_machine.releaseHandle(vm_ref.ptr);
+    }
 
     // Snapshot the table-block pointers before `destroyLocked` zeroes
     // the cd struct. `destroyLockedInner`'s `zeroExceptGenLock` clears
@@ -1207,8 +1230,14 @@ pub fn releaseSelf(cd: *CapabilityDomain) void {
     // `scheduler.run()` epilogue picks up the next ready EC instead
     // of iretq'ing the now-doomed test EC. Mirrors the
     // `fireThreadFault` no-route fallback.
-    if (zag.sched.scheduler.currentEc()) |ec| {
+    //
+    // Capture the caller EC BEFORE `parkSelfFaulted` clears it from
+    // `current_ec`; `destroyCapabilityDomain` must skip this EC when
+    // walking the domain's ECs to destroy (its kernel stack is the
+    // one we are currently executing on).
+    const caller_ec = zag.sched.scheduler.currentEc();
+    if (caller_ec) |ec| {
         zag.sched.execution_context.parkSelfFaulted(ec);
     }
-    destroyCapabilityDomain(cd);
+    destroyCapabilityDomain(cd, caller_ec);
 }
