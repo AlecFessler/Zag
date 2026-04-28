@@ -59,7 +59,7 @@ pub const Vm = struct {
     num_vcpus: u32 = 0,
     /// Owning capability domain. Set by `allocVmArchState` from the
     /// VirtualMachine's `domain` field; cleared by `freeVmArchState`.
-    owner: ?*CapabilityDomain = null,
+    owner: ?SlabRef(CapabilityDomain) = null,
     exit_box: VmExitBox = .{},
     policy: vm_hw.VmPolicy = .{},
     vm_id: u64 = 0,
