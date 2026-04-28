@@ -186,6 +186,25 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
 
     const cd = caller_domain.lockTyped(CapabilityDomain) catch
         return errors.E_BADCAP;
+
+    // SLOT_SELF special case. The slot's type tag is
+    // `.capability_domain_self` — `capability.releaseHandle` routes to
+    // `capability_domain.releaseSelf`, which calls
+    // `destroyCapabilityDomain` -> `slab_instance.destroyLocked`. That
+    // clears the lock bit and bumps gen → even (freed) atomically, then
+    // frees the user/kernel table PMM blocks. After this, both the cd
+    // struct (now on the slab freelist) and the user_table/kernel_table
+    // memory are unsafe to touch:
+    //   - `clearAndFreeSlot` writes to `holder.user_table[slot]` (freed
+    //     PMM block) and `&holder.kernel_table[slot]` (freed PMM block).
+    //   - The deferred `unlockTyped` would assert `prev & 1 == 1` on a
+    //     gen-lock word whose lock bit was just cleared by
+    //     `destroyLocked` — assertion failure on debug builds.
+    // Bypass both for slot 0.
+    if (slot == 0) {
+        capability.releaseHandle(cd, slot, undefined);
+        return 0;
+    }
     defer caller_domain.unlockTyped(CapabilityDomain);
 
     const entry = capability.resolveHandleOnDomain(cd, slot, null) orelse

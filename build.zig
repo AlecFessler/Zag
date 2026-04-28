@@ -395,7 +395,7 @@ pub fn build(b: *std.Build) void {
         ;
         break :blk b.fmt(
             \\exec qemu-system-x86_64 \
-            \\ -m 1G \
+            \\ -m 4G \
             \\ -bios /usr/share/ovmf/x64/OVMF.4m.fd \
             \\ -drive file=fat:rw:{s}/{s},format=raw \
             \\ -serial mon:stdio \

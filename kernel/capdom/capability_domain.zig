@@ -864,25 +864,37 @@ pub fn allocCapabilityDomain(
 fn destroyCapabilityDomain(cd: *CapabilityDomain) void {
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
 
-    // Free the two handle-table PMM blocks. These are the dominant
-    // per-domain allocations (96 KiB each at MAX_HANDLES_PER_DOMAIN =
-    // 4096) and account for the bulk of the per-test PMM consumption
-    // a long-running test runner accumulates.
+    // Snapshot the table-block pointers before `destroyLocked` zeroes
+    // the cd struct. `destroyLockedInner`'s `zeroExceptGenLock` clears
+    // every field of `cd` except `_gen_lock`, so reads of
+    // `cd.user_table` / `cd.kernel_table` after destroy return null.
     const user_buf: [*]u8 = @ptrCast(cd.user_table);
-    pmm_mgr.freeBlock(user_buf[0..USER_TABLE_BYTES]);
     const kernel_buf: [*]u8 = @ptrCast(cd.kernel_table);
+    const addr_space_id = cd.addr_space_id;
+
+    // Drop the slab slot FIRST. Caller (`derivation.deleteAndDetach`
+    // on the SLOT_SELF path) holds `cd._gen_lock` from `lockTyped`;
+    // `destroyLocked` flips gen → (gen+1) even and clears the lock
+    // bit in one release-store. After this point, `forEachAlive`
+    // visitors on other cores skip this slot via parity, so it is safe
+    // to free the table-backing PMM blocks below without UAF'ing a
+    // mid-walk visitor that observed gen=odd before our flip.
+    //
+    // `destroy` (the lock-the-gen variant) would re-enter `lockWithGen`
+    // and deadlock against the caller's lock; `destroyLocked` is the
+    // already-locked sibling and is what convention requires here.
+    const gen = cd._gen_lock.currentGen();
+    slab_instance.destroyLocked(cd, gen);
+
+    // Free table PMM blocks. These are the dominant per-domain
+    // allocations (96 KiB each at MAX_HANDLES_PER_DOMAIN = 4096).
+    pmm_mgr.freeBlock(user_buf[0..USER_TABLE_BYTES]);
     pmm_mgr.freeBlock(kernel_buf[0..KERNEL_TABLE_BYTES]);
 
     // Recycle the PCID/ASID. id 0 is the boot/kernel sentinel and
     // never assigned to a domain, so the != 0 guard mirrors the
     // pcid.free() precondition.
-    if (cd.addr_space_id != 0) arch.paging.freeAddrSpaceId(cd.addr_space_id);
-
-    // Drop the slab slot. Concurrent observers of stale handles
-    // detect the gen-flip on next lockWithGen and surface E_TERM via
-    // the standard at-most-one stale-handle path.
-    const gen = cd._gen_lock.currentGen();
-    slab_instance.destroy(cd, gen) catch {};
+    if (addr_space_id != 0) arch.paging.freeAddrSpaceId(addr_space_id);
 }
 
 /// Pop the head of the free-slot list. Returns `null` (E_FULL) if the
