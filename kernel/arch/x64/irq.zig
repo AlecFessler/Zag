@@ -13,7 +13,6 @@ const kprof_dump = zag.kprof.dump;
 const paging_mod = zag.arch.x64.paging;
 const port = zag.sched.port;
 const sched = zag.sched.scheduler;
-const serial = zag.arch.x64.serial;
 const time = zag.arch.dispatch.time;
 const timer_wheel = zag.sched.timer;
 
@@ -198,11 +197,14 @@ fn fpuFlushIpiHandler(_: *cpu.Context) void {
 /// is also used by `apic.sendSchedulerIpi` for cross-core / self
 /// preempt IPIs (`enqueueOnCore`, `yield`), which is harmless: each
 /// invocation just resets the next tick to `TIMESLICE_NS` from now.
-var _dbg_tick_count: u64 = 0;
 fn schedTimerHandler(ctx: *cpu.Context) void {
     _ = ctx;
-    const n = @atomicRmw(u64, &_dbg_tick_count, .Add, 1, .monotonic);
-    if (n < 5 or n % 100 == 0) serial.print("[tick {}]\n", .{n});
+    // No periodic debug print here. The runner emits its own per-batch
+    // heartbeat over COM1, and any kernel-side periodic `serial.print`
+    // races against the runner's user-side port-IO trap path
+    // (`emulateVirtualBar` issues `cpu.outb` directly without
+    // `print_lock`), interleaving kernel bytes between userspace bytes
+    // and corrupting `[runner] PASS …` lines.
     time.getPreemptionTimer().armInterruptTimer(sched.TIMESLICE_NS);
     // Drive any deadline-based wakeups for recv-with-timeout and
     // futex_wait_val/futex_wait_change. No-op when nothing has expired.
