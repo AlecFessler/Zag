@@ -17,26 +17,6 @@ const VAddr = zag.memory.address.VAddr;
 
 pub const ArchCpuContext = cpu.Context;
 
-/// Number of general-purpose registers saved in a fault snapshot.
-/// x86-64: 15 (rax-r15 minus rsp).
-pub const fault_gpr_count: usize = 15;
-
-/// Size of the register portion of a FaultMessage: ip + flags + sp + GPRs.
-pub const fault_regs_size: usize = (3 + fault_gpr_count) * @sizeOf(u64);
-
-/// Total size of a FaultMessage written to userspace (32-byte header + regs).
-pub const fault_msg_size: usize = 32 + fault_regs_size;
-
-/// Architecture-neutral snapshot of a faulted thread's registers.
-/// Used by fault delivery to serialize register state without the
-/// generic kernel referencing arch-specific register names.
-pub const FaultRegSnapshot = struct {
-    ip: u64,
-    flags: u64,
-    sp: u64,
-    gprs: [fault_gpr_count]u64,
-};
-
 pub const PageFaultContext = struct {
     faulting_address: u64,
     is_kernel_privilege: bool,
@@ -696,28 +676,6 @@ export fn interruptStubEpilogue() callconv(.naked) void {
     );
 }
 
-pub fn serializeFaultRegs(ctx: *const ArchCpuContext) FaultRegSnapshot {
-    const r = &ctx.regs;
-    return .{
-        .ip = ctx.rip,
-        .flags = ctx.rflags,
-        .sp = ctx.rsp,
-        .gprs = .{
-            r.r15, r.r14, r.r13, r.r12, r.r11, r.r10, r.r9,  r.r8,
-            r.rdi, r.rsi, r.rbp, r.rbx, r.rdx, r.rcx, r.rax,
-        },
-    };
-}
-
-pub const SyscallArgs = struct {
-    num: u64,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    arg4: u64,
-};
-
 pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rax = value;
 }
@@ -863,19 +821,6 @@ pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
     ctx.regs.r13 = gprs[10];
     ctx.regs.r14 = gprs[11];
     ctx.regs.r15 = gprs[12];
-}
-
-pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
-    ctx.rip = snapshot.ip;
-    ctx.rflags = snapshot.flags;
-    ctx.rsp = snapshot.sp;
-    const r = &ctx.regs;
-    inline for (.{
-        "r15", "r14", "r13", "r12", "r11", "r10", "r9",  "r8",
-        "rdi", "rsi", "rbp", "rbx", "rdx", "rcx", "rax",
-    }, 0..) |field, i| {
-        @field(r, field) = snapshot.gprs[i];
-    }
 }
 
 export fn dispatchInterrupt(ctx: *cpu.Context) void {

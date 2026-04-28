@@ -8,7 +8,6 @@ const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
-const Range = zag.utils.range.Range;
 const VarPageSize = zag.capdom.var_range.PageSize;
 const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
 
@@ -28,20 +27,6 @@ pub fn vmInit() void {
     }
 }
 
-pub fn vmPerCoreInit() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.vm.vmPerCoreInit(),
-        .aarch64 => {
-            aarch64.vm.vmPerCoreInit();
-            // EL2 vector-table install is a per-core concern but lives in
-            // the hyp.zig half of the aarch64 VM split; keep the call-out
-            // here so vm.zig does not need a back-reference into hyp.
-            aarch64.hyp.installHypVectors();
-        },
-        else => unreachable,
-    }
-}
-
 /// BSP post-bootloader handoff. On aarch64, when UEFI's firmware drops
 /// us at EL2 (only observable by the bootloader, which signals via
 /// `boot_info.arrived_at_el2`), arm the hyp-stub gate and install the
@@ -55,22 +40,6 @@ pub fn bspBootHandoff(arrived_at_el2: bool) void {
             aarch64.hyp.installHypVectors();
         },
         else => unreachable,
-    }
-}
-
-pub fn initVmSlab(data_range: Range, ptrs_range: Range, links_range: Range) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.slab_instance = x64.kvm.vm.VmAllocator.init(data_range, ptrs_range, links_range),
-        .aarch64 => aarch64.kvm.vm.slab_instance = aarch64.kvm.vm.VmAllocator.init(data_range, ptrs_range, links_range),
-        else => {},
-    }
-}
-
-pub fn initVcpuSlab(data_range: Range, ptrs_range: Range, links_range: Range) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.slab_instance = x64.kvm.vcpu.VCpuAllocator.init(data_range, ptrs_range, links_range),
-        .aarch64 => aarch64.kvm.vcpu.slab_instance = aarch64.kvm.vcpu.VCpuAllocator.init(data_range, ptrs_range, links_range),
-        else => {},
     }
 }
 
@@ -125,15 +94,6 @@ pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void
         .aarch64 => aarch64.kvm.vcpu.allocVcpuArchState(vm, vcpu_ec),
         else => unreachable,
     };
-}
-
-/// Free per-vCPU arch state.
-pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.freeVcpuArchState(vcpu_ec),
-        .aarch64 => aarch64.kvm.vcpu.freeVcpuArchState(vcpu_ec),
-        else => unreachable,
-    }
 }
 
 /// Allocate the stage-2 / nested page-table root for `vm` (EPT root on
@@ -274,24 +234,3 @@ pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
     };
 }
 
-/// Arm an emulated guest timer that fires `deadline_ns` (monotonic).
-/// Used by the in-kernel virtual timer device that exposes guest
-/// vtimer behaviour without round-tripping every program through
-/// userspace. Spec §[virtual_machine].
-pub fn vmEmulatedTimerArm(vcpu_ec: *ExecutionContext, deadline_ns: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.vmEmulatedTimerArm(vcpu_ec, deadline_ns),
-        .aarch64 => aarch64.kvm.vcpu.vmEmulatedTimerArm(vcpu_ec, deadline_ns),
-        else => unreachable,
-    }
-}
-
-/// Cancel an emulated guest timer previously armed by
-/// `vmEmulatedTimerArm`.
-pub fn vmEmulatedTimerCancel(vcpu_ec: *ExecutionContext) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.vmEmulatedTimerCancel(vcpu_ec),
-        .aarch64 => aarch64.kvm.vcpu.vmEmulatedTimerCancel(vcpu_ec),
-        else => unreachable,
-    }
-}

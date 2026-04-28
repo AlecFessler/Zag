@@ -43,12 +43,10 @@ const capability_domain = zag.capdom.capability_domain;
 const errors = zag.syscall.errors;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
-const CapabilityType = capability.CapabilityType;
 const ErasedSlabRef = capability.ErasedSlabRef;
 const HandleLink = capability.HandleLink;
 const KernelHandle = capability.KernelHandle;
 const SpinLock = zag.utils.sync.SpinLock;
-const Word0 = capability.Word0;
 
 /// Defensive bound on tree-walk depth. Caps both the max depth a single
 /// tree can reach and the sibling-chain length we will scan before
@@ -244,34 +242,6 @@ fn lockEntrySkip(link: HandleLink, held: ?*CapabilityDomain) ?LockedEntry {
 fn unlockEntrySkip(le: LockedEntry, held: ?*CapabilityDomain) void {
     if (held != null and le.dom_ref.ptr == @as(*anyopaque, @ptrCast(held.?))) return;
     le.dom_ref.unlockTyped(CapabilityDomain);
-}
-
-/// Install `child_entry` as the new head of `parent_entry.first_child`.
-/// Asserts same `CapabilityType`. Both domains must be locked by caller.
-fn linkAsChild(
-    parent_domain: ErasedSlabRef,
-    parent_slot: u12,
-    parent_entry: *KernelHandle,
-    target_domain: ErasedSlabRef,
-    child_slot: u12,
-    child_entry: *KernelHandle,
-    parent_type: CapabilityType,
-    child_word0: u64,
-) void {
-    std.debug.assert(parent_type == Word0.typeTag(child_word0));
-    std.debug.assert(parent_entry.ref.ptr != null);
-    std.debug.assert(child_entry.ref.ptr != null);
-
-    child_entry.parent = .{
-        .domain = parent_domain,
-        .slot = @as(u16, parent_slot),
-    };
-    child_entry.next_sibling = parent_entry.first_child;
-    child_entry.first_child = .{};
-    parent_entry.first_child = .{
-        .domain = target_domain,
-        .slot = @as(u16, child_slot),
-    };
 }
 
 /// Walk a sibling chain rooted at `head`, releasing each subtree DFS.

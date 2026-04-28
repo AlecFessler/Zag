@@ -63,26 +63,6 @@ const sync_debug = zag.utils.sync.debug;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const VAddr = zag.memory.address.VAddr;
 
-/// Number of general-purpose registers saved in a fault snapshot.
-/// aarch64: 31 (x0-x30).
-pub const fault_gpr_count: usize = 31;
-
-/// Size of the register portion of a FaultMessage: ip + flags + sp + GPRs.
-pub const fault_regs_size: usize = (3 + fault_gpr_count) * @sizeOf(u64);
-
-/// Total size of a FaultMessage written to userspace (32-byte header + regs).
-pub const fault_msg_size: usize = 32 + fault_regs_size;
-
-/// Architecture-neutral snapshot of a faulted EC's registers.
-/// Used by fault delivery to serialize register state without the
-/// generic kernel referencing arch-specific register names.
-pub const FaultRegSnapshot = struct {
-    ip: u64,
-    flags: u64,
-    sp: u64,
-    gprs: [fault_gpr_count]u64,
-};
-
 pub const Registers = extern struct {
     x0: u64,
     x1: u64,
@@ -340,75 +320,8 @@ pub fn switchTo(ec: *ExecutionContext) noreturn {
     unreachable;
 }
 
-/// Convert an ArchCpuContext into the arch-neutral FaultRegSnapshot.
-/// ARM ARM D13.2.36: ELR_EL1 is the faulting instruction pointer.
-/// ARM ARM D13.2.127: SPSR_EL1 is the saved processor state (flags equivalent).
-pub fn serializeFaultRegs(ctx: *const ArchCpuContext) FaultRegSnapshot {
-    const r = &ctx.regs;
-    return .{
-        .ip = ctx.elr_el1,
-        .flags = ctx.spsr_el1,
-        .sp = ctx.sp_el0,
-        .gprs = .{
-            r.x0,  r.x1,  r.x2,  r.x3,  r.x4,  r.x5,  r.x6,  r.x7,
-            r.x8,  r.x9,  r.x10, r.x11, r.x12, r.x13, r.x14, r.x15,
-            r.x16, r.x17, r.x18, r.x19, r.x20, r.x21, r.x22, r.x23,
-            r.x24, r.x25, r.x26, r.x27, r.x28, r.x29, r.x30,
-        },
-    };
-}
-
-/// Apply a modified register snapshot back to a faulted thread's context.
-/// Reverse of serializeFaultRegs.
-pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
-    ctx.elr_el1 = snapshot.ip;
-    ctx.spsr_el1 = snapshot.flags;
-    ctx.sp_el0 = snapshot.sp;
-    const r = &ctx.regs;
-    inline for (.{
-        "x0",  "x1",  "x2",  "x3",  "x4",  "x5",  "x6",  "x7",
-        "x8",  "x9",  "x10", "x11", "x12", "x13", "x14", "x15",
-        "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
-        "x24", "x25", "x26", "x27", "x28", "x29", "x30",
-    }, 0..) |field, i| {
-        @field(r, field) = snapshot.gprs[i];
-    }
-}
-
-pub const SyscallArgs = struct {
-    num: u64,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    arg4: u64,
-};
-
-pub fn getSyscallArgs(ctx: *const ArchCpuContext) SyscallArgs {
-    return .{
-        .num = ctx.regs.x8,
-        .arg0 = ctx.regs.x0,
-        .arg1 = ctx.regs.x1,
-        .arg2 = ctx.regs.x2,
-        .arg3 = ctx.regs.x3,
-        .arg4 = ctx.regs.x4,
-    };
-}
-
-pub fn getSyscallReturn(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.x0;
-}
-
 pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x0 = value;
-}
-
-/// Write the syscall return word into vreg 0 — `[user_sp + 0]` per
-/// Spec §[syscall_abi]. Mirrors `arch.x64.interrupts.writeUserSyscallWord`;
-/// see that function's doc comment for the full contract. aarch64 does
-/// not gate user-page kernel writes through SMAP — the write is direct.
-pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
-    @as(*u64, @ptrFromInt(ctx.sp_el0)).* = value;
 }
 
 /// Spec §[event_state] vreg 2 — x1 on aarch64.
@@ -421,26 +334,9 @@ pub fn setEventAddr(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x2 = value;
 }
 
-/// Spec §[event_state] vreg 3 read — x2 on aarch64. Used to snapshot
-/// the suspending EC's GPR-backed vreg 3 for propagation to the
-/// receiver at recv time.
-pub fn getEventVreg3(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.x2;
-}
-
 /// Spec §[event_state] vreg 4 — x3 on aarch64.
 pub fn setEventVreg4(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x3 = value;
-}
-
-/// Spec §[event_state] vreg 4 read — x3 on aarch64.
-pub fn getEventVreg4(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.x3;
-}
-
-/// Spec §[event_state] vreg 5 — x4 on aarch64.
-pub fn getEventVreg5(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.x4;
 }
 
 pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
@@ -460,16 +356,6 @@ pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
 /// receiver's PC modification onto the suspended EC's saved frame.
 pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
     ctx.elr_el1 = value;
-}
-
-/// Spec §[event_state] vreg 32 write — writes the suspended EC's PC
-/// into the receiver's user stack at `[ctx.sp_el0 + 8]`. Caller MUST
-/// ensure TTBR0 already references the receiver's address space (the
-/// stack page only exists there). Mirrors the x86-64
-/// `writeUserVreg14` contract; aarch64 has no SMAP equivalent so the
-/// store is direct.
-pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
-    @as(*u64, @ptrFromInt(ctx.sp_el0 + 8)).* = value;
 }
 
 /// Companion read for `writeUserVreg14`. Returns the value the
@@ -528,40 +414,3 @@ pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
     ctx.regs.x12 = gprs[12];
 }
 
-pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.x5;
-}
-
-pub fn getIpcMetadata(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.x6;
-}
-
-pub fn setIpcMetadata(ctx: *ArchCpuContext, value: u64) void {
-    ctx.regs.x6 = value;
-}
-
-pub fn getIpcPayloadWords(ctx: *const ArchCpuContext) [5]u64 {
-    return .{ ctx.regs.x0, ctx.regs.x1, ctx.regs.x2, ctx.regs.x3, ctx.regs.x4 };
-}
-
-pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_count: u3) void {
-    if (word_count >= 1) dst.regs.x0 = src.regs.x0;
-    if (word_count >= 2) dst.regs.x1 = src.regs.x1;
-    if (word_count >= 3) dst.regs.x2 = src.regs.x2;
-    if (word_count >= 4) dst.regs.x3 = src.regs.x3;
-    if (word_count >= 5) dst.regs.x4 = src.regs.x4;
-}
-
-pub const IpcPayloadSnapshot = struct { words: [5]u64 };
-
-pub fn saveIpcPayload(ctx: *const ArchCpuContext) IpcPayloadSnapshot {
-    return .{ .words = getIpcPayloadWords(ctx) };
-}
-
-pub fn restoreIpcPayload(ctx: *ArchCpuContext, words: [5]u64) void {
-    ctx.regs.x0 = words[0];
-    ctx.regs.x1 = words[1];
-    ctx.regs.x2 = words[2];
-    ctx.regs.x3 = words[3];
-    ctx.regs.x4 = words[4];
-}

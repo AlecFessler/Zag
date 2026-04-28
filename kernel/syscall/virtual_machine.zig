@@ -5,7 +5,6 @@ const errors = zag.syscall.errors;
 const vm_obj = zag.capdom.virtual_machine;
 
 const CapabilityDomainCaps = zag.capdom.capability_domain.CapabilityDomainCaps;
-const CapabilityType = capability.CapabilityType;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PortCaps = zag.sched.port.PortCaps;
 const VmCaps = vm_obj.VmCaps;

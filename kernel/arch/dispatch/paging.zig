@@ -138,19 +138,6 @@ pub fn unmapPage(
     }
 }
 
-pub fn updatePagePerms(
-    addr_space_root: PAddr,
-    virt: VAddr,
-    new_perms: MemoryPerms,
-    kind: MappingKind,
-) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.updatePagePerms(addr_space_root, virt, new_perms, kind),
-        .aarch64 => aarch64.paging.updatePagePerms(addr_space_root, virt, new_perms, kind),
-        else => unreachable,
-    }
-}
-
 pub fn resolveVaddr(
     addr_space_root: PAddr,
     virt: VAddr,
@@ -218,22 +205,6 @@ pub fn setKernelAddrSpace(root: PAddr) void {
     }
 }
 
-pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.freeUserAddrSpace(addr_space_root),
-        .aarch64 => aarch64.paging.freeUserAddrSpace(addr_space_root),
-        else => unreachable,
-    }
-}
-
-pub fn copyKernelMappings(root: VAddr) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.copyKernelMappings(root),
-        .aarch64 => aarch64.paging.copyKernelMappings(root),
-        else => unreachable,
-    }
-}
-
 pub fn dropIdentityMapping() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.dropIdentityMapping(),
@@ -279,14 +250,6 @@ pub fn classifyRelocation(rtype: u32) RelocAction {
             if (rtype == @intFromEnum(R.ABS32)) return .abs32;
             return .unsupported;
         },
-        else => unreachable,
-    };
-}
-
-pub fn isRelativeRelocation(rela_type: u32) bool {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => rela_type == @intFromEnum(std.elf.R_X86_64.RELATIVE),
-        .aarch64 => rela_type == @intFromEnum(std.elf.R_AARCH64.RELATIVE),
         else => unreachable,
     };
 }
@@ -338,33 +301,6 @@ pub fn allocAddrSpaceRoot() !PAddr {
     };
 }
 
-/// Install `root` as the active user address space on the local core,
-/// tagged by `id` (PCID on x86-64, ASID on aarch64).
-pub fn swapAddrSpace(root: PAddr, id: u16) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.swapAddrSpace(root, id),
-        .aarch64 => aarch64.paging.swapAddrSpace(root, id),
-        else => unreachable,
-    }
-}
-
-/// Local-core TLB invalidation over a contiguous run of `page_count`
-/// pages of size `sz` starting at `virt`. Used immediately after
-/// unmapping or permission downgrades when the caller is the only core
-/// that could have cached the translation.
-pub fn invalidateTlbRange(
-    addr_space_root: PAddr,
-    virt: VAddr,
-    sz: VarPageSize,
-    page_count: u32,
-) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.invalidateTlbRange(addr_space_root, virt, sz, page_count),
-        .aarch64 => aarch64.paging.invalidateTlbRange(addr_space_root, virt, sz, page_count),
-        else => unreachable,
-    }
-}
-
 /// Cross-core TLB shootdown over the same page range, addressed by
 /// `addr_space_id` so remote cores can filter quickly. Issues a
 /// shootdown IPI and waits for ack from every core that may hold a
@@ -378,28 +314,6 @@ pub fn shootdownTlbRange(
     switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.shootdownTlbRange(addr_space_id, virt, sz, page_count),
         .aarch64 => aarch64.paging.shootdownTlbRange(addr_space_id, virt, sz, page_count),
-        else => unreachable,
-    }
-}
-
-/// Cross-core full-ASID/PCID shootdown. Used by `delete` of a
-/// capability domain when its address space root is being torn down.
-pub fn shootdownTlbAll(addr_space_id: u16) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.shootdownTlbAll(addr_space_id),
-        .aarch64 => aarch64.paging.shootdownTlbAll(addr_space_id),
-        else => unreachable,
-    }
-}
-
-/// Invalidate cached intermediate paging structures (PML4/PDPT/PD
-/// nodes on x86-64 via INVPCID type-2; TLBI ALLE1IS on aarch64).
-/// Required after edits that change which leaf a higher-level walker
-/// would resolve — e.g. shrinking a 2 MiB page to 4 KiB leaves.
-pub fn invalidatePagingStructureCache(addr_space_root: PAddr) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.invalidatePagingStructureCache(addr_space_root),
-        .aarch64 => aarch64.paging.invalidatePagingStructureCache(addr_space_root),
         else => unreachable,
     }
 }
