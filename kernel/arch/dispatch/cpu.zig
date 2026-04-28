@@ -289,19 +289,6 @@ pub fn fpuClearTrap() void {
     }
 }
 
-/// Cross-core lazy-FPU eviction IPI. Sent by the destination core when
-/// `ec.last_fpu_core` names a different core: the source core saves
-/// `ec`'s live FP regs into `ec.fpu_state`, clears its `last_fpu_owner`
-/// slot, then ACKs. Synchronous — caller spins until the source core
-/// finishes. Spec §[execution_context] lazy FPU.
-pub fn fpuFlushIpiEc(target_core: u8, ec: *ExecutionContext) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.fpuFlushIpiEc(target_core, ec),
-        .aarch64 => aarch64.cpu.fpuFlushIpiEc(target_core, ec),
-        else => unreachable,
-    }
-}
-
 // --- Power / shutdown / entropy ----------------------------------------
 
 pub const PowerAction = switch (builtin.cpu.arch) {
@@ -368,17 +355,6 @@ pub fn sysInfoInit() void {
 // ── Spec v3 EC dispatch primitives ───────────────────────────────────
 // FPU-trap arming, register-bank load, and TLS-base accessors used by
 // the ExecutionContext dispatch path. Spec §[execution_context].
-
-/// Arm the FPU-disabled trap (CR0.TS on x86-64, CPACR_EL1.FPEN=0 on
-/// aarch64) so the next user FP/SIMD instruction faults into the
-/// scheduler's lazy-FPU eviction path. Spec §[execution_context] lazy FPU.
-pub fn fpuArmTrap() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.fpuArmTrap(),
-        .aarch64 => aarch64.cpu.fpuArmTrap(),
-        else => unreachable,
-    }
-}
 
 /// Restore `ec.ctx` into the live register file and return to userspace
 /// via iretq / eret. Never returns to the caller. Used by the scheduler

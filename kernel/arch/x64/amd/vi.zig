@@ -45,11 +45,6 @@ const MMIO_EVT_LOG_BASE = 0x0010;
 /// Controls IOMMU enable, command buffer enable, event log enable, etc.
 const MMIO_CONTROL = 0x0018;
 
-/// Command Buffer Tail Pointer — spec MMIO Offset 2008h.
-/// Bits [18:4] = CmdTailPtr (16-byte aligned offset from buffer base).
-/// Written by software after enqueueing commands.
-const MMIO_CMD_BUF_TAIL = 0x2008;
-
 // ---------------------------------------------------------------------------
 // IOMMU Control Register bit definitions (spec MMIO Offset 0018h)
 // ---------------------------------------------------------------------------

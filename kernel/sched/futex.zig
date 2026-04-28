@@ -93,15 +93,6 @@ var expire_timed_scratch: [sched.MAX_CORES][MAX_TIMED_WAITERS]Snapshot = undefin
 /// in `addTimedWaiter` failure path).
 const FUTEX_TIMED_GROUP: u32 = 2;
 
-/// Returned by `wakeFromIrq`: count of woken ECs plus the mask of cores
-/// that need an explicit wake IPI follow-up. The IRQ path can't ride
-/// `enqueueOnCore`'s normal IPI emission because the caller wants to
-/// batch IPIs across the entire device handle list.
-pub const WakeResult = struct {
-    woken: u32 = 0,
-    idle_core_mask: u64 = 0,
-};
-
 fn bucketIdx(paddr: PAddr) usize {
     return @intCast((paddr.addr >> 3) % BUCKET_COUNT);
 }
@@ -169,94 +160,6 @@ fn removeNodesExcept(ec: *ExecutionContext, except_node: *const WaitNode, held_i
 fn pickCoreForEc(ec: *ExecutionContext) u64 {
     if (ec.affinity == 0) return arch.smp.coreID();
     return @ctz(ec.affinity);
-}
-
-/// Drop a torn-down EC from any futex bucket(s) and the timed list.
-/// Called by `terminate` and event tear-down for ECs blocked on a futex.
-pub fn removeBlockedEc(ec: *ExecutionContext) void {
-    if (ec.futex_wait_nodes) |nodes| {
-        const count: usize = ec.futex_bucket_count;
-        var i: usize = 0;
-        while (i < count) {
-            const node = &nodes[i];
-            const bucket = &buckets[bucketIdx(node.paddr)];
-            const irq = bucket.lock.lockIrqSave(@src());
-            _ = bucket.pq.remove(node);
-            bucket.lock.unlockIrqRestore(irq);
-            i += 1;
-        }
-        ec.futex_wait_nodes = null;
-        ec.futex_wait_vaddrs = null;
-        ec.futex_bucket_count = 0;
-    }
-    if (ec.futex_deadline_ns != 0) {
-        ec.futex_deadline_ns = 0;
-        removeTimedWaiter(ec);
-    }
-}
-
-/// Single-address futex wait. Equivalent to `waitVal` with N=1; kept
-/// as a thin entry point for callers that don't want to materialize a
-/// one-element slice.
-pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, ec: *ExecutionContext) i64 {
-    const bucket = &buckets[bucketIdx(paddr)];
-
-    const vaddr = VAddr.fromPAddr(paddr, null);
-    const value_ptr: *const u64 = @ptrFromInt(vaddr.addr);
-
-    const irq = bucket.lock.lockIrqSave(@src());
-
-    if (@atomicLoad(u64, value_ptr, .acquire) != expected) {
-        bucket.lock.unlockIrqRestore(irq);
-        return errors.E_AGAIN;
-    }
-
-    if (timeout_ns == 0) {
-        bucket.lock.unlockIrqRestore(irq);
-        return errors.E_TIMEOUT;
-    }
-
-    const max_timeout: u64 = @bitCast(@as(i64, -1));
-    if (timeout_ns != max_timeout) {
-        const now_ns = arch.time.getMonotonicClock().now();
-        ec.futex_deadline_ns = now_ns +| timeout_ns;
-    } else {
-        ec.futex_deadline_ns = 0;
-    }
-
-    var nodes: [1]WaitNode = .{.{
-        .ec = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen()),
-        .paddr = paddr,
-        .priority = ec.priority,
-    }};
-    ec.futex_wait_nodes = &nodes;
-    ec.futex_bucket_count = 1;
-    ec.state = .futex_wait;
-    bucket.pq.enqueue(&nodes[0]);
-
-    if (ec.futex_deadline_ns != 0) {
-        if (!addTimedWaiter(ec)) {
-            // All timed waiter slots are full. Undo while still holding
-            // the bucket lock to keep wake() (which spins on on_cpu) out
-            // of a deadlock.
-            _ = bucket.pq.remove(&nodes[0]);
-            bucket.lock.unlockIrqRestore(irq);
-            ec.state = .running;
-            ec.futex_wait_nodes = null;
-            ec.futex_bucket_count = 0;
-            ec.futex_deadline_ns = 0;
-            return errors.E_NOMEM;
-        }
-    }
-
-    bucket.lock.unlockIrqRestore(irq);
-
-    arch.cpu.enableInterrupts();
-    sched.yieldTo(null);
-
-    const was_timeout: bool = ec.futex_deadline_ns == FUTEX_TIMEOUT_SENTINEL;
-    ec.futex_deadline_ns = 0;
-    return if (was_timeout) errors.E_TIMEOUT else 0;
 }
 
 /// `futex_wake` — wake up to `count` ECs blocked on `paddr`.
@@ -327,68 +230,6 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
 
     bucket.lock.unlockIrqRestore(irq);
     return woken;
-}
-
-/// Device IRQ entry point — wake every EC blocked on `paddr` (no count
-/// cap) and return the set of cores that need an explicit wake IPI
-/// follow-up. Called by `devices/device_region.propagateIrqAndWake`
-/// after it bumps `field1.irq_count` for each domain-local handle copy.
-/// Spec §[device_irq] step 3.
-///
-/// The IRQ caller batches IPIs across the entire device handle list,
-/// so this function returns the mask instead of emitting IPIs inline.
-pub fn wakeFromIrq(paddr: PAddr) WakeResult {
-    var result: WakeResult = .{};
-    const wake_idx = bucketIdx(paddr);
-    const bucket = &buckets[wake_idx];
-
-    const irq = bucket.lock.lockIrqSaveOrdered(@src(), FUTEX_BUCKET_GROUP);
-
-    var requeue: WaitNodePriorityQueue = .{};
-
-    while (true) {
-        const node = bucket.pq.dequeue() orelse break;
-
-        if (node.paddr.addr != paddr.addr) {
-            requeue.enqueue(node);
-            continue;
-        }
-
-        const ec = node.ec.lock(@src()) catch continue;
-        node.ec.unlock();
-
-        const nodes = ec.futex_wait_nodes.?;
-        const node_idx: usize = (@intFromPtr(node) - @intFromPtr(nodes)) / @sizeOf(WaitNode);
-        ec.futex_wake_index = @intCast(node_idx);
-
-        removeNodesExcept(ec, node, wake_idx);
-
-        while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-        if (ec.futex_deadline_ns != 0) {
-            ec.futex_deadline_ns = 0;
-            removeTimedWaiter(ec);
-        }
-        // Spec §[futex_wait_val] / §[futex_wait_change]: write the woken
-        // user vaddr into the parked EC's syscall return slot before
-        // marking it ready. See `wake` above for the rationale.
-        if (ec.futex_wait_vaddrs) |vaddrs_ptr| {
-            arch_syscall.setSyscallReturn(ec.ctx, vaddrs_ptr[node_idx]);
-        }
-        ec.futex_bucket_count = 0;
-        ec.futex_wait_nodes = null;
-        ec.futex_wait_vaddrs = null;
-        ec.state = .ready;
-
-        const target_core = pickCoreForEc(ec);
-        sched.enqueueOnCore(@intCast(target_core), ec);
-        result.idle_core_mask |= @as(u64, 1) << @intCast(target_core);
-        result.woken += 1;
-    }
-
-    while (requeue.dequeue()) |n| bucket.pq.enqueue(n);
-
-    bucket.lock.unlockIrqRestore(irq);
-    return result;
 }
 
 /// `futex_wait_val` — block while every `(addrs[i], expected[i])`

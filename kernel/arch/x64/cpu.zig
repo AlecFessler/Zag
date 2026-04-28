@@ -194,14 +194,6 @@ pub const FpuFlushMailbox = struct {
 
 pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
 
-/// Spec-v3 EC fpu-flush IPI. Receiver is `fpuFlushIpiHandler`
-/// registered in `irq.zig`. Spec §[execution_context] lazy FPU.
-pub fn fpuFlushIpiEc(target_core: u8, ec: *ExecutionContext) void {
-    _ = target_core;
-    _ = ec;
-    @panic("not implemented");
-}
-
 pub const Registers = packed struct {
     r15: u64,
     r14: u64,

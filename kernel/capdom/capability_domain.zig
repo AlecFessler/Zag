@@ -28,7 +28,6 @@ const arch = zag.arch.dispatch;
 const elf_util = zag.utils.elf;
 const errors = zag.syscall.errors;
 const execution_context_mod = zag.sched.execution_context;
-const page_frame_mod = zag.memory.page_frame;
 const pmm = zag.memory.pmm;
 const scheduler = zag.sched.scheduler;
 const userspace_init = zag.boot.userspace_init;
@@ -42,7 +41,6 @@ const KernelHandle = zag.caps.capability.KernelHandle;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
 const ParsedElf = zag.utils.elf.ParsedElf;
-const Priority = zag.sched.execution_context.Priority;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAR = zag.capdom.var_range.VAR;
@@ -946,25 +944,6 @@ fn allocFreeSlot(cd: *CapabilityDomain) ?u12 {
     return slot;
 }
 
-/// Push a slot back onto the free-slot list. Zeros the user/kernel
-/// entries.
-fn returnSlotToFreeList(cd: *CapabilityDomain, slot: u12) void {
-    cd.user_table[slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
-    cd.kernel_table[slot].ref = .{};
-    cd.kernel_table[slot].parent = zag.caps.capability.encodeFreeNext(cd.free_head);
-    cd.kernel_table[slot].first_child = .{};
-    cd.kernel_table[slot].next_sibling = .{};
-    cd.free_head = @as(u16, slot);
-    cd.free_count += 1;
-}
-
-/// Look up a slot, validate type tag against `expected`, return the
-/// kernel-side entry. Returns null on free-slot, out-of-range, or
-/// type mismatch.
-fn lookupSlot(cd: *CapabilityDomain, slot: u12, expected: CapabilityType) ?*KernelHandle {
-    return zag.caps.capability.resolveHandleOnDomain(cd, slot, expected);
-}
-
 /// Linear scan for an existing handle to `obj` in this domain, used
 /// to enforce the at-most-one-per-(domain, object) invariant.
 /// Returns the existing slot id if found.
@@ -1130,12 +1109,6 @@ fn unlinkFreeSlot(cd: *CapabilityDomain, slot: u12) void {
 fn readSelfField0(cd: *const CapabilityDomain) u64 {
     return cd.user_table[0].field0;
 }
-fn readSelfField1(cd: *const CapabilityDomain) u64 {
-    return cd.user_table[0].field1;
-}
-fn readSelfCaps(cd: *const CapabilityDomain) u16 {
-    return Word0.caps(cd.user_table[0].word0);
-}
 
 /// Append `v` to `vars[var_count]`. Returns E_FULL when at MAX.
 pub fn appendVar(cd: *CapabilityDomain, v: *VAR) i64 {
@@ -1187,14 +1160,6 @@ pub fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64)
         i += 1;
     }
     return 0;
-}
-
-/// Top-level domain restart driver. Walks handle table applying per-
-/// handle restart_policy, copies snapshot-bound VARs, re-launches ECs.
-/// Returns negative E_TERM on unrecoverable failure (caller tears down).
-pub fn restartDomain(cd: *CapabilityDomain) i64 {
-    _ = cd;
-    return -1;
 }
 
 /// Public release-handle entry point invoked when `delete` is called

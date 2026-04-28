@@ -157,57 +157,6 @@ pub fn invalidateStage2Range(
     }
 }
 
-/// Load saved guest state from `vcpu_ec.ctx` into VMCS/VMCB or sysregs
-/// in preparation for `enterGuest`.
-pub fn loadGuestState(vcpu_ec: *ExecutionContext) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.loadGuestState(vcpu_ec),
-        .aarch64 => aarch64.kvm.vcpu.loadGuestState(vcpu_ec),
-        else => unreachable,
-    }
-}
-
-/// Save the live guest register state into `vcpu_ec.ctx`. Called from
-/// the VM-exit dispatch path before suspending the vCPU on its
-/// `exit_port`. Spec §[vm_exit_state].
-pub fn saveGuestState(vcpu_ec: *ExecutionContext) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.saveGuestState(vcpu_ec),
-        .aarch64 => aarch64.kvm.vcpu.saveGuestState(vcpu_ec),
-        else => unreachable,
-    }
-}
-
-/// VMLAUNCH/VMRESUME on x86-64 / `eret` from EL2 on aarch64. Returns
-/// when the guest exits. Caller is responsible for `loadGuestState`
-/// before and `saveGuestState` after.
-pub fn enterGuest(vcpu_ec: *ExecutionContext) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.enterGuest(vcpu_ec),
-        .aarch64 => aarch64.kvm.vcpu.enterGuest(vcpu_ec),
-        else => unreachable,
-    }
-}
-
-/// Snapshot of the most recent VM exit, populated by the per-arch exit
-/// handler. Subcode and payload encode per-arch reason bits according
-/// to Spec §[vm_exit_state].
-pub const VmExitInfo = struct {
-    subcode: u8,
-    payload: [3]u64,
-};
-
-/// Read the last VM-exit info captured for `vcpu_ec`. The kernel exit
-/// path stores this immediately after exit so the suspension event
-/// payload reflects the correct reason. Spec §[vm_exit_state].
-pub fn lastVmExitInfo(vcpu_ec: *ExecutionContext) VmExitInfo {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.lastVmExitInfo(vcpu_ec),
-        .aarch64 => aarch64.kvm.vcpu.lastVmExitInfo(vcpu_ec),
-        else => unreachable,
-    };
-}
-
 /// Apply a typed slice of VM policy entries to the VM (MSR bitmap,
 /// sysreg passthrough table, exception passthrough mask, etc. — see
 /// Spec §[vm_policy] for the per-kind encoding). `count` is the

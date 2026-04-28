@@ -36,16 +36,6 @@ pub fn triggerSchedulerInterrupt(core_id: u64) void {
     }
 }
 
-/// Kprof-dump IPI vector. Chosen in the same reserved high-vector band
-/// as the scheduler / TLB-shootdown / spurious vectors so it stays out
-/// of the device IRQ range.
-const kprof_dump_ipi_vector: u8 = switch (builtin.cpu.arch) {
-    .x86_64 => @intFromEnum(x64.interrupts.IntVecs.kprof_dump),
-    // ARM GIC SGI 1 — SGI 0 is claimed by the scheduler IPI.
-    .aarch64 => 1,
-    else => unreachable,
-};
-
 
 // ── Spec v3 SMP primitives ───────────────────────────────────────────
 

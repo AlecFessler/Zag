@@ -235,36 +235,6 @@ pub fn initMairIndices() void {
     }
 }
 
-/// Return the physical address of the current user page table from TTBR0_EL1.
-///
-/// ARM ARM D13.2.136: TTBR0_EL1 holds the base address of the translation
-/// table for the lower VA range (user space). Bits [47:1] hold the table
-/// address (4KB aligned means bits [11:0] are zero in the address).
-pub fn getAddrSpaceRoot() PAddr {
-    const ttbr0 = readTtbr0();
-    const mask: u64 = 0x0000_FFFF_FFFF_F000;
-    return PAddr.fromInt(ttbr0 & mask);
-}
-
-/// Load a new user page table address into TTBR0_EL1, tagged with the
-/// process's ASID.
-///
-/// ARM ARM D13.2.136 -- TTBR0_EL1 layout when TCR_EL1.AS=1:
-///   bits [47:1]  = BADDR (page-table base)
-///   bits [63:48] = ASID
-///
-/// User PTEs are mapped with nG=1, so each TLB entry is tagged with the
-/// ASID active when it was loaded. With per-process ASIDs, stale entries
-/// from a different ASID simply miss on lookup and never alias the new
-/// process — no flush needed on context switch. ARM ARM D5.10.2.
-///
-/// ISB publishes the new TTBR0 to instruction fetch.
-pub fn swapAddrSpace(root: PAddr, id: u16) void {
-    const ttbr0 = (@as(u64, id) << 48) | (root.addr & 0x0000_FFFF_FFFF_FFFE);
-    writeTtbr0(ttbr0);
-    asm volatile ("isb" ::: .{ .memory = true });
-}
-
 /// Disable UEFI's identity mapping by disabling TTBR0 walks and flushing TLB.
 ///
 /// On aarch64, UEFI's identity mapping lives in TTBR0 which is separate
@@ -585,23 +555,6 @@ fn permsToAp(perms: MemoryPerms, user: bool) u2 {
 }
 
 // ── AArch64 system register and barrier intrinsics ──────────────────────────
-
-/// Read TTBR0_EL1 (Translation Table Base Register 0).
-/// ARM ARM D13.2.136.
-fn readTtbr0() u64 {
-    return asm volatile ("mrs %[ret], ttbr0_el1"
-        : [ret] "=r" (-> u64),
-    );
-}
-
-/// Write TTBR0_EL1 (Translation Table Base Register 0).
-/// ARM ARM D13.2.136.
-fn writeTtbr0(val: u64) void {
-    asm volatile ("msr ttbr0_el1, %[val]"
-        :
-        : [val] "r" (val),
-        : .{ .memory = true });
-}
 
 /// Read TTBR1_EL1 (Translation Table Base Register 1 -- kernel space).
 /// ARM ARM D13.2.136.

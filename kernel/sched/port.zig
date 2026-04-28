@@ -1124,24 +1124,8 @@ pub fn releaseHandle(p: *Port, caps: u16) void {
     if (!destroyed) p._gen_lock.unlock();
 }
 
-fn onHandleRestrict(p: *Port, old_caps: u16, new_caps: u16) bool {
-    const old_c: PortCaps = @bitCast(old_caps);
-    const new_c: PortCaps = @bitCast(new_caps);
-    const old_send = old_c.bind or old_c.xfer;
-    const new_send = new_c.bind or new_c.xfer;
-    var destroyed = false;
-    if (old_send and !new_send) destroyed = decSendRefcount(p) or destroyed;
-    if (old_c.recv and !new_c.recv) destroyed = decRecvRefcount(p) or destroyed;
-    return destroyed;
-}
-
 /// Wait queue ops — assert empty or matching kind, transition kind
 /// on (en)queue, reset to .none when drained.
-fn enqueueSender(p: *Port, sender: *ExecutionContext) void {
-    std.debug.assert(p.waiter_kind != .receivers);
-    p.waiters.enqueue(sender);
-    p.waiter_kind = .senders;
-}
 fn enqueueReceiver(p: *Port, receiver: *ExecutionContext) void {
     std.debug.assert(p.waiter_kind != .senders);
     p.waiters.enqueue(receiver);

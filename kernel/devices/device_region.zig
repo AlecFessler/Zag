@@ -278,7 +278,6 @@ pub fn propagateIrqAndWake(dr: *DeviceRegion) void {
 /// spec-v3 EC + port wiring lands; calling sites here treat it as
 /// opaque.
 pub const FutexWakeResult = struct {
-    woken: u32 = 0,
     idle_core_mask: u64 = 0,
 };
 
