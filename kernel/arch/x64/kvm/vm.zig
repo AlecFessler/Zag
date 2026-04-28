@@ -1,73 +1,19 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const exit_box_mod = zag.arch.x64.kvm.exit_box;
-const guest_memory = zag.arch.x64.kvm.guest_memory;
 const ioapic_mod = zag.arch.x64.kvm.ioapic;
-const kvm = zag.arch.x64.kvm;
-const lapic_mod = zag.arch.x64.kvm.lapic;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-const vcpu_mod = kvm.vcpu;
 const vm_hw = zag.arch.x64.vm;
 
-const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
-const GuestMemory = guest_memory.GuestMemory;
-const Ioapic = ioapic_mod.Ioapic;
-const Lapic = lapic_mod.Lapic;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
 const VarPageSize = zag.capdom.var_range.PageSize;
-const VCpu = vcpu_mod.VCpu;
 const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
-const VmExitBox = exit_box_mod.VmExitBox;
 
 pub const MAX_VCPUS = 64;
-
-pub const VmAllocator = SecureSlab(Vm, 256);
-
-pub const Vm = struct {
-    _gen_lock: GenLock = .{},
-    vcpus: [MAX_VCPUS]SlabRef(VCpu) = undefined,
-    num_vcpus: u32 = 0,
-    owner: SlabRef(CapabilityDomain),
-    exit_box: VmExitBox = .{},
-    policy: vm_hw.VmPolicy = .{},
-    arch_structures: PAddr = PAddr.fromInt(0),
-    guest_mem: GuestMemory = .{},
-    /// Host virtual base and size of the main guest RAM region (from first vm_guest_map).
-    /// Used by MMIO decoder to read guest physical memory (page table walk).
-    guest_ram_host_base: u64 = 0,
-    guest_ram_size: u64 = 0,
-    /// In-kernel LAPIC emulation state.
-    lapic: Lapic = .{},
-    /// In-kernel IOAPIC emulation state.
-    ioapic: Ioapic = .{},
-
-    /// Translate a guest-physical address backed by the main RAM region into
-    /// a host pointer. Returns null if the main-RAM-at-guest-phys-0 mapping
-    /// has not been established yet, or `[phys, phys+len)` is out of bounds.
-    /// Single home for guest-phys → host-VA arithmetic so the bookkeeping
-    /// fields stay private to `Vm`.
-    pub fn guestPhysToHost(self: *const Vm, phys: u64, len: usize) ?[*]u8 {
-        if (self.guest_ram_host_base == 0) return null;
-        if (self.guest_ram_size < len) return null;
-        if (phys > self.guest_ram_size - len) return null;
-        return @ptrFromInt(self.guest_ram_host_base + phys);
-    }
-
-    /// Read a slice from guest physical memory via the main RAM mapping.
-    /// Convenience wrapper around `guestPhysToHost`.
-    pub fn readGuestPhysSlice(self: *const Vm, phys: u64, len: usize) ?[]const u8 {
-        const ptr = self.guestPhysToHost(phys, len) orelse return null;
-        return ptr[0..len];
-    }
-};
 
 // ── Spec-v3 dispatch backings ────────────────────────────────────────
 //

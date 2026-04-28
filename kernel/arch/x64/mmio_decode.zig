@@ -11,12 +11,11 @@
 ///
 /// Guest virtual -> physical translation via 4-level page table walk,
 /// reading guest physical memory through the kernel physmap.
-const zag = @import("zag");
+// MMIO instruction byte decoder used by exception/fault paths to inspect
+// faulting MOV opcodes. The full guest-virt → guest-phys → instruction
+// fetch pipeline is parked along with the spec-v2 KVM run loop; only the
+// pure byte-buffer decoder (`decodeBytes`) is wired today.
 
-const cpu = zag.arch.x64.cpu;
-
-const GuestState = zag.arch.x64.vm.GuestState;
-const Vm = zag.arch.x64.kvm.vm.Vm;
 
 /// Result of decoding an MMIO instruction.
 pub const MmioOp = struct {
@@ -32,88 +31,6 @@ pub const DecodeError = error{
     UnsupportedInstruction,
     IncompleteDecode,
 };
-
-// --- Guest virtual -> physical page table walk ---
-
-/// Translate guest virtual address to guest physical using CR3 4-level paging.
-/// AMD APM Vol 2, Section 5.3: Long-Mode Page Translation.
-/// Reads guest physical memory via the kernel physmap.
-fn guestVirtToPhys(vm: *const Vm, cr3: u64, vaddr: u64) ?u64 {
-    const pml4_base = cr3 & 0x000F_FFFF_FFFF_F000;
-    const pml4_idx = (vaddr >> 39) & 0x1FF;
-    const pml4e = readGuestPhysU64(vm, pml4_base + pml4_idx * 8) orelse return null;
-    if (pml4e & 1 == 0) return null;
-
-    const pdpt_base = pml4e & 0x000F_FFFF_FFFF_F000;
-    const pdpt_idx = (vaddr >> 30) & 0x1FF;
-    const pdpte = readGuestPhysU64(vm, pdpt_base + pdpt_idx * 8) orelse return null;
-    if (pdpte & 1 == 0) return null;
-    if (pdpte & 0x80 != 0) // 1 GB page (PS bit)
-        return (pdpte & 0x000F_FFFF_C000_0000) | (vaddr & 0x3FFF_FFFF);
-
-    const pd_base = pdpte & 0x000F_FFFF_FFFF_F000;
-    const pd_idx = (vaddr >> 21) & 0x1FF;
-    const pde = readGuestPhysU64(vm, pd_base + pd_idx * 8) orelse return null;
-    if (pde & 1 == 0) return null;
-    if (pde & 0x80 != 0) // 2 MB page (PS bit)
-        return (pde & 0x000F_FFFF_FFE0_0000) | (vaddr & 0x1F_FFFF);
-
-    const pt_base = pde & 0x000F_FFFF_FFFF_F000;
-    const pt_idx = (vaddr >> 12) & 0x1FF;
-    const pte = readGuestPhysU64(vm, pt_base + pt_idx * 8) orelse return null;
-    if (pte & 1 == 0) return null;
-
-    return (pte & 0x000F_FFFF_FFFF_F000) | (vaddr & 0xFFF);
-}
-
-/// Read a u64 from guest physical memory via the VM's host RAM mapping.
-/// Delegates the bounds-checked guest-phys → host-VA translation to `Vm`
-/// so this module never touches `Vm`'s memory bookkeeping fields directly.
-///
-/// `guestPhysToHost` returns a *user-mode* virtual address (the VMM's own
-/// mapping of guest RAM), so the dereference must be bracketed by
-/// userAccessBegin/userAccessEnd to satisfy SMAP at CPL 0.
-fn readGuestPhysU64(vm: *const Vm, phys: u64) ?u64 {
-    const ptr = vm.guestPhysToHost(phys, 8) orelse return null;
-    const u64_ptr: *align(1) const u64 = @ptrCast(ptr);
-    cpu.stac();
-    defer cpu.clac();
-    return u64_ptr.*;
-}
-
-// --- Instruction fetch ---
-
-/// Fetch up to 15 instruction bytes from guest virtual address.
-/// Returns number of bytes actually fetched, or null on translation failure.
-fn fetchInsn(vm: *const Vm, cr0: u64, cr3: u64, rip: u64, buf: *[15]u8) ?u8 {
-    // If paging is disabled (CR0.PG=0), guest virtual = guest physical
-    const phys = if (cr0 & (1 << 31) == 0) rip else (guestVirtToPhys(vm, cr3, rip) orelse return null);
-    const page_off = phys & 0xFFF;
-    const avail: u64 = 4096 - page_off;
-    const first: u8 = @intCast(@min(15, avail));
-
-    // readGuestPhysSlice returns a slice backed by a user-mode VA (the
-    // VMM's mapping of guest RAM), so the @memcpy reads must run with
-    // SMAP disarmed. Keep the window scoped to the copy itself.
-    const slice = vm.readGuestPhysSlice(phys, first) orelse return null;
-    cpu.stac();
-    @memcpy(buf[0..first], slice);
-    cpu.clac();
-
-    if (first < 15) {
-        const next_vaddr = (rip & ~@as(u64, 0xFFF)) + 4096;
-        const next_phys = if (cr0 & (1 << 31) == 0) next_vaddr else (guestVirtToPhys(vm, cr3, next_vaddr) orelse return first);
-        const remaining: u8 = 15 - first;
-        if (vm.readGuestPhysSlice(next_phys, remaining)) |next_slice| {
-            cpu.stac();
-            @memcpy(buf[first..15], next_slice);
-            cpu.clac();
-            return 15;
-        }
-        return first;
-    }
-    return first;
-}
 
 // --- Instruction decode ---
 
@@ -283,62 +200,3 @@ pub fn decodeBytes(buf: []const u8) DecodeError!MmioOp {
     };
 }
 
-/// Decode the MMIO instruction at guest RIP.
-/// Returns the decoded operation, or null if the instruction is unrecognized.
-pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
-    var insn: [15]u8 = undefined;
-    const fetched = fetchInsn(vm, gs.cr0, gs.cr3, gs.rip, &insn) orelse return null;
-    if (fetched < 2) return null;
-
-    var op = decodeBytes(insn[0..fetched]) catch return null;
-
-    // For register-source writes, fill in the value from guest state
-    if (op.is_write and !op.is_immediate) {
-        op.value = @truncate(readGpr(gs, op.reg));
-    }
-
-    return op;
-}
-
-fn readGpr(gs: *const GuestState, reg: u4) u64 {
-    return switch (reg) {
-        0 => gs.rax,
-        1 => gs.rcx,
-        2 => gs.rdx,
-        3 => gs.rbx,
-        4 => gs.rsp,
-        5 => gs.rbp,
-        6 => gs.rsi,
-        7 => gs.rdi,
-        8 => gs.r8,
-        9 => gs.r9,
-        10 => gs.r10,
-        11 => gs.r11,
-        12 => gs.r12,
-        13 => gs.r13,
-        14 => gs.r14,
-        15 => gs.r15,
-    };
-}
-
-/// Write a value to a guest GPR in the GuestState.
-pub fn writeGpr(gs: *GuestState, reg: u4, value: u64) void {
-    switch (reg) {
-        0 => gs.rax = value,
-        1 => gs.rcx = value,
-        2 => gs.rdx = value,
-        3 => gs.rbx = value,
-        4 => gs.rsp = value,
-        5 => gs.rbp = value,
-        6 => gs.rsi = value,
-        7 => gs.rdi = value,
-        8 => gs.r8 = value,
-        9 => gs.r9 = value,
-        10 => gs.r10 = value,
-        11 => gs.r11 = value,
-        12 => gs.r12 = value,
-        13 => gs.r13 = value,
-        14 => gs.r14 = value,
-        15 => gs.r15 = value,
-    }
-}
