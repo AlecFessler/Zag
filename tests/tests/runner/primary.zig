@@ -93,66 +93,87 @@ pub fn main(cap_table_base: u64) void {
     serial.printU64(embedded_tests.manifest.len);
     serial.print(" tests\n");
 
-    // Phase 1: spawn every embedded test against the shared port.
+    // Phase 1+2 interleaved. Spawn `BATCH` tests, then drain `BATCH`
+    // results before spawning the next batch. Bounded in-flight test
+    // count keeps simultaneous EC/CD/PageFrame slab usage well below
+    // the per-class capacities and avoids running every test child to
+    // peak concurrency in a 4-core scheduler — the kernel's debug
+    // accounting (lockdep stacks, IRQ-handler depth tables, slab
+    // randomized-cursor BSS) compounds with per-EC kernel-stack frames
+    // and pushes total stack pressure over the budget on full-475
+    // bursts. Spec doesn't forbid batched orchestration; the kernel
+    // sees identical per-test syscalls regardless of batching.
+    const BATCH: usize = 16;
     var successful_spawns: usize = 0;
-    inline for (embedded_tests.manifest) |entry| {
-        if (spawnOne(entry, port_handle)) {
-            successful_spawns += 1;
-        }
-    }
-
-    serial.print("[runner] spawned ");
-    serial.printU64(successful_spawns);
-    serial.print(" / ");
-    serial.printU64(embedded_tests.manifest.len);
-    serial.print("\n");
-
-    // Phase 2: drain exactly `successful_spawns` suspension events
-    // from the shared port. Each event carries:
-    //   syscall_word reply_handle_id — slot of the inserted reply handle
-    //   vreg 3 — result_code (per libz/testing.report)
-    //   vreg 4 — assertion_id
-    //   vreg 5 — test tag (manifest index)
-    // The tag comes from the test ELF's per-build test_tag module
-    // injected via tests/tests/build.zig.
     var collected: usize = 0;
-    while (collected < successful_spawns) {
-        const got = syscall.recv(port_handle, RECV_TIMEOUT_NS);
-
-        // E_TIMEOUT lands in vreg 1 because no reply handle was minted.
-        // Stop draining; remaining slots stay `.not_run` (= MISS in
-        // summarize). Sender ECs that were still hung are reaped at
-        // domain teardown when the runner returns / power_shutdown.
-        if (got.regs.v1 == @intFromEnum(errors.Error.E_TIMEOUT)) {
-            serial.print("[runner] recv timeout after ");
-            serial.printU64(RECV_TIMEOUT_NS / 1_000_000_000);
-            serial.print("s with ");
-            serial.printU64(collected);
-            serial.print(" / ");
-            serial.printU64(successful_spawns);
-            serial.print(" results — dumping partial table\n");
-            break;
+    var batch_idx: usize = 0;
+    while (batch_idx < embedded_tests.manifest.len) {
+        const batch_end = @min(batch_idx + BATCH, embedded_tests.manifest.len);
+        // Per-batch progress so a stalled batch isn't ambiguous with
+        // a stalled test ELF or a stalled spawn syscall.
+        serial.print("[runner] batch ");
+        serial.printU64(batch_idx);
+        serial.print("..");
+        serial.printU64(batch_end);
+        serial.print("\n");
+        var batch_started: usize = 0;
+        var i = batch_idx;
+        while (i < batch_end) : (i += 1) {
+            if (spawnOne(embedded_tests.manifest[i], port_handle)) {
+                successful_spawns += 1;
+                batch_started += 1;
+            }
         }
+        serial.print("[runner]   spawned ");
+        serial.printU64(batch_started);
+        serial.print("/");
+        serial.printU64(batch_end - batch_idx);
+        serial.print("\n");
+        // Drain this batch's events before staging the next.
+        var batch_collected: usize = 0;
+        var batch_recv_timed_out = false;
+        while (batch_collected < batch_started) {
+            const got = syscall.recv(port_handle, RECV_TIMEOUT_NS);
 
-        // §[event_state] return word — composed by sched.port.deliverEvent
-        // and written to the receiver's rax (vreg 1) via setSyscallReturn.
-        // Layout: pair_count [12..19], tstart [20..31],
-        // reply_handle_id [32..43], event_type [44..].
-        const reply_handle_id: caps.HandleId = @truncate((got.regs.v1 >> 32) & 0xFFF);
-        const result_code: ResultCode = @enumFromInt(got.regs.v3);
-        const assertion_id: u64 = got.regs.v4;
-        const tag: u64 = got.regs.v5;
+            // E_TIMEOUT lands in vreg 1 because no reply handle was minted.
+            // Drop the batch on the floor (its survivors stay `.not_run` =
+            // MISS in summarize). Hung sender ECs are reaped at domain
+            // teardown when the runner returns / power_shutdown.
+            if (got.regs.v1 == @intFromEnum(errors.Error.E_TIMEOUT)) {
+                serial.print("[runner] recv timeout after ");
+                serial.printU64(RECV_TIMEOUT_NS / 1_000_000_000);
+                serial.print("s with ");
+                serial.printU64(collected);
+                serial.print(" / ");
+                serial.printU64(successful_spawns);
+                serial.print(" results — skipping rest of batch\n");
+                batch_recv_timed_out = true;
+                break;
+            }
 
-        record(tag, .{
-            .code = result_code,
-            .assertion_id = assertion_id,
-        });
+            // §[event_state] return word — composed by sched.port.deliverEvent
+            // and written to the receiver's rax (vreg 1) via setSyscallReturn.
+            // Layout: pair_count [12..19], tstart [20..31],
+            // reply_handle_id [32..43], event_type [44..].
+            const reply_handle_id: caps.HandleId = @truncate((got.regs.v1 >> 32) & 0xFFF);
+            const result_code: ResultCode = @enumFromInt(got.regs.v3);
+            const assertion_id: u64 = got.regs.v4;
+            const tag: u64 = got.regs.v5;
 
-        // Resume the child so it can return out of testing.report,
-        // fall through to start.zig, and tear down its self-handle.
-        _ = syscall.reply(reply_handle_id);
+            record(tag, .{
+                .code = result_code,
+                .assertion_id = assertion_id,
+            });
 
-        collected += 1;
+            // Resume the child so it can return out of testing.report,
+            // fall through to start.zig, and tear down its self-handle.
+            _ = syscall.reply(reply_handle_id);
+
+            collected += 1;
+            batch_collected += 1;
+        }
+        if (batch_recv_timed_out) break;
+        batch_idx = batch_end;
     }
 
     summarize();

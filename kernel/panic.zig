@@ -34,10 +34,12 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
     arch.boot.printRaw(msg);
 
     if (ret_addr) |ra| {
+        arch.boot.printRaw(" @ 0x");
+        printHex(ra);
         if (debug_info.global_ptr) |dbg_info| {
             const sym_name = dbg_info.getSymbolName(ra - debug_info.kaslr_slide);
             if (sym_name) |sym| {
-                arch.boot.printRaw(" @ ");
+                arch.boot.printRaw(" ");
                 arch.boot.printRaw(sym);
             }
         }

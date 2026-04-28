@@ -836,8 +836,47 @@ pub fn allocCapabilityDomain(
 /// Final teardown — walks `vars` freeing each VAR, walks
 /// `kernel_table` releasing every used slot per type, tears down the
 /// address space, frees the table pages, frees slab.
+///
+/// Step 10 minimal teardown. The caller invokes this from `releaseSelf`
+/// AFTER the calling EC has been retired via `parkSelfFaulted` (it is
+/// the bound initial EC by spec — `delete(SLOT_SELF)` from inside the
+/// child runs on this very EC). At entry the EC is no longer the
+/// current_ec on its core; its kernel stack frame is the one we are
+/// currently executing on, so we MUST not free the kernel stack pages
+/// here. The scheduler's noreturn dispatch will iretq off this stack
+/// once we return; the next preemption tick observes the EC as
+/// `terminated` and reaps it via the slab generation flip.
+///
+/// What this does free now: the user/kernel handle-table PMM blocks,
+/// the address-space PCID, and the CD slab slot itself. What is
+/// deliberately leaked for later: page-table page frames (need an
+/// arch.paging walk), page_frame slab refcount drops for handle-table
+/// entries (refcounted PFs survive), VARs (require domain.vars[] walk
+/// + per-VAR unmap + slab destroy). These are smaller per-test than
+/// the table blocks and don't push the full-475-test runner past the
+/// PMM budget on a 1 GB QEMU instance.
 fn destroyCapabilityDomain(cd: *CapabilityDomain) void {
-    _ = cd;
+    const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
+
+    // Free the two handle-table PMM blocks. These are the dominant
+    // per-domain allocations (96 KiB each at MAX_HANDLES_PER_DOMAIN =
+    // 4096) and account for the bulk of the per-test PMM consumption
+    // a long-running test runner accumulates.
+    const user_buf: [*]u8 = @ptrCast(cd.user_table);
+    pmm_mgr.freeBlock(user_buf[0..USER_TABLE_BYTES]);
+    const kernel_buf: [*]u8 = @ptrCast(cd.kernel_table);
+    pmm_mgr.freeBlock(kernel_buf[0..KERNEL_TABLE_BYTES]);
+
+    // Recycle the PCID/ASID. id 0 is the boot/kernel sentinel and
+    // never assigned to a domain, so the != 0 guard mirrors the
+    // pcid.free() precondition.
+    if (cd.addr_space_id != 0) arch.paging.freeAddrSpaceId(cd.addr_space_id);
+
+    // Drop the slab slot. Concurrent observers of stale handles
+    // detect the gen-flip on next lockWithGen and surface E_TERM via
+    // the standard at-most-one stale-handle path.
+    const gen = cd._gen_lock.currentGen();
+    slab_instance.destroy(cd, gen) catch {};
 }
 
 /// Pop the head of the free-slot list. Returns `null` (E_FULL) if the
@@ -1100,15 +1139,27 @@ pub fn restartDomain(cd: *CapabilityDomain) i64 {
 }
 
 /// Public release-handle entry point invoked when `delete` is called
-/// on the domain's self-handle. Wraps `destroyCapabilityDomain`.
+/// on the domain's self-handle. Tears the domain down via
+/// `destroyCapabilityDomain`.
 ///
-/// STUB step 7h: full domain teardown (handle-table walk, kernel-thread
-/// kill, PMM frees) is not wired yet. Children leak after they call
-/// `delete(SLOT_SELF)`, but the kernel does not panic — the suspended
-/// initial EC is still suspended on the parent's port and gets recv'd
-/// + reply'd; control returns to the test, which falls through to this
-/// path. Without this, the very first child to complete kills the
-/// kernel and the runner produces zero `[runner] result` lines.
+/// `delete(SLOT_SELF)` runs on an EC bound to the very domain being
+/// destroyed (commonly the initial EC, which on test ELFs falls
+/// through to start.zig's `_start`-tail `delete(SLOT_SELF)` after main
+/// returns). We cannot reclaim the kernel stack of the calling EC
+/// from here — it is the stack we are currently executing on — so
+/// this path frees the heaviest per-domain allocations (handle-table
+/// PMM blocks, slab slot, PCID) and lets the EC frame iretq off into
+/// scheduler.run() via the normal post-syscall fall-through. The
+/// caller's `_start` then enters its `while(true) hlt` until the next
+/// tick preempts; the EC is no longer reachable from any handle (its
+/// owning domain's slab gen flipped) so it is unrunnable past that.
+///
+/// Without this, every child domain spawned by the test runner leaks
+/// ~256 KiB of buddy-allocated handle-table pages and a slab slot. By
+/// ~iteration 416 the runner exhausts buddy-allocator capacity, and
+/// further `createCapabilityDomain` syscalls hang on the failed
+/// allocBlock (no E_NOMEM is currently surfaced from that path —
+/// see TODO in allocCapabilityDomain).
 pub fn releaseSelf(cd: *CapabilityDomain) void {
-    _ = cd;
+    destroyCapabilityDomain(cd);
 }
