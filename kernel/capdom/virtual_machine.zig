@@ -194,7 +194,7 @@ pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64
         return errors.E_FULL;
     };
 
-    domain.vm = new_vm;
+    domain.vm = SlabRef(VirtualMachine).init(new_vm, vm_gen);
     // Spec §[error_codes] / §[capabilities]: pack Word0 so the type
     // tag in bits 12..15 disambiguates a real handle word from the
     // small-positive error range 1..15.

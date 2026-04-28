@@ -44,6 +44,7 @@ const PageFrame = zag.memory.page_frame.PageFrame;
 const ParsedElf = zag.utils.elf.ParsedElf;
 const Priority = zag.sched.execution_context.Priority;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAR = zag.capdom.var_range.VAR;
 const VAddr = zag.memory.address.VAddr;
 const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
@@ -155,7 +156,7 @@ pub const CapabilityDomain = struct {
     /// Entries `[0..var_count)` are populated; entries beyond are null.
     /// On removal the tail is moved into the freed slot to keep the
     /// populated prefix dense (no holes to skip).
-    vars: [MAX_VARS_PER_DOMAIN]?*VAR = .{null} ** MAX_VARS_PER_DOMAIN,
+    vars: [MAX_VARS_PER_DOMAIN]?SlabRef(VAR) = .{null} ** MAX_VARS_PER_DOMAIN,
 
     /// Number of populated entries in `vars`. Range 0..MAX_VARS_PER_DOMAIN.
     var_count: u16 = 0,
@@ -174,7 +175,7 @@ pub const CapabilityDomain = struct {
     /// VM bound to this domain. Capability-domain lifetime; at most
     /// one per spec (the VM handle is non-transferable, exactly one
     /// holder = the binding domain). `null` on non-VM domains.
-    vm: ?*VirtualMachine = null,
+    vm: ?SlabRef(VirtualMachine) = null,
 };
 
 pub const Allocator = SecureSlab(CapabilityDomain, 256);
@@ -649,7 +650,10 @@ pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
     {
         var j: u16 = 0;
         while (j < target_cd.var_count) : (j += 1) {
-            const v = target_cd.vars[j] orelse continue;
+            const v_ref = target_cd.vars[j] orelse continue;
+            // self-alive: VAR's domain ref pins it for the
+            // duration of this walk (target_cd's gen-lock is held).
+            const v = v_ref.ptr;
             switch (v.map) {
                 .page_frame, .demand => var_count += 1,
                 else => {},
@@ -663,7 +667,9 @@ pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
 
     var i: u16 = 0;
     while (i < target_cd.var_count) : (i += 1) {
-        const v = target_cd.vars[i] orelse continue;
+        const v_ref = target_cd.vars[i] orelse continue;
+        // self-alive: see prior loop.
+        const v = v_ref.ptr;
         switch (v.map) {
             .page_frame, .demand => {},
             else => continue, // [test 07]: exclude MMIO and unmapped/DMA-only
@@ -1086,7 +1092,7 @@ fn readSelfCaps(cd: *const CapabilityDomain) u16 {
 /// Append `v` to `vars[var_count]`. Returns E_FULL when at MAX.
 pub fn appendVar(cd: *CapabilityDomain, v: *VAR) i64 {
     if (cd.var_count >= cd.vars.len) return errors.E_FULL;
-    cd.vars[cd.var_count] = v;
+    cd.vars[cd.var_count] = SlabRef(VAR).init(v, v._gen_lock.currentGen());
     cd.var_count += 1;
     return 0;
 }
@@ -1095,11 +1101,14 @@ pub fn appendVar(cd: *CapabilityDomain, v: *VAR) i64 {
 pub fn removeVar(cd: *CapabilityDomain, v: *VAR) void {
     var i: u16 = 0;
     while (i < cd.var_count) {
-        if (cd.vars[i] == v) {
-            cd.var_count -= 1;
-            cd.vars[i] = cd.vars[cd.var_count];
-            cd.vars[cd.var_count] = null;
-            return;
+        if (cd.vars[i]) |v_ref| {
+            // Identity compare: SlabRef.ptr == raw pointer.
+            if (v_ref.ptr == v) {
+                cd.var_count -= 1;
+                cd.vars[i] = cd.vars[cd.var_count];
+                cd.vars[cd.var_count] = null;
+                return;
+            }
         }
         i += 1;
     }
@@ -1112,10 +1121,12 @@ pub fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64)
     const new_end = new_start + bytes;
     var i: u16 = 0;
     while (i < cd.var_count) {
-        const v = cd.vars[i] orelse {
+        const v_ref = cd.vars[i] orelse {
             i += 1;
             continue;
         };
+        // self-alive: VAR's domain ref pins it; cd is the owner here.
+        const v = v_ref.ptr;
         const sz_bytes: u64 = switch (v.sz) {
             .sz_4k => 0x1000,
             .sz_2m => 0x20_0000,

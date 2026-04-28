@@ -940,10 +940,13 @@ fn domainOverlaps(domain: *const CapabilityDomain, base: u64, bytes: u64) bool {
     const new_end = base + bytes;
     var i: u16 = 0;
     while (i < domain.var_count) {
-        const v = domain.vars[i] orelse {
+        const v_ref = domain.vars[i] orelse {
             i += 1;
             continue;
         };
+        // self-alive: VAR's domain owns it; the walking caller holds
+        // the domain alive across this scan.
+        const v = v_ref.ptr;
         const v_sz_bytes = pageSizeBytes(v.sz);
         const v_start = v.base_vaddr.addr;
         const v_end = v_start + @as(u64, v.page_count) * v_sz_bytes;
@@ -1157,10 +1160,12 @@ fn incMapCntShim(pf: *PageFrame) void {
 pub fn findVarCovering(cd: *CapabilityDomain, fault_vaddr: VAddr) ?*VAR {
     var i: u16 = 0;
     while (i < cd.var_count) {
-        const v = cd.vars[i] orelse {
+        const v_ref = cd.vars[i] orelse {
             i += 1;
             continue;
         };
+        // self-alive: VAR's domain (= cd) owns it.
+        const v = v_ref.ptr;
         const sz_bytes = pageSizeBytes(v.sz);
         const end = v.base_vaddr.addr + @as(u64, v.page_count) * sz_bytes;
         if (fault_vaddr.addr >= v.base_vaddr.addr and fault_vaddr.addr < end) {
