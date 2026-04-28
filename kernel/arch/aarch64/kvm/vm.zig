@@ -47,7 +47,6 @@ const VmExitBox = kvm.exit_box.VmExitBox;
 pub const MAX_VCPUS = 64;
 
 pub const VmAllocator = SecureSlab(Vm, 256);
-pub var slab_instance: VmAllocator = undefined;
 
 pub const Vm = struct {
     _gen_lock: GenLock = .{},
@@ -81,80 +80,6 @@ pub const Vm = struct {
     vmid: u8 = 0,
     vmid_generation: u64 = 0,
 
-    /// Returns a pointer to the VM's exit box.
-    pub fn exitBox(self: *Vm) *VmExitBox {
-        return &self.exit_box;
-    }
-
-    /// Inject a virtual interrupt into the in-kernel vGIC. Routes
-    /// `vm_inject_irq` and SPI assertion through a single Vm-level
-    /// entry. This is the rough analogue of x64 `injectExternal`, but on
-    /// ARM "external" maps to "SPI" and is per-VM, not per-vCPU.
-    pub fn assertSpi(self: *Vm, intid: u32) void {
-        vgic_mod.assertSpi(&self.vgic, intid);
-    }
-
-    /// `tryHandleMmio` — called from the stage-2 fault inline path. If the
-    /// faulting IPA falls inside the GICD MMIO page or any GICR page,
-    /// dispatch the access to the vGIC and resume; otherwise return false
-    /// so the exit handler forwards the fault to the VMM.
-    ///
-    /// The aarch64 stage-2 syndrome (ESR_EL2.ISS with ISV=1) already
-    /// supplies the access size, target register, and direction — see
-    /// 102142 §4.5 — so unlike x64 we do not need to decode the guest
-    /// instruction to handle a vGIC MMIO access.
-    pub fn tryHandleMmio(self: *Vm, vcpu_obj: *VCpu, fault: vm_hw.VmExitInfo.Stage2Fault) bool {
-        const ipa = fault.guest_phys;
-
-        // GICD page.
-        if (ipa >= vgic_mod.GICD_BASE and ipa < vgic_mod.GICD_BASE + vgic_mod.GICD_SIZE) {
-            const offset = ipa - vgic_mod.GICD_BASE;
-            return self.handleVgicMmio(vcpu_obj, offset, fault, .gicd);
-        }
-
-        // Per-vCPU GICR pages.
-        const gicr_total = vgic_mod.GICR_STRIDE * self.num_vcpus;
-        if (ipa >= vgic_mod.GICR_BASE and ipa < vgic_mod.GICR_BASE + gicr_total) {
-            const offset = ipa - vgic_mod.GICR_BASE;
-            return self.handleVgicMmio(vcpu_obj, offset, fault, .gicr);
-        }
-
-        return false;
-    }
-
-    const VgicTarget = enum { gicd, gicr };
-
-    fn handleVgicMmio(
-        self: *Vm,
-        vcpu_obj: *VCpu,
-        offset: u64,
-        fault: vm_hw.VmExitInfo.Stage2Fault,
-        target: VgicTarget,
-    ) bool {
-        // Without a valid syndrome we cannot decode the access. Forward
-        // to VMM in that case so it can do an instruction decode.
-        if (!fault.issValid()) return false;
-
-        const size: u8 = @as(u8, 1) << @intCast(fault.access_size);
-        if (fault.isWrite()) {
-            const value = readGuestGpr(&vcpu_obj.guest_state, fault.srt);
-            switch (target) {
-                .gicd => vgic_mod.mmioWrite(&self.vgic, &vcpu_obj.vgic_state, offset, size, value),
-                .gicr => vgic_mod.mmioWrite(&self.vgic, &vcpu_obj.vgic_state, offset, size, value),
-            }
-        } else {
-            const value = switch (target) {
-                .gicd => vgic_mod.mmioRead(&self.vgic, &vcpu_obj.vgic_state, offset, size),
-                .gicr => vgic_mod.mmioRead(&self.vgic, &vcpu_obj.vgic_state, offset, size),
-            };
-            writeGuestGpr(&vcpu_obj.guest_state, fault.srt, value);
-        }
-        // Advance PC past the faulting instruction. AArch64 instructions
-        // are always 4 bytes (ARM ARM B1.2.4). ESR_EL2.IL is informational.
-        vcpu_obj.guest_state.pc +%= 4;
-        return true;
-    }
-
     /// Translate a guest-physical address backed by the main RAM region
     /// into a host pointer. Returns null if the main-RAM mapping has not
     /// been established yet, or `[phys, phys+len)` is out of bounds.
@@ -167,23 +92,6 @@ pub const Vm = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Read GPR `n` from a guest state. n=31 returns the zero register.
-fn readGuestGpr(gs: *const vm_hw.GuestState, n: u8) u64 {
-    if (n == 31) return 0; // XZR
-    const base: [*]const u64 = @ptrCast(gs);
-    return base[n];
-}
-
-/// Write GPR `n` into a guest state. n=31 is XZR (write ignored).
-fn writeGuestGpr(gs: *vm_hw.GuestState, n: u8, value: u64) void {
-    if (n == 31) return;
-    const base: [*]u64 = @ptrCast(gs);
-    base[n] = value;
-}
-
 // ── Spec-v3 dispatch backings (STUB) ─────────────────────────────────
 //
 // TODO(step 6): implement the dispatch primitives below. Stage-2

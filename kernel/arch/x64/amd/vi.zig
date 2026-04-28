@@ -19,7 +19,6 @@ const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
-const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
@@ -54,9 +53,6 @@ const MMIO_CMD_BUF_TAIL = 0x2008;
 // ---------------------------------------------------------------------------
 // IOMMU Control Register bit definitions (spec MMIO Offset 0018h)
 // ---------------------------------------------------------------------------
-
-/// IommuEn (bit 0): Master enable — all upstream transactions processed by IOMMU.
-const CTRL_IOMMU_EN: u64 = 1 << 0;
 
 /// EventLogEn (bit 2): Enable event logging to the Event Log buffer.
 const CTRL_EVT_LOG_EN: u64 = 1 << 2;
@@ -150,64 +146,6 @@ const IommuUnit = struct {
         // For the minimum 4KB buffer this wraps at 0x1000.
         self.writeReg64(MMIO_CMD_BUF_TAIL, (tail + 16) % self.cmd_buf_len);
     }
-
-    /// Issue INVALIDATE_DEVTAB_ENTRY for the given DeviceID.
-    ///
-    /// Spec Section 2.4.2, Figure 42:
-    ///   lo[15:0]  = DeviceID
-    ///   lo[31:16] = Reserved
-    ///   lo[63:60] = Opcode 02h
-    ///   hi        = Reserved (zero)
-    ///
-    /// Forces the IOMMU to discard its cached copy of this device's DTE so that
-    /// subsequent DMA from the device triggers a fresh DTE fetch from memory.
-    fn invalidateDeviceEntry(self: *const IommuUnit, device_id: u16) void {
-        self.issueCommand(
-            CMD_INVALIDATE_DEVTAB_ENTRY | @as(u64, device_id),
-            0,
-        );
-    }
-
-    /// Issue INVALIDATE_IOMMU_PAGES for all pages in the given domain.
-    ///
-    /// Spec Section 2.4.3, Figure 43:
-    ///   lo[19:0]  = PASID (zero — no guest translation)
-    ///   lo[31:20] = Reserved
-    ///   lo[47:32] = DomainID
-    ///   lo[59:48] = Reserved
-    ///   lo[63:60] = Opcode 03h
-    ///   hi[0]     = S (size: 1 = use address-encoded size)
-    ///   hi[1]     = PDE (1 = also flush page directory entries)
-    ///   hi[2]     = GN (0 = guest physical / nested)
-    ///   hi[63:12] = Address[63:12]
-    ///
-    /// To invalidate ALL cached translations for the domain, set S=1, PDE=1,
-    /// and Address[63:12] = 0x7_FFFF_FFFF_FFFF (spec software note in 2.4.3).
-    fn invalidatePages(self: *const IommuUnit, domain_id: u16) void {
-        const lo = CMD_INVALIDATE_IOMMU_PAGES | (@as(u64, domain_id) << 32);
-        // S=1 (bit 0), PDE=1 (bit 1), Address[63:12] all 1s except bit 63
-        // Address[31:12] = 0xFFFFF in hi[31:12], Address[63:32] = 0x7FFFFFFF in hi[63:32]
-        const hi: u64 = 0x7FFF_FFFF_FFFF_F003;
-        self.issueCommand(lo, hi);
-    }
-
-    /// Issue COMPLETION_WAIT to synchronize with the IOMMU command stream.
-    ///
-    /// Spec Section 2.4.1, Figure 41:
-    ///   lo[0]     = s (store): 0 = no store
-    ///   lo[1]     = i (interrupt): 0 = no interrupt
-    ///   lo[2]     = f (flush queue): 1 = strict ordering, subsequent commands
-    ///               wait until this completes
-    ///   lo[63:60] = Opcode 01h
-    ///   hi        = Store data (unused when s=0)
-    ///
-    /// This command does not finish until all older commands have completed.
-    /// Software must issue this after invalidation sequences before allowing
-    /// device DMA to ensure no stale translations persist (spec Section 2.4.9).
-    fn completionWait(self: *const IommuUnit) void {
-        // f=1 (flush queue), s=0, i=0
-        self.issueCommand(CMD_COMPLETION_WAIT | 0x4, 0);
-    }
 };
 
 const AliasEntry = struct {
@@ -235,15 +173,6 @@ pub fn addAlias(source: u16, alias: u16) void {
         aliases[alias_count] = .{ .source = source, .alias = alias };
         alias_count += 1;
     }
-}
-
-/// Look up whether a device BDF has an alias (e.g., from IVRS ACPI table).
-/// Returns the alias DeviceID if found, otherwise the original BDF.
-fn lookupAlias(bdf: u16) u16 {
-    for (aliases[0..alias_count]) |entry| {
-        if (entry.source == bdf) return entry.alias;
-    }
-    return bdf;
 }
 
 /// Initialize one IOMMU unit given its MMIO register base physical address.
@@ -367,46 +296,5 @@ pub fn init(reg_base_phys: PAddr) !void {
     unit_count += 1;
 }
 
-/// Configure a device's DTE to enable IOMMU-translated DMA through a
-/// per-device I/O page table.
-///
-/// This allocates a fresh level-4 root page table for the device and programs
-/// the DTE to use 4-level host translation (Mode=100b → 48-bit DMA address space,
-/// per spec Table 7 Mode field / Table 15 level parameters).
-///
-/// Spec Section 2.2.2.2 (Making Device Table Entry Changes):
-///   When V=1 before the change, the DTE must be updated carefully. We clear V
-///   first to mark the entry invalid, write all fields, then set V=1 as the
-///   final step, followed by INVALIDATE_DEVTAB_ENTRY.
-/// Construct a non-leaf (Page Directory Entry) I/O page table entry.
-///
-/// Spec Section 2.2.3, Figure 10, Table 18 (PDE fields, PR=1):
-///   Bit  0:      PR = 1 (present)
-///   Bits [11:9]: NextLevel (level of the page table this entry points to;
-///                must not be 000b or 111b for a PDE)
-///   Bits [51:12]: Next Table Address (SPA of the child page table)
-///   Bit  61:     IR = 1 (read permission — ANDed into cumulative perms)
-///   Bit  62:     IW = 1 (write permission — ANDed into cumulative perms)
-fn amdviNonLeaf(phys_addr: u64, next_level: u64) u64 {
-    return (phys_addr & AMDVI_ADDR_MASK) | (next_level << 9) | AMDVI_RW | 0x1;
-}
-
-/// Construct a leaf (Page Translation Entry) I/O page table entry for a 4KB page.
-///
-/// Spec Section 2.2.3, Figure 9, Table 17 (PTE fields, PR=1):
-///   Bit  0:      PR = 1 (present)
-///   Bits [11:9]: NextLevel = 000b (page translation entry, not a directory)
-///   Bits [51:12]: Page Address (SPA of the 4KB physical page)
-///   Bit  61:     IR = 1 (read allowed)
-///   Bit  62:     IW = 1 (write allowed)
-fn amdviLeaf(phys_addr: u64) u64 {
-    return (phys_addr & AMDVI_ADDR_MASK) | AMDVI_RW | 0x1;
-}
-
-/// Check the Present bit (bit 0) of a page table entry.
-/// Spec Table 16: PR=0 means the entry is not present; remaining bits are ignored.
-fn amdviPresent(entry: u64) bool {
-    return (entry & 0x1) != 0;
-}
 
 

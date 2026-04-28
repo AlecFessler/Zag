@@ -38,12 +38,7 @@ const Vm = kvm.vm.Vm;
 const VmExitInfo = zag.arch.dispatch.vm.VmExitInfo;
 
 pub const VCpuAllocator = SecureSlab(VCpu, 256);
-pub var slab_instance: VCpuAllocator = undefined;
 
-/// State of a vCPU. Accessed from multiple ECs (the vCPU's own EC,
-/// `kickRunningVcpus`, the exit handler, and reply-side resume); all
-/// reads/writes must use atomic load/store via `loadState`/`storeState`
-/// helpers.
 pub const VCpuState = enum(u8) {
     idle,
     running,
@@ -52,29 +47,11 @@ pub const VCpuState = enum(u8) {
 
 pub const VCpu = struct {
     _gen_lock: GenLock = .{},
-    /// Back-reference to the vCPU's owning ExecutionContext. The EC is
-    /// what scheduler code observes; the VCpu carries arch-specific
-    /// world-switch state.
     ec: SlabRef(ExecutionContext),
     vm: SlabRef(Vm),
     guest_state: vm_hw.GuestState = .{},
-    /// Atomic state. Use `loadState`/`storeState`. Direct writes are only
-    /// allowed inside regions already holding `vm._gen_lock`.
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(VCpuState.idle)),
-    /// Per-vCPU vGIC state: redistributor SGI/PPI bookkeeping plus the
-    /// list-register shadow consumed by `vgic.prepareEntry` /
-    /// `vgic.saveExit`. Initialized after the VCpu allocation and
-    /// before the vcpu EC is started.
-    /// See `kernel/arch/aarch64/kvm/vgic.zig`.
     vgic_state: VgicVcpuState = .{},
-
-    pub inline fn loadState(self: *const VCpu) VCpuState {
-        return @enumFromInt(self.state.load(.acquire));
-    }
-
-    pub inline fn storeState(self: *VCpu, new_state: VCpuState) void {
-        self.state.store(@intFromEnum(new_state), .release);
-    }
 };
 
 // ── Spec-v3 dispatch backings (STUB) ─────────────────────────────────
@@ -89,11 +66,6 @@ pub const VCpu = struct {
 
 pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void {
     _ = vm;
-    _ = vcpu_ec;
-    @panic("step 6: rewrite for spec-v3");
-}
-
-pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
     _ = vcpu_ec;
     @panic("step 6: rewrite for spec-v3");
 }
@@ -114,17 +86,6 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) void {
 }
 
 pub fn lastVmExitInfo(vcpu_ec: *ExecutionContext) VmExitInfo {
-    _ = vcpu_ec;
-    @panic("step 6: rewrite for spec-v3");
-}
-
-pub fn vmEmulatedTimerArm(vcpu_ec: *ExecutionContext, deadline_ns: u64) void {
-    _ = vcpu_ec;
-    _ = deadline_ns;
-    @panic("step 6: rewrite for spec-v3");
-}
-
-pub fn vmEmulatedTimerCancel(vcpu_ec: *ExecutionContext) void {
     _ = vcpu_ec;
     @panic("step 6: rewrite for spec-v3");
 }

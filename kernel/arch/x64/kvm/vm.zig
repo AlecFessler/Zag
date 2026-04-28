@@ -6,7 +6,6 @@ const guest_memory = zag.arch.x64.kvm.guest_memory;
 const ioapic_mod = zag.arch.x64.kvm.ioapic;
 const kvm = zag.arch.x64.kvm;
 const lapic_mod = zag.arch.x64.kvm.lapic;
-const mmio_decode = zag.arch.x64.mmio_decode;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const vcpu_mod = kvm.vcpu;
@@ -30,14 +29,7 @@ const VmExitBox = exit_box_mod.VmExitBox;
 
 pub const MAX_VCPUS = 64;
 
-/// Intel SDM Vol 3, Section 13.4.1: default APIC base.
-const LAPIC_BASE: u64 = 0xFEE00000;
-/// Intel 82093AA datasheet, Section 3.0: default IOAPIC base.
-const IOAPIC_BASE: u64 = 0xFEC00000;
-
 pub const VmAllocator = SecureSlab(Vm, 256);
-
-pub var slab_instance: VmAllocator = undefined;
 
 pub const Vm = struct {
     _gen_lock: GenLock = .{},
@@ -56,74 +48,6 @@ pub const Vm = struct {
     lapic: Lapic = .{},
     /// In-kernel IOAPIC emulation state.
     ioapic: Ioapic = .{},
-
-    /// Destroy this VM: kill all vCPU ECs, free structures.
-    /// `carried_gen` is the generation the caller's SlabRef(Vm) held;
-    /// passing it through (instead of reading `currentGen()` at destroy
-    /// time) ensures a stale caller panics cleanly rather than freeing
-    /// the wrong tenant of a recycled slot.
-    pub fn destroy(self: *Vm, carried_gen: u63) void {
-        // TODO step 6: rewrite for spec-v3. VM teardown lives in
-        // `kernel/capdom/virtual_machine.zig` destroyVm, which calls
-        // `dispatch.vm.{freeVmArchState,freeStage2Root}`, drops the
-        // policy_pf reference, and clears the owning domain's `vm`.
-        _ = self;
-        _ = carried_gen;
-        @panic("step 6: rewrite for spec-v3");
-    }
-
-    /// Returns a pointer to the VM's exit box. Used by `vcpu` and
-    /// `exit_handler` so neither has to know the box lives inside `Vm`.
-    pub fn exitBox(self: *Vm) *VmExitBox {
-        return &self.exit_box;
-    }
-
-    /// Inject an external-interrupt vector into the LAPIC IRR. Routes
-    /// `vm_vcpu_interrupt` and IOAPIC delivery through a single Vm-level entry.
-    pub fn injectExternal(self: *Vm, vector: u8) void {
-        self.lapic.injectExternal(vector);
-    }
-
-    /// If `guest_phys` falls inside the in-kernel LAPIC or IOAPIC page,
-    /// decode the instruction at guest RIP, dispatch the access to the
-    /// matching controller, write any read result back into the guest GPR,
-    /// and advance RIP. Returns true if handled (the exit can be resumed
-    /// inline) or false if it should fall through to the VMM.
-    pub fn tryHandleMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
-        if (guest_phys >= LAPIC_BASE and guest_phys < LAPIC_BASE + 0x1000) {
-            return self.handleLapicMmio(vcpu_obj, guest_phys);
-        }
-        if (guest_phys >= IOAPIC_BASE and guest_phys < IOAPIC_BASE + 0x1000) {
-            return self.handleIoapicMmio(vcpu_obj, guest_phys);
-        }
-        return false;
-    }
-
-    fn handleLapicMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
-        const op = mmio_decode.decode(self, &vcpu_obj.guest_state) orelse return false;
-        const offset: u32 = @truncate(guest_phys - LAPIC_BASE);
-        if (op.is_write) {
-            self.lapic.mmioWrite(offset, op.value);
-        } else {
-            const value = self.lapic.mmioRead(offset);
-            mmio_decode.writeGpr(&vcpu_obj.guest_state, op.reg, @as(u64, value));
-        }
-        vcpu_obj.advanceRip(op.len);
-        return true;
-    }
-
-    fn handleIoapicMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
-        const op = mmio_decode.decode(self, &vcpu_obj.guest_state) orelse return false;
-        const offset: u32 = @truncate(guest_phys - IOAPIC_BASE);
-        if (op.is_write) {
-            self.ioapic.mmioWrite(offset, op.value);
-        } else {
-            const value = self.ioapic.mmioRead(offset);
-            mmio_decode.writeGpr(&vcpu_obj.guest_state, op.reg, @as(u64, value));
-        }
-        vcpu_obj.advanceRip(op.len);
-        return true;
-    }
 
     /// Translate a guest-physical address backed by the main RAM region into
     /// a host pointer. Returns null if the main-RAM-at-guest-phys-0 mapping

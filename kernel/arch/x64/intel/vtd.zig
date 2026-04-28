@@ -14,7 +14,6 @@ const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
-const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
@@ -46,21 +45,11 @@ const REG_GSTS = 0x1C;
 /// Takes effect only after SRTP command via GCMD.
 const REG_RTADDR = 0x20;
 
-/// Context Command Register (Section 11.4.6.1, offset 028h).
-/// 64-bit register for context-cache invalidation commands.
-const REG_CCMD = 0x28;
-
 // ── Command/status bit definitions (Section 11.4.4) ─────────────────────
-
-/// GCMD bit 31: Translation Enable — write 1 to enable DMA remapping.
-const GCMD_TE: u32 = 1 << 31;
 
 /// GCMD bit 30: Set Root Table Pointer — one-shot command to latch
 /// the value in RTADDR_REG. Cleared automatically; do not preserve.
 const GCMD_SRTP: u32 = 1 << 30;
-
-/// GSTS bit 31: Translation Enable Status — set when TE is active.
-const GSTS_TES: u32 = 1 << 31;
 
 /// GSTS bit 30: Root Table Pointer Status — set when SRTP completes.
 const GSTS_RTPS: u32 = 1 << 30;
@@ -79,54 +68,6 @@ const GSTS_CMD_MASK: u32 = 0x96FFFFFF;
 /// Offset of the IOTLB registers, derived from ECAP.IRO at init time.
 /// The IOTLB Invalidate Register is at this offset + 8 (Section 11.4.6.2).
 var iotlb_offset: u32 = 0;
-
-/// Legacy-mode Root Table Entry (Section 9.1, Table 3).
-///
-/// 128-bit entry, one per PCI bus (256 entries in root table).
-/// The upper 64 bits are reserved in legacy mode (used only in
-/// scalable mode for the upper context table pointer).
-///
-/// Layout:
-///   Bits 127:64 — Reserved (must be 0)
-///   Bits 63:12  — CTP: 4KB-aligned physical address of context table
-///   Bits 11:1   — Reserved (must be 0)
-///   Bit  0      — P: Present (1 = valid entry)
-const RootEntry = packed struct(u128) {
-    present: bool,
-    _res0: u11 = 0,
-    context_table_ptr: u52,
-    _res1: u64 = 0,
-};
-
-/// Legacy-mode Context Table Entry (Section 9.3, Table 12).
-///
-/// 128-bit entry, 256 per context table (one per devfn on a PCI bus).
-/// Maps a device to its second-stage page table and domain ID.
-///
-/// Layout:
-///   Bits 127:88 — Reserved
-///   Bits 87:72  — DID: 16-bit Domain Identifier
-///   Bit  71     — Reserved
-///   Bits 70:67  — Ignored
-///   Bits 66:64  — AW: Address Width (001=39-bit/3-level, 010=48-bit/4-level, 011=57-bit/5-level)
-///   Bits 63:12  — SLPTPTR: 4KB-aligned second-stage page table pointer
-///   Bits 11:4   — Reserved
-///   Bits 3:2    — TT: Translation Type (00=second-stage only, 10=pass-through)
-///   Bit  1      — FPD: Fault Processing Disable (1=suppress fault logging)
-///   Bit  0      — P: Present
-const ContextEntry = packed struct(u128) {
-    present: bool,
-    fault_disable: bool,
-    translation_type: u2,
-    _res0: u8 = 0,
-    slptptr: u52,
-    address_width: u3,
-    _ignored: u1 = 0,
-    _avail: u3 = 0,
-    _res1: u1 = 0,
-    domain_id: u16,
-    _res2: u40 = 0,
-};
 
 var iommu_base: u64 = 0;
 var root_table_phys: PAddr = PAddr.fromInt(0);
