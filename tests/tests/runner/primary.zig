@@ -162,10 +162,21 @@ pub fn main(cap_table_base: u64) void {
             }
 
             // §[event_state] return word — composed by sched.port.deliverEvent
-            // and written to the receiver's rax (vreg 1) via setSyscallReturn.
+            // and written to the receiver's `[user_rsp + 0]` (vreg 0,
+            // captured into `got.word` by issueRawCaptureWord). vreg 1
+            // (rax) carries the syscall success/error code (0 on a
+            // delivered event, E_TIMEOUT on the deadline path).
+            // Previous code read vreg 1 here, so `reply_handle_id`
+            // came back as 0 and every reply syscall hit
+            // `resolveHandleOnDomain(...) == null` → E_BADCAP. The
+            // sender ECs stayed parked on the result port, their CDs
+            // (and any periodic timer they'd armed) lived
+            // indefinitely, and accumulated wheel-tick load starved
+            // the runner past iter ~416 — the cascade-MISS root cause.
+            //
             // Layout: pair_count [12..19], tstart [20..31],
             // reply_handle_id [32..43], event_type [44..].
-            const reply_handle_id: caps.HandleId = @truncate((got.regs.v1 >> 32) & 0xFFF);
+            const reply_handle_id: caps.HandleId = @truncate((got.word >> 32) & 0xFFF);
             const result_code: ResultCode = @enumFromInt(got.regs.v3);
             const assertion_id: u64 = got.regs.v4;
             const tag: u64 = got.regs.v5;
@@ -177,7 +188,21 @@ pub fn main(cap_table_base: u64) void {
 
             // Resume the child so it can return out of testing.report,
             // fall through to start.zig, and tear down its self-handle.
-            _ = syscall.reply(reply_handle_id);
+            //
+            // Use the discard variant of issueReg directly. The plain
+            // `_ = syscall.reply(…)` chain (issueRawNoStack with 13
+            // output operands → Regs return → discard) is provably
+            // dead from LLVM's POV: every output operand traces to a
+            // discarded slot, which lets ReleaseSmall strip the entire
+            // chain INCLUDING the inner `asm volatile`. The visible
+            // failure was the runner emitting ~10 of ~420 expected
+            // reply syscalls, every elided reply leaving a test EC
+            // parked on the result port and the test's CD (with any
+            // periodic timer it armed) live indefinitely. The
+            // accumulated wheel-tick load starved the runner past
+            // iter ~416 and produced the cascade-MISS tail in
+            // `timer_arm_07..yield_04`.
+            syscall.issueRegDiscard(.reply, 0, .{ .v1 = reply_handle_id });
 
             collected += 1;
             batch_collected += 1;
@@ -325,7 +350,7 @@ fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
         i += 1;
     }
 
-    _ = syscall.delete(var_handle);
+    syscall.issueRegDiscard(.delete, 0, .{ .v1 = var_handle });
 
     return pf_handle;
 }

@@ -1197,5 +1197,18 @@ pub fn restartDomain(cd: *CapabilityDomain) i64 {
 /// allocBlock (no E_NOMEM is currently surfaced from that path —
 /// see TODO in allocCapabilityDomain).
 pub fn releaseSelf(cd: *CapabilityDomain) void {
+    // Park the calling EC before tearing the domain down. The caller
+    // is the running EC of `cd` (delete(SLOT_SELF) is dispatched on
+    // its own kernel stack); without this `parkSelfFaulted` it would
+    // continue executing user-mode code at the post-syscall RIP after
+    // iretq, but the `user_table` PMM block has just been freed and
+    // the user-mode pages backing the read-only cap-table view are
+    // unmapped. Park as `.exited` so syscallDispatch's
+    // `scheduler.run()` epilogue picks up the next ready EC instead
+    // of iretq'ing the now-doomed test EC. Mirrors the
+    // `fireThreadFault` no-route fallback.
+    if (zag.sched.scheduler.currentEc()) |ec| {
+        zag.sched.execution_context.parkSelfFaulted(ec);
+    }
     destroyCapabilityDomain(cd);
 }

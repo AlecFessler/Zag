@@ -197,6 +197,44 @@ pub fn issueReg(num: SyscallNum, extra: u64, in: Regs) Regs {
     return issueRawNoStack(buildWord(num, extra), in);
 }
 
+/// Fire-and-forget variant: same syscall semantics, but the result is
+/// discarded inside the asm. Used by call sites that previously did
+/// `_ = lib.syscall.<…>(…)`. ReleaseSmall LLVM was DCE'ing those —
+/// the chain `issueRawNoStack → issueReg → wrapper → caller`'s 13
+/// output operands are all dead at the discard, and the optimizer
+/// proves the entire `Regs` struct can be elided, taking the volatile
+/// asm with it. Keeping a single inline asm with no outputs and a
+/// `memory` clobber forces emission. Must mirror the kernel ABI of
+/// `issueRawNoStack` exactly: syscall_word at `[rsp]`, vreg-1..13 in
+/// rax/rbx/rdx/rbp/rsi/rdi/r8/r9/r10/r12/r13/r14/r15.
+pub fn issueRegDiscard(num: SyscallNum, extra: u64, in: Regs) void {
+    const word = buildWord(num, extra);
+    asm volatile (
+        \\ subq $16, %%rsp
+        \\ movq %%rcx, (%%rsp)
+        \\ syscall
+        \\ addq $16, %%rsp
+        :
+        : [word] "{rcx}" (word),
+          [iv1] "{rax}" (in.v1),
+          [iv2] "{rbx}" (in.v2),
+          [iv3] "{rdx}" (in.v3),
+          [iv4] "{rbp}" (in.v4),
+          [iv5] "{rsi}" (in.v5),
+          [iv6] "{rdi}" (in.v6),
+          [iv7] "{r8}" (in.v7),
+          [iv8] "{r9}" (in.v8),
+          [iv9] "{r10}" (in.v9),
+          [iv10] "{r12}" (in.v10),
+          [iv11] "{r13}" (in.v11),
+          [iv12] "{r14}" (in.v12),
+          [iv13] "{r15}" (in.v13),
+        : .{ .rax = true, .rbx = true, .rdx = true, .rbp = true,
+             .rsi = true, .rdi = true, .r8 = true, .r9 = true,
+             .r10 = true, .r12 = true, .r13 = true, .r14 = true,
+             .r15 = true, .rcx = true, .r11 = true, .memory = true });
+}
+
 // Stack-arg path. SPEC AMBIGUITY: spec lists vreg 14 at [rsp + 8]
 // when the syscall executes, but does not pin who is responsible for
 // stack alignment / red-zone discipline. We push the highest-numbered
