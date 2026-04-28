@@ -1,8 +1,6 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const apic = zag.arch.x64.apic;
-const arch_paging = zag.arch.x64.paging;
 const exit_box_mod = zag.arch.x64.kvm.exit_box;
 const guest_memory = zag.arch.x64.kvm.guest_memory;
 const ioapic_mod = zag.arch.x64.kvm.ioapic;
@@ -11,12 +9,10 @@ const lapic_mod = zag.arch.x64.kvm.lapic;
 const mmio_decode = zag.arch.x64.mmio_decode;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-const sched = zag.sched.scheduler;
 const vcpu_mod = kvm.vcpu;
 const vm_hw = zag.arch.x64.vm;
 
 const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const GuestMemory = guest_memory.GuestMemory;
 const Ioapic = ioapic_mod.Ioapic;
@@ -43,8 +39,6 @@ pub const VmAllocator = SecureSlab(Vm, 256);
 
 pub var slab_instance: VmAllocator = undefined;
 
-var vm_id_counter: u64 = 1;
-
 pub const Vm = struct {
     _gen_lock: GenLock = .{},
     vcpus: [MAX_VCPUS]SlabRef(VCpu) = undefined,
@@ -52,7 +46,6 @@ pub const Vm = struct {
     owner: SlabRef(CapabilityDomain),
     exit_box: VmExitBox = .{},
     policy: vm_hw.VmPolicy = .{},
-    vm_id: u64 = 0,
     arch_structures: PAddr = PAddr.fromInt(0),
     guest_mem: GuestMemory = .{},
     /// Host virtual base and size of the main guest RAM region (from first vm_guest_map).
@@ -89,24 +82,6 @@ pub const Vm = struct {
     /// `vm_vcpu_interrupt` and IOAPIC delivery through a single Vm-level entry.
     pub fn injectExternal(self: *Vm, vector: u8) void {
         self.lapic.injectExternal(vector);
-    }
-
-    /// Advance every kernel-managed interrupt-controller timer by `elapsed_ns`.
-    /// Called from the vCPU entry loop before each VMRUN.
-    pub fn tickInterruptControllers(self: *Vm, elapsed_ns: u64) void {
-        self.lapic.tick(elapsed_ns);
-    }
-
-    /// If the LAPIC has a deliverable pending vector and the guest is ready
-    /// to accept it (IF=1, no prior pending EVENTINJ), build the EVENTINJ
-    /// word, mark the vector accepted in the LAPIC, and return.
-    /// AMD APM Vol 2, Section 15.20, Figure 15-4.
-    pub fn deliverPendingInterrupts(self: *Vm, gs: *vm_hw.GuestState) void {
-        const vector = self.lapic.getPendingVector() orelse return;
-        const guest_if = gs.rflags & (1 << 9);
-        if (guest_if == 0 or gs.pending_eventinj != 0) return;
-        gs.pending_eventinj = @as(u64, vector) | (1 << 31);
-        self.lapic.acceptInterrupt(vector);
     }
 
     /// If `guest_phys` falls inside the in-kernel LAPIC or IOAPIC page,
@@ -169,162 +144,6 @@ pub const Vm = struct {
         return ptr[0..len];
     }
 };
-
-/// Syscall implementation: create a VM for the calling capability domain.
-pub fn vmCreate(domain: *CapabilityDomain, vcpu_count: u32, policy_ptr: u64) i64 {
-    // TODO step 6: rewrite for spec-v3. VM creation flows through
-    // `kernel/capdom/virtual_machine.zig` createVirtualMachine and
-    // createVcpu. Handle minting goes through capdom.mintHandle on
-    // the calling domain's user_table; vCPUs are minted as separate
-    // execution_context handles via createVcpu.
-    _ = domain;
-    _ = vcpu_count;
-    _ = policy_ptr;
-    @panic("step 6: rewrite for spec-v3");
-}
-
-/// Syscall implementation: map host virtual memory into guest physical address space (EPT).
-pub fn guestMap(domain: *CapabilityDomain, vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
-    // TODO step 6: rewrite for spec-v3. `map_guest` consumes
-    // page_frame handles (spec §[virtual_machine].map_guest) and
-    // dispatches per-page via `dispatch.vm.stage2MapPage`.
-    _ = domain;
-    _ = vm_handle;
-    _ = host_vaddr;
-    _ = guest_addr;
-    _ = size;
-    _ = rights;
-    @panic("step 6: rewrite for spec-v3");
-}
-
-/// Unmap pages that were successfully mapped during a partial guestMap.
-fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
-    var off: u64 = 0;
-    while (off < mapped_size) {
-        vm_hw.unmapGuestPage(vm_obj.arch_structures, guest_addr + off);
-        off += 0x1000;
-    }
-}
-
-/// Syscall implementation: allow/deny system-register passthrough for the
-/// calling domain's VM. On x86 a "sysreg" is an MSR — `sysreg_id` is the
-/// 32-bit MSR address. Modifies MSRPM bits in the VMCB. Refuses
-/// security-critical MSRs.
-pub fn sysregPassthrough(domain: *CapabilityDomain, vm_handle: u64, sysreg_id: u32, allow_read: bool, allow_write: bool) i64 {
-    // TODO step 6: rewrite for spec-v3. Sysreg passthrough is
-    // configured through `vm_set_policy` (spec §[virtual_machine])
-    // and routed via `dispatch.vm.applyVmPolicyTable`.
-    _ = domain;
-    _ = vm_handle;
-    _ = sysreg_id;
-    _ = allow_read;
-    _ = allow_write;
-    @panic("step 6: rewrite for spec-v3");
-}
-
-/// Syscall implementation: assert an IRQ line on the in-kernel interrupt
-/// controller (x86: IOAPIC).
-pub fn intcAssertIrq(domain: *CapabilityDomain, vm_handle: u64, irq_num: u64) i64 {
-    // TODO step 6: rewrite for spec-v3. IRQ assert/deassert flows
-    // through `vm_inject_irq` (spec §[virtual_machine]); the per-arch
-    // primitive lives in `dispatch.vm.vmInjectIrq`.
-    _ = domain;
-    _ = vm_handle;
-    _ = irq_num;
-    @panic("step 6: rewrite for spec-v3");
-}
-
-/// Syscall implementation: de-assert an IRQ line on the in-kernel interrupt
-/// controller (x86: IOAPIC).
-pub fn intcDeassertIrq(domain: *CapabilityDomain, vm_handle: u64, irq_num: u64) i64 {
-    // TODO step 6: rewrite for spec-v3. IRQ assert/deassert flows
-    // through `vm_inject_irq` (spec §[virtual_machine]); the per-arch
-    // primitive lives in `dispatch.vm.vmInjectIrq`.
-    _ = domain;
-    _ = vm_handle;
-    _ = irq_num;
-    @panic("step 6: rewrite for spec-v3");
-}
-
-/// Send an IPI to any core currently running a vCPU EC for this VM,
-/// forcing a VMEXIT so the vCPU re-enters VMRUN and checks pending interrupts.
-fn kickRunningVcpus(vm_obj: *Vm) void {
-    for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |vcpu_ref| {
-        const vcpu_obj = vcpu_ref.lock(@src()) catch continue;
-        defer vcpu_ref.unlock();
-        if (vcpu_obj.loadState() == .running) {
-            const ec = vcpu_obj.vcpu_ec.lock(@src()) catch continue;
-            defer vcpu_obj.vcpu_ec.unlock();
-            if (sched.coreRunning(ec)) |core_id| {
-                apic.sendSchedulerIpi(core_id);
-            }
-        }
-    }
-}
-
-/// Resolve a VM handle from the calling capability domain's table.
-fn resolveVmHandle(domain: *CapabilityDomain, vm_handle: u64) ?*Vm {
-    // TODO step 6: rewrite for spec-v3. Handle resolution goes through
-    // the CapabilityDomain user/kernel handle tables and returns
-    // `VirtualMachine` from `kernel/capdom/virtual_machine.zig`.
-    _ = domain;
-    _ = vm_handle;
-    @panic("step 6: rewrite for spec-v3");
-}
-
-/// Read a struct from userspace into a kernel buffer, handling cross-page boundaries.
-fn readUserStruct(domain: *CapabilityDomain, user_va: u64, buf: []u8) bool {
-    // TODO step 6: rewrite for spec-v3. Capability-domain user-memory
-    // accessors live behind a different API.
-    _ = domain;
-    _ = user_va;
-    _ = buf;
-    @panic("step 6: rewrite for spec-v3");
-}
-
-/// AMD APM Vol 2, §15.10; Intel SDM Vol 3C, §25.6.9.
-/// MSRs that must always be intercepted by the hypervisor.
-///
-/// FS_BASE (0xC0000100) and GS_BASE (0xC0000101) are intentionally
-/// NOT in this list. On SVM the VMCB host-state save area saves and
-/// restores both across VMRUN, and on VMX the host-state MSR fields
-/// do the same; real guests (Linux) write these on every task
-/// switch, so forcing an intercept here collapses scheduler
-/// throughput without buying any ring-0 protection. KERNEL_GS_BASE
-/// is different: it survives SWAPGS and the host depends on it for
-/// per-CPU data, which is why that one stays intercepted.
-fn isSecurityCriticalSysreg(msr: u32) bool {
-    return switch (msr) {
-        0xC0000080, // EFER
-        0xC0000081, // STAR
-        0xC0000082, // LSTAR
-        0xC0000083, // CSTAR
-        0xC0000084, // SFMASK
-        0x1B, // APIC_BASE
-        0xC0000102, // KERNEL_GS_BASE
-        0x174, // SYSENTER_CS
-        0x175, // SYSENTER_ESP
-        0x176, // SYSENTER_EIP
-        => true,
-        else => false,
-    };
-}
-
-// ── Cross-device routing trampolines ─────────────────────────────────
-// `Lapic` and `Ioapic` used to hold typed pointers at each other, which
-// made `kvm/lapic.zig` and `kvm/ioapic.zig` import each other. These
-// trampolines sit on the Vm side (which already owns both) so the
-// device files stay free of peer imports.
-
-fn lapicNotifyLevelEoi(ctx: *anyopaque, vector: u8) void {
-    const vm_obj: *Vm = @ptrCast(@alignCast(ctx));
-    vm_obj.ioapic.handleEOI(vector);
-}
-
-fn ioapicInjectExternal(ctx: *anyopaque, vector: u8) void {
-    const vm_obj: *Vm = @ptrCast(@alignCast(ctx));
-    vm_obj.lapic.injectExternal(vector);
-}
 
 // ── Spec-v3 dispatch backings ────────────────────────────────────────
 //

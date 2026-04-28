@@ -4,10 +4,8 @@ const zag = @import("zag");
 
 const aarch64 = zag.arch.aarch64;
 const paging = zag.arch.dispatch.paging;
-const port = zag.sched.port;
 const x64 = zag.arch.x64;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PmuCounterConfig = zag.syscall.pmu.PmuCounterConfig;
 const PmuInfo = zag.syscall.pmu.PmuInfo;
 const PmuSample = zag.syscall.pmu.PmuSample;
@@ -24,20 +22,10 @@ pub const PmuState = switch (builtin.cpu.arch) {
 /// Duplicated from `zag.syscall.pmu.MAX_COUNTERS` so the arch dispatch
 /// layer does not force its callers to pull in `zag.syscall.pmu` just to
 /// size a stack buffer.
-pub const pmu_max_counters: usize = 8;
-
 pub fn pmuInit() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.pmu.pmuInit(),
         .aarch64 => aarch64.pmu.pmuInit(),
-        else => unreachable,
-    }
-}
-
-pub fn pmuPerCoreInit() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.pmu.pmuPerCoreInit(),
-        .aarch64 => aarch64.pmu.pmuPerCoreInit(),
         else => unreachable,
     }
 }
@@ -163,14 +151,6 @@ pub fn pmuRead(state: *PmuState, sample: *PmuSample) void {
     }
 }
 
-pub fn pmuReset(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => try x64.pmu.pmuReset(state, configs),
-        .aarch64 => try aarch64.pmu.pmuReset(state, configs),
-        else => unreachable,
-    }
-}
-
 pub fn pmuStop(state: *PmuState) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.pmu.pmuStop(state),
@@ -202,29 +182,3 @@ pub fn pmuClearState(state: *PmuState) void {
     }
 }
 
-// ── Spec v3 PMU overflow delivery ────────────────────────────────────
-
-/// Called from the per-arch PMU overflow handler. Routes a
-/// `pmu_overflow` event for `ec` carrying the overflow bitmask
-/// per Spec §[event_type] (pmu_overflow). Fallback policy
-/// (no route bound, port closed, queue full) is owned by
-/// `port.firePmuOverflow`: drop the event, let the EC keep
-/// running. The mask widens to u64 to match the underlying
-/// fire signature; high bits are zero.
-pub fn pmuOverflowDispatch(ec: *ExecutionContext, overflow_mask: u32) void {
-    port.firePmuOverflow(ec, @as(u64, overflow_mask));
-}
-
-/// IDT vector (x86_64) or GIC INTID (aarch64) used for PMU overflow
-/// delivery on this arch. On x86_64 both Intel and AMD share the same
-/// vector, so the runtime vendor select is irrelevant here. On aarch64
-/// PMU overflow is a per-core PPI (not an SPI), but the dispatch
-/// surface still returns the raw INTID for callers that just need to
-/// match against `dispatchIrq` routing.
-pub fn pmuOverflowVector() u8 {
-    switch (builtin.cpu.arch) {
-        .x86_64 => return x64.intel.pmu.OVERFLOW_VECTOR,
-        .aarch64 => return aarch64.pmu.OVERFLOW_PPI,
-        else => unreachable,
-    }
-}

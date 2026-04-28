@@ -33,8 +33,6 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const pmu_facade = zag.arch.x64.pmu;
 const pmu_sched = zag.syscall.pmu;
-const port = zag.sched.port;
-const sched = zag.sched.scheduler;
 
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuEvent = pmu_sched.PmuEvent;
@@ -69,12 +67,6 @@ const PERFEVTSEL_INT: u64 = 1 << 20;
 const PERFEVTSEL_EN: u64 = 1 << 22;
 
 const PMI_VECTOR: u8 = @intFromEnum(interrupts.IntVecs.pmu);
-
-/// IDT vector used by the PMU overflow PMI on AMD. Exposed for the
-/// arch-dispatch layer (`pmuOverflowVector`) so generic code can wire
-/// userspace overflow delivery without reaching into the vendor
-/// backend's private constants.
-pub const OVERFLOW_VECTOR: u8 = PMI_VECTOR;
 
 /// AMD counters are 48 bits wide across all supported families (K8+).
 const AMD_COUNTER_BITS: u8 = 48;

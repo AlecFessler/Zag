@@ -7,7 +7,6 @@
 //! Slab-allocated so ECs that never call perfmon don't carry the
 //! per-counter buffers as inline bloat.
 
-const std = @import("std");
 const zag = @import("zag");
 
 const dispatch = zag.arch.dispatch;

@@ -21,7 +21,6 @@
 //!      `injectExternal` — delegate to vGIC instead of LAPIC. The vGIC
 //!      owns the entry/exit-time list-register dance.
 
-const std = @import("std");
 const zag = @import("zag");
 
 const kvm = zag.arch.aarch64.kvm;
@@ -31,7 +30,6 @@ const vgic_mod = kvm.vgic;
 const vm_hw = zag.arch.aarch64.vm;
 
 const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const GuestMemory = guest_memory.GuestMemory;
 const MemoryPerms = zag.memory.address.MemoryPerms;
@@ -51,8 +49,6 @@ pub const MAX_VCPUS = 64;
 pub const VmAllocator = SecureSlab(Vm, 256);
 pub var slab_instance: VmAllocator = undefined;
 
-var vm_id_counter: u64 = 1;
-
 pub const Vm = struct {
     _gen_lock: GenLock = .{},
     vcpus: [MAX_VCPUS]SlabRef(VCpu) = undefined,
@@ -62,7 +58,6 @@ pub const Vm = struct {
     owner: ?SlabRef(CapabilityDomain) = null,
     exit_box: VmExitBox = .{},
     policy: vm_hw.VmPolicy = .{},
-    vm_id: u64 = 0,
     arch_structures: PAddr = PAddr.fromInt(0),
     guest_mem: GuestMemory = .{},
     /// Host virtual base + size of the main guest RAM region (from the

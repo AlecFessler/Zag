@@ -26,7 +26,6 @@ const zag = @import("zag");
 
 const kvm = zag.arch.aarch64.kvm;
 const vm_hw = zag.arch.aarch64.vm;
-const vm_hyp = zag.arch.aarch64.hyp;
 const vm_mod = kvm.vm;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -37,7 +36,6 @@ const VgicVcpuState = kvm.vgic.VcpuState;
 const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
 const Vm = kvm.vm.Vm;
 const VmExitInfo = zag.arch.dispatch.vm.VmExitInfo;
-const VtimerState = kvm.vtimer.VtimerState;
 
 pub const VCpuAllocator = SecureSlab(VCpu, 256);
 pub var slab_instance: VCpuAllocator = undefined;
@@ -50,7 +48,6 @@ pub const VCpuState = enum(u8) {
     idle,
     running,
     exited,
-    waiting_reply,
 };
 
 pub const VCpu = struct {
@@ -64,26 +61,12 @@ pub const VCpu = struct {
     /// Atomic state. Use `loadState`/`storeState`. Direct writes are only
     /// allowed inside regions already holding `vm._gen_lock`.
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(VCpuState.idle)),
-    last_exit_info: vm_hw.VmExitInfo = .{ .unknown = 0 },
-    /// Guest FPSIMD state (V0..V31, FPCR, FPSR). Saved/restored by `vmResume`
-    /// across each guest entry. ARM ARM B1.2.2.
-    guest_fxsave: vm_hw.FxsaveArea align(16) = vm_hw.fxsaveInit(),
-    /// Per-vCPU scratch the EL2 hyp stub uses for the world-switch
-    /// marshalling block (WorldSwitchCtx + HostSave). Lives inline in
-    /// the VCpu so its PA is reachable by `PAddr.fromVAddr` while the
-    /// stub runs with EL2 MMU off. See `arch.aarch64.hyp.ArchScratch`.
-    arch_scratch: vm_hyp.ArchScratch align(16) = .{},
     /// Per-vCPU vGIC state: redistributor SGI/PPI bookkeeping plus the
     /// list-register shadow consumed by `vgic.prepareEntry` /
     /// `vgic.saveExit`. Initialized after the VCpu allocation and
     /// before the vcpu EC is started.
     /// See `kernel/arch/aarch64/kvm/vgic.zig`.
     vgic_state: VgicVcpuState = .{},
-    /// Per-vCPU virtual timer save area (CNTVOFF_EL2 / CNTV_CTL_EL0 /
-    /// CNTV_CVAL_EL0 / CNTKCTL_EL1). Loaded into the hardware just
-    /// before world-switch entry and snapshotted back out on exit.
-    /// See `kernel/arch/aarch64/kvm/vtimer.zig`.
-    vtimer_state: VtimerState = .{},
 
     pub inline fn loadState(self: *const VCpu) VCpuState {
         return @enumFromInt(self.state.load(.acquire));
@@ -93,32 +76,6 @@ pub const VCpu = struct {
         self.state.store(@intFromEnum(new_state), .release);
     }
 };
-
-// ---------------------------------------------------------------------------
-// Cross-module bridge
-// ---------------------------------------------------------------------------
-
-/// Route an interrupt injection addressed by GuestState pointer into the
-/// in-kernel vGIC. The caller passes `&vcpu_obj.guest_state`; we recover
-/// the containing VCpu via `@fieldParentPtr("guest_state", ...)` because
-/// the real injection state lives on the per-vCPU vGIC shadow (list
-/// registers + SGI/PPI pending bits), not directly on GuestState.
-///
-/// `aarch64/vm.zig` cannot `@import("zag").arch.aarch64.kvm.vgic`
-/// directly without a circular module dependency (kvm imports vm), so
-/// this bridge lives in the KVM object layer where both the VCpu type
-/// and the vGIC module are in scope.
-///
-/// Reference: GICv3 §11.2 "List registers", `vgic.injectInterrupt`.
-pub fn injectInterrupt(guest_state: *vm_hw.GuestState, interrupt: vm_hw.GuestInterrupt) void {
-    // `@fieldParentPtr` yields a `*align(@alignOf(GuestState)) VCpu`;
-    // `VCpu` has a stricter alignment than `GuestState` so the cast
-    // back to the natural-alignment pointer is sound — every caller
-    // passes `&vcpu.guest_state` from a `VCpu` allocated by the VCpu
-    // slab allocator, which preserves `VCpu`'s 16-byte alignment.
-    const vcpu: *VCpu = @alignCast(@fieldParentPtr("guest_state", guest_state));
-    kvm.vgic.injectInterrupt(&vcpu.vgic_state, interrupt);
-}
 
 // ── Spec-v3 dispatch backings (STUB) ─────────────────────────────────
 //

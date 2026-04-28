@@ -47,7 +47,6 @@
 //! - ARM ARM DDI 0487: D13.2.83 (MPIDR_EL1)
 
 const std = @import("std");
-const zag = @import("zag");
 
 // ── GICD register offsets (IHI 0069H, Section 8.9 / IHI 0048B, Section 4.3) ──
 

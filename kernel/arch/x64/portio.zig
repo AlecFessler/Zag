@@ -1,4 +1,3 @@
-const builtin = @import("builtin");
 const zag = @import("zag");
 
 const dispatch_portio = zag.arch.dispatch.portio;

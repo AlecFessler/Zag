@@ -718,21 +718,6 @@ pub const SyscallArgs = struct {
     arg4: u64,
 };
 
-pub fn getSyscallArgs(ctx: *const ArchCpuContext) SyscallArgs {
-    return .{
-        .num = ctx.regs.rax,
-        .arg0 = ctx.regs.rdi,
-        .arg1 = ctx.regs.rsi,
-        .arg2 = ctx.regs.rdx,
-        .arg3 = ctx.regs.r10,
-        .arg4 = ctx.regs.r8,
-    };
-}
-
-pub fn getSyscallReturn(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.rax;
-}
-
 pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rax = value;
 }
@@ -762,28 +747,9 @@ pub fn setEventAddr(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rdx = value;
 }
 
-/// Spec §[event_state] vreg 3 read (rdx on x86-64) — used to snapshot
-/// the suspending EC's GPR-backed vreg 3 for propagation to the
-/// receiver at recv time.
-pub fn getEventVreg3(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.rdx;
-}
-
 /// Spec §[event_state] vreg 4 — rbp on x86-64.
 pub fn setEventVreg4(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rbp = value;
-}
-
-/// Spec §[event_state] vreg 4 read (rbp on x86-64) — companion to
-/// `getEventVreg3`.
-pub fn getEventVreg4(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.rbp;
-}
-
-/// Spec §[event_state] vreg 5 — rsi on x86-64. Sender's snapshot is
-/// propagated to the receiver alongside vreg 3 / vreg 4.
-pub fn getEventVreg5(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.rsi;
 }
 
 pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
@@ -897,44 +863,6 @@ pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
     ctx.regs.r13 = gprs[10];
     ctx.regs.r14 = gprs[11];
     ctx.regs.r15 = gprs[12];
-}
-
-pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.r13;
-}
-
-pub fn getIpcMetadata(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.r14;
-}
-
-pub fn setIpcMetadata(ctx: *ArchCpuContext, value: u64) void {
-    ctx.regs.r14 = value;
-}
-
-pub fn getIpcPayloadWords(ctx: *const ArchCpuContext) [5]u64 {
-    return .{ ctx.regs.rdi, ctx.regs.rsi, ctx.regs.rdx, ctx.regs.r8, ctx.regs.r9 };
-}
-
-pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_count: u3) void {
-    if (word_count >= 1) dst.regs.rdi = src.regs.rdi;
-    if (word_count >= 2) dst.regs.rsi = src.regs.rsi;
-    if (word_count >= 3) dst.regs.rdx = src.regs.rdx;
-    if (word_count >= 4) dst.regs.r8 = src.regs.r8;
-    if (word_count >= 5) dst.regs.r9 = src.regs.r9;
-}
-
-pub const IpcPayloadSnapshot = struct { words: [5]u64 };
-
-pub fn saveIpcPayload(ctx: *const ArchCpuContext) IpcPayloadSnapshot {
-    return .{ .words = getIpcPayloadWords(ctx) };
-}
-
-pub fn restoreIpcPayload(ctx: *ArchCpuContext, words: [5]u64) void {
-    ctx.regs.rdi = words[0];
-    ctx.regs.rsi = words[1];
-    ctx.regs.rdx = words[2];
-    ctx.regs.r8 = words[3];
-    ctx.regs.r9 = words[4];
 }
 
 pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
