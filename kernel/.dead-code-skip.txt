@@ -35,7 +35,6 @@ arch/x64/paging.zig:75-107    sha256:8ddd540ea47de3e50064e49149cd957639099d8ac58
 arch/x64/serial.zig:7-14    sha256:46d763d4c76231115d8106df67c15f4de6a101bf7dc5ecac257a5194fc77ac89
 boot/protocol.zig:41-58    sha256:9882b3f612fe4d90fdb2562a1b3a666ca8ce0b6b5b0b5d0c6236a2d633e1cf4a
 syscall/errors.zig:1-15    sha256:17074f900b9a78fe15d0e0bcb1bd8ae6e2e41ea15d8f945ccba7c4e372600c4e
-arch/aarch64/kvm/guest_memory.zig:76-85    sha256:277646cefa4d4bcc5d76fa7d11007a95848df1c66c08a4ecf737f52df835ff17
 kprof/kprof.zig:1-7    sha256:5e3abe0fd57384783fda05ca7a1ea2a640da43cd9d050a61d8033e5ea13c8e34
 memory/allocators/secure_slab.zig:642-646    sha256:c007f868df3081f7e51df09fe636a252800ed7b9cdbeb3fbee7eb449cca1d255
 memory/address.zig:138-141    sha256:0ecc8fdea0ed710fd68ef4dcc965759ffb653161cfd41abc5941ed000bfc2eaf
