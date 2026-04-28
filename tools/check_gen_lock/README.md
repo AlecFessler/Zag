@@ -23,7 +23,7 @@ kernel/ directory automatically):
 ```
 tools/check_gen_lock/zig-out/bin/check_gen_lock           # full report
 tools/check_gen_lock/zig-out/bin/check_gen_lock --summary # one line per entry
-tools/check_gen_lock/zig-out/bin/check_gen_lock --entry sysThreadCreate
+tools/check_gen_lock/zig-out/bin/check_gen_lock --entry createExecutionContext
 tools/check_gen_lock/zig-out/bin/check_gen_lock --list-slab-types
 tools/check_gen_lock/zig-out/bin/check_gen_lock --list-methods
 tools/check_gen_lock/zig-out/bin/check_gen_lock --help
@@ -34,9 +34,11 @@ Exit status is nonzero if any err-severity findings are emitted.
 ## Checks performed
 
 1. **Slab-backed type discovery.** Struct definitions that contain
-   `_gen_lock: GenLock = .{}` are marked as slab-backed. The current set:
-   Process, Thread, Vm, VCpu, VmNode, SharedMemory, DeviceRegion,
-   PmuState.
+   `_gen_lock: GenLock = .{}` are marked as slab-backed. Discovered
+   dynamically; the current spec-v3 tree has 13 slab-backed types
+   (CapabilityDomain, ExecutionContext, VAR, Port, PageFrame, Timer,
+   DeviceRegion, VirtualMachine, VmNode, PerfmonState, Vm, VCpu,
+   PmuState).
 
 2. **Bare-pointer invariant.** Struct fields whose type matches `*T`,
    `?*T`, `[N]*T`, `[]*T` for slab-backed T are violations — slab
@@ -50,54 +52,56 @@ Exit status is nonzero if any err-severity findings are emitted.
      the contiguous `//` comment block immediately above.
 
 4. **Per-entry gen-lock bracketing.** For every kernel entry point —
-   `pub fn sys*` in `kernel/syscall/`, exception/IRQ handlers in
-   `kernel/arch/{x64,aarch64}/exceptions.zig`, and the scheduler tick —
-   the analyzer walks the function body ONCE with a fresh ident env.
-   At each call site, it looks up the callee's memoized per-param
-   **summary** — the list of (access / lock / unlock / defer_unlock)
-   events the callee performs on each of its slab-typed params — and
-   folds those events into the caller's per-ident event timeline at
-   the real source line of the call. Callee-internal locals never
-   enter the caller env; only param-keyed effects are visible across
-   the call boundary.
+   every `pub fn` in `kernel/syscall/<file>.zig` (excluding the
+   dispatch / errors / pmu / syscall re-export files), the
+   exception/IRQ handlers in `kernel/arch/{x64,aarch64}/exceptions.zig`,
+   and the scheduler tick — the analyzer walks the function body ONCE
+   with a fresh ident env. At each call site, it looks up the callee's
+   memoized per-param **summary** — the list of (access / lock /
+   unlock / defer_unlock) events the callee performs on each of its
+   slab-typed params — and folds those events into the caller's
+   per-ident event timeline at the real source line of the call.
+   Callee-internal locals never enter the caller env; only param-keyed
+   effects are visible across the call boundary.
 
    Each access to a slab-typed local must be:
-   - tight-preceded by a `lock()` / `lockWithGen()` on the same ident,
+   - tight-preceded by a `lock(@src())` / `lockWithGen()` on the same
+     ident,
    - tight-followed by an `unlock()`, OR a `defer <ident>.unlock()`
      covering the scope exit.
-   - Self-alive idents (derived from `scheduler.currentThread()`,
-     refcount-pinned via `defer x.releaseRef()` / `.decRef()`, or
-     explicitly annotated with `// self-alive`) are exempt.
+   - Self-alive idents are exempt. A local is self-alive when it
+     derives from any of:
+     - `scheduler.currentThread()` / `scheduler.currentProc()`
+     - a refcount pin (`defer x.releaseRef()` / `.decRef()`)
+     - an explicit `// self-alive` comment
+     - the spec-v3 syscall caller-cast pattern
+       `const ec: *T = @ptrCast(@alignCast(caller))`, where `caller`
+       is the entry's first parameter of type `*anyopaque` — the
+       kernel ABI hands the syscall handler a pointer to the running
+       ExecutionContext, which cannot be reaped during the syscall.
+
+## Spec-v3 conventions baked into the analyzer
+
+- Entry-point discovery treats every `pub fn` in
+  `kernel/syscall/<file>.zig` as a syscall handler (with
+  `dispatch.zig`, `errors.zig`, `pmu.zig`, and `syscall.zig` excluded
+  as non-handler re-exports). Spec-v3 dropped the `sys*` prefix the
+  spec-v2 tool relied on.
+- The static `FAT_YIELDING_FIELDS` and `DEFAULT_FIELD_CHAINS` tables
+  enumerate every `SlabRef(T)` field on a slab-backed struct. When the
+  schema changes, re-scan with
+  `grep -n 'SlabRef(' kernel/.../<owner>.zig` and update both tables.
+- `lock()` matchers accept the spec-v3 `lock(@src())` form (any
+  balanced argument list), not just the spec-v2 `lock()` shape.
 
 ## Current finding totals
 
 On the current kernel tree the analyzer reports:
 
-- 67 entry points analyzed, 118 tracked slab-typed idents.
+- 67 entry points analyzed, 82 tracked slab-typed idents.
 - 0 err / 0 info bracketing findings.
-- 8 slab-backed types, 0 bare-pointer violations, 0 `.ptr` bypass
+- 13 slab-backed types, 0 bare-pointer violations, 0 `.ptr` bypass
   sites.
-
-The pre-summary port of this tool reported 11 err / 15 info findings.
-Ten err / fourteen info of those were false positives caused by the
-old inline-expansion walker: helper-internal locals like `prev` or
-`restored_caller_ref` leaked into the caller's ident env, and their
-events at synthetic line numbers spanning thousands (e.g. "access at
-L5616 in a 400-line syscall") bore no relation to real source code.
-The summary-based walker drops all helper-internal locals and emits
-events at real source lines, so those ghost findings are gone.
-
-A follow-up pass closed the last five false positives:
-
-- Chained assignments `<ident> = <head>.<variant>` (where `<variant>`
-  is a KernelObject union-variant or a known fat-yielding field name)
-  now promote the LHS into `env.fat` even when `<head>` itself wasn't
-  in env — the four `target_proc_ref` sites in sysThread{Suspend,
-  Resume,Kill} / sysFaultSetThreadMode chain through such a ref.
-- `<slab_module>.destroy(<ident>, <gen>)` is recognized as terminal
-  (the allocator re-acquires the gen-lock internally); no access
-  event is emitted, so the bracket check doesn't demand an unlock
-  after destroy — fixes the sysPmuStop unlock-then-destroy pattern.
 
 ## Directory layout
 

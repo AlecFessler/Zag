@@ -76,35 +76,87 @@ const SELF_ALIVE_HELPERS = [_][]const u8{
 };
 
 // KernelObject union-variant field names, keyed to their slab type.
+// Spec-v3: handle table entries reference slab objects through these
+// variant names on the typed-union side of `capability.ErasedSlabRef`.
 const UnionVariantEntry = struct { variant: []const u8, ty: []const u8 };
 const UNION_VARIANTS = [_]UnionVariantEntry{
-    .{ .variant = "thread", .ty = "Thread" },
-    .{ .variant = "process", .ty = "Process" },
-    .{ .variant = "dead_process", .ty = "Process" },
-    .{ .variant = "shared_memory", .ty = "SharedMemory" },
+    .{ .variant = "execution_context", .ty = "ExecutionContext" },
+    .{ .variant = "capability_domain", .ty = "CapabilityDomain" },
+    .{ .variant = "var_range", .ty = "VAR" },
+    .{ .variant = "page_frame", .ty = "PageFrame" },
     .{ .variant = "device_region", .ty = "DeviceRegion" },
-    .{ .variant = "vm", .ty = "Vm" },
+    .{ .variant = "virtual_machine", .ty = "VirtualMachine" },
+    .{ .variant = "vcpu", .ty = "VCpu" },
+    .{ .variant = "port", .ty = "Port" },
+    .{ .variant = "timer", .ty = "Timer" },
 };
 
+// Static `<owner>.<field>` chain → slab type map. Used for two slightly
+// different inferences:
+//   1. `const x = <head_typed_as_owner>.<field>` declares `x` with the
+//      slab type stored in `ty`, so downstream `x.lock(...)` /
+//      `x.<lock_field>.lock()` chains classify.
+//   2. `const y = <head>.<field>.lock(...)` chains: when the chain
+//      walker can't resolve the leading ident, the trailing
+//      `<field>.lock()` still names the locked slab type via this map.
+// Every entry mirrors a SlabRef(T) field on a slab-backed struct in
+// the kernel (`grep -n 'SlabRef(' kernel/...`). Entries are duplicated
+// from FAT_YIELDING_FIELDS but here paired with the inner T so the
+// type can flow into env.map.
 const DefaultFieldChainEntry = struct { owner: []const u8, field: []const u8, ty: []const u8 };
 const DEFAULT_FIELD_CHAINS = [_]DefaultFieldChainEntry{
-    .{ .owner = "Thread", .field = "process", .ty = "Process" },
-    .{ .owner = "Thread", .field = "pmu_state", .ty = "PmuState" },
-    .{ .owner = "VCpu", .field = "process", .ty = "Process" },
+    // ExecutionContext.
+    .{ .owner = "ExecutionContext", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "ExecutionContext", .field = "next", .ty = "ExecutionContext" },
+    .{ .owner = "ExecutionContext", .field = "prev", .ty = "ExecutionContext" },
+    .{ .owner = "ExecutionContext", .field = "suspend_port", .ty = "Port" },
+    .{ .owner = "ExecutionContext", .field = "pending_reply_domain", .ty = "CapabilityDomain" },
+    .{ .owner = "ExecutionContext", .field = "vm", .ty = "VirtualMachine" },
+    .{ .owner = "ExecutionContext", .field = "exit_port", .ty = "Port" },
+    .{ .owner = "ExecutionContext", .field = "perfmon_state", .ty = "PerfmonState" },
+    // VAR.
+    .{ .owner = "VAR", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "VAR", .field = "pf", .ty = "PageFrame" },
+    .{ .owner = "VAR", .field = "device", .ty = "DeviceRegion" },
+    .{ .owner = "VAR", .field = "snapshot_source", .ty = "VAR" },
+    // VirtualMachine.
+    .{ .owner = "VirtualMachine", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "VirtualMachine", .field = "policy_pf", .ty = "PageFrame" },
+    .{ .owner = "VirtualMachine", .field = "pf", .ty = "PageFrame" },
+    // VCpu.
     .{ .owner = "VCpu", .field = "vm", .ty = "Vm" },
-    .{ .owner = "Vm", .field = "proc", .ty = "Process" },
 };
 
+// Fields whose declared type is `SlabRef(T)` / `?SlabRef(T)`. Reading
+// such a field yields a fat ref, so the LHS of `<x> = <head>.<field>`
+// gets `is_fat = true`. The list mirrors every `SlabRef(_)` field on a
+// slab-backed struct in the kernel; updating this requires re-scanning
+// the kernel for `SlabRef(...)` field decls when the schema changes.
 const FatFieldEntry = struct { owner: []const u8, field: []const u8 };
 const FAT_YIELDING_FIELDS = [_]FatFieldEntry{
-    .{ .owner = "Thread", .field = "process" },
-    .{ .owner = "Thread", .field = "next" },
-    .{ .owner = "Thread", .field = "ipc_server" },
-    .{ .owner = "Thread", .field = "pmu_state" },
-    .{ .owner = "VCpu", .field = "process" },
+    // ExecutionContext (kernel/sched/execution_context.zig).
+    .{ .owner = "ExecutionContext", .field = "domain" },
+    .{ .owner = "ExecutionContext", .field = "next" },
+    .{ .owner = "ExecutionContext", .field = "prev" },
+    .{ .owner = "ExecutionContext", .field = "suspend_port" },
+    .{ .owner = "ExecutionContext", .field = "pending_reply_domain" },
+    .{ .owner = "ExecutionContext", .field = "vm" },
+    .{ .owner = "ExecutionContext", .field = "exit_port" },
+    .{ .owner = "ExecutionContext", .field = "perfmon_state" },
+    // VAR (kernel/capdom/var_range.zig).
+    .{ .owner = "VAR", .field = "domain" },
+    .{ .owner = "VAR", .field = "pf" },
+    .{ .owner = "VAR", .field = "device" },
+    .{ .owner = "VAR", .field = "snapshot_source" },
+    // VirtualMachine (kernel/capdom/virtual_machine.zig).
+    .{ .owner = "VirtualMachine", .field = "domain" },
+    .{ .owner = "VirtualMachine", .field = "policy_pf" },
+    .{ .owner = "VirtualMachine", .field = "pf" },
+    // VCpu (kernel/arch/x64/kvm/vcpu.zig + aarch64 mirror).
     .{ .owner = "VCpu", .field = "vm" },
-    .{ .owner = "VCpu", .field = "thread" },
-    .{ .owner = "Process", .field = "vm" },
+    // Timer (kernel/sched/timer.zig — the `timer_ref` field on
+    // TimerWheelEntry / wheel slot points back at the slab Timer).
+    .{ .owner = "TimerWheelEntry", .field = "timer_ref" },
 };
 
 const EXCEPTION_ENTRY_NAMES = [_][]const u8{
@@ -116,13 +168,23 @@ const EXCEPTION_ENTRY_NAMES = [_][]const u8{
     "handleIrqCurrentEl",
     "handleUnexpected",
     "dispatchIrq",
-    "faultOrKillUser",
     "schedTimerHandler",
 };
 
 const ExtraRoot = struct { rel_path: []const u8, fn_name: []const u8 };
 const EXTRA_ROOTS = [_]ExtraRoot{
-    .{ .rel_path = "kernel/sched/scheduler.zig", .fn_name = "schedTimerHandler" },
+    .{ .rel_path = "kernel/arch/x64/irq.zig", .fn_name = "schedTimerHandler" },
+};
+
+// Files under kernel/syscall/ that DON'T host userspace-reachable
+// syscall handlers — they re-export modules, host the dispatch
+// trampoline, define error codes, or carry shared type definitions.
+// `pub fn` declarations here are not entry points.
+const SYSCALL_DIR_NON_HANDLER_FILES = [_][]const u8{
+    "kernel/syscall/dispatch.zig",
+    "kernel/syscall/errors.zig",
+    "kernel/syscall/pmu.zig",
+    "kernel/syscall/syscall.zig",
 };
 
 const SlabReturnHelperEntry = struct { name: []const u8, ty: []const u8 };
@@ -1325,7 +1387,8 @@ fn findEntryPoints(
 ) !void {
     for (files, tokens_per_file) |sf, toks| {
         const rel = sf.rel_path;
-        const is_syscall_dir = mem.startsWith(u8, rel, "kernel/syscall/");
+        const is_syscall_dir = mem.startsWith(u8, rel, "kernel/syscall/") and
+            !inList(rel, &SYSCALL_DIR_NON_HANDLER_FILES);
         const is_x64_except = mem.eql(u8, rel, "kernel/arch/x64/exceptions.zig");
         const is_arm_except = mem.eql(u8, rel, "kernel/arch/aarch64/exceptions.zig");
         const is_extra_root = blk: {
@@ -1340,7 +1403,10 @@ fn findEntryPoints(
             var start_i_mut: usize = i;
             if (i > 0 and toks[i - 1].tag == .keyword_pub) start_i_mut = i - 1;
             const start_i = start_i_mut;
-            // Only pub fn for sys*; any fn for exception list.
+            // Spec-v3 syscall handlers are every `pub fn` in
+            // kernel/syscall/<file>.zig (excluding dispatch/error/type
+            // helper files); exception/IRQ handlers may be plain `fn`
+            // (handed to the IDT/exception-vector tables by name).
             const is_pub = start_i != i;
             const header = parseFnHeaderAt(toks, start_i) orelse continue;
             const name = tokSlice(sf, toks[header.name_tok_idx]);
@@ -1357,7 +1423,7 @@ fn findEntryPoints(
             }
 
             var accept = false;
-            if (is_syscall_dir and is_pub and mem.startsWith(u8, name, "sys")) accept = true;
+            if (is_syscall_dir and is_pub) accept = true;
             if ((is_x64_except or is_arm_except) and inList(name, &EXCEPTION_ENTRY_NAMES)) accept = true;
             if (is_extra_root) {
                 for (EXTRA_ROOTS) |r| if (mem.eql(u8, r.rel_path, rel) and mem.eql(u8, r.fn_name, name)) {
@@ -1520,6 +1586,15 @@ const SlabEnv = struct {
     // slab-typed but does have a known struct type (method receiver,
     // non-slab fn param, etc.). Entries are interned.
     all_types: StringStringMap,
+    // For spec-v3 syscall entries: the name of the entry's first param
+    // when its type is `*anyopaque` (always `caller` in the current
+    // kernel, but recorded by name so a future rename or alternate
+    // spelling Just Works). When set, the decl walker treats
+    // `@ptrCast(@alignCast(<this>))` as a self-alive RHS — the syscall
+    // ABI hands the kernel a pointer to the running EC and the running
+    // EC cannot be reaped while the syscall body executes. Empty for
+    // exception/IRQ entries and for helper bodies (summary walks).
+    caller_param: []const u8,
 
     fn init(gpa: Allocator) SlabEnv {
         return .{
@@ -1527,6 +1602,7 @@ const SlabEnv = struct {
             .fat = SliceSet.init(gpa),
             .self_alive = SliceSet.init(gpa),
             .all_types = StringStringMap.init(gpa),
+            .caller_param = "",
         };
     }
     fn deinit(self: *SlabEnv) void {
@@ -1830,6 +1906,36 @@ fn isFreshAlloc(rhs: []const u8, slab_types: *const SlabTypeMap) bool {
         }
     }
     return false;
+}
+
+// Spec-v3 syscall caller-cast detector. Matches the canonical
+// `@ptrCast(@alignCast(<caller>))` pattern (modulo whitespace and an
+// optional trailing `;`/`,`) where `<caller>` is the syscall entry's
+// `caller: *anyopaque` first parameter. The kernel guarantees that
+// pointer references the running ExecutionContext for the duration
+// of the syscall, so the LHS local is self-alive without needing a
+// gen-lock op. Returns false when caller_param is empty (e.g. summary
+// walks of helper bodies, exception entries) — only entry analysis
+// surfaces the `caller_param` name.
+fn isCallerSelfCast(rhs: []const u8, caller_param: []const u8) bool {
+    if (caller_param.len == 0) return false;
+    var s = trimAscii(rhs);
+    if (s.len > 0 and s[s.len - 1] == ';') s = trimAscii(s[0 .. s.len - 1]);
+    if (s.len > 0 and s[s.len - 1] == ',') s = trimAscii(s[0 .. s.len - 1]);
+
+    // Strip leading `@ptrCast(`.
+    const ptr_open = "@ptrCast(";
+    if (!mem.startsWith(u8, s, ptr_open)) return false;
+    if (!mem.endsWith(u8, s, ")")) return false;
+    var inner = trimAscii(s[ptr_open.len .. s.len - 1]);
+
+    // Strip leading `@alignCast(`.
+    const align_open = "@alignCast(";
+    if (!mem.startsWith(u8, inner, align_open)) return false;
+    if (!mem.endsWith(u8, inner, ")")) return false;
+    inner = trimAscii(inner[align_open.len .. inner.len - 1]);
+
+    return mem.eql(u8, inner, caller_param);
 }
 
 // Heuristic: is RHS a bare chain `<ident>.ptr` with head in self_alive?
@@ -2471,7 +2577,13 @@ fn walkBody(
                 if (mem.indexOfScalar(u8, rhs_plain, '.')) |dotp| {
                     const head = rhs_plain[0..dotp];
                     const tail = rhs_plain[dotp + 1 ..];
-                    if (mem.eql(u8, tail, "lock()")) {
+                    // SlabRef.lock takes a `SrcLoc` arg in spec-v3; match
+                    // any `lock(...)` shape (`lock()`, `lock(@src())`,
+                    // `lock(some.src)`) by checking the prefix + balanced
+                    // close paren.
+                    const is_lock_call = mem.startsWith(u8, tail, "lock(") and
+                        mem.endsWith(u8, tail, ")");
+                    if (is_lock_call) {
                         var all_ident_h = head.len > 0;
                         for (head) |c| if (!isIdentChar(c)) { all_ident_h = false; break; };
                         if (all_ident_h and env.fat.contains(head)) {
@@ -2499,8 +2611,33 @@ fn walkBody(
             var chained_lock_alias = false;
             if (resolved == null) {
                 const rhs_cs = stripPostfix(dp.rhs);
-                if (mem.endsWith(u8, rhs_cs, ".lock()")) {
-                    const chain = rhs_cs[0 .. rhs_cs.len - ".lock()".len];
+                // Match `<chain>.lock(...)` where `<chain>` is a pure
+                // ident-dot chain and `(...)` is the trailing balanced
+                // call. spec-v3 SlabRef.lock takes a SrcLoc, so the arg
+                // list isn't always literally empty.
+                const chain_opt: ?[]const u8 = blk: {
+                    if (!mem.endsWith(u8, rhs_cs, ")")) break :blk null;
+                    const lock_open = ".lock(";
+                    const lp_opt = mem.lastIndexOf(u8, rhs_cs, lock_open);
+                    if (lp_opt == null) break :blk null;
+                    const lp = lp_opt.?;
+                    // The substring from `lp+1` to end should be exactly
+                    // one balanced `lock(...)`; equivalently the paren
+                    // depth must hit 0 only at the final `)`.
+                    var depth: i32 = 0;
+                    var k: usize = lp + lock_open.len - 1; // points at `(`
+                    while (k < rhs_cs.len) : (k += 1) {
+                        const c = rhs_cs[k];
+                        if (c == '(') depth += 1;
+                        if (c == ')') {
+                            depth -= 1;
+                            if (depth == 0 and k != rhs_cs.len - 1) break :blk null;
+                        }
+                    }
+                    if (depth != 0) break :blk null;
+                    break :blk rhs_cs[0..lp];
+                };
+                if (chain_opt) |chain| {
                     // chain must be all idents + dots.
                     var all_chain = chain.len > 0;
                     for (chain) |c| if (!isIdentChar(c) and c != '.') {
@@ -2591,6 +2728,12 @@ fn walkBody(
                 const fresh = isFreshAlloc(dp.rhs, ctx.slab_types);
                 const ptr_fresh = try isPtrOfFresh(dp.rhs, &env.self_alive);
                 if (fresh or ptr_fresh) {
+                    try env.self_alive.add(dp.name);
+                    became_self_alive = true;
+                }
+            }
+            if (!became_self_alive) {
+                if (isCallerSelfCast(dp.rhs, env.caller_param)) {
                     try env.self_alive.add(dp.name);
                     became_self_alive = true;
                 }
@@ -3488,11 +3631,24 @@ fn analyzeEntry(
     }
     if (hdr == null) return;
 
-    const is_syscall_entry = mem.startsWith(u8, entry.name, "sys");
+    // Syscall entries live under kernel/syscall/. Spec-v3 syscall
+    // handlers all take `caller: *anyopaque` as their first parameter;
+    // the kernel-side syscall dispatcher hands the handler a pointer
+    // to the running ExecutionContext, which cannot be reaped while
+    // the syscall body executes. Recover the param name so the body
+    // walker can recognize the canonical `@ptrCast(@alignCast(caller))`
+    // recovery pattern as a self-alive seed.
+    const is_syscall_entry = mem.startsWith(u8, entry.file_rel, "kernel/syscall/");
 
     // Seed env from the fn header params.
     const params = try parseParamList(gpa, sf, toks, hdr.?.l_paren_idx, hdr.?.r_paren_idx);
     defer gpa.free(params);
+    if (is_syscall_entry and params.len > 0) {
+        const p0_ty = trimAscii(params[0].type_str);
+        if (mem.eql(u8, p0_ty, "*anyopaque")) {
+            out_env.caller_param = try pool.intern(params[0].name);
+        }
+    }
     for (params) |pp| {
         const nm = try pool.intern(pp.name);
         if (parseTypeRef(pp.type_str)) |ty| {
@@ -3501,9 +3657,6 @@ fn analyzeEntry(
                 try out_env.map.put(nm, ty_i);
                 try out_env.all_types.put(nm, ty_i);
                 if (mem.indexOf(u8, pp.type_str, "SlabRef") != null) try out_env.fat.add(nm);
-                if (is_syscall_entry and (mem.eql(u8, ty, "Process") or mem.eql(u8, ty, "Thread"))) {
-                    try out_env.self_alive.add(nm);
-                }
                 continue;
             }
         }
@@ -3952,6 +4105,16 @@ fn pathReleaseCheck(gpa: Allocator, res: *CheckResult) !void {
                         continue;
                     }
                     if (ex.kind == .panic_or_unreachable) continue;
+                    // `break` / `continue` exit the enclosing loop or
+                    // labeled block, not the enclosing function. When
+                    // the break/continue is at a depth strictly deeper
+                    // than the lock acquisition, it cannot escape the
+                    // lock's scope — the sequential walk continues past
+                    // the break target into code still inside the lock.
+                    // (At-or-shallower-than-lock break/continue is rare
+                    // in kernel code but would escape, so still report.)
+                    if ((ex.kind == .break_stmt or ex.kind == .continue_stmt) and
+                        ex.depth > lock_ev.depth) continue;
                     if (in_catch_skip and ex.depth > lock_ev.depth) continue;
                     if (in_catch_skip and ex.depth <= lock_ev.depth) {
                         in_catch_skip = false;
