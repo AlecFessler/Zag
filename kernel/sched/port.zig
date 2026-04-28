@@ -1400,7 +1400,10 @@ fn mintReply(receiver_domain: *CapabilityDomain, sender: *ExecutionContext, xfer
     );
 
     sender.pending_reply_holder = &receiver_domain.kernel_table[slot];
-    sender.pending_reply_domain = receiver_domain;
+    sender.pending_reply_domain = SlabRef(CapabilityDomain).init(
+        receiver_domain,
+        receiver_domain._gen_lock.currentGen(),
+    );
     sender.pending_reply_slot = slot;
     return slot;
 }

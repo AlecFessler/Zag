@@ -384,7 +384,7 @@ pub const ExecutionContext = struct {
     /// `terminate` path can mark the user_table caps with the
     /// `abandoned` bit (the kernel_table entry alone has no caps
     /// field). Both are set/cleared together with `pending_reply_holder`.
-    pending_reply_domain: ?*CapabilityDomain = null,
+    pending_reply_domain: ?SlabRef(CapabilityDomain) = null,
     pending_reply_slot: u12 = 0,
 
     /// Write-cap snapshot from the originating EC handle taken at the
@@ -1216,17 +1216,23 @@ pub fn resumeFromReply(ec: *ExecutionContext, apply_writes: bool) void {
 /// died for other reasons".
 pub fn abandonPendingReply(ec: *ExecutionContext) void {
     _ = ec.pending_reply_holder orelse return;
-    if (ec.pending_reply_domain) |dom| {
-        const slot = ec.pending_reply_slot;
-        const word0 = dom.user_table[slot].word0;
-        const tag = zag.caps.capability.Word0.typeTag(word0);
-        if (tag == .reply) {
-            const caps_u16 = zag.caps.capability.Word0.caps(word0);
-            var rc: zag.sched.port.ReplyCaps = @bitCast(caps_u16);
-            rc.abandoned = true;
-            const new_caps: u16 = @bitCast(rc);
-            dom.user_table[slot].word0 = zag.caps.capability.Word0.pack(slot, .reply, new_caps);
-        }
+    if (ec.pending_reply_domain) |dom_ref| {
+        // Re-validate the domain through the SlabRef before mutating
+        // its user_table — terminate may race against destroy of the
+        // receiver's domain.
+        if (dom_ref.lock(@src())) |dom| {
+            defer dom_ref.unlock();
+            const slot = ec.pending_reply_slot;
+            const word0 = dom.user_table[slot].word0;
+            const tag = zag.caps.capability.Word0.typeTag(word0);
+            if (tag == .reply) {
+                const caps_u16 = zag.caps.capability.Word0.caps(word0);
+                var rc: zag.sched.port.ReplyCaps = @bitCast(caps_u16);
+                rc.abandoned = true;
+                const new_caps: u16 = @bitCast(rc);
+                dom.user_table[slot].word0 = zag.caps.capability.Word0.pack(slot, .reply, new_caps);
+            }
+        } else |_| {}
     }
     ec.pending_reply_holder = null;
     ec.pending_reply_domain = null;
