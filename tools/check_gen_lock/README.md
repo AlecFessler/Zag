@@ -113,9 +113,9 @@ tools/check_gen_lock/
     └── main.zig
 ```
 
-## Follow-up
+## CI integration
 
-- `./test.sh pre-commit` runs this tool (advisory stage). It runs in
-  ~1.7s on the current tree.
-- 0 err / 0 info on the current tree; safe to promote from advisory
-  to gating at the caller's discretion.
+- `./test.sh pre-commit` runs this tool as a **gating stage**: any
+  err-severity finding fails the commit gate. Standalone target:
+  `./test.sh genlock`.
+- Runs in ~1.7s on the current tree; 0 err / 0 info.

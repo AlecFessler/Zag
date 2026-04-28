@@ -16,11 +16,13 @@ usage() {
 Usage: ./test.sh [target] [options]
 
 Targets:
-  kernel          Run kernel integration tests (QEMU, 473 tests)
+  kernel          Run kernel integration tests (QEMU, 475 tests)
   router          Run router integration tests (pytest)
   linux           Boot Linux guest in hyprvOS (x86_64), verify shell prompt
   linux-arm       Boot Linux guest in hyprvOS (aarch64 TCG), verify 'hello from guest'
-  pre-commit      Run kernel + linux + router (gate before commit)
+  genlock         Run gen-lock static analyzer (gates on err-severity findings)
+  dead-code       Run dead-code static analyzer (gates on any findings)
+  pre-commit      Run genlock + dead-code + kernel + linux + router (gate before commit)
   perf            Run kernel performance benchmarks (sequential)
   kernel-fuzz     Run all kernel fuzzers (buddy, heap, vmm, rbt)
   router-fuzz     Run router packet processing fuzzer
@@ -117,6 +119,24 @@ run_kernel_tests() {
     echo "=== Kernel Tests ==="
     clean_nvvars
     PARALLEL="${PARALLEL:-8}" bash "$SCRIPT_DIR/tests/tests/run_tests.sh"
+}
+
+run_genlock_check() {
+    echo "=== Gen-lock Static Analyzer ==="
+    (cd "$SCRIPT_DIR/tools/check_gen_lock" && zig build) \
+        || { echo "[FAIL] check_gen_lock build failed"; return 1; }
+    (cd "$SCRIPT_DIR" && tools/check_gen_lock/zig-out/bin/check_gen_lock --summary) \
+        || { echo "[FAIL] gen-lock analyzer reported err-severity findings"; return 1; }
+    echo "[PASS] gen-lock analyzer clean"
+}
+
+run_dead_code_check() {
+    echo "=== Dead-code Analyzer ==="
+    (cd "$SCRIPT_DIR/tools/dead_code_zig" && zig build) \
+        || { echo "[FAIL] dead_code_zig build failed"; return 1; }
+    (cd "$SCRIPT_DIR" && tools/dead_code_zig/zig-out/bin/dead_code_zig) \
+        || { echo "[FAIL] dead-code analyzer reported findings"; return 1; }
+    echo "[PASS] dead-code analyzer clean"
 }
 
 run_linux_boot_test() {
@@ -290,8 +310,16 @@ case "$TARGET" in
     router-fuzz)
         run_router_fuzzer
         ;;
+    genlock)
+        run_genlock_check || exit 1
+        ;;
+    dead-code)
+        run_dead_code_check || exit 1
+        ;;
     pre-commit)
         # Required gate before any agent commits — fails fast on the first failure.
+        run_genlock_check || exit 1
+        run_dead_code_check || exit 1
         run_kernel_tests || exit 1
         run_linux_boot_test || exit 1
         run_router_tests || exit 1
