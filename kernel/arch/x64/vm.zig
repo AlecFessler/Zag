@@ -84,10 +84,6 @@ pub const GuestState = extern struct {
     };
 };
 
-/// FXSAVE area (512 bytes, must be 16-byte aligned).
-/// Used to save/restore FPU/SSE state across VM transitions.
-pub const FxsaveArea = [512]u8;
-
 /// Tagged union of x64 VM exit reasons.
 pub const VmExitInfo = union(enum) {
     cpuid: CpuidExit,
