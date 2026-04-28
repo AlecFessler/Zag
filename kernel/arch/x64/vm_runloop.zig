@@ -14,9 +14,7 @@ const cpu_dispatch = zag.arch.dispatch.cpu;
 const kvm_vcpu = zag.arch.x64.kvm.vcpu;
 const kvm_vm = zag.arch.x64.kvm.vm;
 const vm_hw = zag.arch.x64.vm;
-const x64_interrupts = zag.arch.x64.interrupts;
 
-const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GuestState = vm_hw.GuestState;
 const PAddr = zag.memory.address.PAddr;
@@ -119,8 +117,9 @@ const VREG52_SYSENTER_ESP_OFF: u64 = 312;
 const VREG53_SYSENTER_EIP_OFF: u64 = 320;
 const VREG54_PAT_OFF: u64 = 328;
 // vreg 55 = TSC_AUX (not in GuestState)
-// DR band: vregs 56..61.
-const VREG56_DR0_OFF: u64 = 344;
+// DR band: vregs 56..61. Only DR6/DR7 are stored in GuestState; DR0..DR3
+// (vregs 56..59) are wired to user reads/writes once the debug-register
+// passthrough path is restored.
 const VREG60_DR6_OFF: u64 = 376;
 const VREG61_DR7_OFF: u64 = 384;
 // Exit sub-code + payload: vregs 70..73.
