@@ -584,26 +584,6 @@ fn permsToAp(perms: MemoryPerms, user: bool) u2 {
     return 0b10;
 }
 
-/// Extract the physical address from a non-leaf table descriptor and return
-/// a pointer to the next-level table.
-/// ARM ARM D5.3, Table D5-15 -- bits [47:12] of a table descriptor hold the
-/// 4KB-aligned physical address of the next translation table.
-fn entryToTable(entry: *const PageEntry) *[page_entry_table_size]PageEntry {
-    const virt = VAddr.fromPAddr(entry.getPAddr(), null);
-    return @ptrFromInt(virt.addr);
-}
-
-fn freePhysPage(paddr: PAddr, pmm_mgr: *pmm.PhysicalMemoryManager) void {
-    const virt = VAddr.fromPAddr(paddr, null);
-    const page: *paging.PageMem(.page4k) = @ptrFromInt(virt.addr);
-    pmm_mgr.destroy(page);
-}
-
-fn freeTablePage(table: *[page_entry_table_size]PageEntry, pmm_mgr: *pmm.PhysicalMemoryManager) void {
-    const page: *paging.PageMem(.page4k) = @ptrCast(@alignCast(table));
-    pmm_mgr.destroy(page);
-}
-
 // ── AArch64 system register and barrier intrinsics ──────────────────────────
 
 /// Read TTBR0_EL1 (Translation Table Base Register 0).

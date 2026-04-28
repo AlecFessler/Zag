@@ -97,12 +97,6 @@ fn eventNumber(e: PmuEvent) ?u16 {
     };
 }
 
-// ── PMCR_EL0 bit layout (DDI 0487 §D13.3.3) ────────────────────────────
-const PMCR_E: u64 = 1 << 0; // Global enable
-const PMCR_P: u64 = 1 << 1; // Reset event counters (write-only)
-const PMCR_C: u64 = 1 << 2; // Reset cycle counter
-const PMCR_LC: u64 = 1 << 6; // Long cycle counter (64-bit PMCCNTR)
-
 // ── State ───────────────────────────────────────────────────────────────
 
 var cached_info: PmuInfo = .{
@@ -124,13 +118,6 @@ inline fn readPMCR() u64 {
         : [v] "=r" (v),
     );
     return v;
-}
-
-inline fn writePMCR(v: u64) void {
-    asm volatile ("msr pmcr_el0, %[v]"
-        :
-        : [v] "r" (v),
-    );
 }
 
 inline fn readID_AA64DFR0() u64 {
@@ -155,13 +142,6 @@ inline fn readPMCEID1() u64 {
         : [v] "=r" (v),
     );
     return v;
-}
-
-inline fn writePMUSERENR(v: u64) void {
-    asm volatile ("msr pmuserenr_el0, %[v]"
-        :
-        : [v] "r" (v),
-    );
 }
 
 inline fn writePMINTENCLR(mask: u64) void {

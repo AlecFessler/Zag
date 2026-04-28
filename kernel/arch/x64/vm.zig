@@ -71,11 +71,6 @@ pub const GuestState = extern struct {
     dr6: u64 = 0,
     dr7: u64 = 0x400, // bit 10 always set per x86 spec
 
-    // Pending event injection for SVM (VMCB EVENTINJ format).
-    // Written by svm.injectInterrupt/injectException, consumed by svm.vmResume.
-    // Not used by VMX (which writes directly to the VMCS).
-    pending_eventinj: u64 = 0,
-
     pub const SegmentReg = extern struct {
         base: u64 = 0,
         limit: u32 = 0,
@@ -143,24 +138,6 @@ pub const VmExitInfo = union(enum) {
         vector: u8,
         error_code: u64,
     };
-};
-
-/// Interrupt to inject into a guest vCPU.
-pub const GuestInterrupt = extern struct {
-    vector: u8,
-    interrupt_type: u8, // 0=external, 4=NMI, 5=exception, 6=software
-    error_code_valid: bool,
-    _pad: [5]u8 = .{0} ** 5,
-    error_code: u32 = 0,
-    _pad2: [4]u8 = .{0} ** 4,
-};
-
-/// Exception to inject into a guest vCPU.
-pub const GuestException = extern struct {
-    vector: u8,
-    _pad: [3]u8 = .{0} ** 3,
-    error_code: u32 = 0,
-    fault_addr: u64 = 0,
 };
 
 /// Static policy table for inline exit handling.

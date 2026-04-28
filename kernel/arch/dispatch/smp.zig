@@ -46,33 +46,6 @@ const kprof_dump_ipi_vector: u8 = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-/// Send a kprof-dump IPI to every core except the caller. Invoked by the
-/// dumping core inside `kprof.dump.end()` to quiesce every other CPU
-/// before serial-dumping the per-CPU logs.
-pub fn broadcastKprofIpi() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            const self_id = x64.apic.coreID();
-            const lapics = x64.apic.lapics orelse return;
-            for (lapics, 0..) |la, i| {
-                if (i == self_id) continue;
-                x64.apic.sendIpi(@intCast(la.apic_id), kprof_dump_ipi_vector);
-            }
-        },
-        .aarch64 => {
-            const self_id = aarch64.gic.coreID();
-            const n = aarch64.gic.coreCount();
-            var i: u64 = 0;
-            while (i < n) {
-                if (i != self_id) {
-                    aarch64.gic.sendIpiToCore(i, kprof_dump_ipi_vector);
-                }
-                i += 1;
-            }
-        },
-        else => unreachable,
-    }
-}
 
 // ── Spec v3 SMP primitives ───────────────────────────────────────────
 

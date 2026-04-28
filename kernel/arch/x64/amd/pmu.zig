@@ -168,30 +168,11 @@ pub fn init() void {
     );
 }
 
-pub fn perCoreInit() void {
-    if (cached_info.num_counters == 0) return;
-    // LAPIC LVT PerfMon entry is architecturally identical on AMD and Intel;
-    // reuse the same register. Fixed delivery, unmasked.
-    if (apic.x2_apic) {
-        const lvt_val: u64 = PMI_VECTOR;
-        cpu.wrmsr(
-            @intFromEnum(apic.X2ApicMsr.local_vector_table_performance_monitor_register),
-            lvt_val,
-        );
-    } else {
-        apic.writeReg(.lvt_perf_monitoring_counters_reg, PMI_VECTOR);
-    }
-}
-
 pub fn getInfo() PmuInfo {
     return cached_info;
 }
 
 pub fn start(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    programCounters(state, configs);
-}
-
-pub fn reset(state: *PmuState, configs: []const PmuCounterConfig) !void {
     programCounters(state, configs);
 }
 

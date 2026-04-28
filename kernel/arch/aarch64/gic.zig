@@ -1007,13 +1007,6 @@ pub fn sendSchedulerIpi(core_id: u64) void {
     sendIpiToCore(core_id, sched_sgi_id);
 }
 
-/// Send the scheduler-rearm IPI to the local core. There is no cheaper
-/// path on aarch64 than issuing an SGI to the current core, so this is
-/// a thin wrapper around sendIpiToCore.
-pub fn sendSchedulerIpiSelf() void {
-    sendIpiToCore(coreID(), sched_sgi_id);
-}
-
 /// Dedicated SGI INTID reserved for the BSP-driven scheduler-tick
 /// broadcast (Pi 5 KVM vGICv2 workaround — see `broadcastSchedTick`
 /// below). Must not collide with SGI 0 (the scheduler IPI / yield /

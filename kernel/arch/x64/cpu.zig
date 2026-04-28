@@ -2,7 +2,6 @@ const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
-const apic = zag.arch.x64.apic;
 const interrupts = zag.arch.x64.interrupts;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -188,17 +187,6 @@ pub const FpuFlushMailbox = struct {
     requested_thread: ?*anyopaque align(64) = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
-    pub fn requestThread(self: *FpuFlushMailbox, thread: anytype) void {
-        @atomicStore(?*anyopaque, &self.requested_thread, @ptrCast(thread), .release);
-        self.done.store(false, .release);
-    }
-
-    pub fn waitDone(self: *FpuFlushMailbox) void {
-        while (!self.done.load(.acquire)) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
     pub fn ackDone(self: *FpuFlushMailbox) void {
         self.done.store(true, .release);
     }
@@ -206,25 +194,8 @@ pub const FpuFlushMailbox = struct {
 
 pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
 
-/// Send the FPU-flush IPI to `target_core`, encoding `thread` as the
-/// target via the per-core mailbox. Spins on the mailbox's done flag
-/// until the receiver finishes saving `thread`'s state. Receiver is
-/// `fpuFlushIpiHandler` registered in `irq.zig`.
-///
-/// Pointer-index `fpu_flush_mailbox[]` to avoid Debug-mode codegen
-/// copying the entire [64]FpuFlushMailbox array onto the lazy-FPU
-/// IPI stack frame on every cross-core flush. See the matching note
-/// in sched.scheduler on `core_states[]`.
-pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
-    const slot = &fpu_flush_mailbox[target_core];
-    slot.requestThread(thread);
-    apic.sendIpiToCore(target_core, @intFromEnum(interrupts.IntVecs.fpu_flush));
-    slot.waitDone();
-}
-
-/// Spec-v3 EC variant of `fpuFlushIpi`. Identical wire protocol but the
-/// mailbox payload names an `*ExecutionContext`. Spec §[execution_context]
-/// lazy FPU.
+/// Spec-v3 EC fpu-flush IPI. Receiver is `fpuFlushIpiHandler`
+/// registered in `irq.zig`. Spec §[execution_context] lazy FPU.
 pub fn fpuFlushIpiEc(target_core: u8, ec: *ExecutionContext) void {
     _ = target_core;
     _ = ec;

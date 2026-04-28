@@ -104,15 +104,6 @@ pub const names = [_]struct { id: TraceId, name: []const u8 }{
     .{ .id = .vm_exit, .name = "vm_exit" },
 };
 
-/// Program the local core's free-running trace counters (cycles,
-/// cache misses, branch misses). Called from `sched.perCoreInit`
-/// after `pmuPerCoreInit` when compiled under `-Dkernel_profile=trace`.
-/// No-op in any other mode.
-pub fn perCoreInit() void {
-    if (comptime !mode.trace_enabled) return;
-    arch.pmu.kprofTraceCountersPerCoreInit();
-}
-
 /// Emit an enter record for a scoped tracepoint. Paired with `exit`.
 /// Compiles to nothing unless `-Dkernel_profile=trace`.
 ///

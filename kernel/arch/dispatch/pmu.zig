@@ -30,19 +30,6 @@ pub fn pmuInit() void {
     }
 }
 
-/// Program one PMC on the local core for cycle-overflow sampling and
-/// set the LAPIC LVT PerfMon entry to NMI delivery. Called under
-/// `-Dkernel_profile=sample` once per core after `pmuPerCoreInit`.
-pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.pmu.kprofSamplePerCoreInit(period_cycles),
-        // aarch64 backend for kprof sampling isn't wired yet; safe
-        // no-op so the generic kprof code compiles on ARM.
-        .aarch64 => {},
-        else => unreachable,
-    }
-}
-
 /// Called from the NMI handler. Returns true if PMC 0 overflowed and
 /// was rearmed with a fresh `period_cycles` preload — i.e. this NMI
 /// belongs to kprof. Returns false for any non-sampling NMI.
@@ -50,20 +37,6 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
     switch (builtin.cpu.arch) {
         .x86_64 => return x64.pmu.kprofSampleCheckAndRearm(period_cycles),
         .aarch64 => return false,
-        else => unreachable,
-    }
-}
-
-/// Program PMCs 0/1/2 on the local core for free-running
-/// cycles / cache-miss / branch-mispredict counting. Called under
-/// `-Dkernel_profile=trace` from `sched.perCoreInit` after
-/// `pmuPerCoreInit`. Counters run unattended forever; the trace
-/// helpers in `kprof.trace_id` snapshot them into each emitted
-/// record so the post-processor can compute per-scope deltas.
-pub fn kprofTraceCountersPerCoreInit() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.pmu.kprofTraceCountersPerCoreInit(),
-        .aarch64 => {},
         else => unreachable,
     }
 }

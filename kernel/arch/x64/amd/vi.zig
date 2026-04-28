@@ -127,25 +127,6 @@ const IommuUnit = struct {
         const ptr: *volatile u64 = @ptrFromInt(self.base + offset);
         ptr.* = value;
     }
-
-    /// Enqueue a 128-bit command into the circular command buffer and advance
-    /// the tail pointer to notify the IOMMU.
-    ///
-    /// Spec Section 2.4 / Figure 39: Commands are 128 bits (16 bytes). Software
-    /// writes the command at the current tail offset, then advances the tail
-    /// pointer register. The IOMMU fetches commands between head and tail.
-    ///
-    /// Spec Section 3.3.13, MMIO Offset 2008h: CmdTailPtr is at bits [18:4],
-    /// representing a 16-byte-aligned byte offset from the buffer base.
-    fn issueCommand(self: *const IommuUnit, lo: u64, hi: u64) void {
-        const tail = self.readReg64(MMIO_CMD_BUF_TAIL);
-        const cmd_ptr: [*]volatile u64 = @ptrFromInt(self.cmd_buf_virt.addr + tail);
-        cmd_ptr[0] = lo;
-        cmd_ptr[1] = hi;
-        // Advance tail by 16 bytes (one command entry), wrapping at buffer length.
-        // For the minimum 4KB buffer this wraps at 0x1000.
-        self.writeReg64(MMIO_CMD_BUF_TAIL, (tail + 16) % self.cmd_buf_len);
-    }
 };
 
 const AliasEntry = struct {

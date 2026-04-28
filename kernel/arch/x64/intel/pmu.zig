@@ -21,7 +21,6 @@
 
 const zag = @import("zag");
 
-const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
@@ -164,29 +163,11 @@ pub fn init() void {
     );
 }
 
-pub fn perCoreInit() void {
-    if (cached_info.num_counters == 0) return;
-    if (apic.x2_apic) {
-        const lvt_val: u64 = PMI_VECTOR;
-        cpu.wrmsr(
-            @intFromEnum(apic.X2ApicMsr.local_vector_table_performance_monitor_register),
-            lvt_val,
-        );
-    } else {
-        apic.writeReg(.lvt_perf_monitoring_counters_reg, PMI_VECTOR);
-    }
-}
-
 pub fn getInfo() PmuInfo {
     return cached_info;
 }
 
 pub fn start(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    programCounters(state, configs);
-}
-
-pub fn reset(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    clearAllOverflowStatus(state.num_counters);
     programCounters(state, configs);
 }
 

@@ -8,7 +8,6 @@ const arch = zag.arch.dispatch;
 const arch_paging = zag.arch.x64.paging;
 const capability = zag.caps.capability;
 const errors = zag.syscall.errors;
-const fpu = zag.sched.fpu;
 const memory_init = zag.memory.init;
 const paging_consts = zag.memory.paging;
 const perfmon_mod = zag.sched.perfmon;

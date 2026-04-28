@@ -1,4 +1,3 @@
-const std = @import("std");
 const zag = @import("zag");
 
 const secure_slab = zag.memory.allocators.secure_slab;
