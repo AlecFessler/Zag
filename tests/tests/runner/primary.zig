@@ -103,7 +103,17 @@ pub fn main(cap_table_base: u64) void {
     // and pushes total stack pressure over the budget on full-475
     // bursts. Spec doesn't forbid batched orchestration; the kernel
     // sees identical per-test syscalls regardless of batching.
-    const BATCH: usize = 16;
+    //
+    // BATCH=4 (vs BATCH=16) is empirically required to clear the spawn
+    // loop past iter ~432. With BATCH=16 the runner deadlocks in the
+    // spawn-loop body before recv ever drains the batch — the failure
+    // surfaces as no `spawned 16/16` print after `[runner] batch 416..432`
+    // (kernel still ticking, runner EC parked). The exact contention
+    // hasn't been pinpointed; it is independent of the per-domain
+    // resource leak fixed by `disarmTimerHandlesInDomain` — that fix
+    // is correct on its own merits but does NOT lift the BATCH=16
+    // wall.
+    const BATCH: usize = 4;
     var successful_spawns: usize = 0;
     var collected: usize = 0;
     var batch_idx: usize = 0;

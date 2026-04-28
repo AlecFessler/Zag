@@ -864,6 +864,19 @@ pub fn allocCapabilityDomain(
 fn destroyCapabilityDomain(cd: *CapabilityDomain) void {
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
 
+    // Disarm every Timer reachable from this domain's handle table
+    // BEFORE destroying the cd struct. A periodic timer that survives
+    // its owning domain's destroy keeps firing forever — each fire
+    // walks the CapabilityDomain slab via `forEachAlive` and pins a
+    // per-core wheel-heap slot. Disarm-only here (no slab destroy, no
+    // wheelRemove) avoids racing against other domains that hold a copy
+    // of the same timer handle and avoids the wheel_locks acquisition
+    // (which an IRQ-context fire on another core would contend against).
+    // Caller (`releaseSelf` via `deleteAndDetach` SLOT_SELF path) holds
+    // `cd._gen_lock`, so `cd.kernel_table` / `cd.user_table` are stable
+    // for this walk.
+    zag.sched.timer.disarmTimerHandlesInDomain(cd);
+
     // Snapshot the table-block pointers before `destroyLocked` zeroes
     // the cd struct. `destroyLockedInner`'s `zeroExceptGenLock` clears
     // every field of `cd` except `_gen_lock`, so reads of

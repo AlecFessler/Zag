@@ -432,6 +432,62 @@ pub fn decHandleRef(t: *Timer) void {
     if (last) destroyTimer(t);
 }
 
+/// Disarm every Timer reachable from `cd`'s handle table. Called by
+/// `destroyCapabilityDomain` BEFORE the cd struct is destroyed, while
+/// the caller still holds `cd._gen_lock` from `lockTyped`. Without this,
+/// a periodic timer armed by a test that has since released its
+/// self-handle keeps firing indefinitely — its onFire path runs an
+/// O(N_domains × MAX_HANDLES_PER_DOMAIN) `forEachAlive` walk every
+/// `period_ns` nanoseconds and pins a per-core wheel-heap slot.
+///
+/// Lock order respected: caller holds `cd._gen_lock`; we acquire each
+/// Timer's `_gen_lock` independently (canonical CD → Timer order). We
+/// only flip `armed = false` — we do NOT call `wheelRemove` here. The
+/// timer's slot stays in the per-core wheel until its next fire; on
+/// fire, `onFire`'s opening `if (!t.armed) return` short-circuits
+/// before `propagateAndWake` and (for periodic) before `wheelInsert`,
+/// so the slot is naturally consumed and not re-inserted. Avoiding
+/// `wheel_locks` during destroy keeps the lock-order shallow:
+/// `tree_mutex → cd._gen_lock → t._gen_lock` here, vs. the
+/// `cd._gen_lock → t._gen_lock → wheel_locks` chain a `wheelRemove`
+/// would add — and avoids the IRQ-context contention an active timer
+/// IRQ on another core could create against `wheel_locks` during a
+/// concurrent destroy.
+///
+/// We do NOT destroy the Timer slab slot or call `decHandleRef` here.
+/// Other domains holding a copy of this timer handle still see a live
+/// SlabRef; releasing the timer's slab is the responsibility of the
+/// existing `decHandleRef` path when the last handle is explicitly
+/// deleted.
+pub fn disarmTimerHandlesInDomain(cd: *CapabilityDomain) void {
+    var slot: u16 = 3;
+    while (slot < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) {
+        const entry = &cd.kernel_table[slot];
+        const obj_ptr = entry.ref.ptr orelse {
+            slot += 1;
+            continue;
+        };
+
+        const tag = capability.Word0.typeTag(cd.user_table[slot].word0);
+        if (tag != .timer) {
+            slot += 1;
+            continue;
+        }
+
+        const ref: SlabRef(Timer) = .{
+            .ptr = @ptrCast(@alignCast(obj_ptr)),
+            .gen = entry.ref.gen,
+        };
+        const t = ref.lock(@src()) catch {
+            slot += 1;
+            continue;
+        };
+        t.armed = false;
+        ref.unlock();
+        slot += 1;
+    }
+}
+
 /// Insert `t` into the local core's wheel at `deadline_ns`. If the
 /// new entry becomes the heap minimum, re-arm the LAPIC deadline so
 /// the wheel ISR fires when it expires.
