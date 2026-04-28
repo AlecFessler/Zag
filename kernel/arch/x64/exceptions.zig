@@ -302,7 +302,8 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
             v._gen_lock.lock(@src());
             const is_port_io = v.map == .mmio and
                 v.device != null and
-                v.device.?.device_type == .port_io;
+                // self-alive: device ref under v's gen-lock.
+                v.device.?.ptr.device_type == .port_io;
             v._gen_lock.unlock();
             if (is_port_io) {
                 emulateVirtualBar(ctx, ec, v, faulting_addr, domain);
@@ -346,7 +347,9 @@ fn emulateVirtualBar(
     // for the kernel's lifetime once bound and `base_vaddr` is
     // immutable on the VAR, so the snapshot is safe to use unlocked.
     v._gen_lock.lock(@src());
-    const device: *DeviceRegion = v.device.?;
+    // self-alive: device ref under v's gen-lock; the DeviceRegion is
+    // stable for the kernel's lifetime once bound.
+    const device: *DeviceRegion = v.device.?.ptr;
     const var_base_addr = v.base_vaddr.addr;
     v._gen_lock.unlock();
 

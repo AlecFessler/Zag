@@ -24,6 +24,7 @@ const MemoryPerms = zag.memory.address.MemoryPerms;
 const PageFrame = zag.memory.page_frame.PageFrame;
 const PageFrameCaps = zag.memory.page_frame.PageFrameCaps;
 const SecureSlab = secure_slab.SecureSlab;
+const SlabRef = secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
 const Word0 = zag.caps.capability.Word0;
 
@@ -89,7 +90,10 @@ pub const MAX_INSTALLED_PFS: usize = 64;
 /// null` marks an empty slot in the inline `installed_pfs` array.
 pub const InstalledPf = struct {
     offset: u64 = 0,
-    pf: ?*PageFrame = null,
+    /// Bound page_frame for this offset. `null` ⇒ empty slot. UAF
+    /// safety: `map_pf` bumps the PageFrame's refcount; `unmap` /
+    /// `destroy` decrement it under the VAR's gen-lock.
+    pf: ?SlabRef(PageFrame) = null,
 };
 
 pub const VAR = struct {
@@ -97,9 +101,12 @@ pub const VAR = struct {
     /// guards every mutable field below.
     _gen_lock: GenLock = .{},
 
-    /// Owning capability domain. VARs cannot outlive their owner.
-    /// Set at create_var; immutable.
-    domain: *CapabilityDomain,
+    /// Owning capability domain. VARs cannot outlive their owner —
+    /// `destroyVar` runs ahead of any domain teardown — but the
+    /// invariant lives in code, not the type, so the slot is carried
+    /// as a SlabRef for analyzer-level UAF safety on cross-domain
+    /// `acquire_vars` lookups.
+    domain: SlabRef(CapabilityDomain),
 
     /// Base virtual address (or base IOVA for DMA VARs). Mirrors the
     /// user-visible Capability.field0. Set at create; immutable.
@@ -128,7 +135,7 @@ pub const VAR = struct {
     /// IOMMU domain). Set/cleared by map_mmio/unmap when this is an
     /// MMIO VAR. Null otherwise. Mirrors field1 bits 41-52 (handle id
     /// in the owning domain's table).
-    device: ?*DeviceRegion = null,
+    device: ?SlabRef(DeviceRegion) = null,
 
     /// Snapshot binding source. Set by `snapshot` when this VAR has
     /// `restart_policy = snapshot` (3) and a source has been bound.
@@ -136,7 +143,7 @@ pub const VAR = struct {
     /// copied into this VAR before resume. Source may live in another
     /// domain — cross-domain UAF protection routes through
     /// `source._gen_lock`. Null when no binding.
-    snapshot_source: ?*VAR = null,
+    snapshot_source: ?SlabRef(VAR) = null,
 
     /// Out-of-band per-page mapping table. Tracks which page_frames
     /// are installed at which offsets (when `map = page_frame`) or
@@ -456,7 +463,7 @@ pub fn mapMmio(caller: *ExecutionContext, var_handle: u64, device_region: u64) i
         }
     }
 
-    v.device = dr;
+    v.device = SlabRef(DeviceRegion).init(dr, dr._gen_lock.currentGen());
     v.map = .mmio;
     return 0;
 }
@@ -547,7 +554,10 @@ pub fn remap(caller: *ExecutionContext, var_handle: u64, new_cur_rwx: u64) i64 {
     if (v.map == .page_frame) {
         var pf_intersect_rwx: u3 = 0b111;
         for (&v.installed_pfs) |*entry| {
-            const pf = entry.pf orelse continue;
+            // self-alive: PF refcount kept by VAR's installed list;
+            // VAR's gen-lock is held, so no concurrent install/unmap.
+            const pf_ref = entry.pf orelse continue;
+            const pf = pf_ref.ptr;
             const pf_caps_word: u16 = blk: {
                 var i: usize = 0;
                 while (i < domain.user_table.len) : (i += 1) {
@@ -620,7 +630,7 @@ pub fn snapshot(caller: *ExecutionContext, target_var: u64, source_var: u64) i64
     const s_size = @as(u64, source.page_count) * pageSizeBytes(source.sz);
     if (t_size != s_size) return errors.E_INVAL;
 
-    target.snapshot_source = source;
+    target.snapshot_source = SlabRef(VAR).init(source, source._gen_lock.currentGen());
     return 0;
 }
 
@@ -650,8 +660,10 @@ pub fn idcRead(caller: *ExecutionContext, var_handle: u64, offset: u64, count: u
     // offset 8, ...), then resume. Spec §[idc_read] test 07. The
     // syscall executes with the caller's CR3 active so VAR.base_vaddr
     // is directly addressable; SMAP gates the user-mem load.
-    quiesceDomain(v.domain);
-    defer resumeDomain(v.domain);
+    // self-alive: VAR's domain is its owner; the VAR cannot exist
+    // without it (destroyVar runs ahead of any domain teardown).
+    quiesceDomain(v.domain.ptr);
+    defer resumeDomain(v.domain.ptr); // self-alive
 
     // Per §[var], VARs with `map = unmapped` have no backing storage.
     // Reading from a user vaddr in that range would page-fault under
@@ -726,8 +738,10 @@ pub fn idcWrite(
     // install backing (map_pf / map_mmio) before retrying.
     if (v.map == .unmapped) return errors.E_INVAL;
 
-    quiesceDomain(v.domain);
-    defer resumeDomain(v.domain);
+    // self-alive: VAR's domain is its owner; the VAR cannot exist
+    // without it.
+    quiesceDomain(v.domain.ptr);
+    defer resumeDomain(v.domain.ptr); // self-alive
 
     const dst_base: u64 = v.base_vaddr.addr + offset;
     dispatch.cpu.userAccessBegin();
@@ -781,7 +795,9 @@ fn resolveVar(cd: *CapabilityDomain, slot: u12) ?*VAR {
 /// touching the handle).
 fn refreshVarSnapshot(cd: *CapabilityDomain, slot: u12, v: *const VAR) void {
     if (slot >= cd.user_table.len) return;
-    const dev_id: u12 = if (v.device) |dr| handleIdOf(cd, dr) else 0;
+    // self-alive: device ref is part of v's mutable state, accessed
+    // under v's gen-lock by the caller.
+    const dev_id: u12 = if (v.device) |dr_ref| handleIdOf(cd, dr_ref.ptr) else 0;
     cd.user_table[slot].field0 = v.base_vaddr.addr;
     cd.user_table[slot].field1 = packField1(v.page_count, v.sz, v.cch, v.cur_rwx, v.map, dev_id);
 }
@@ -815,14 +831,17 @@ fn allocVar(
 ) !*VAR {
     const ref = try slab_instance.create();
     const v = ref.ptr;
-    v.domain = domain;
+    v.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
     v.base_vaddr = base;
     v.page_count = pages;
     v.sz = sz;
     v.cch = cch;
     v.cur_rwx = cur_rwx;
     v.map = .unmapped;
-    v.device = device;
+    v.device = if (device) |d|
+        SlabRef(DeviceRegion).init(d, d._gen_lock.currentGen())
+    else
+        null;
     v.snapshot_source = null;
     v.mapping_table = null;
     for (&v.installed_pfs) |*entry| {
@@ -834,7 +853,9 @@ fn allocVar(
 /// Final teardown — unmaps all installations, releases device/snapshot
 /// refs, removes from `domain.vars[]`, frees VA range, frees slab slot.
 pub fn destroyVar(v: *VAR) void {
-    const domain = v.domain;
+    // self-alive: domain owns this VAR and outlives it (destroyVar
+    // runs ahead of any domain teardown).
+    const domain = v.domain.ptr;
     const gen = v._gen_lock.currentGen();
     if (v.map == .page_frame or v.map == .demand) {
         unmapAll(v, domain);
@@ -949,7 +970,8 @@ var aslr_fallback_counter: u64 = 0;
 /// IOMMU PTE. Spec §[var].map_pf — installs every page in the page
 /// frame contiguously starting at `offset`.
 fn mappingInstall(v: *VAR, offset: u64, pf: *PageFrame) i64 {
-    const domain = v.domain;
+    // self-alive: VAR's domain is its owner.
+    const domain = v.domain.ptr;
     const slot_idx = handleSlotOf(v, domain);
     const caps_word: u16 = if (slot_idx < domain.user_table.len)
         Word0.caps(domain.user_table[slot_idx].word0)
@@ -979,9 +1001,10 @@ fn mappingInstall(v: *VAR, offset: u64, pf: *PageFrame) i64 {
             pf.phys_base.addr + @as(u64, p) * pf_sz_bytes,
         );
         if (var_caps.dma) {
-            const dev = v.device orelse return errors.E_INVAL;
+            // self-alive: device ref under VAR's gen-lock.
+            const dev_ref = v.device orelse return errors.E_INVAL;
             dispatch.iommu.iommuMapPage(
-                dev,
+                dev_ref.ptr,
                 v.base_vaddr.addr + off_p,
                 phys_p,
                 v.sz,
@@ -999,7 +1022,10 @@ fn mappingInstall(v: *VAR, offset: u64, pf: *PageFrame) i64 {
         }
         p += 1;
     }
-    v.installed_pfs[slot_reserved.?] = .{ .offset = offset, .pf = pf };
+    v.installed_pfs[slot_reserved.?] = .{
+        .offset = offset,
+        .pf = SlabRef(PageFrame).init(pf, pf._gen_lock.currentGen()),
+    };
     incMapCntShim(pf);
     return 0;
 }
@@ -1007,7 +1033,8 @@ fn mappingInstall(v: *VAR, offset: u64, pf: *PageFrame) i64 {
 /// Remove an installation, decrements mapcnt, tears down PTE.
 /// Returns the removed page_frame so caller can release its handle ref.
 fn mappingRemove(v: *VAR, offset: u64) ?*PageFrame {
-    const domain = v.domain;
+    // self-alive: VAR's domain is its owner.
+    const domain = v.domain.ptr;
     const slot_idx = handleSlotOf(v, domain);
     const caps_word: u16 = if (slot_idx < domain.user_table.len)
         Word0.caps(domain.user_table[slot_idx].word0)
@@ -1017,17 +1044,23 @@ fn mappingRemove(v: *VAR, offset: u64) ?*PageFrame {
 
     var removed: ?*PageFrame = null;
     for (&v.installed_pfs) |*entry| {
-        if (entry.pf != null and entry.offset == offset) {
-            removed = entry.pf;
-            entry.* = .{};
-            break;
+        if (entry.pf) |pf_ref| {
+            if (entry.offset == offset) {
+                // self-alive: PF refcount kept by the installed entry
+                // we are about to remove; caller will release the
+                // mapcnt below.
+                removed = pf_ref.ptr;
+                entry.* = .{};
+                break;
+            }
         }
     }
 
     if (var_caps.dma) {
-        const dev = v.device orelse return removed;
-        _ = dispatch.iommu.iommuUnmapPage(dev, v.base_vaddr.addr + offset, v.sz);
-        dispatch.iommu.invalidateIotlbRange(dev, v.base_vaddr.addr + offset, v.sz, 1);
+        // self-alive: device ref under VAR's gen-lock.
+        const dev_ref = v.device orelse return removed;
+        _ = dispatch.iommu.iommuUnmapPage(dev_ref.ptr, v.base_vaddr.addr + offset, v.sz);
+        dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, v.base_vaddr.addr + offset, v.sz, 1);
     } else {
         _ = dispatch.paging.unmapPageSized(
             domain.addr_space_root,
@@ -1075,7 +1108,9 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             // RIP. Spec §[port_io_virtualization]. Plain MMIO faults
             // here are spurious (real PTEs were installed at map time)
             // and route to the EC's memory_fault event.
-            const dev = v.device orelse return errors.E_BADADDR;
+            // self-alive: device ref under VAR's gen-lock.
+            const dev_ref = v.device orelse return errors.E_BADADDR;
+            const dev = dev_ref.ptr;
             if (dev.device_type == .port_io) {
                 return decodePortIoFault(domain, fault_vaddr, v, dev);
             }
@@ -1095,14 +1130,19 @@ fn restartCleanup(v: *VAR, policy: u2) i64 {
             return 0;
         },
         .decommit => {
-            unmapAll(v, v.domain);
+            // self-alive: VAR's domain owns it.
+            unmapAll(v, v.domain.ptr);
             v.map = .unmapped;
             return 0;
         },
         .preserve => return 0,
         .snapshot => {
-            const src = v.snapshot_source orelse return errors.E_TERM;
-            return copySnapshot(v, src);
+            // self-alive: snapshot source ref is under v's gen-lock
+            // and cross-domain UAF is mediated by source._gen_lock if
+            // we needed to read from it (current `copySnapshot` is a
+            // stub).
+            const src_ref = v.snapshot_source orelse return errors.E_TERM;
+            return copySnapshot(v, src_ref.ptr);
         },
     }
 }
@@ -1154,7 +1194,10 @@ fn handleSlotOf(v: *const VAR, cd: *const CapabilityDomain) u16 {
 /// layout.
 fn findInstalledOffset(v: *VAR, pf: *PageFrame) ?u64 {
     for (&v.installed_pfs) |*entry| {
-        if (entry.pf == pf) return entry.offset;
+        if (entry.pf) |pf_ref| {
+            // Identity compare: SlabRef.ptr == raw pointer.
+            if (pf_ref.ptr == pf) return entry.offset;
+        }
     }
     return null;
 }
