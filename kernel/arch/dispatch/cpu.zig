@@ -408,6 +408,19 @@ pub fn patchUserModeIretFrame(
     }
 }
 
+/// Read the user-mode stack pointer captured on syscall entry from a
+/// saved EC context. x86_64 stashes it in `ctx.rsp`; aarch64 stashes
+/// it in `ctx.sp_el0` (the user SP banked register). Used by syscall
+/// paths that need to re-read vreg overflow entries off the user stack
+/// per spec §[syscall_abi].
+pub fn userStackPointer(ctx: *const ArchCpuContext) u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => ctx.rsp,
+        .aarch64 => ctx.sp_el0,
+        else => unreachable,
+    };
+}
+
 /// Halt the local core in an interrupts-enabled state until the next
 /// interrupt (HLT with IF=1 on x86-64, WFI with DAIF cleared on
 /// aarch64). Used by the per-core idle EC.

@@ -54,6 +54,9 @@ const scheduler = zag.sched.scheduler;
 const serial = zag.arch.aarch64.serial;
 const sync_debug = zag.utils.sync.debug;
 const syscall_dispatch = zag.syscall.dispatch;
+const var_range = zag.capdom.var_range;
+
+const VAddr = zag.memory.address.VAddr;
 
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -408,6 +411,103 @@ fn readFarEl1() u64 {
 ///   EC=0x24 (Data Abort from lower EL): page fault -- dispatch to fault handler.
 ///   EC=0x20 (Instruction Abort from lower EL): page fault -- dispatch to fault handler.
 ///   Others: route via `port.fireThreadFault` / `port.fireBreakpoint`.
+/// Intercept a data-abort that hit a userspace port-IO VAR (no PTEs
+/// installed → every access faults) and forward the access to the
+/// underlying port-IO device. Returns `true` when the fault was
+/// handled; the caller skips the generic page-fault router and ERETs.
+///
+/// The data abort syndrome (ESR_EL1.ISS) provides:
+///   ISS[24]   = ISV (instruction syndrome valid) — required for decode
+///   ISS[23:22] = SAS (size: 0=byte, 1=hword, 2=word, 3=dword)
+///   ISS[20:16] = SRT (Xt register holding the value, for stores)
+///   ISS[6]    = WnR (write=1)
+/// ARM ARM DDI 0487 §D13.2.37 ESR_EL1 (Data Abort).
+///
+/// On aarch64 the platform has no real port-IO bus; we route the
+/// emulated access into the kernel's PL011 driver when the device's
+/// declared base_port matches COM1 (0x3F8). This is the minimal
+/// surface needed to land the test runner's `[runner] starting`
+/// banner — full I/O port emulation will replace this when a generic
+/// in-kernel I/O bus arrives.
+fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
+    const ec_ptr = scheduler.currentEc() orelse return false;
+    const domain = ec_ptr.domain.ptr;
+    const fault_va = VAddr.fromInt(readFarEl1());
+
+    const v = var_range.findVarCovering(domain, fault_va) orelse return false;
+
+    const v_irq = v._gen_lock.lockIrqSave(@src());
+    const is_port_io = v.map == .mmio and v.device != null and
+        v.device.?.ptr.device_type == .port_io;
+    v._gen_lock.unlockIrqRestore(v_irq);
+    if (!is_port_io) return false;
+
+    const iss: u32 = @truncate(esr & 0x1FFFFFF);
+    const isv = (iss >> 24) & 1;
+
+    var srt: u5 = 0;
+    var sas: u32 = 0;
+    var wnr: u32 = 0;
+
+    if (isv != 0) {
+        wnr = (iss >> 6) & 1;
+        sas = (iss >> 22) & 0b11;
+        srt = @truncate((iss >> 16) & 0x1F);
+    } else {
+        // QEMU TCG does not populate ISV for software-generated data
+        // aborts. Decode the faulting instruction by hand. The runner's
+        // serial output is a chain of `strb wN, [xM]` (STR (immediate
+        // unsigned offset), 8-bit). DDI 0487 §C6.2.300 STRB (immediate)
+        // unsigned offset: bits [31:22]=0011_1001_00, bits [21:10]=imm12,
+        // bits [9:5]=Rn, bits [4:0]=Rt.
+        const insn_ptr: *const u32 = @ptrFromInt(ctx.elr_el1);
+        const insn = insn_ptr.*;
+        const top10 = (insn >> 22) & 0x3FF;
+        if (top10 != 0b00_1110_0100) return false; // not strb-imm-uoff
+        wnr = 1;
+        sas = 0; // byte
+        srt = @truncate(insn & 0x1F);
+    }
+
+    if (wnr == 0) return false; // reads not yet implemented
+
+    // Read the source register's value. AAPCS64 packs 31 GP regs as
+    // x0..x30 in our `Registers` extern struct in declaration order.
+    const regs_ptr: [*]const u64 = @ptrCast(&ctx.regs);
+    const value: u64 = if (srt < 31) regs_ptr[srt] else 0;
+
+    // Compute the offset within the port range. PL011 forwarding only
+    // looks at the low byte of `value`; multi-byte stores get split.
+    const dev = v.device.?.ptr;
+    const base_port = dev.access.port_io.base_port;
+    const port_offset_u64 = fault_va.addr - v.base_vaddr.addr;
+    const port_offset: u16 = @truncate(port_offset_u64);
+    const io_port: u16 = base_port + port_offset;
+
+    // Width per SAS (ARM ARM §D13.2.37 SAS table).
+    const width: u8 = switch (sas) {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        else => 8,
+    };
+
+    // Forward COM1 byte writes (port 0x3F8 + tx-data offset 0) into the
+    // PL011 driver. Other ports / widths are currently dropped on the
+    // floor — sufficient for runner banner output. The PL011 register
+    // map differs from the 8250 (COM1), so even byte writes to UART
+    // control/IER/etc. ports must NOT be forwarded blindly.
+    if (io_port == 0x3F8 and width == 1) {
+        const byte_buf = [_]u8{@as(u8, @truncate(value))};
+        serial.printRaw(byte_buf[0..1]);
+    }
+
+    // Advance ELR_EL1 past the faulting instruction. AArch64 fixed-
+    // length instructions are 4 bytes.
+    ctx.elr_el1 += 4;
+    return true;
+}
+
 fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     const esr = readEsrEl1();
     const ec = extractEc(esr);
@@ -441,11 +541,13 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
         },
 
         .data_abort_lower_el => {
-            // Port-IO virtualization for VARs backed by `dev_type =
-            // port_io` is centralized in
-            // `zag.capdom.var_range.handlePageFault`, reached through
-            // the generic page-fault router below — the arch entry no
-            // longer intercepts those faults itself.
+            // Intercept port-IO virtual_bar faults from userspace before
+            // the generic handler routes them through the var_range
+            // page-fault dispatch (whose port_io decoder is currently
+            // a stub on aarch64). Spec §[port_io_virtualization].
+            // Mirrors the arch.x64.exceptions pageFaultHandler shortcut.
+            if (interceptPortIoFault(ctx, esr)) return;
+
             const pf_ctx = PageFaultContext{
                 .faulting_address = readFarEl1(),
                 .is_kernel_privilege = false,
@@ -767,7 +869,7 @@ fn deliverThreadFault(subcode: ThreadFaultSubcode, payload: u64) void {
         @panic("user thread fault with no current EC");
     port.fireThreadFault(ec, @intFromEnum(subcode), payload);
     cpu.enableInterrupts();
-    scheduler.yield();
+    scheduler.yieldTo(null);
 }
 
 /// Look up the running EC, fire a `breakpoint` event with `subcode`,
@@ -777,5 +879,5 @@ fn deliverBreakpoint(subcode: BreakpointSubcode) void {
         @panic("user breakpoint with no current EC");
     port.fireBreakpoint(ec, @intFromEnum(subcode));
     cpu.enableInterrupts();
-    scheduler.yield();
+    scheduler.yieldTo(null);
 }

@@ -175,7 +175,7 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
     // = N entries occupy vregs [128-N..127] — i.e. offsets
     // (128-N-13)*8 .. (127-13)*8 from the user RSP captured on syscall
     // entry. SMAP gates the load.
-    const user_rsp = ec.ctx.rsp;
+    const user_rsp = cpu.userStackPointer(ec.ctx);
     const first_vreg: u64 = 128 - @as(u64, n);
     const first_off: u64 = (first_vreg - 13) * 8;
 

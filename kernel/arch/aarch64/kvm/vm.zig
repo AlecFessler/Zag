@@ -23,7 +23,11 @@ pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
 pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
     _ = vm;
     _ = policy_pf;
-    @panic("step 6: rewrite for spec-v3");
+    // aarch64 KVM is not yet implemented for spec-v3. Surface this as
+    // `error.NoDevice` so `capdom.virtual_machine.createVirtualMachine`
+    // returns `E_NODEV` per spec §[create_virtual_machine] rather than
+    // panicking the kernel on the first VM-create syscall.
+    return error.NoDevice;
 }
 
 pub fn freeVmArchState(vm: *VirtualMachine) void {
@@ -33,7 +37,7 @@ pub fn freeVmArchState(vm: *VirtualMachine) void {
 
 pub fn allocStage2Root(vm: *VirtualMachine) !PAddr {
     _ = vm;
-    @panic("step 6: rewrite for spec-v3");
+    return error.NoDevice;
 }
 
 pub fn freeStage2Root(vm: *VirtualMachine) void {

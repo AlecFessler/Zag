@@ -31,8 +31,6 @@
 const zag = @import("zag");
 
 const pmu_sched = zag.syscall.pmu;
-const port = zag.sched.port;
-const sched = zag.sched.scheduler;
 
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
@@ -93,7 +91,6 @@ fn eventNumber(e: PmuEvent) ?u16 {
         .bus_cycles => EVENT_BUS_CYCLES,
         .stalled_cycles_frontend => EVENT_STALL_FRONTEND,
         .stalled_cycles_backend => EVENT_STALL_BACKEND,
-        else => null,
     };
 }
 
@@ -518,76 +515,11 @@ fn clearAllOverflowStatus(num_counters: u8) void {
 ///     the counter's contribution to PMUIRQ without losing PMOVSSET state.
 pub fn pmiHandler(ctx: *ArchCpuContext) void {
     _ = ctx;
-    const ec = sched.currentEc() orelse {
-        // No EC context (can happen during early boot transitions).
-        // Just scrub any pending overflow bits so the PPI deasserts.
-        writePMINTENCLR(~@as(u64, 0));
-        writePMOVSCLR(~@as(u64, 0));
-        return;
-    };
-    // self-alive: PMI fires on the core running `ec`; its pmu_state
-    // slot can't be freed under us during this handler.
-    const state_ref = ec.pmu_state orelse {
-        // No PMU state on this EC — another EC's overflow that was
-        // latched before the context switch. Mask and clear so the
-        // level-sensitive PPI line drops, then return.
-        writePMINTENCLR(~@as(u64, 0));
-        writePMOVSCLR(~@as(u64, 0));
-        return;
-    };
-    const state_ptr = state_ref.ptr;
-
-    // Stale-PMI filter: require at least one overflow bit that maps to
-    // a counter owned by the current EC. Matches the Intel PMI
-    // filter in `arch/x64/intel/pmu.zig`.
-    if (state_ptr.num_counters == 0) {
-        writePMINTENCLR(~@as(u64, 0));
-        writePMOVSCLR(~@as(u64, 0));
-        return;
-    }
-    const nbits: u6 = @intCast(state_ptr.num_counters);
-    const owned_mask: u64 = (@as(u64, 1) << nbits) - 1;
-    const status = readPMOVSCLR();
-    if ((status & owned_mask) == 0) {
-        // Overflow bit belongs to a different EC or a slot we no
-        // longer own; just clear every bit to drop the PPI and return.
-        writePMOVSCLR(status);
-        return;
-    }
-
-    // Snapshot every counter's live value so the faulted EC's
-    // userspace fault handler can observe the sample.
-    var i: u8 = 0;
-    while (i < state_ptr.num_counters) {
-        writePMSELR(i);
-        state_ptr.values[i] = readPMXEVCNTR();
-        i += 1;
-    }
-
-    // Mask PMU overflow contributions for every owned counter, and
-    // clear PMOVSCLR so the level-sensitive PPI 23 line deasserts
-    // before we ERET. PMINTENSET is re-armed on the next pmuRestore
-    // (or pmuStart) for counters that still have has_threshold = true.
-    writePMINTENCLR(owned_mask);
-    writePMOVSCLR(status);
-
-    // Identify the first overflowing counter slot as the event sub-code
-    // payload. Routes that bind pmu_overflow get the index of the
-    // counter that fired; no-route fallback drops the event.
-    var fired_idx: u64 = 0;
-    var bit: u8 = 0;
-    while (bit < state_ptr.num_counters) {
-        const sh: u6 = @intCast(bit);
-        if (((status >> sh) & 1) != 0) {
-            fired_idx = bit;
-            break;
-        }
-        bit += 1;
-    }
-    port.firePmuOverflow(ec, fired_idx);
-
-    // Hand off to the scheduler so the route's bound port handler (or
-    // the next ready EC, if no route was bound) can run. yield is
-    // noreturn.
-    sched.yield();
+    // TODO(spec-v3): pmu_state has been removed from ExecutionContext;
+    // PMI ownership / state lookup needs to be re-wired against the new
+    // PMU storage location (per-core or per-port?). Until then we panic
+    // — userspace cannot start counters, so this should be unreachable
+    // in practice. Mirrors the Intel PMI handler stub in
+    // `arch/x64/intel/pmu.zig`.
+    @panic("aarch64 pmu not yet implemented");
 }

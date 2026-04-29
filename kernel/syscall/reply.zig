@@ -168,7 +168,7 @@ pub fn replyTransfer(caller: *anyopaque, syscall_word: u64, n: u8) i64 {
     // vregs `[128-N..127]`. SMAP gates the load via STAC/CLAC.
     var entries: [PAIR_BUF_LEN]u64 = undefined;
     const len: usize = n;
-    const user_rsp = ec.ctx.rsp;
+    const user_rsp = cpu.userStackPointer(ec.ctx);
     const first_vreg: u64 = 128 - @as(u64, n);
     const first_off: u64 = (first_vreg - 13) * 8;
 

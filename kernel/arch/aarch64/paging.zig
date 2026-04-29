@@ -736,8 +736,46 @@ pub fn unmapPageSized(
     @panic("not implemented");
 }
 
+/// Allocate a fresh user-half L0 page-table root (TTBR0_EL1 will point at
+/// this PA on context switch). Kernel mappings live in TTBR1_EL1 and are
+/// shared across address spaces, so unlike the x86 PML4 we do NOT copy
+/// kernel half-entries into the new root — `dispatch.paging.copyKernelMappings`
+/// is a no-op on aarch64. ARM ARM DDI 0487 §D5.2 / §D13.2.136.
 pub fn allocAddrSpaceRoot() !PAddr {
-    @panic("not implemented");
+    const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
+    const new_table = try pmm_mgr.create(paging.PageMem(.page4k));
+    const new_virt = VAddr.fromInt(@intFromPtr(new_table));
+    return PAddr.fromVAddr(new_virt, null);
+}
+
+/// Read the current TTBR0_EL1 base PA (low-half / user translation root).
+/// Strips ASID bits [63:48] and reserved bits [11:0]; returns a clean PA.
+/// ARM ARM DDI 0487 §D13.2.136 TTBR0_EL1.
+pub fn getAddrSpaceRoot() PAddr {
+    const ttbr0 = asm volatile ("mrs %[ret], ttbr0_el1"
+        : [ret] "=r" (-> u64),
+    );
+    const mask: u64 = 0x0000_FFFF_FFFF_F000;
+    return PAddr.fromInt(ttbr0 & mask);
+}
+
+/// Swap TTBR0_EL1 to a new user-half page-table root and tag the
+/// translation with `id` (ASID, 16-bit). Per ARM ARM §D13.2.136 the
+/// ASID lives in TTBR0_EL1[63:48] when TCR_EL1.AS=1 (which
+/// `setKernelAddrSpace` already sets). Following the write the manual
+/// requires a context-synchronization event before EL0 access can use
+/// the new translation; an `isb` provides it. No explicit TLBI is
+/// needed when the ASID changes — the new ASID inherently scopes
+/// future lookups.
+pub fn swapAddrSpace(root: PAddr, id: u16) void {
+    const asid: u64 = @as(u64, id) << 48;
+    const value: u64 = (root.addr & 0x0000_FFFF_FFFF_F000) | asid;
+    asm volatile (
+        \\msr ttbr0_el1, %[v]
+        \\isb
+        :
+        : [v] "r" (value),
+        : .{ .memory = true });
 }
 
 pub fn shootdownTlbRange(
