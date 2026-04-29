@@ -1,0 +1,2 @@
+UNUSED CONST: deadConst
+UNUSED FUNCTION: deadFn

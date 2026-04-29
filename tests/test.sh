@@ -168,6 +168,12 @@ run_dead_code_check() {
     echo "=== Dead-code Analyzer ==="
     (cd "$SCRIPT_DIR/tools/dead_code_zig" && zig build) \
         || { echo "[FAIL] dead_code_zig build failed"; return 1; }
+    # Fixture suite first — exercises the analyzer on synthetic trees
+    # that don't depend on the kernel build.
+    if ! bash "$SCRIPT_DIR/tools/dead_code_zig/test/run_tests.sh"; then
+        echo "[FAIL] dead-code fixture suite failed"
+        return 1
+    fi
     ensure_oracle_db || return 1
     local detector="$SCRIPT_DIR/tools/dead_code_zig/zig-out/bin/dead_code_zig"
     local any_failed=0

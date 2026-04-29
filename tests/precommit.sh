@@ -111,6 +111,10 @@ stage_dead_code_report() {
         FAILURES+=("dead-code detector build")
         return 1
     fi
+    if ! bash "$ZAG_ROOT/tools/dead_code_zig/test/run_tests.sh"; then
+        FAILURES+=("dead-code fixture suite")
+        return 1
+    fi
     ensure_oracle_db || return 1
     local detector="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
     local any_failed=0
