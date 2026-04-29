@@ -923,15 +923,17 @@ pub fn handleType(
     var found = false;
 
     while (try stmt.step()) {
-        const qname = stmt.columnText(1) orelse "";
-        try path_chain.append(a, try a.dupe(u8, qname));
+        // SQLite invalidates columnText pointers when step() advances or
+        // returns done; dupe every string we want past the loop.
+        const qname = try a.dupe(u8, stmt.columnText(1) orelse "");
+        try path_chain.append(a, qname);
         final_qname = qname;
-        final_kind = stmt.columnText(2) orelse "";
-        final_path = stmt.columnText(3) orelse "";
+        final_kind = try a.dupe(u8, stmt.columnText(2) orelse "");
+        final_path = try a.dupe(u8, stmt.columnText(3) orelse "");
         final_line = @intCast(stmt.columnInt(4));
         final_bs = @intCast(stmt.columnInt(5));
         final_be = @intCast(stmt.columnInt(6));
-        final_source = stmt.columnText(7) orelse "";
+        final_source = try a.dupe(u8, stmt.columnText(7) orelse "");
         found = true;
         // const_alias only chains from `const`-kind entities; the moment
         // we see a non-const we have the underlying type and stop.

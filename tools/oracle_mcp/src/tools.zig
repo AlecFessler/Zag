@@ -526,7 +526,32 @@ pub const Registry = struct {
             });
             any = true;
         }
-        if (!any) try std.fmt.format(out.writer(al), "{s}: no type record / alias chain\n", .{name});
+        if (any) return;
+        // Fallback: dump the entity's source body so the user gets *something*.
+        // Matches the HTTP /api/type behavior — the type table isn't populated
+        // by the indexer yet, but the entity row + file source are.
+        var src_stmt = try entry.db.prepare(
+            \\SELECT e.kind, f.path, e.def_line, e.def_byte_start, e.def_byte_end, f.source
+            \\  FROM entity e JOIN file f ON f.id = e.def_file_id
+            \\ WHERE e.id = ? LIMIT 1
+        , al);
+        defer src_stmt.finalize();
+        try src_stmt.bindInt(1, ent.id);
+        if (!try src_stmt.step()) {
+            try std.fmt.format(out.writer(al), "{s}: not found\n", .{name});
+            return;
+        }
+        const kind = try al.dupe(u8, src_stmt.columnText(0) orelse "");
+        const path = try al.dupe(u8, src_stmt.columnText(1) orelse "");
+        const def_line: u32 = @intCast(src_stmt.columnInt(2));
+        const bs: usize = @intCast(src_stmt.columnInt(3));
+        const be: usize = @intCast(src_stmt.columnInt(4));
+        const source = try al.dupe(u8, src_stmt.columnText(5) orelse "");
+        try std.fmt.format(out.writer(al), "{s} ({s}) — {s}:{d}\n---\n", .{ ent.qualified_name, kind, path, def_line });
+        if (be <= source.len and bs <= be) {
+            try out.appendSlice(al, source[bs..be]);
+            if (be == 0 or source[be - 1] != '\n') try out.append(al, '\n');
+        }
     }
 
     fn toolSrcBin(self: *Registry, al: std.mem.Allocator, args: std.json.Value, out: *std.ArrayList(u8)) !void {
@@ -628,7 +653,7 @@ pub const Registry = struct {
             try ins.bindInt(2, hi);
             while (try ins.step()) {
                 try std.fmt.format(out.writer(al), "  {x:0>8}: {s} {s}\n", .{
-                    @as(u64, @intCast(ins.columnInt(0))),
+                    @as(u64, @bitCast(ins.columnInt(0))),
                     ins.columnText(1) orelse "",
                     ins.columnText(2) orelse "",
                 });
