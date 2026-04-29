@@ -257,7 +257,7 @@ noinline fn bootLinux() void {
     mem.copyGuest(boot.KERNEL_ADDR, TEMP_ADDR + setup_size, hdr.bzimage_size - setup_size);
 
     buildBootParams(hdr.initramfs_size);
-    boot.setupCmdline("console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200 earlyprintk=serial,ttyS0,115200,keep earlycon=uart,io,0x3f8,115200n8 nokaslr nolapic noapic acpi=off nohpet nosmp ignore_loglevel tsc=reliable lpj=5000000");
     acpi.setupTables();
     setupLinuxState();
     log.print("Linux configured\n");
@@ -287,7 +287,7 @@ noinline fn bootLinuxEmbedded() void {
     log.print("\n");
 
     buildBootParams(initramfs_data.len);
-    boot.setupCmdline("console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200 earlyprintk=serial,ttyS0,115200,keep earlycon=uart,io,0x3f8,115200n8 nokaslr nolapic noapic acpi=off nohpet nosmp ignore_loglevel tsc=reliable lpj=5000000");
     acpi.setupTables();
     setupLinuxState();
     log.print("Linux configured (embedded)\n");
@@ -358,8 +358,25 @@ noinline fn setupLinuxState() void {
 /// or a recv error.
 noinline fn exitLoop() void {
     log.print("entering exit loop\n");
+    // Timeout-based polling cadence: when the guest is idle (HLT or busy
+    // doing pure compute that doesn't trap), recv returns E_TIMEOUT after
+    // the given window so the VMM can tick the emulated PIT and poll
+    // host serial RX. Linux's `check_timer` waits ~100ms for PIT IRQ0
+    // fires; 1 ms is well below that threshold and gives plenty of
+    // periodic-timer fires within Linux's measurement window.
+    const RECV_POLL_NS: u64 = 1_000_000; // 1 ms
     while (true) {
-        const r = syscall.recvVmExit(exit_port, 0);
+        const r = syscall.recvVmExit(exit_port, RECV_POLL_NS);
+        if (r.err == @intFromEnum(errors.Error.E_TIMEOUT) or r.event_type == 0) {
+            // No exit pending; tick PIT + serial RX and re-poll.
+            io.pitCheckIrq();
+            if (serial.irq_pending) {
+                serial.irq_pending = false;
+                _ = syscall.vmInjectIrq(vm_handle, 4, 1);
+                _ = syscall.vmInjectIrq(vm_handle, 4, 0);
+            }
+            continue;
+        }
         if (r.err != 0) {
             log.print("recvVmExit err=");
             log.dec(r.err);
