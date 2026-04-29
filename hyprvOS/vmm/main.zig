@@ -92,6 +92,8 @@ var ept_count: u64 = 0;
 var intr_count: u64 = 0;
 var other_count: u64 = 0;
 var last_inject_ns: u64 = 0;
+var inject_count: u64 = 0;
+var last_if_seen: u64 = 99;
 
 pub fn main(cap_table_base: u64) void {
     log.init(cap_table_base);
@@ -474,15 +476,48 @@ noinline fn exitLoop() void {
         // Linux reaches "Run /init" around exit#80k under our cmdline,
         // so an exit_count threshold gives us a stable late-boot
         // injection point without a fragile event-shape probe.
+        // Track distinct rflags values seen past the gate.
+        if (exit_count > 81_000) {
+            const if_bit: u64 = (state.rflags >> 9) & 1;
+            if (if_bit != last_if_seen) {
+                log.print("IF=");
+                log.dec(if_bit);
+                log.print(" @exit#");
+                log.dec(exit_count);
+                log.print(" rflags=0x");
+                log.hex64(state.rflags);
+                log.print(" rip=0x");
+                log.hex64(state.rip);
+                log.print(" subcode=");
+                log.dec(state.exit_subcode);
+                log.print("\n");
+                last_if_seen = if_bit;
+            }
+        }
+        // No IF gate — SVM/VMX EVENTINJ delivers unconditionally
+        // regardless of guest IF (AMD APM Vol 2 §15.20). Linux's
+        // printk-during-env-dump path holds IF=0 across hundreds of
+        // exits, so gating on IF=1 means we never inject. The OLD
+        // VMM gated on IF but used a *separate* IPI-driven injection
+        // path that kicked the vCPU; our reply-path injection has
+        // strict EVENTINJ semantics, so the gate is unnecessary
+        // (and harmful).
         if (exit_count > 81_000 and
             io.pic1_vector_base != 0x08 and
-            (state.rflags & (1 << 9)) != 0 and
             state.vcpu_event_intr_nmi == 0)
         {
             const now_ns = syscall.timeMonotonic().v1;
             if (now_ns -% last_inject_ns >= 4_000_000) {
                 last_inject_ns = now_ns;
                 state.vcpu_event_intr_nmi = @as(u64, io.pic1_vector_base) | (1 << 31);
+                inject_count += 1;
+                if (inject_count <= 5) {
+                    log.print("INJECT#");
+                    log.dec(inject_count);
+                    log.print(" vec=0x");
+                    log.hex8(io.pic1_vector_base);
+                    log.print("\n");
+                }
             }
         }
 
