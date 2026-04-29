@@ -33,14 +33,7 @@ pub fn main(cap_table_base: u64) void {
     log.init(cap_table_base);
     log.print("\n=== hyprvOS (spec-v3 port stub) ===\n");
     log.print("VMM body migration in progress.\n");
-    log.print("cap_table_base=0x");
-    log.hex64(cap_table_base);
-    log.print("\n");
 
-    // Smoke-check that we can issue capability syscalls. info_system is
-    // a no-cap-required syscall that returns core count, total phys
-    // pages, and feature bits — handy as a sanity probe before we
-    // start touching the per-VM machinery.
     const sys = syscall.infoSystem();
     log.print("info_system: cores=");
     log.dec(sys.v1);
@@ -48,11 +41,9 @@ pub fn main(cap_table_base: u64) void {
     log.hex64(sys.v2);
     log.print(" total_pages=");
     log.dec(sys.v3);
-    log.print(" page_size_mask=0x");
-    log.hex64(sys.v4);
     log.print("\n");
 
-    log.print("\nBoot-loop migration TODO. Halting cleanly.\n");
+    log.print("\nBoot-loop migration TODO. Halting.\n");
     _ = syscall.powerShutdown();
     while (true) asm volatile ("hlt");
 }

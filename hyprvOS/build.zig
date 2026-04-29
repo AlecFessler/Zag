@@ -18,8 +18,9 @@ pub fn build(b: *std.Build) void {
     const lib_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/lib.zig" },
         .target = target,
-        .optimize = .Debug,
+        .optimize = .ReleaseSmall,
         .pic = true,
+        .omit_frame_pointer = true,
     });
     lib_mod.addImport("lib", lib_mod);
 
@@ -28,8 +29,9 @@ pub fn build(b: *std.Build) void {
     const app_mod = b.createModule(.{
         .root_source_file = b.path(app_root),
         .target = target,
-        .optimize = .Debug,
+        .optimize = .ReleaseSmall,
         .pic = true,
+        .omit_frame_pointer = true,
     });
     app_mod.addImport("lib", lib_mod);
 
@@ -39,16 +41,18 @@ pub fn build(b: *std.Build) void {
     const assets_mod = b.createModule(.{
         .root_source_file = b.path("assets/assets.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = .ReleaseSmall,
         .pic = true,
+        .omit_frame_pointer = true,
     });
     app_mod.addImport("assets", assets_mod);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/start.zig" },
         .target = target,
-        .optimize = .Debug,
+        .optimize = .ReleaseSmall,
         .pic = true,
+        .omit_frame_pointer = true,
     });
     start_mod.addImport("lib", lib_mod);
     start_mod.addImport("app", app_mod);
