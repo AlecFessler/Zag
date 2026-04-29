@@ -2309,8 +2309,121 @@ pub fn main() !u8 {
     total_errs += n_discipline + n_pairing;
 
     try w.flush();
+
+    // Persist findings to lint_finding so /api/findings + tmp_callgraph_findings
+    // can serve them. We close the read-only handle and re-open R/W; SQLite
+    // WAL allows concurrent readers.
+    db.close();
+    writeGenlockFindings(gpa, db_path, bare_findings.items, ptr_findings.items, release_findings.items) catch |err| {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "warning: failed to write lint_finding rows: {s}\n", .{@errorName(err)}) catch "warning: lint_finding write failed\n";
+        _ = std.fs.File.stderr().write(msg) catch {};
+    };
+
     if (total_errs > 0) return 1;
     return 0;
+}
+
+fn writeGenlockFindings(
+    gpa: std.mem.Allocator,
+    db_path: []const u8,
+    bare: []const BarePtrFinding,
+    ptr: []const PtrBypassFinding,
+    release: []const ReleaseFinding,
+) !void {
+    var rwdb = try sqlite.Db.openReadWrite(db_path, gpa);
+    defer rwdb.close();
+
+    try rwdb.exec("BEGIN IMMEDIATE");
+    errdefer rwdb.exec("ROLLBACK") catch {};
+
+    {
+        var del = try rwdb.prepare(
+            "DELETE FROM lint_finding WHERE analyzer = 'genlock'",
+            gpa,
+        );
+        defer del.finalize();
+        _ = try del.step();
+    }
+
+    var ins = try rwdb.prepare(
+        \\INSERT INTO lint_finding
+        \\  (analyzer, severity, rule, entity_id, file_id, byte_start, byte_end, line, message)
+        \\VALUES ('genlock', 'err', ?1, NULL, ?2, ?3, ?3, ?4, ?5)
+    , gpa);
+    defer ins.finalize();
+
+    // file_id lookup helper. Genlock prepends `kernel/` for display; the
+    // file table stores the kernel-relative path (no prefix).
+    var lookup = try rwdb.prepare(
+        "SELECT id, byte_start FROM file LEFT JOIN file_line_index fli ON fli.file_id = file.id AND fli.line = ?2 WHERE file.path = ?1 LIMIT 1",
+        gpa,
+    );
+    defer lookup.finalize();
+
+    const reset = sqlite.c.sqlite3_reset;
+    const clear = sqlite.c.sqlite3_clear_bindings;
+
+    const insert = struct {
+        fn go(
+            ins_stmt: *sqlite.Stmt,
+            lookup_stmt: *sqlite.Stmt,
+            display_path: []const u8,
+            line: u32,
+            rule_str: []const u8,
+            message: []const u8,
+            rst: anytype,
+            clr: anytype,
+        ) !void {
+            // Strip `kernel/` prefix if present.
+            const path = if (std.mem.startsWith(u8, display_path, "kernel/"))
+                display_path["kernel/".len..]
+            else
+                display_path;
+
+            _ = rst(lookup_stmt.raw);
+            _ = clr(lookup_stmt.raw);
+            try lookup_stmt.bindText(1, path);
+            try lookup_stmt.bindInt(2, line);
+            if (!try lookup_stmt.step()) return;
+            const file_id = lookup_stmt.columnInt(0);
+            const byte_start_text = lookup_stmt.columnText(1);
+            const byte_start: i64 = if (byte_start_text == null) 0 else lookup_stmt.columnInt(1);
+
+            _ = rst(ins_stmt.raw);
+            _ = clr(ins_stmt.raw);
+            try ins_stmt.bindText(1, rule_str);
+            try ins_stmt.bindInt(2, file_id);
+            try ins_stmt.bindInt(3, byte_start);
+            try ins_stmt.bindInt(4, line);
+            try ins_stmt.bindText(5, message);
+            _ = try ins_stmt.step();
+        }
+    }.go;
+
+    for (bare) |f| {
+        const msg = try std.fmt.allocPrint(
+            gpa,
+            "{s}.{s}: {s} → use SlabRef({s})",
+            .{ f.struct_name, f.field_name, f.field_type, f.slab_type },
+        );
+        defer gpa.free(msg);
+        try insert(&ins, &lookup, f.file_path, f.line, "fat_pointer_field", msg, reset, clear);
+    }
+    for (ptr) |f| {
+        const msg = try std.fmt.allocPrint(
+            gpa,
+            "{s}  →  use `<ref>.lock()` / `<ref>.unlock()` bracket",
+            .{f.chain},
+        );
+        defer gpa.free(msg);
+        try insert(&ins, &lookup, f.file_path, f.line, "ptr_bypass", msg, reset, clear);
+    }
+    for (release) |f| {
+        try insert(&ins, &lookup, f.file_path, f.line, f.rule, f.message, reset, clear);
+    }
+
+    try rwdb.exec("COMMIT");
 }
 
 // Sort helpers ────────────────────────────────────────────────────────
