@@ -36,6 +36,15 @@ pub const VcpuArchState = struct {
     /// `Lapic.tick`. Drives the emulated APIC timer's countdown across
     /// VM exits; reset when this field is 0 (first entry).
     last_tick_ns: u64 = 0,
+    /// Vector to auto-inject as IRQ0-equivalent every 4ms in the
+    /// pre-VMRUN hook. 0 disables. Set by the VMM via vreg 64 reply
+    /// — once the VMM has armed it, the kernel keeps re-firing the
+    /// vector even when the guest stops generating vm_exits (so
+    /// /init's user-mode-only progress doesn't strand jiffies). The
+    /// kernel-side throttle keeps the rate at ~250 Hz.
+    auto_inject_vector: u8 = 0,
+    /// Monotonic-clock timestamp (ns) at the last auto-inject fire.
+    last_auto_inject_ns: u64 = 0,
     /// True once the VMM has supplied an initial guest state via the
     /// reply path. The first vm_exit delivered after `create_vcpu` is
     /// synthetic (zeroed `GuestState`); the run loop must not actually

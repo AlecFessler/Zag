@@ -83,6 +83,28 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
         }
         arch_state.last_tick_ns = now_ns;
 
+        // Auto-inject the guest's PIC-IRQ0 vector at a fixed 4ms
+        // cadence so /init makes scheduler progress even when the
+        // guest is in user-mode busy-loops that don't generate vm
+        // exits. This is the kernel-side equivalent of the OLD VMM's
+        // out-of-band `vcpu_interrupt` syscall — which spec-v3
+        // doesn't expose — and unblocks the busybox path that needs
+        // jiffies to advance during /init's mount syscalls.
+        // Vector hardcoded to 0x30 because that's what Linux 6.18
+        // remaps the 8259 PIC's IRQ0 to under our `nolapic noapic
+        // acpi=off` cmdline. Skip while a prior EVENTINJ is still
+        // outstanding (consumed by the next VMRUN before this fires).
+        if (arch_state.auto_inject_vector != 0 and
+            arch_state.guest_state.pending_eventinj == 0)
+        {
+            const since_inject = now_ns -% arch_state.last_auto_inject_ns;
+            if (since_inject >= 4_000_000) {
+                arch_state.last_auto_inject_ns = now_ns;
+                arch_state.guest_state.pending_eventinj =
+                    @as(u64, arch_state.auto_inject_vector) | (1 << 31);
+            }
+        }
+
         // Pre-VMRUN: deliver any pending interrupt vector queued in
         // the VM's emulated LAPIC (driven by IOAPIC pin asserts via
         // `vm_inject_irq`, or the local APIC timer above). The LAPIC
@@ -383,7 +405,19 @@ pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregS
     gs.dr6 = snap.dr6;
     gs.dr7 = snap.dr7;
 
-    if (snap.intr_nmi != 0) gs.pending_eventinj = snap.intr_nmi;
+    // VMM-supplied vreg 64 — both armed as a one-shot
+    // `gs.pending_eventinj` (delivered on next VMRUN) AND latched as
+    // the kernel's `auto_inject_vector` for the periodic re-injection
+    // hook. The OLD VMM had a separate `vcpu_interrupt` syscall that
+    // could kick a running vCPU out-of-band; spec-v3 doesn't expose
+    // that path, so the kernel mimics it by re-firing the vector
+    // every ~4 ms once the VMM has armed it.
+    if (snap.intr_nmi != 0) {
+        gs.pending_eventinj = snap.intr_nmi;
+        if ((snap.intr_nmi & (1 << 31)) != 0) {
+            arch_state.auto_inject_vector = @truncate(snap.intr_nmi & 0xFF);
+        }
+    }
 
     arch_state.started = true;
 }
