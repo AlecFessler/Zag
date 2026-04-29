@@ -98,7 +98,7 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
             arch_state.guest_state.pending_eventinj == 0)
         {
             const since_inject = now_ns -% arch_state.last_auto_inject_ns;
-            if (since_inject >= 4_000_000) {
+            if (since_inject >= 4_000_000) { // 4ms = 250Hz, matches Linux CONFIG_HZ
                 arch_state.last_auto_inject_ns = now_ns;
                 arch_state.guest_state.pending_eventinj =
                     @as(u64, arch_state.auto_inject_vector) | (1 << 31);
