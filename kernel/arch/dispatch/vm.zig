@@ -233,3 +233,35 @@ pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
     };
 }
 
+/// Project the receiver's modified §[vm_exit_state] vregs back onto a
+/// vCPU's per-arch GuestState, gated by the originating EC's
+/// `write` cap. Called by `sched.port.consumeReply` when a vm_exit
+/// reply lands on a vCPU sender. Non-vCPU senders short-circuit
+/// inside the per-arch impl.
+pub fn applyReplyStateToVcpu(receiver: *ExecutionContext, vcpu_ec: *ExecutionContext) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm_runloop.applyReplyStateToVcpu(receiver, vcpu_ec),
+        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        else => unreachable,
+    }
+}
+
+/// Project the vCPU's full guest state into the receiver's vreg slots
+/// per §[vm_exit_state] for that arch, but only once the VMM has
+/// supplied initial state (post-first-reply). The synthetic
+/// pre-started exit delivers only sub-code + zeroed GPRs so receivers
+/// that haven't reserved the full vreg window aren't stomped.
+/// Called by `sched.port.fireRouted` on `event_type = vm_exit` when
+/// the originating EC handle had the `read` cap.
+pub fn populateVmExitVregsIfStarted(
+    receiver: *ExecutionContext,
+    sender: *ExecutionContext,
+    subcode: u8,
+) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm_runloop.populateVmExitVregsIfStarted(receiver, sender, subcode),
+        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        else => unreachable,
+    }
+}
+

@@ -1346,26 +1346,13 @@ fn deliverEvent(
     // Spec §[vm_exit_state]: project the vCPU's full guest state
     // (CR0/2/3/4, EFER, segs, GDTR/IDTR, MSRs, DRs) plus the exit
     // sub-code + 3-vreg payload into the receiver's vreg slots. Only
-    // active for vCPUs whose VMM has supplied initial state — i.e.
-    // post-first-reply (`arch_state.started = true`). The pre-started
-    // synthetic-init exit delivers only sub-code + zeroed GPRs (the
-    // existing minimal projection above) so receivers that haven't
-    // reserved the full §[vm_exit_state] stack window aren't stomped.
-    // x86-64 only — aarch64 vm_exit layout follows §[vm_exit_state]
-    // aarch64 and is wired separately when that arch's run loop lands.
+    // active for vCPUs whose VMM has supplied initial state
+    // (post-first-reply); the pre-started synthetic-init exit
+    // delivers only sub-code + zeroed GPRs (the existing minimal
+    // projection above) so receivers that haven't reserved the full
+    // §[vm_exit_state] stack window aren't stomped.
     if (event_type == .vm_exit and sender.vm != null and sender.originating_read_cap) {
-        if (@import("builtin").cpu.arch == .x86_64) {
-            if (zag.arch.x64.kvm.vcpu.archStateOf(sender)) |arch_state| {
-                if (arch_state.started) {
-                    zag.arch.x64.vm_runloop.populateVmExitVregs(
-                        receiver,
-                        sender,
-                        subcode,
-                        arch_state.last_exit_payload,
-                    );
-                }
-            }
-        }
+        arch.vm.populateVmExitVregsIfStarted(receiver, sender, subcode);
     }
 
     // i64 return == OK on success. The composed `ret_word` is delivered
@@ -1494,15 +1481,11 @@ fn consumeReply(holder: *KernelHandle, receiver: *ExecutionContext, sender: *Exe
         const receiver_frame = receiver.iret_frame orelse receiver.ctx;
         arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
     }
-    // Spec §[vm_exit_state] reply writeback for vCPUs is wired through
-    // `vm_runloop.applyReplyStateToVcpu` once the VMM (hyprvOS) lands
-    // with a recv frame reservation that fits the full vreg window.
-    // The pre-rewrite spec-test runner only reserves 144 bytes on its
-    // recv stack — too small to safely read vregs 14..73 (which extend
-    // to offset 480) — so the broad writeback would stomp the runner's
-    // own stack frames. Until the libz scaffolding upgrades, vCPUs
-    // continue to drive through the synthetic-exit loop in
-    // scheduler.switchTo (gated on `arch_state.started`).
+    // Spec §[vm_exit_state] reply writeback for vCPUs. hyprvOS's libz
+    // routes recv/reply through a static `vm_exit_buf` that fits the
+    // full vreg window, so this writeback is now safe for vCPUs.
+    // Non-vCPU senders short-circuit inside the per-arch impl.
+    if (sender.originating_write_cap) arch.vm.applyReplyStateToVcpu(receiver, sender);
     execution_context.resumeFromReply(sender, sender.originating_write_cap);
 }
 

@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     const lib_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/lib.zig" },
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseSafe,
         .pic = true,
         .omit_frame_pointer = true,
     });
@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     const app_mod = b.createModule(.{
         .root_source_file = b.path(app_root),
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseSafe,
         .pic = true,
         .omit_frame_pointer = true,
     });
@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
     const assets_mod = b.createModule(.{
         .root_source_file = b.path("assets/assets.zig"),
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseSafe,
         .pic = true,
         .omit_frame_pointer = true,
     });
@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/start.zig" },
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .ReleaseSafe,
         .pic = true,
         .omit_frame_pointer = true,
     });
@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
     exe.pie = true;
     exe.entry = .{ .symbol_name = "_start" };
     exe.setLinkerScript(b.path("linker.ld"));
+    exe.root_module.strip = false;
 
     const install_name = if (is_arm) "../bin/hyprvOS-arm.elf" else "../bin/hyprvOS.elf";
     const install = b.addInstallFile(exe.getEmittedBin(), install_name);

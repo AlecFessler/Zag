@@ -318,6 +318,32 @@ pub fn populateVmExitVregs(
     storeU64(rsp, VREG73_EXIT_PAYLOAD_2_OFF, payload[2]);
 }
 
+/// Dispatch-shim entrypoint: project the vCPU's full §[vm_exit_state]
+/// onto the receiver's vregs only when the VMM has supplied initial
+/// state (post-first-reply). Synthetic pre-started exits skip the
+/// broad projection so receivers without a 488-byte recv stack window
+/// aren't stomped. Reads `arch_state.last_exit_payload` for the
+/// per-subcode payload tuple.
+///
+/// Side-effect: clears `receiver.pending_event_rip_valid`. The
+/// generic event-state pipeline stages vreg 14 (`[user_rsp+8]`) for
+/// flushing at iretq time via `writeUserVreg14`, sourcing the value
+/// from `sender.event_rip` which is the sender EC's *host* RIP — for
+/// a vCPU EC that's a kernel-mode address from the run-loop hook,
+/// not the guest's RIP. Without this clear, the iretq writeback
+/// stomps the guest RIP we just wrote at offset VREG14_RIP_OFF.
+pub fn populateVmExitVregsIfStarted(
+    receiver: *ExecutionContext,
+    sender: *ExecutionContext,
+    subcode: u8,
+) void {
+    const arch_state = kvm_vcpu.archStateOf(sender) orelse return;
+    if (!arch_state.started) return;
+    populateVmExitVregs(receiver, sender, subcode, arch_state.last_exit_payload);
+    receiver.pending_event_rip = 0;
+    receiver.pending_event_rip_valid = false;
+}
+
 fn deliverPendingInterrupts(vm_ptr: *zag.capdom.virtual_machine.VirtualMachine, gs: *vm_hw.GuestState) void {
     // Skip if guest interrupts are masked. On AMD, also skip if a prior
     // EVENTINJ is still pending (the guest hasn't entered yet).

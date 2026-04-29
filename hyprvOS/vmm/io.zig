@@ -78,7 +78,7 @@ var pit_ch2_gate: bool = false; // gate input (controlled via port 0x61 bit 0), 
 var port61_val: u8 = 0; // shadow of last value written to port 0x61
 
 noinline fn pitGetCount(reload: u16, start_ns: u64) u16 {
-    const now = syscall.clock_gettime();
+    const now = syscall.timeMonotonic().v1;
     const elapsed_ns = now -% start_ns;
     const reload_val: u64 = if (reload == 0) 65536 else @as(u64, reload);
     // How many ticks elapsed
@@ -132,16 +132,16 @@ noinline fn handlePitWrite(channel: u2, value: u8) void {
             } else {
                 pit_ch0_reload = (pit_ch0_reload & 0x00FF) | (@as(u16, value) << 8);
                 pit_ch0_write_hi = false;
-                pit_ch0_start_ns = syscall.clock_gettime();
+                pit_ch0_start_ns = syscall.timeMonotonic().v1;
             }
         } else if (pit_ch0_access == 1) {
             // lobyte only
             pit_ch0_reload = value;
-            pit_ch0_start_ns = syscall.clock_gettime();
+            pit_ch0_start_ns = syscall.timeMonotonic().v1;
         } else if (pit_ch0_access == 2) {
             // hibyte only
             pit_ch0_reload = @as(u16, value) << 8;
-            pit_ch0_start_ns = syscall.clock_gettime();
+            pit_ch0_start_ns = syscall.timeMonotonic().v1;
         }
     } else if (channel == 2) {
         if (pit_ch2_access == 3) {
@@ -151,14 +151,14 @@ noinline fn handlePitWrite(channel: u2, value: u8) void {
             } else {
                 pit_ch2_reload = (pit_ch2_reload & 0x00FF) | (@as(u16, value) << 8);
                 pit_ch2_write_hi = false;
-                pit_ch2_start_ns = syscall.clock_gettime();
+                pit_ch2_start_ns = syscall.timeMonotonic().v1;
             }
         } else if (pit_ch2_access == 1) {
             pit_ch2_reload = value;
-            pit_ch2_start_ns = syscall.clock_gettime();
+            pit_ch2_start_ns = syscall.timeMonotonic().v1;
         } else if (pit_ch2_access == 2) {
             pit_ch2_reload = @as(u16, value) << 8;
-            pit_ch2_start_ns = syscall.clock_gettime();
+            pit_ch2_start_ns = syscall.timeMonotonic().v1;
         }
     }
 }
@@ -224,21 +224,21 @@ pub noinline fn pitCheckIrq() void {
 
     const reload_val: u64 = if (pit_ch0_reload == 0) 65536 else @as(u64, pit_ch0_reload);
     const period_ns = reload_val * PIT_NS_PER_TICK;
-    const now = syscall.clock_gettime();
+    const now = syscall.timeMonotonic().v1;
 
     if (pit_ch0_mode == 0) {
         if (pit_ch0_last_irq_ns == 0 and pit_ch0_start_ns > 0) {
             if (now -% pit_ch0_start_ns >= period_ns) {
                 pit_ch0_last_irq_ns = now;
-                _ = syscall.vm_intc_assert_irq(@import("main.zig").vm_handle, 2);
+                _ = syscall.vmInjectIrq(@truncate(@import("main.zig").vm_handle & 0xFFF), 2, 1);
             }
         }
     } else {
         if (pit_ch0_start_ns == 0) return;
         if (now -% pit_ch0_last_irq_ns >= period_ns) {
             pit_ch0_last_irq_ns = now;
-            _ = syscall.vm_intc_assert_irq(@import("main.zig").vm_handle, 2);
-            _ = syscall.vm_intc_deassert_irq(@import("main.zig").vm_handle, 2);
+            _ = syscall.vmInjectIrq(@truncate(@import("main.zig").vm_handle & 0xFFF), 2, 1);
+            _ = syscall.vmInjectIrq(@truncate(@import("main.zig").vm_handle & 0xFFF), 2, 0);
         }
     }
 }
@@ -331,7 +331,7 @@ pub fn handleOut(port: u16, size: u8, value: u32, state: *GuestState) void {
             port61_val = v;
             if (pit_ch2_gate and !old_gate) {
                 // Rising edge on gate restarts the counter
-                pit_ch2_start_ns = syscall.clock_gettime();
+                pit_ch2_start_ns = syscall.timeMonotonic().v1;
             }
         },
         // ELCR (edge/level control)
@@ -371,7 +371,7 @@ pub fn handleIn(port: u16, size: u8, state: *GuestState) u32 {
                 if (pit_ch2_mode == 0) {
                     // Mode 0 (interrupt on terminal count): output starts LOW,
                     // goes HIGH when count reaches 0.
-                    const now = syscall.clock_gettime();
+                    const now = syscall.timeMonotonic().v1;
                     const elapsed_ns = now -% pit_ch2_start_ns;
                     const reload_u64: u64 = if (pit_ch2_reload == 0) 65536 else @as(u64, pit_ch2_reload);
                     const total_ns = reload_u64 * PIT_NS_PER_TICK;
