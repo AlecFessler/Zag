@@ -173,16 +173,6 @@ const VREG54_PAT_OFF: u64 = 328;
 // passthrough path is restored.
 const VREG60_DR6_OFF: u64 = 376;
 const VREG61_DR7_OFF: u64 = 384;
-// vcpu_events band: vregs 62..65. Only the interrupt/nmi packed slot
-// (vreg 64) is wired today — that is how the VMM tells the kernel to
-// inject a pending external interrupt on the next guest entry. Layout
-// follows the SVM EVENTINJ encoding the OLD VMM used directly:
-//   bits[7:0]   = vector
-//   bits[10:8]  = type (0 = external interrupt, 2 = NMI)
-//   bit[11]     = error_code_valid
-//   bit[31]     = valid (must be set for the kernel to inject)
-//   bits[63:32] = error_code (when EV=1)
-const VREG64_INTR_NMI_OFF: u64 = 408;
 // Exit sub-code + payload: vregs 70..73.
 const VREG70_EXIT_SUBCODE_OFF: u64 = 456;
 const VREG71_EXIT_PAYLOAD_0_OFF: u64 = 464;
@@ -277,19 +267,6 @@ pub fn applyReplyStateToVcpu(receiver: *ExecutionContext, vcpu_ec: *ExecutionCon
     // DRs vregs 56..61 (DR0..DR3 not in GuestState — skipped; DR6/DR7 are).
     gs.dr6 = loadU64(rsp, VREG60_DR6_OFF);
     gs.dr7 = loadU64(rsp, VREG61_DR7_OFF);
-
-    // vreg 64 — pending intr/NMI injection. The VMM sets this when a
-    // PIC IRQ (e.g. PIT IRQ0 at vector 0x20 after Linux remaps 8259) or
-    // NMI needs to be delivered into the guest on the next entry, in
-    // configurations where the in-kernel LAPIC/IOAPIC isn't the
-    // delivery path (Linux booted with `nolapic noapic`). The
-    // pre-VMRUN deliverPendingInterrupts hook honours `gs.pending_eventinj`
-    // alongside its LAPIC-IRR check, so the value flows straight
-    // through to the hardware event-injection field. Sticky `valid`
-    // semantics: VMM is responsible for clearing the field once the
-    // event has been delivered.
-    const intr = loadU64(rsp, VREG64_INTR_NMI_OFF);
-    if (intr != 0) gs.pending_eventinj = intr;
 
     arch_state.started = true;
 }
