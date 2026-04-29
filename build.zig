@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.display else "none";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
-    const emit_ir = b.option(bool, "emit_ir", "Emit kernel LLVM IR to zig-out/kernel.ll (for tools/callgraph)") orelse false;
+    const emit_ir = b.option(bool, "emit_ir", "Emit kernel LLVM IR to zig-out/kernel.ll (consumed by tools/indexer)") orelse false;
     const emit_index = b.option(bool, "emit_index", "Build the per-(arch, commit_sha) oracle SQLite DB to tools/oracle_http/test/dbs/ (implies -Demit_ir=true)") orelse false;
     const commit_sha = b.option([]const u8, "commit_sha", "Commit SHA recorded in the oracle DB when -Demit_index=true (default: 'DEV')") orelse "DEV";
     const kernel_profile = b.option([]const u8, "kernel_profile", "Kernel profiling mode: none, trace, or sample (default: none)") orelse "none";

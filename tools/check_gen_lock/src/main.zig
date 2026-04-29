@@ -2347,7 +2347,7 @@ pub fn main() !u8 {
 
     try w.flush();
 
-    // Persist findings to lint_finding so /api/findings + tmp_callgraph_findings
+    // Persist findings to lint_finding so /api/findings + callgraph_findings
     // can serve them. We close the read-only handle and re-open R/W; SQLite
     // WAL allows concurrent readers.
     db.close();

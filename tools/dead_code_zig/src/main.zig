@@ -928,7 +928,7 @@ pub fn main() !void {
     const skip_errors = try reportSkipDiagnostics();
 
     // Persist findings into lint_finding so downstream tooling (oracle_http
-    // /api/findings, oracle_mcp tmp_callgraph_findings, CI dashboards) can
+    // /api/findings, oracle_mcp callgraph_findings, CI dashboards) can
     // query them by SQL. We close the read-only handle and re-open R/W to
     // write the rows; SQLite WAL mode allows concurrent readers.
     db.close();
