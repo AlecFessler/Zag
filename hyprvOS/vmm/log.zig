@@ -47,7 +47,19 @@ pub fn init(cap_table_base: u64) void {
         0,
         0,
     );
-    if (cvar.v1 != 0) return;
+    // FRAGILE — relies on the current spec convention that error codes
+    // are positive 1..15 and handle words are ≥ 0x1000 (the type tag in
+    // cap word 0 bits 12-15 is non-zero for any real handle, so no real
+    // handle ever lives in [1..15]). That makes `< 16` a clean
+    // success/failure split.
+    //
+    // If error codes are EVER changed to be negative (signed) — or to
+    // any encoding where the error and success-handle ranges overlap —
+    // every site in libz/hyprvOS that disambiguates with `< 16` (or
+    // similar small-positive checks) MUST be revisited. Grep for
+    // `cvar.v1 <` and `lib.errors.isError` before flipping the
+    // convention.
+    if (cvar.v1 < 16) return;
     const var_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 

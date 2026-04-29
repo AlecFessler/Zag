@@ -26,24 +26,12 @@ const lib = @import("lib");
 
 const log = @import("log.zig");
 
-const caps = lib.caps;
 const syscall = lib.syscall;
 
 pub fn main(cap_table_base: u64) void {
     log.init(cap_table_base);
-    log.print("\n=== hyprvOS (spec-v3 port stub) ===\n");
-    log.print("VMM body migration in progress.\n");
+    log.print("hyprvOS: serial up\n");
 
-    const sys = syscall.infoSystem();
-    log.print("info_system: cores=");
-    log.dec(sys.v1);
-    log.print(" features=0x");
-    log.hex64(sys.v2);
-    log.print(" total_pages=");
-    log.dec(sys.v3);
-    log.print("\n");
-
-    log.print("\nBoot-loop migration TODO. Halting.\n");
     _ = syscall.powerShutdown();
     while (true) asm volatile ("hlt");
 }
