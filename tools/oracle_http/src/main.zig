@@ -160,6 +160,7 @@ fn handleRequest(
     if (std.mem.eql(u8, path, "/api/src_bin_at")) return handlers.handleSrcBinAt(allocator, request, query, registry);
     if (std.mem.eql(u8, path, "/api/bin_addr2line")) return handlers.handleBinAddr2Line(allocator, request, query, registry);
     if (std.mem.eql(u8, path, "/api/bin_dataflow_reg")) return handlers.handleBinDataflowReg(allocator, request, query, registry);
+    if (std.mem.eql(u8, path, "/api/findings")) return handlers.handleFindings(allocator, request, query, registry);
 
     // Git-plumbing endpoints — these shell out to `git -C <git_root>`
     // and don't read any DB. /api/load_commit is special: see the

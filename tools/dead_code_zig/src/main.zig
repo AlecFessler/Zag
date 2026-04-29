@@ -491,6 +491,9 @@ const Finding = struct {
     line: u32,
     kind_label: []const u8,
     byte_start: u32,
+    byte_end: u32,
+    entity_id: i64,
+    file_id: i64,
 };
 
 fn kindLabel(kind: []const u8) []const u8 {
@@ -697,7 +700,8 @@ fn collectFindings(
         \\                   OR t.byte_start >= e.def_byte_end)
         \\         )
         \\  )
-        \\SELECT e.id, e.kind, e.qualified_name, e.def_line, e.def_byte_start, f.path
+        \\SELECT e.id, e.kind, e.qualified_name, e.def_line, e.def_byte_start, f.path,
+        \\       e.def_byte_end, f.id
         \\FROM entity e
         \\JOIN file f ON f.id = e.def_file_id
         \\WHERE e.def_file_id IN target_files
@@ -710,11 +714,14 @@ fn collectFindings(
 
     var findings: ArrayList(Finding) = .{};
     while (try stmt.step()) {
+        const entity_id = stmt.columnInt(0);
         const kind = stmt.columnText(1) orelse continue;
         const qname = stmt.columnText(2) orelse continue;
         const line: u32 = @intCast(stmt.columnInt(3));
         const byte_start: u32 = @intCast(stmt.columnInt(4));
         const path = stmt.columnText(5) orelse continue;
+        const byte_end: u32 = @intCast(stmt.columnInt(6));
+        const file_id = stmt.columnInt(7);
 
         // Split qname into parent + name on the LAST '.' for fields, on the
         // last simple-segment for methods (kind=fn with parent qname).
@@ -739,6 +746,9 @@ fn collectFindings(
             .line = line,
             .kind_label = kindLabel(kind),
             .byte_start = byte_start,
+            .byte_end = byte_end,
+            .entity_id = entity_id,
+            .file_id = file_id,
         });
     }
     return findings.toOwnedSlice(a);
@@ -916,5 +926,82 @@ pub fn main() !void {
 
     const skip_errors = try reportSkipDiagnostics();
 
+    // Persist findings into lint_finding so downstream tooling (oracle_http
+    // /api/findings, oracle_mcp tmp_callgraph_findings, CI dashboards) can
+    // query them by SQL. We close the read-only handle and re-open R/W to
+    // write the rows; SQLite WAL mode allows concurrent readers.
+    db.close();
+    writeFindingsToDb(g_arena, db_path.?, findings, target_name) catch |err| {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "warning: failed to write lint_finding rows: {s}\n", .{@errorName(err)}) catch "warning: lint_finding write failed\n";
+        _ = std.fs.File.stderr().write(msg) catch {};
+    };
+
     if (unused_total > 0 or skip_errors) std.process.exit(1);
 }
+
+fn writeFindingsToDb(
+    a: Allocator,
+    db_path: []const u8,
+    findings: []const Finding,
+    target: []const u8,
+) !void {
+    var rwdb = try sqlite.Db.openReadWrite(db_path, a);
+    defer rwdb.close();
+
+    try rwdb.exec("BEGIN IMMEDIATE");
+    errdefer rwdb.exec("ROLLBACK") catch {};
+
+    // Wipe prior dead_code findings for this target only — other targets'
+    // rows are owned by separate analyzer runs and stay live.
+    {
+        var del = try rwdb.prepare(
+            "DELETE FROM lint_finding WHERE analyzer = 'dead_code' AND extra_json LIKE ?",
+            a,
+        );
+        defer del.finalize();
+        const pat = try std.fmt.allocPrint(a, "%\"target\":\"{s}\"%", .{target});
+        try del.bindText(1, pat);
+        _ = try del.step();
+    }
+
+    var ins = try rwdb.prepare(
+        \\INSERT INTO lint_finding
+        \\  (analyzer, severity, rule, entity_id, file_id, byte_start, byte_end, line, message, extra_json)
+        \\VALUES ('dead_code', 'warn', ?, ?, ?, ?, ?, ?, ?, ?)
+    , a);
+    defer ins.finalize();
+
+    for (findings) |f| {
+        if (skipCovers(f.file_path, f.line)) continue;
+
+        const rule = if (mem.eql(u8, f.kind_label, "FIELD"))
+            "unused_field"
+        else if (mem.eql(u8, f.kind_label, "VARIANT"))
+            "unused_variant"
+        else
+            "unused_pub";
+
+        const message = if (f.parent) |p|
+            try std.fmt.allocPrint(a, "UNUSED {s}: {s}.{s}", .{ f.kind_label, p, f.name })
+        else
+            try std.fmt.allocPrint(a, "UNUSED {s}: {s}", .{ f.kind_label, f.name });
+
+        const extra = try std.fmt.allocPrint(a, "{{\"target\":\"{s}\"}}", .{target});
+
+        _ = sqlite.c.sqlite3_reset(ins.raw);
+        _ = sqlite.c.sqlite3_clear_bindings(ins.raw);
+        try ins.bindText(1, rule);
+        try ins.bindInt(2, f.entity_id);
+        try ins.bindInt(3, f.file_id);
+        try ins.bindInt(4, @intCast(f.byte_start));
+        try ins.bindInt(5, @intCast(f.byte_end));
+        try ins.bindInt(6, @intCast(f.line));
+        try ins.bindText(7, message);
+        try ins.bindText(8, extra);
+        _ = try ins.step();
+    }
+
+    try rwdb.exec("COMMIT");
+}
+

@@ -139,7 +139,51 @@ pub const Registry = struct {
             try self.toolCommits(al, args, out);
             return true;
         }
+        if (std.mem.eql(u8, tool, "tmp_callgraph_findings")) {
+            try self.toolFindings(al, args, out);
+            return true;
+        }
         return false;
+    }
+
+    fn toolFindings(self: *Registry, al: std.mem.Allocator, args: std.json.Value, out: *std.ArrayList(u8)) !void {
+        const entry = self.pick(jsonString(args, "arch")) orelse return out.appendSlice(al, "no DBs loaded\n");
+        const analyzer = jsonString(args, "analyzer") orelse "";
+        const rule = jsonString(args, "rule") orelse "";
+        const severity = jsonString(args, "severity") orelse "";
+        const file_glob = jsonString(args, "file") orelse "";
+        const limit_v = jsonInt(args, "limit") orelse 500;
+
+        var stmt = try entry.db.prepare(
+            \\SELECT lf.analyzer, lf.severity, lf.rule, f.path, lf.line, lf.message
+            \\  FROM lint_finding lf
+            \\  JOIN file f ON f.id = lf.file_id
+            \\ WHERE (?1 = '' OR lf.analyzer = ?1)
+            \\   AND (?2 = '' OR lf.rule = ?2)
+            \\   AND (?3 = '' OR lf.severity = ?3)
+            \\   AND (?4 = '' OR f.path GLOB ?4)
+            \\ ORDER BY f.path, lf.line, lf.id
+            \\ LIMIT ?5
+        , al);
+        defer stmt.finalize();
+        try stmt.bindText(1, analyzer);
+        try stmt.bindText(2, rule);
+        try stmt.bindText(3, severity);
+        try stmt.bindText(4, file_glob);
+        try stmt.bindInt(5, limit_v);
+
+        var matches: u32 = 0;
+        while (try stmt.step()) {
+            const an = stmt.columnText(0) orelse "";
+            const sv = stmt.columnText(1) orelse "";
+            const ru = stmt.columnText(2) orelse "";
+            const fp = stmt.columnText(3) orelse "";
+            const line: u32 = @intCast(stmt.columnInt(4));
+            const msg = stmt.columnText(5) orelse "";
+            try std.fmt.format(out.writer(al), "{s}\t[{s}]\t{s}\t{s}:{d}\t{s}\n", .{ an, sv, ru, fp, line, msg });
+            matches += 1;
+        }
+        if (matches == 0) try out.appendSlice(al, "(no findings — analyzers may not have populated lint_finding yet)\n");
     }
 
     // ----------------------------------------------------------- helpers

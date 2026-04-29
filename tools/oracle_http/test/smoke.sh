@@ -104,6 +104,7 @@ probe load_commit_status "$BASE/api/load_commit/status?sha=$DB_SHA"             
 probe diff               "$BASE/api/diff?sha=$DB_SHA"                                             '.'
 probe diff_files         "$BASE/api/diff_files?sha=$DB_SHA"                                       '.'
 probe diff_hunks         "$BASE/api/diff_hunks?sha=$DB_SHA&path=$DIFF_PATH_ENC"                   '.'
+probe findings           "$BASE/api/findings?limit=3"                                             '.'
 
 echo
 total=$((ok + fail))

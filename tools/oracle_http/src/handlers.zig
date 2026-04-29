@@ -1508,3 +1508,66 @@ pub fn handleDiffHunks(
     defer allocator.free(stdout);
     return respondText(request, stdout);
 }
+
+// ── /api/findings ─────────────────────────────────────────────────────────
+// Query the lint_finding table populated by the analyzer pass(es). Filter
+// by analyzer / rule / severity / file (path GLOB) / limit. Results are
+// "<analyzer>  <severity>  <rule>  <file>:<line>  <message>" one per line.
+pub fn handleFindings(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    registry: *Registry,
+) !void {
+    const sha = getQueryValue(query, "sha") orelse "";
+    const arch = getQueryValue(query, "arch") orelse "";
+    const entry = (try resolveArch(request, registry, sha, arch)) orelse return;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const analyzer = getQueryValue(query, "analyzer") orelse "";
+    const rule = getQueryValue(query, "rule") orelse "";
+    const severity = getQueryValue(query, "severity") orelse "";
+    const file_glob = getQueryValue(query, "file") orelse "";
+    const limit_raw = getQueryValue(query, "limit") orelse "500";
+    const limit = std.fmt.parseInt(u32, limit_raw, 10) catch 500;
+
+    var stmt = try entry.db.prepare(
+        \\SELECT lf.analyzer, lf.severity, lf.rule, f.path, lf.line, lf.message
+        \\  FROM lint_finding lf
+        \\  JOIN file f ON f.id = lf.file_id
+        \\ WHERE (?1 = '' OR lf.analyzer = ?1)
+        \\   AND (?2 = '' OR lf.rule = ?2)
+        \\   AND (?3 = '' OR lf.severity = ?3)
+        \\   AND (?4 = '' OR f.path GLOB ?4)
+        \\ ORDER BY f.path, lf.line, lf.id
+        \\ LIMIT ?5
+    , a);
+    defer stmt.finalize();
+    try stmt.bindText(1, analyzer);
+    try stmt.bindText(2, rule);
+    try stmt.bindText(3, severity);
+    try stmt.bindText(4, file_glob);
+    try stmt.bindInt(5, @intCast(limit));
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    var matches: u32 = 0;
+    while (try stmt.step()) {
+        const an = stmt.columnText(0) orelse "";
+        const sv = stmt.columnText(1) orelse "";
+        const ru = stmt.columnText(2) orelse "";
+        const fp = stmt.columnText(3) orelse "";
+        const line: u32 = @intCast(stmt.columnInt(4));
+        const msg = stmt.columnText(5) orelse "";
+        try buf.writer(allocator).print(
+            "{s}  [{s}]  {s}  {s}:{d}  {s}\n",
+            .{ an, sv, ru, fp, line, msg },
+        );
+        matches += 1;
+    }
+    if (matches == 0) try buf.appendSlice(allocator, "(no findings — analyzers may not have populated lint_finding yet)\n");
+    return respondText(request, buf.items);
+}

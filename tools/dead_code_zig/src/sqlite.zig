@@ -41,6 +41,23 @@ pub const Db = struct {
         return db;
     }
 
+    pub fn openReadWrite(path: []const u8, gpa: std.mem.Allocator) !Db {
+        var db: Db = .{};
+        const cpath = try gpa.dupeZ(u8, path);
+        defer gpa.free(cpath);
+        const flags: c_int = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_NOMUTEX;
+        const rc = c.sqlite3_open_v2(cpath.ptr, &db.handle, flags, null);
+        if (rc != c.SQLITE_OK) {
+            if (db.handle) |h| _ = c.sqlite3_close(h);
+            return Error.SqliteOpenFailed;
+        }
+        if (!try db.schemaComplete(gpa)) {
+            db.close();
+            return Error.SchemaIncomplete;
+        }
+        return db;
+    }
+
     pub fn close(self: *Db) void {
         if (self.handle) |h| _ = c.sqlite3_close(h);
         self.handle = null;

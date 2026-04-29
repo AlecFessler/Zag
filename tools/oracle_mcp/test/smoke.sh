@@ -54,6 +54,7 @@ trap 'rm -f "$REQ_FILE"' EXIT
 {"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"tmp_callgraph_bin_dataflow_reg","arguments":{"name":"arch.x64.cpu.halt","reg":"rsp"}}}
 {"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"tmp_callgraph_bin_addr2line","arguments":{"addr":"0xffffffff8000f815"}}}
 {"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"tmp_callgraph_commits","arguments":{"limit":3}}}
+{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"tmp_callgraph_findings","arguments":{"limit":3}}}
 JSON
 } > "$REQ_FILE"
 
@@ -69,9 +70,9 @@ declare -A NAMES=(
     [1]=arches [2]=find [3]=loc [4]=src [5]=callers
     [6]=reaches [7]=entries [8]=modules [9]=trace [10]=type
     [11]=src_bin [12]=src_bin_at [13]=bin_dataflow_reg
-    [14]=bin_addr2line [15]=commits
+    [14]=bin_addr2line [15]=commits [16]=findings
 )
-for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
     name="${NAMES[$id]}"
     if grep -qE "\"id\":${id},.*\"result\":" "$OUT_FILE"; then
         ok=$((ok+1)); printf "[OK ] %s\n" "$name"
