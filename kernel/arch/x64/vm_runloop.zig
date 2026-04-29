@@ -101,12 +101,25 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
                 if (!kvm_vm.tryHandleMmio(vm_ptr, vcpu_ec, ept.guest_phys)) break;
                 // Handled inline — re-enter the guest immediately.
             },
-            // EXIT_REASON_EXTERNAL_INT — host took an IRQ during guest
-            // execution. The host IDT already serviced it; just
-            // re-enter the guest. (vmx.zig labels this as
-            // `.interrupt_window` for historical reasons; that variant
-            // currently only originates here.)
-            .interrupt_window => {},
+            // EXIT_REASON_EXTERNAL_INT — a host IRQ was pending when the
+            // guest tried to enter (or fired during guest execution).
+            // The exit happened with host IRQs masked (see scheduler.zig
+            // `saveAndDisableInterrupts` around enterGuest). The pending
+            // interrupt is still latched in the LAPIC; if we just re-
+            // entered the guest, VMX would EXTERNAL_INT-exit again on
+            // the very next instruction boundary, an infinite loop.
+            // Crack the IRQ window open here so the host IDT actually
+            // services the interrupt (timer tick, IPI, device IRQ),
+            // then re-mask before re-entering. (vmx.zig labels this
+            // variant `.interrupt_window` for historical reasons; today
+            // it only originates from EXIT_REASON_EXTERNAL_INT.)
+            .interrupt_window => {
+                asm volatile (
+                    \\sti
+                    \\nop
+                    \\cli
+                    ::: .{ .memory = true });
+            },
             else => break,
         }
     }

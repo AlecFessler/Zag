@@ -368,7 +368,7 @@ noinline fn exitLoop() void {
         }
 
         exit_count += 1;
-        if (exit_count <= 5 or exit_count % 100 == 0) {
+        if (exit_count <= 5 or exit_count % 25 == 0) {
             log.print("exit#");
             log.dec(exit_count);
             log.print(" et=");
@@ -377,8 +377,6 @@ noinline fn exitLoop() void {
             log.dec(r.state.exit_subcode);
             log.print(" rip=0x");
             log.hex64(r.state.rip);
-            log.print(" err=");
-            log.dec(r.err);
             log.print("\n");
         }
 
