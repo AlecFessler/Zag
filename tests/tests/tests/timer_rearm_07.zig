@@ -68,12 +68,24 @@
 //   7: spin timed out before field0 reached 2 (periodic not firing)
 //   8: post-fires field1.arm != 1 (periodic spuriously cleared arm)
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+// Arch-portable yield-during-spin hint. Issued from a memory-clobber'd
+// volatile asm so the compiler keeps the load chain on the spinning
+// counter alive across iterations.
+inline fn cpuRelax() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
+        .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
+        else => @compileError("unsupported arch"),
+    }
+}
 
 // 5 ms expressed in nanoseconds. Short enough that the test resolves
 // in real time on QEMU+TCG, long enough that scheduling jitter from
@@ -124,7 +136,7 @@ pub fn main(cap_table_base: u64) void {
     var iter: u64 = 0;
     while (iter < SPIN_BOUND) {
         if (field0_ptr.* >= 1) break;
-        asm volatile ("pause" ::: .{ .memory = true });
+        cpuRelax();
         iter += 1;
     }
     if (field0_ptr.* < 1) {
@@ -138,7 +150,7 @@ pub fn main(cap_table_base: u64) void {
     // succession would surface here rather than racing past us.
     var settle: u64 = 0;
     while (settle < SPIN_BOUND / 100) {
-        asm volatile ("pause" ::: .{ .memory = true });
+        cpuRelax();
         settle += 1;
     }
     if (field0_ptr.* != 1) {
@@ -169,7 +181,7 @@ pub fn main(cap_table_base: u64) void {
     iter = 0;
     while (iter < SPIN_BOUND * 2) {
         if (field0_ptr.* >= 2) break;
-        asm volatile ("pause" ::: .{ .memory = true });
+        cpuRelax();
         iter += 1;
     }
     if (field0_ptr.* < 2) {

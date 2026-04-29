@@ -72,6 +72,7 @@
 //      (i.e. the kernel did not refuse the read on a non-suspended
 //      sibling EC)
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -88,10 +89,17 @@ const testing = lib.testing;
 // precondition for the E_BUSY path under test.
 fn busyEntry() noreturn {
     while (true) {
-        asm volatile ("pause"
-            :
-            :
-            : .{ .memory = true });
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("pause"
+                :
+                :
+                : .{ .memory = true }),
+            .aarch64 => asm volatile ("yield"
+                :
+                :
+                : .{ .memory = true }),
+            else => @compileError("unsupported arch"),
+        }
     }
 }
 

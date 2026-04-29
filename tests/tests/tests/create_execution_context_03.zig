@@ -49,6 +49,7 @@
 //   child path:
 //     2: create_execution_context returned something other than E_PERM
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -58,6 +59,22 @@ const testing = lib.testing;
 
 const SLOT_RESULT_PORT: caps.HandleId = caps.SLOT_FIRST_PASSED; // 3
 const SLOT_TEST_ELF_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 1; // 4
+
+// Portable no-op entry — local to this test so we don't depend on the
+// libz testing.dummyEntry (which is x86-only `hlt`). The kernel never
+// runs this entry: the child path's createExecutionContext call must
+// be rejected with E_PERM by the inner-ceiling check before any EC
+// becomes runnable, so the entry pointer just needs to be a valid
+// code address.
+fn localDummyEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
+}
 
 pub fn main(cap_table_base: u64) void {
     const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);
@@ -73,7 +90,7 @@ pub fn main(cap_table_base: u64) void {
         // reject path can fire ahead of the inner-ceiling check.
         const ec_caps = caps.EcCap{ .write = true };
         const caps_word: u64 = @as(u64, ec_caps.toU16());
-        const entry: u64 = @intFromPtr(&testing.dummyEntry);
+        const entry: u64 = @intFromPtr(&localDummyEntry);
 
         const result = syscall.createExecutionContext(
             caps_word,
@@ -169,5 +186,11 @@ pub fn main(cap_table_base: u64) void {
     // Parent halts forever. The child is the sole reporter; the
     // runner indexes results by build-time test tag so a single
     // report from the child satisfies this test's slot.
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
 }

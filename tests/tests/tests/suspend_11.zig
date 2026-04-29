@@ -106,6 +106,7 @@
 //   receiver places into its v13 input when issuing `reply` is what
 //   ends up in W's r15 on resume.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -128,23 +129,42 @@ fn workerEntry() callconv(.c) noreturn {
     // pairs with the release store on the test side and prevents the
     // compiler from caching the load across iterations.
     while (@atomicLoad(u64, &g_released, .acquire) == 0) {
-        asm volatile ("pause");
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("pause"),
+            .aarch64 => asm volatile ("yield"),
+            else => @compileError("unsupported arch"),
+        }
     }
 
-    // Read r15 directly. Per §[event_state], when W's EC handle had
-    // the `write` cap, the kernel applied the receiver's v13 input
-    // (== MAGIC) to W's r15 across the suspend/reply cycle. We capture
-    // the post-resume r15 here without any compiler-introduced
-    // intermediate use of r15.
+    // Read the vreg-13 backing register directly. Per §[event_state],
+    // when W's EC handle had the `write` cap, the kernel applied the
+    // receiver's v13 input (== MAGIC) to W's vreg-13 backing register
+    // across the suspend/reply cycle. We capture the post-resume
+    // value here without any compiler-introduced intermediate use.
+    //   x86-64: vreg 13 = r15
+    //   aarch64: vreg 13 = x12 (vreg 1..31 = x0..x30)
     var observed: u64 = undefined;
-    asm volatile ("movq %%r15, %[out]"
-        : [out] "=r" (observed),
-        :
-        : .{ .memory = false });
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("movq %%r15, %[out]"
+            : [out] "=r" (observed),
+            :
+            : .{ .memory = false }),
+        .aarch64 => asm volatile ("mov %[out], x12"
+            : [out] "=r" (observed),
+            :
+            : .{ .memory = false }),
+        else => @compileError("unsupported arch"),
+    }
 
     @atomicStore(u64, &g_observed, observed, .release);
 
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
 }
 
 pub fn main(cap_table_base: u64) void {

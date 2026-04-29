@@ -61,6 +61,7 @@
 //   2: yield returned a non-OK status in vreg 1
 //   3: sentinel was not visible after the bounded yield-and-poll loop
 
+const builtin = @import("builtin");
 const std = @import("std");
 const lib = @import("lib");
 
@@ -78,7 +79,13 @@ var observed: u64 = 0;
 
 fn childEntry() callconv(.c) noreturn {
     @atomicStore(u64, &observed, SENTINEL, .release);
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
 }
 
 pub fn main(cap_table_base: u64) void {
