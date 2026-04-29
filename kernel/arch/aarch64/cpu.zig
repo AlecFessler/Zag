@@ -386,6 +386,21 @@ pub fn prepareEcContext(
     @panic("aarch64 prepareEcContext not implemented");
 }
 
+/// aarch64 user-mode iret-frame patch — stub mirroring the x86_64
+/// helper signature; aarch64 spec-v3 bringup will fill this in.
+pub fn patchUserModeIretFrame(
+    ctx: *zag.arch.aarch64.interrupts.ArchCpuContext,
+    entry: zag.memory.address.VAddr,
+    user_stack_top: zag.memory.address.VAddr,
+    arg: u64,
+) void {
+    _ = ctx;
+    _ = entry;
+    _ = user_stack_top;
+    _ = arg;
+    @panic("aarch64 patchUserModeIretFrame not implemented");
+}
+
 /// Halt the local core with DAIF.{I,F} clear until the next IRQ (WFI).
 /// Spec §[execution_context] idle EC.
 pub fn idle() void {

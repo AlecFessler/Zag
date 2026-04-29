@@ -5,7 +5,6 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const arch_paging = zag.arch.x64.paging;
 const capability = zag.caps.capability;
 const errors = zag.syscall.errors;
 const memory_init = zag.memory.init;
@@ -1229,7 +1228,7 @@ pub fn allocExecutionContext(
         const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
         const page = try pmm_mgr.create(paging_consts.PageMem(.page4k));
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
-        try arch_paging.mapPage(
+        try arch.paging.mapPage(
             memory_init.kernel_addr_space_root,
             phys,
             VAddr.fromInt(page_addr),
@@ -1265,7 +1264,7 @@ pub fn allocExecutionContext(
             const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
             const page = try pmm_mgr.create(paging_consts.PageMem(.page4k));
             const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
-            try arch_paging.mapPage(
+            try arch.paging.mapPage(
                 domain.addr_space_root,
                 phys,
                 VAddr.fromInt(stack_base + off),

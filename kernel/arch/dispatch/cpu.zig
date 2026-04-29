@@ -387,6 +387,27 @@ pub fn prepareEcContext(
 }
 
 
+/// Re-patch a previously-built iret frame from kernel-mode shape to
+/// user-mode shape. Used when an EC was allocated without a user stack
+/// (so `prepareEcContext` left the frame in kernel mode) and the
+/// caller is wiring in the user stack and entry afterward — the root
+/// service's primordial EC and freshly-spawned domain ECs both follow
+/// this pattern. Writes user code/data selectors, the user stack
+/// pointer (with the SysV `rsp%16==8` skew baked in), the entry RIP,
+/// and the first-arg register.
+pub fn patchUserModeIretFrame(
+    ctx: *ArchCpuContext,
+    entry: VAddr,
+    user_stack_top: VAddr,
+    arg: u64,
+) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.patchUserModeIretFrame(ctx, entry, user_stack_top, arg),
+        .aarch64 => aarch64.cpu.patchUserModeIretFrame(ctx, entry, user_stack_top, arg),
+        else => unreachable,
+    }
+}
+
 /// Halt the local core in an interrupts-enabled state until the next
 /// interrupt (HLT with IF=1 on x86-64, WFI with DAIF cleared on
 /// aarch64). Used by the per-core idle EC.

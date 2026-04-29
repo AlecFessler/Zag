@@ -293,6 +293,18 @@ pub fn unmapPageSized(
 /// stage-1 TTBR0 root on aarch64). Bumps the per-arch ASID/PCID
 /// allocator implicitly is the caller's responsibility — this only
 /// hands back the page-table root. Spec §[capability_domain].
+/// Mirror the kernel half (upper) of the current address-space root into
+/// a freshly-allocated child root. On x86_64 this copies PML4 entries
+/// 256..511; on aarch64 the kernel half lives in TTBR1 and is shared by
+/// hardware so this is a no-op.
+pub fn copyKernelMappings(root: VAddr) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.copyKernelMappings(root),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
 pub fn allocAddrSpaceRoot() !PAddr {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.allocAddrSpaceRoot(),

@@ -292,7 +292,7 @@ pub fn createCapabilityDomain(
     // this re-mirror the child's iret epilogue's stack pop faults on
     // the kernel stack VA).
     const child_root_virt = VAddr.fromPAddr(child_cd.addr_space_root, null);
-    zag.arch.x64.paging.copyKernelMappings(child_root_virt);
+    zag.arch.dispatch.paging.copyKernelMappings(child_root_virt);
 
     // Load ELF segments into the child's address space.
     userspace_init.loadElfSegments(child_cd, elf_bytes, &parsed, layout.elf_slide) catch
@@ -314,7 +314,12 @@ pub fn createCapabilityDomain(
     ) catch return errors.E_NOMEM;
 
     // Patch the initial EC's iret frame for user-mode dispatch.
-    patchInitialIretFrame(child_ec.ctx, slid_entry, layout);
+    zag.arch.dispatch.cpu.patchUserModeIretFrame(
+        child_ec.ctx,
+        slid_entry,
+        VAddr.fromInt(layout.stack_top),
+        layout.table_base,
+    );
 
     // Mint slot-1 EC handle in the child for the initial EC. Caps =
     // ec_inner_ceiling from ceilings_inner bits 0-7 per spec §[20].
@@ -426,34 +431,6 @@ inline fn pageFrameSizeBytes(sz: zag.capdom.var_range.PageSize) u64 {
     };
 }
 
-/// Patch a fresh EC's iret frame for the initial user-mode dispatch.
-/// The arch-side `prepareEcContext` (called by `allocExecutionContext`
-/// for ECs without a pre-allocated user stack) leaves the frame in
-/// kernel-mode shape; this writes the user selectors, the user RSP,
-/// and the entry-point arg expected by the spec.
-fn patchInitialIretFrame(
-    ctx: *zag.arch.dispatch.cpu.ArchCpuContext,
-    entry: VAddr,
-    layout: userspace_init.DomainLayout,
-) void {
-    const USER_CODE_SEL: u64 = 0x23; // (USER_CODE >> 3) | 3 — matches gdt
-    const USER_DATA_SEL: u64 = 0x1b;
-    ctx.cs = USER_CODE_SEL;
-    ctx.ss = USER_DATA_SEL;
-    ctx.rip = entry.addr;
-    // SysV AMD64 ABI: at a function's first instruction, the stack pointer
-    // satisfies `rsp % 16 == 8` (the prior `call` instruction pushed a
-    // return address onto a 16-byte-aligned stack). Compilers emit
-    // `movaps`/`movdqa` against `rsp+offset` slots assuming this offset
-    // holds; if `_start` is entered with `rsp % 16 == 0` instead, those
-    // 16-byte aligned moves trap with #GP. `layout.stack_top` is page-
-    // aligned (and therefore 16-byte aligned), so subtract 8 to mimic
-    // the post-`call` skew the compiler relied on. The first 8 bytes
-    // below `stack_top` are unused — `_start` has no return address to
-    // pop — so this costs only the offset.
-    ctx.rsp = layout.stack_top - 8;
-    ctx.regs.rdi = layout.table_base;
-}
 
 /// `acquire_ecs` syscall handler.
 /// Spec §[capability_domain].acquire_ecs.

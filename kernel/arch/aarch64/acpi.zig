@@ -23,7 +23,6 @@ const std = @import("std");
 const zag = @import("zag");
 
 const aarch64_paging = zag.arch.aarch64.paging;
-const device_registry = zag.devices.registry;
 const gic = zag.arch.aarch64.gic;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
@@ -32,10 +31,8 @@ const rtc = zag.arch.aarch64.rtc;
 const serial = zag.arch.aarch64.serial;
 const smp = zag.arch.aarch64.smp;
 
-const DeviceClass = zag.memory.device_region.DeviceClass;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
-const PixelFormat = zag.boot.protocol.PixelFormat;
 const VAddr = zag.memory.address.VAddr;
 
 /// Map an MMIO region as Device memory into the kernel's physmap range

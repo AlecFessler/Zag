@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
+const gdt = zag.arch.x64.gdt;
 const interrupts = zag.arch.x64.interrupts;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -848,6 +849,32 @@ pub fn prepareEcContext(
         entry_fn,
         arg,
     );
+}
+
+/// Re-patch an already-built kernel-mode iret frame into user-mode
+/// shape. Mirrors the user-mode arm of `interrupts.prepareThreadContext`
+/// (sets USER_CODE/USER_DATA selectors, applies the SysV ABI
+/// `rsp%16==8` skew, writes RIP and the first-arg register). Used by
+/// callers that allocate an EC without an attached user stack and wire
+/// the stack in afterward.
+pub fn patchUserModeIretFrame(
+    ctx: *interrupts.ArchCpuContext,
+    entry: VAddr,
+    user_stack_top: VAddr,
+    arg: u64,
+) void {
+    const ring_3: u64 = 3;
+    ctx.cs = gdt.USER_CODE_OFFSET | ring_3;
+    ctx.ss = gdt.USER_DATA_OFFSET | ring_3;
+    ctx.rip = entry.addr;
+    // SysV AMD64 ABI §3.4.1: at the first instruction of `_start` /
+    // any function entry, `rsp % 16 == 8` (the implicit CALL pushed an
+    // 8-byte return address onto a 16-byte-aligned stack). `user_stack_top`
+    // is page-aligned, so subtract 8 to mimic that post-CALL skew —
+    // without it, 16-byte aligned moves (movaps/movdqa for XMM spills)
+    // emitted against `rsp+offset` trap with #GP at the first instruction.
+    ctx.rsp = user_stack_top.addr - 8;
+    ctx.regs.rdi = arg;
 }
 
 /// Halt the local core with interrupts enabled until the next IRQ.

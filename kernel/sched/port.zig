@@ -1058,9 +1058,7 @@ pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
     // without re-threading the [3]u64 through suspendOnPort. payload[0]
     // also rides in `event_addr` for compatibility with the
     // event-state addr field, and is mirrored here for vm_exit.
-    if (zag.arch.x64.kvm.vcpu.archStateOf(ec)) |arch_state| {
-        arch_state.last_exit_payload = payload;
-    }
+    arch.vm.stashLastExitPayload(ec, payload);
 
     // The originating EC handle for vm_exit is the vCPU EC handle held
     // by the VMM. `read`/`write` default to true so §[event_state] /

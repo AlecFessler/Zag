@@ -246,6 +246,22 @@ pub fn applyReplyStateToVcpu(receiver: *ExecutionContext, vcpu_ec: *ExecutionCon
     }
 }
 
+/// Stash the [3]u64 exit payload onto the vCPU's per-arch state so the
+/// rendezvous-resume / `deliverEvent` path can pick it up at delivery
+/// time without re-threading the payload through `suspendOnPort`.
+/// No-op when `ec` has no per-arch vCPU state (non-vCPU ECs).
+pub fn stashLastExitPayload(ec: *ExecutionContext, payload: [3]u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            if (x64.kvm.vcpu.archStateOf(ec)) |arch_state| {
+                arch_state.last_exit_payload = payload;
+            }
+        },
+        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        else => unreachable,
+    }
+}
+
 /// Project the vCPU's full guest state into the receiver's vreg slots
 /// per §[vm_exit_state] for that arch, but only once the VMM has
 /// supplied initial state (post-first-reply). The synthetic

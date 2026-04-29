@@ -2,7 +2,6 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const arch_paging = zag.arch.x64.paging;
 const capability = zag.caps.capability;
 const capdom = zag.capdom.capability_domain;
 const elf_util = zag.utils.elf;
@@ -242,7 +241,7 @@ pub fn init(root_service_elf: []const u8) !void {
     // new domain leaves the kernel-stack VAs unmapped and the iret
     // epilogue's stack pop / writethrough faults.
     const root_virt = VAddr.fromPAddr(root_cd.addr_space_root, null);
-    arch_paging.copyKernelMappings(root_virt);
+    arch.paging.copyKernelMappings(root_virt);
 
     try loadElfSegments(root_cd, root_service_elf, &parsed, layout.elf_slide);
     try mapUserStack(root_cd, layout.stack_top);
@@ -255,7 +254,7 @@ pub fn init(root_service_elf: []const u8) !void {
     // Re-mirror once more — the user mappings we just installed live in
     // user-half PML4 entries (0..255), which copyKernelMappings does
     // not touch. They went into root_cd's PML4 directly via mapPage.
-    arch_paging.copyKernelMappings(root_virt);
+    arch.paging.copyKernelMappings(root_virt);
 
     arch.boot.print("[boot] root EC ready: entry=0x{x} stack_top=0x{x} ut=0x{x}\n", .{ slid_entry.addr, layout.stack_top, layout.table_base });
 
@@ -305,7 +304,7 @@ pub fn loadElfSegments(
         var off: u64 = 0;
         while (seg_start + off < seg_end) {
             const target_vaddr = VAddr.fromInt(seg_start + off);
-            const existing_phys = arch_paging.resolveVaddr(root_cd.addr_space_root, target_vaddr);
+            const existing_phys = arch.paging.resolveVaddr(root_cd.addr_space_root, target_vaddr);
 
             // Compute the union of perms across every PT_LOAD that
             // touches this 4 KiB page. Test ELFs commonly split a
@@ -330,7 +329,7 @@ pub fn loadElfSegments(
                 // preserve previously-installed bytes.
                 const dst: [*]u8 = @ptrCast(page);
                 @memset(dst[0..paging_consts.PAGE4K], 0);
-                try arch_paging.mapPage(
+                try arch.paging.mapPage(
                     root_cd.addr_space_root,
                     phys,
                     target_vaddr,
@@ -442,7 +441,7 @@ fn applyRelativeRelocations(
 
             const slid_target = rela.r_offset + slide;
             const target_va = VAddr.fromInt(slid_target);
-            const target_pa = arch_paging.resolveVaddr(
+            const target_pa = arch.paging.resolveVaddr(
                 root_cd.addr_space_root,
                 target_va,
             ) orelse return error.RelocationTargetUnmapped;
@@ -468,7 +467,7 @@ pub fn mapUserStack(root_cd: *CapabilityDomain, stack_top: u64) !void {
         const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
         const page = try pmm_mgr.create(paging_consts.PageMem(.page4k));
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
-        try arch_paging.mapPage(
+        try arch.paging.mapPage(
             root_cd.addr_space_root,
             phys,
             VAddr.fromInt(base + off),
@@ -489,7 +488,7 @@ pub fn mapUserTableView(root_cd: *CapabilityDomain, table_base: u64) !void {
     while (off < ROOT_USER_TABLE_BYTES) {
         const kernel_page_va = VAddr.fromInt(ut_kernel_va + off);
         const phys = PAddr.fromVAddr(kernel_page_va, null);
-        try arch_paging.mapPage(
+        try arch.paging.mapPage(
             root_cd.addr_space_root,
             phys,
             VAddr.fromInt(table_base + off),
@@ -520,19 +519,12 @@ fn resolveOrSpawnRootEc(
 
     // allocExecutionContext built an iret frame in kernel-mode (no user
     // stack was wired through allocVar yet). Patch it for user mode.
-    const ctx = ec.ctx;
-    const gdt = zag.arch.x64.gdt;
-    const ring_3: u64 = 3;
-    ctx.cs = gdt.USER_CODE_OFFSET | ring_3;
-    ctx.ss = gdt.USER_DATA_OFFSET | ring_3;
-    // SysV AMD64 ABI: `_start`'s first instruction must see `rsp % 16 == 8`
-    // (matching the post-`call` skew compilers assume when emitting 16-byte
-    // aligned moves like `movaps`). `layout.stack_top` is page-aligned;
-    // subtract 8 so user code does not #GP on `movaps [rsp+k]` patterns.
-    // Mirrors the same adjustment in `capdom.capability_domain.patchInitialIretFrame`.
-    ctx.rsp = layout.stack_top - 8;
-    ctx.rip = entry.addr;
-    ctx.regs.rdi = layout.table_base;
+    arch.cpu.patchUserModeIretFrame(
+        ec.ctx,
+        entry,
+        VAddr.fromInt(layout.stack_top),
+        layout.table_base,
+    );
 
     const obj_ref: ErasedSlabRef = .{
         .ptr = ec,
