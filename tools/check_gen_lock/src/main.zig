@@ -268,9 +268,24 @@ fn loadFiles(db: *sqlite.Db, st: *State) !void {
     const a = st.arena.allocator();
     var stmt = try db.prepare("SELECT id, path, source FROM file ORDER BY id", st.gpa);
     defer stmt.finalize();
+    // Trees added via --extra-source-root prefix their files with the tree's
+    // basename. Skip those — gen-lock is a kernel-only invariant and the
+    // routerOS / hyprvOS / bootloader / tools / tests trees are userspace
+    // code with their own concurrency models. Without this filter, every
+    // ArrayList mutex inside the indexer or callgraph tool gets pulled into
+    // the IRQ-discipline analysis as a "lock class reachable from trap_sync".
+    const NON_KERNEL_PREFIXES = [_][]const u8{
+        "routerOS/",  "hyprvOS/",  "bootloader/",
+        "tools/",     "tests/",
+    };
     while (try stmt.step()) {
         const id: u32 = @intCast(stmt.columnInt(0));
         const path = stmt.columnText(1) orelse continue;
+        var is_non_kernel = false;
+        for (NON_KERNEL_PREFIXES) |pfx| {
+            if (mem.startsWith(u8, path, pfx)) { is_non_kernel = true; break; }
+        }
+        if (is_non_kernel) continue;
         const src = stmt.columnBlob(2) orelse "";
         // Indexer stores paths relative to the kernel root (e.g.
         // `syscall/var.zig`). Prepend `kernel/` when missing so the
