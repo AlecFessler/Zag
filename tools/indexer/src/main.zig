@@ -180,10 +180,17 @@ pub fn main() !void {
     if (args.ir_path) |ir_path| {
         // Build qualified-name → entity_id lookup map for IR resolution.
         var qmap: std.StringHashMapUnmanaged(u32) = .empty;
-        try qmap.ensureTotalCapacity(palloc, @intCast(resolve_result.final_entities.len));
+        try qmap.ensureTotalCapacity(palloc, @intCast(resolve_result.final_entities.len * 2));
         for (resolve_result.final_entities) |e| {
             // Last write wins on dup; entity table dedups already, but defensively skip.
             try qmap.put(palloc, e.qualified_name, e.id);
+            // Zig keyword-fn names appear in the AST as `@"suspend"` but
+            // come out of LLVM IR as plain `suspend`. Insert an
+            // unquoted alias so ir_pass lookups resolve either form.
+            if (std.mem.indexOf(u8, e.qualified_name, "@\"") != null) {
+                const stripped = try stripZigQuotes(palloc, e.qualified_name);
+                try qmap.put(palloc, stripped, e.id);
+            }
         }
 
         const ir_result = try ir_pass.pass(palloc, ir_path, &qmap);
@@ -245,53 +252,50 @@ pub fn main() !void {
     }
 
     // ── Stage 5: entry_point discovery + entry_reaches BFS ────────────────
-    // Convention-based entry classification:
-    //   - exception: fn in kernel/arch/<arch>/exceptions.zig whose short
-    //     name matches a fixed list of handler entry names. (genlock's
-    //     EXCEPTION_ENTRY_NAMES list — keeps the entry set narrow so
-    //     downstream consumers don't pick up helpers.)
-    //   - irq: fn in kernel/arch/<arch>/irq.zig named schedTimerHandler
-    //     (the timer-tick async entry).
-    //   - syscall: fn in kernel/syscall/<file>.zig where <file> is a
-    //     handler module (excludes dispatch / errors / pmu / syscall).
-    //   - boot: main.kEntry.
     //
-    // Short-name comparison uses the qualified_name's last `.`-segment.
-    // We use SQL substr/instr to extract it without a temp table.
+    //   - exception: fns in kernel/arch/<arch>/exceptions.zig whose short
+    //     name matches the EXCEPTION_ENTRY_NAMES list (the handler set
+    //     genlock and other consumers expect).
+    //   - irq: fns in kernel/arch/<arch>/irq.zig named schedTimerHandler.
+    //   - syscall: every fn called directly from `syscall.dispatch.dispatch`'s
+    //     switch table — i.e. the actual real syscalls. Walking the
+    //     dispatch arms via ir_call gives us the exact 57 handlers
+    //     (one per SyscallNum enum value) instead of the older
+    //     "every pub fn in syscall/*.zig" overcount that pulled in
+    //     ~16 private helpers.
+    //   - boot: main.kEntry.
     const entry_sql: [:0]const u8 =
         \\INSERT INTO entry_point (entity_id, kind, label)
-        \\SELECT e.id,
-        \\    CASE
-        \\        WHEN f.path LIKE 'arch/%/exceptions.zig' THEN 'exception'
-        \\        WHEN f.path LIKE 'arch/%/irq.zig' THEN 'irq'
-        \\        WHEN f.path LIKE 'syscall/%.zig'
-        \\             AND f.path NOT IN ('syscall/dispatch.zig', 'syscall/errors.zig',
-        \\                                'syscall/pmu.zig', 'syscall/syscall.zig') THEN 'syscall'
-        \\        WHEN e.qualified_name = 'main.kEntry' THEN 'boot'
-        \\        ELSE 'unknown'
-        \\    END,
-        \\    e.qualified_name
-        \\FROM entity e
-        \\JOIN file f ON f.id = e.def_file_id
+        \\SELECT e.id, 'exception', e.qualified_name
+        \\FROM entity e JOIN file f ON f.id = e.def_file_id
         \\WHERE e.kind = 'fn'
-        \\  AND (
-        \\      (f.path LIKE 'arch/%/exceptions.zig'
-        \\       AND (e.qualified_name LIKE '%.exceptionHandler'
-        \\            OR e.qualified_name LIKE '%.pageFaultHandler'
-        \\            OR e.qualified_name LIKE '%.handleSyncLowerEl'
-        \\            OR e.qualified_name LIKE '%.handleIrqLowerEl'
-        \\            OR e.qualified_name LIKE '%.handleSyncCurrentEl'
-        \\            OR e.qualified_name LIKE '%.handleIrqCurrentEl'
-        \\            OR e.qualified_name LIKE '%.handleUnexpected'
-        \\            OR e.qualified_name LIKE '%.dispatchIrq'
-        \\            OR e.qualified_name LIKE '%.schedTimerHandler'))
-        \\      OR (f.path LIKE 'arch/%/irq.zig'
-        \\          AND e.qualified_name LIKE '%.schedTimerHandler')
-        \\      OR (f.path LIKE 'syscall/%.zig'
-        \\          AND f.path NOT IN ('syscall/dispatch.zig', 'syscall/errors.zig',
-        \\                             'syscall/pmu.zig', 'syscall/syscall.zig'))
-        \\      OR e.qualified_name = 'main.kEntry'
-        \\  );
+        \\  AND f.path LIKE 'arch/%/exceptions.zig'
+        \\  AND (e.qualified_name LIKE '%.exceptionHandler'
+        \\       OR e.qualified_name LIKE '%.pageFaultHandler'
+        \\       OR e.qualified_name LIKE '%.handleSyncLowerEl'
+        \\       OR e.qualified_name LIKE '%.handleIrqLowerEl'
+        \\       OR e.qualified_name LIKE '%.handleSyncCurrentEl'
+        \\       OR e.qualified_name LIKE '%.handleIrqCurrentEl'
+        \\       OR e.qualified_name LIKE '%.handleUnexpected'
+        \\       OR e.qualified_name LIKE '%.dispatchIrq'
+        \\       OR e.qualified_name LIKE '%.schedTimerHandler');
+        \\INSERT INTO entry_point (entity_id, kind, label)
+        \\SELECT e.id, 'irq', e.qualified_name
+        \\FROM entity e JOIN file f ON f.id = e.def_file_id
+        \\WHERE e.kind = 'fn'
+        \\  AND f.path LIKE 'arch/%/irq.zig'
+        \\  AND e.qualified_name LIKE '%.schedTimerHandler';
+        \\INSERT INTO entry_point (entity_id, kind, label)
+        \\SELECT e.id, 'boot', e.qualified_name FROM entity e
+        \\WHERE e.kind = 'fn' AND e.qualified_name = 'main.kEntry';
+        \\INSERT INTO entry_point (entity_id, kind, label)
+        \\SELECT DISTINCT callee.id, 'syscall', callee.qualified_name
+        \\FROM ir_call ic
+        \\JOIN entity caller ON caller.id = ic.caller_entity_id
+        \\JOIN entity callee ON callee.id = ic.callee_entity_id
+        \\WHERE caller.qualified_name = 'syscall.dispatch.dispatch'
+        \\  AND callee.qualified_name LIKE 'syscall.%'
+        \\  AND callee.kind = 'fn';
     ;
     try channel.send(.{ .raw_sql = entry_sql });
 
@@ -457,6 +461,31 @@ fn processFile(
     processFileInner(palloc, channel, file, module_qname, shared, out) catch |e| {
         std.log.err("worker failed on {s}: {s}", .{ file.path, @errorName(e) });
     };
+}
+
+/// Strip Zig's `@"keyword"` quoting from each segment of a qualified name
+/// so the result matches what LLVM IR emits — e.g. `syscall.port.@"suspend"`
+/// → `syscall.port.suspend`. Allocates the result in `palloc`; only called
+/// for names that actually contain `@"`.
+fn stripZigQuotes(palloc: std.mem.Allocator, qname: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < qname.len) {
+        if (i + 1 < qname.len and qname[i] == '@' and qname[i + 1] == '"') {
+            // Skip the opening @"
+            i += 2;
+            // Copy until closing "
+            while (i < qname.len and qname[i] != '"') : (i += 1) {
+                try out.append(palloc, qname[i]);
+            }
+            // Skip closing "
+            if (i < qname.len) i += 1;
+        } else {
+            try out.append(palloc, qname[i]);
+            i += 1;
+        }
+    }
+    return try out.toOwnedSlice(palloc);
 }
 
 fn processFileInner(
