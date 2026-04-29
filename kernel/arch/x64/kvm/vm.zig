@@ -2,16 +2,26 @@ const std = @import("std");
 const zag = @import("zag");
 
 const ioapic_mod = zag.arch.x64.kvm.ioapic;
+const mmio_decode = zag.arch.x64.mmio_decode;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const vm_hw = zag.arch.x64.vm;
 
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
 const VAddr = zag.memory.address.VAddr;
 const VarPageSize = zag.capdom.var_range.PageSize;
 const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
+
+/// Kernel-emulated LAPIC/IOAPIC MMIO base addresses. Linux's xAPIC code
+/// hits these page-aligned regions for ICR/EOI/IRR programming and IRQ
+/// routing — handled inline so the run loop never punts these exits to
+/// the VMM (a CPU-bound 1376-exits-per-second hot loop in pre-restoration
+/// builds).
+const LAPIC_BASE: u64 = 0xFEE0_0000;
+const IOAPIC_BASE: u64 = 0xFEC0_0000;
 
 // ── Spec-v3 dispatch backings ────────────────────────────────────────
 //
@@ -247,6 +257,54 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
 /// Section 3.0; any `irq_num` beyond that range cannot be emulated
 /// and must be rejected with E_INVAL per Spec §[vm_inject_irq] test 02.
 /// Returns 0 on success.
+/// If `guest_phys` falls inside the kernel-emulated LAPIC or IOAPIC
+/// MMIO page, decode the instruction at guest RIP, dispatch the access
+/// to the matching controller, write any read result back into the
+/// guest GPR, advance RIP past the decoded instruction, and return
+/// true so the run loop can re-enter the guest inline. Returns false
+/// if `guest_phys` is outside both ranges or the instruction can't be
+/// decoded — the exit then falls through to the VMM as a normal
+/// `ept_violation` delivery.
+pub fn tryHandleMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
+    if (guest_phys >= LAPIC_BASE and guest_phys < LAPIC_BASE + 0x1000) {
+        return handleLapicMmio(vm, vcpu_ec, guest_phys);
+    }
+    if (guest_phys >= IOAPIC_BASE and guest_phys < IOAPIC_BASE + 0x1000) {
+        return handleIoapicMmio(vm, vcpu_ec, guest_phys);
+    }
+    return false;
+}
+
+fn handleLapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
+    const arch_state = zag.arch.x64.kvm.vcpu.archStateOf(vcpu_ec) orelse return false;
+    const gs = &arch_state.guest_state;
+    const op = mmio_decode.decode(vm, gs) orelse return false;
+    const offset: u32 = @truncate(guest_phys - LAPIC_BASE);
+    if (op.is_write) {
+        vm.lapic.mmioWrite(offset, op.value);
+    } else {
+        const value = vm.lapic.mmioRead(offset);
+        mmio_decode.writeGpr(gs, op.reg, @as(u64, value));
+    }
+    gs.rip += op.len;
+    return true;
+}
+
+fn handleIoapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
+    const arch_state = zag.arch.x64.kvm.vcpu.archStateOf(vcpu_ec) orelse return false;
+    const gs = &arch_state.guest_state;
+    const op = mmio_decode.decode(vm, gs) orelse return false;
+    const offset: u32 = @truncate(guest_phys - IOAPIC_BASE);
+    if (op.is_write) {
+        vm.ioapic.mmioWrite(offset, op.value);
+    } else {
+        const value = vm.ioapic.mmioRead(offset);
+        mmio_decode.writeGpr(gs, op.reg, @as(u64, value));
+    }
+    gs.rip += op.len;
+    return true;
+}
+
 pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
     if (irq_num >= ioapic_mod.NUM_REDIR_ENTRIES)
         return zag.syscall.errors.E_INVAL;

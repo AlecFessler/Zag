@@ -13,6 +13,7 @@ const zag = @import("zag");
 const cpu_dispatch = zag.arch.dispatch.cpu;
 const kvm_vcpu = zag.arch.x64.kvm.vcpu;
 const kvm_vm = zag.arch.x64.kvm.vm;
+const time_dispatch = zag.arch.dispatch.time;
 const vm_hw = zag.arch.x64.vm;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -60,18 +61,55 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
 
     const vmcs_paddr = ctrl_phys orelse return null;
 
-    // Pre-VMRUN: deliver any pending interrupt vector queued in the VM's
-    // emulated LAPIC (driven by IOAPIC pin asserts via `vm_inject_irq`).
-    // The LAPIC tracks IRR/ISR per Intel SDM Vol 3 §13; if a deliverable
-    // vector is pending and the guest is interruptible (RFLAGS.IF=1, no
-    // prior EVENTINJ on AMD), we call `injectInterrupt` to set up the
-    // VMCS/VMCB event-injection field and acknowledge the LAPIC.
-    deliverPendingInterrupts(vm_ptr, &arch_state.guest_state);
+    // Inline-handle EPT violations against the kernel-emulated LAPIC /
+    // IOAPIC pages. Linux's xAPIC + I/O APIC code hits these MMIO
+    // ranges thousands of times during boot (timer programming, EOI,
+    // ICR writes); punting each one to the VMM as a vm_exit would burn
+    // a full recv→reply round-trip per access. Loop here, handling
+    // them in-kernel until the guest hits a non-MMIO exit, then
+    // deliver to the VMM. The per-iteration deliverPendingInterrupts
+    // call is intentional — handling LAPIC writes can ack/queue new
+    // vectors that should be injected on the next entry.
+    var exit_info: vm_hw.VmExitInfo = undefined;
+    while (true) {
+        // Advance the emulated LAPIC timer by the wall-clock time that
+        // elapsed since the last pre-VMRUN tick. Linux's local timer is
+        // the LAPIC timer; without this, programmed initial-counts
+        // never countdown to zero and the guest spins forever in
+        // interrupt-window exits waiting for a tick that won't come.
+        const now_ns = time_dispatch.currentMonotonicNs();
+        if (arch_state.last_tick_ns != 0) {
+            vm_ptr.lapic.tick(now_ns - arch_state.last_tick_ns);
+        }
+        arch_state.last_tick_ns = now_ns;
 
-    // Run the guest until the next VM exit. On return, GuestState +
-    // last_exit are populated.
-    const exit_info = vm_hw.vmResume(&arch_state.guest_state, vmcs_paddr, &arch_state.guest_fxsave);
-    arch_state.last_exit = exit_info;
+        // Pre-VMRUN: deliver any pending interrupt vector queued in
+        // the VM's emulated LAPIC (driven by IOAPIC pin asserts via
+        // `vm_inject_irq`, or the local APIC timer above). The LAPIC
+        // tracks IRR/ISR per Intel SDM Vol 3 §13; if a deliverable
+        // vector is pending and the guest is interruptible
+        // (RFLAGS.IF=1, no prior EVENTINJ on AMD), `injectInterrupt`
+        // sets up the VMCS/VMCB event-injection field and acknowledges
+        // the LAPIC.
+        deliverPendingInterrupts(vm_ptr, &arch_state.guest_state);
+
+        exit_info = vm_hw.vmResume(&arch_state.guest_state, vmcs_paddr, &arch_state.guest_fxsave);
+        arch_state.last_exit = exit_info;
+
+        switch (exit_info) {
+            .ept_violation => |ept| {
+                if (!kvm_vm.tryHandleMmio(vm_ptr, vcpu_ec, ept.guest_phys)) break;
+                // Handled inline — re-enter the guest immediately.
+            },
+            // EXIT_REASON_EXTERNAL_INT — host took an IRQ during guest
+            // execution. The host IDT already serviced it; just
+            // re-enter the guest. (vmx.zig labels this as
+            // `.interrupt_window` for historical reasons; that variant
+            // currently only originates here.)
+            .interrupt_window => {},
+            else => break,
+        }
+    }
 
     return decodeDelivery(exit_info, &arch_state.guest_state);
 }

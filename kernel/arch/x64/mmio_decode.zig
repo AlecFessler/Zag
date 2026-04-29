@@ -9,13 +9,15 @@
 ///   0x88 MOV r/m8, r8      (MMIO write byte)
 ///   0x8A MOV r8, r/m8      (MMIO read byte)
 ///
-/// Guest virtual -> physical translation via 4-level page table walk,
-/// reading guest physical memory through the kernel physmap.
-// MMIO instruction byte decoder used by exception/fault paths to inspect
-// faulting MOV opcodes. The full guest-virt → guest-phys → instruction
-// fetch pipeline is parked along with the spec-v2 KVM run loop; only the
-// pure byte-buffer decoder (`decodeBytes`) is wired today.
+/// Guest virtual -> physical translation via the guest's CR3 page-table
+/// walk; guest physical memory is read through the kernel physmap (SMAP
+/// does not gate kernel-mode VAs).
+const zag = @import("zag");
 
+const virtual_machine = zag.capdom.virtual_machine;
+
+const GuestState = zag.arch.x64.vm.GuestState;
+const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
 
 /// Result of decoding an MMIO instruction.
 pub const MmioOp = struct {
@@ -31,6 +33,134 @@ pub const DecodeError = error{
     UnsupportedInstruction,
     IncompleteDecode,
 };
+
+// --- Guest virtual -> physical page table walk ---
+
+/// Translate guest virtual address to guest physical using CR3 4-level
+/// paging. Intel SDM Vol 3A §4.5 / AMD APM Vol 2 §5.3.
+/// Reads guest page-table entries via the VM's `installs[]` mapping.
+fn guestVirtToPhys(vm: *const VirtualMachine, cr3: u64, vaddr: u64) ?u64 {
+    const pml4_base = cr3 & 0x000F_FFFF_FFFF_F000;
+    const pml4_idx = (vaddr >> 39) & 0x1FF;
+    const pml4e = readGuestPhysU64(vm, pml4_base + pml4_idx * 8) orelse return null;
+    if (pml4e & 1 == 0) return null;
+
+    const pdpt_base = pml4e & 0x000F_FFFF_FFFF_F000;
+    const pdpt_idx = (vaddr >> 30) & 0x1FF;
+    const pdpte = readGuestPhysU64(vm, pdpt_base + pdpt_idx * 8) orelse return null;
+    if (pdpte & 1 == 0) return null;
+    if (pdpte & 0x80 != 0) // 1 GiB page
+        return (pdpte & 0x000F_FFFF_C000_0000) | (vaddr & 0x3FFF_FFFF);
+
+    const pd_base = pdpte & 0x000F_FFFF_FFFF_F000;
+    const pd_idx = (vaddr >> 21) & 0x1FF;
+    const pde = readGuestPhysU64(vm, pd_base + pd_idx * 8) orelse return null;
+    if (pde & 1 == 0) return null;
+    if (pde & 0x80 != 0) // 2 MiB page
+        return (pde & 0x000F_FFFF_FFE0_0000) | (vaddr & 0x1F_FFFF);
+
+    const pt_base = pde & 0x000F_FFFF_FFFF_F000;
+    const pt_idx = (vaddr >> 12) & 0x1FF;
+    const pte = readGuestPhysU64(vm, pt_base + pt_idx * 8) orelse return null;
+    if (pte & 1 == 0) return null;
+
+    return (pte & 0x000F_FFFF_FFFF_F000) | (vaddr & 0xFFF);
+}
+
+/// Read a u64 from guest physical memory through the VM's `installs[]`
+/// bookkeeping. The host pointer returned by `guestPhysToHost` is a
+/// kernel-mode physmap VA, so the dereference does not need SMAP
+/// bracketing.
+fn readGuestPhysU64(vm: *const VirtualMachine, phys: u64) ?u64 {
+    const ptr = virtual_machine.guestPhysToHost(vm, phys, 8) orelse return null;
+    const u64_ptr: *const align(1) u64 = @ptrCast(ptr);
+    return u64_ptr.*;
+}
+
+/// Fetch up to 15 instruction bytes from guest virtual address `rip`,
+/// crossing a page boundary if needed. Returns the number of bytes
+/// actually fetched, or null if neither half of the fetch translates.
+fn fetchInsn(vm: *const VirtualMachine, cr0: u64, cr3: u64, rip: u64, buf: *[15]u8) ?u8 {
+    // CR0.PG=0 ⇒ guest virtual = guest physical (paging disabled).
+    const phys = if (cr0 & (1 << 31) == 0) rip else (guestVirtToPhys(vm, cr3, rip) orelse return null);
+    const page_off = phys & 0xFFF;
+    const avail: u64 = 4096 - page_off;
+    const first: u8 = @intCast(@min(15, avail));
+
+    const slice_ptr = virtual_machine.guestPhysToHost(vm, phys, first) orelse return null;
+    @memcpy(buf[0..first], slice_ptr[0..first]);
+
+    if (first < 15) {
+        const next_vaddr = (rip & ~@as(u64, 0xFFF)) + 4096;
+        const next_phys = if (cr0 & (1 << 31) == 0) next_vaddr else (guestVirtToPhys(vm, cr3, next_vaddr) orelse return first);
+        const remaining: u8 = 15 - first;
+        if (virtual_machine.guestPhysToHost(vm, next_phys, remaining)) |next_ptr| {
+            @memcpy(buf[first..15], next_ptr[0..remaining]);
+            return 15;
+        }
+        return first;
+    }
+    return first;
+}
+
+/// Decode the MMIO instruction at guest RIP. Wraps `fetchInsn` +
+/// `decodeBytes`; for register-source writes, fills in `value` from the
+/// matching guest GPR so the caller doesn't have to read it again.
+pub fn decode(vm: *const VirtualMachine, gs: *const GuestState) ?MmioOp {
+    var insn: [15]u8 = undefined;
+    const fetched = fetchInsn(vm, gs.cr0, gs.cr3, gs.rip, &insn) orelse return null;
+    if (fetched < 2) return null;
+
+    var op = decodeBytes(insn[0..fetched]) catch return null;
+
+    if (op.is_write and !op.is_immediate) {
+        op.value = @truncate(readGpr(gs, op.reg));
+    }
+    return op;
+}
+
+pub fn readGpr(gs: *const GuestState, reg: u4) u64 {
+    return switch (reg) {
+        0 => gs.rax,
+        1 => gs.rcx,
+        2 => gs.rdx,
+        3 => gs.rbx,
+        4 => gs.rsp,
+        5 => gs.rbp,
+        6 => gs.rsi,
+        7 => gs.rdi,
+        8 => gs.r8,
+        9 => gs.r9,
+        10 => gs.r10,
+        11 => gs.r11,
+        12 => gs.r12,
+        13 => gs.r13,
+        14 => gs.r14,
+        15 => gs.r15,
+    };
+}
+
+/// Write a value to a guest GPR slot in `GuestState`.
+pub fn writeGpr(gs: *GuestState, reg: u4, value: u64) void {
+    switch (reg) {
+        0 => gs.rax = value,
+        1 => gs.rcx = value,
+        2 => gs.rdx = value,
+        3 => gs.rbx = value,
+        4 => gs.rsp = value,
+        5 => gs.rbp = value,
+        6 => gs.rsi = value,
+        7 => gs.rdi = value,
+        8 => gs.r8 = value,
+        9 => gs.r9 = value,
+        10 => gs.r10 = value,
+        11 => gs.r11 = value,
+        12 => gs.r12 = value,
+        13 => gs.r13 = value,
+        14 => gs.r14 = value,
+        15 => gs.r15 = value,
+    }
+}
 
 // --- Instruction decode ---
 

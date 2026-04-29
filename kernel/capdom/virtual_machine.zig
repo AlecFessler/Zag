@@ -638,6 +638,33 @@ fn lookupPort(domain: *CapabilityDomain, slot: u12) ?*Port {
     return ref.ptr;
 }
 
+/// Translate a guest-physical address to a kernel-mode physmap pointer
+/// using the VM's `installs[]` bookkeeping. Walks the install table
+/// looking for the region that covers `[gpa, gpa+len)` and returns a
+/// kernel-VA pointer at `pf.phys_base + (gpa - install.guest_addr)`.
+/// Returns null if no install covers the requested range.
+///
+/// Used by per-arch in-kernel device emulation (LAPIC/IOAPIC MMIO,
+/// instruction fetch on EPT/stage-2 violations) to read/write guest
+/// memory via the kernel physmap. Reads through the returned pointer
+/// don't need SMAP bracketing — physmap is a kernel-mode VA range.
+pub fn guestPhysToHost(vm: *const VirtualMachine, gpa: u64, len: usize) ?[*]u8 {
+    for (vm.installs) |inst| {
+        const pf_ref = inst.pf orelse continue;
+        const pf = pf_ref.ptr;
+        const stride = pageStride(inst.sz);
+        const region_size = stride * @as(u64, inst.page_count);
+        if (gpa < inst.guest_addr) continue;
+        const offset = gpa - inst.guest_addr;
+        if (offset >= region_size) continue;
+        if (region_size - offset < @as(u64, len)) continue;
+        const host_pa = zag.memory.address.PAddr.fromInt(pf.phys_base.addr + offset);
+        const host_va = zag.memory.address.VAddr.fromPAddr(host_pa, null);
+        return @ptrFromInt(host_va.addr);
+    }
+    return null;
+}
+
 fn pageStride(sz: VarPageSize) u64 {
     return switch (sz) {
         .sz_4k => 0x1000,
