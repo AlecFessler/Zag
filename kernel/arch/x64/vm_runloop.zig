@@ -192,96 +192,198 @@ fn storeU64(rsp: u64, off: u64, value: u64) void {
     ptr.* = value;
 }
 
-/// Project the receiver's modified §[vm_exit_state] vregs back onto the
-/// vCPU's GuestState. Called from `port.consumeReply` when the
-/// originating event was vm_exit, before the vCPU's `resumeFromReply`.
-/// Receiver MUST be the running EC on the current core (so CR3 already
-/// references the receiver's address space; SMAP gates the user-stack
-/// loads via STAC/CLAC).
+/// Plain-data snapshot of the receiver's §[vm_exit_state] vregs,
+/// captured outside the sender EC's `_gen_lock` so a fault on the
+/// SMAP-bracketed user-stack reads can't strand the lock bit.
+/// `applyReplyStateToVcpu` projects this snapshot onto the vCPU's
+/// GuestState under the sender lock.
+pub const ReplyVregSnapshot = extern struct {
+    rax: u64 = 0,
+    rbx: u64 = 0,
+    rcx: u64 = 0,
+    rdx: u64 = 0,
+    rbp: u64 = 0,
+    rsi: u64 = 0,
+    rdi: u64 = 0,
+    rsp: u64 = 0,
+    rip: u64 = 0,
+    r8: u64 = 0,
+    r9: u64 = 0,
+    r10: u64 = 0,
+    r11: u64 = 0,
+    r12: u64 = 0,
+    r13: u64 = 0,
+    r14: u64 = 0,
+    r15: u64 = 0,
+    rflags: u64 = 0,
+    cr0: u64 = 0,
+    cr2: u64 = 0,
+    cr3: u64 = 0,
+    cr4: u64 = 0,
+    efer: u64 = 0,
+    cs: GuestState.SegmentReg = .{},
+    ds: GuestState.SegmentReg = .{},
+    es: GuestState.SegmentReg = .{},
+    fs: GuestState.SegmentReg = .{},
+    gs: GuestState.SegmentReg = .{},
+    ss: GuestState.SegmentReg = .{},
+    tr: GuestState.SegmentReg = .{},
+    ldtr: GuestState.SegmentReg = .{},
+    gdtr_base: u64 = 0,
+    gdtr_limit: u32 = 0,
+    idtr_base: u64 = 0,
+    idtr_limit: u32 = 0,
+    star: u64 = 0,
+    lstar: u64 = 0,
+    cstar: u64 = 0,
+    sfmask: u64 = 0,
+    kernel_gs_base: u64 = 0,
+    sysenter_cs: u64 = 0,
+    sysenter_esp: u64 = 0,
+    sysenter_eip: u64 = 0,
+    pat: u64 = 0,
+    dr6: u64 = 0,
+    dr7: u64 = 0,
+    intr_nmi: u64 = 0,
+};
+
+/// Snapshot the receiver's §[vm_exit_state] vregs into a kernel-stack
+/// buffer. Reads receiver-side state only — kernel-saved iret frame for
+/// vregs 1..13 and the receiver's user stack (gated by SMAP STAC/CLAC)
+/// for vregs 14..73. Receiver MUST be the running EC on the current
+/// core (so CR3 already references the receiver's address space).
 ///
-/// On first successful reply this also flips `arch_state.started = true`,
-/// arming the next `enterGuest` to actually execute VMLAUNCH/VMRUN with
-/// the supplied initial guest state.
-pub fn applyReplyStateToVcpu(receiver: *ExecutionContext, vcpu_ec: *ExecutionContext) void {
-    const arch_state = kvm_vcpu.archStateOf(vcpu_ec) orelse return;
-    const gs = &arch_state.guest_state;
+/// Run BEFORE acquiring the sender's `_gen_lock`: a page fault on the
+/// user-stack reads aborts the syscall via `memory.fault.handlePageFault`
+/// without touching the sender, so no lock bit can leak.
+pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
+    var snap: ReplyVregSnapshot = .{};
     const recv_frame = receiver.iret_frame orelse receiver.ctx;
 
-    // vregs 1..13 — register-backed. Read straight from receiver's
-    // saved iret frame into the vCPU's GuestState GPR slots.
-    gs.rax = recv_frame.regs.rax;
-    gs.rbx = recv_frame.regs.rbx;
-    gs.rdx = recv_frame.regs.rdx;
-    gs.rbp = recv_frame.regs.rbp;
-    gs.rsi = recv_frame.regs.rsi;
-    gs.rdi = recv_frame.regs.rdi;
-    gs.r8 = recv_frame.regs.r8;
-    gs.r9 = recv_frame.regs.r9;
-    gs.r10 = recv_frame.regs.r10;
-    gs.r12 = recv_frame.regs.r12;
-    gs.r13 = recv_frame.regs.r13;
-    gs.r14 = recv_frame.regs.r14;
-    gs.r15 = recv_frame.regs.r15;
+    snap.rax = recv_frame.regs.rax;
+    snap.rbx = recv_frame.regs.rbx;
+    snap.rdx = recv_frame.regs.rdx;
+    snap.rbp = recv_frame.regs.rbp;
+    snap.rsi = recv_frame.regs.rsi;
+    snap.rdi = recv_frame.regs.rdi;
+    snap.r8 = recv_frame.regs.r8;
+    snap.r9 = recv_frame.regs.r9;
+    snap.r10 = recv_frame.regs.r10;
+    snap.r12 = recv_frame.regs.r12;
+    snap.r13 = recv_frame.regs.r13;
+    snap.r14 = recv_frame.regs.r14;
+    snap.r15 = recv_frame.regs.r15;
 
-    // vregs 14..73 live on the receiver's user stack at the rsp captured
-    // by the syscall trampoline. SMAP gates the loads.
     const rsp = recv_frame.rsp;
     cpu_dispatch.userAccessBegin();
     defer cpu_dispatch.userAccessEnd();
 
-    gs.rip = loadU64(rsp, VREG14_RIP_OFF);
-    gs.rflags = loadU64(rsp, VREG15_RFLAGS_OFF);
-    gs.rsp = loadU64(rsp, VREG16_RSP_OFF);
-    gs.rcx = loadU64(rsp, VREG17_RCX_OFF);
-    gs.r11 = loadU64(rsp, VREG18_R11_OFF);
-    gs.cr0 = loadU64(rsp, VREG19_CR0_OFF);
-    gs.cr2 = loadU64(rsp, VREG20_CR2_OFF);
-    gs.cr3 = loadU64(rsp, VREG21_CR3_OFF);
-    gs.cr4 = loadU64(rsp, VREG22_CR4_OFF);
-    gs.efer = loadU64(rsp, VREG24_EFER_OFF);
+    snap.rip = loadU64(rsp, VREG14_RIP_OFF);
+    snap.rflags = loadU64(rsp, VREG15_RFLAGS_OFF);
+    snap.rsp = loadU64(rsp, VREG16_RSP_OFF);
+    snap.rcx = loadU64(rsp, VREG17_RCX_OFF);
+    snap.r11 = loadU64(rsp, VREG18_R11_OFF);
+    snap.cr0 = loadU64(rsp, VREG19_CR0_OFF);
+    snap.cr2 = loadU64(rsp, VREG20_CR2_OFF);
+    snap.cr3 = loadU64(rsp, VREG21_CR3_OFF);
+    snap.cr4 = loadU64(rsp, VREG22_CR4_OFF);
+    snap.efer = loadU64(rsp, VREG24_EFER_OFF);
 
-    // Segments: vregs 26..41 = 8 segs × 2 vregs each.
-    // {base u64, {limit u32, selector u16, access_rights u16}}
-    loadSegment(rsp, VREG26_CS_BASE_OFF + 0 * 16, &gs.cs);
-    loadSegment(rsp, VREG26_CS_BASE_OFF + 1 * 16, &gs.ds);
-    loadSegment(rsp, VREG26_CS_BASE_OFF + 2 * 16, &gs.es);
-    loadSegment(rsp, VREG26_CS_BASE_OFF + 3 * 16, &gs.fs);
-    loadSegment(rsp, VREG26_CS_BASE_OFF + 4 * 16, &gs.gs);
-    loadSegment(rsp, VREG26_CS_BASE_OFF + 5 * 16, &gs.ss);
-    loadSegment(rsp, VREG26_CS_BASE_OFF + 6 * 16, &gs.tr);
-    loadSegment(rsp, VREG26_CS_BASE_OFF + 7 * 16, &gs.ldtr);
+    loadSegment(rsp, VREG26_CS_BASE_OFF + 0 * 16, &snap.cs);
+    loadSegment(rsp, VREG26_CS_BASE_OFF + 1 * 16, &snap.ds);
+    loadSegment(rsp, VREG26_CS_BASE_OFF + 2 * 16, &snap.es);
+    loadSegment(rsp, VREG26_CS_BASE_OFF + 3 * 16, &snap.fs);
+    loadSegment(rsp, VREG26_CS_BASE_OFF + 4 * 16, &snap.gs);
+    loadSegment(rsp, VREG26_CS_BASE_OFF + 5 * 16, &snap.ss);
+    loadSegment(rsp, VREG26_CS_BASE_OFF + 6 * 16, &snap.tr);
+    loadSegment(rsp, VREG26_CS_BASE_OFF + 7 * 16, &snap.ldtr);
 
-    // GDTR / IDTR
-    gs.gdtr_base = loadU64(rsp, VREG42_GDTR_BASE_OFF);
-    gs.gdtr_limit = @truncate(loadU64(rsp, VREG43_GDTR_LIMIT_OFF));
-    gs.idtr_base = loadU64(rsp, VREG44_IDTR_BASE_OFF);
-    gs.idtr_limit = @truncate(loadU64(rsp, VREG45_IDTR_LIMIT_OFF));
+    snap.gdtr_base = loadU64(rsp, VREG42_GDTR_BASE_OFF);
+    snap.gdtr_limit = @truncate(loadU64(rsp, VREG43_GDTR_LIMIT_OFF));
+    snap.idtr_base = loadU64(rsp, VREG44_IDTR_BASE_OFF);
+    snap.idtr_limit = @truncate(loadU64(rsp, VREG45_IDTR_LIMIT_OFF));
 
-    // MSRs vregs 46..54 (vreg 55 = TSC_AUX, not in GuestState).
-    gs.star = loadU64(rsp, VREG46_STAR_OFF);
-    gs.lstar = loadU64(rsp, VREG47_LSTAR_OFF);
-    gs.cstar = loadU64(rsp, VREG48_CSTAR_OFF);
-    gs.sfmask = loadU64(rsp, VREG49_SFMASK_OFF);
-    gs.kernel_gs_base = loadU64(rsp, VREG50_KERNEL_GS_BASE_OFF);
-    gs.sysenter_cs = loadU64(rsp, VREG51_SYSENTER_CS_OFF);
-    gs.sysenter_esp = loadU64(rsp, VREG52_SYSENTER_ESP_OFF);
-    gs.sysenter_eip = loadU64(rsp, VREG53_SYSENTER_EIP_OFF);
-    gs.pat = loadU64(rsp, VREG54_PAT_OFF);
+    snap.star = loadU64(rsp, VREG46_STAR_OFF);
+    snap.lstar = loadU64(rsp, VREG47_LSTAR_OFF);
+    snap.cstar = loadU64(rsp, VREG48_CSTAR_OFF);
+    snap.sfmask = loadU64(rsp, VREG49_SFMASK_OFF);
+    snap.kernel_gs_base = loadU64(rsp, VREG50_KERNEL_GS_BASE_OFF);
+    snap.sysenter_cs = loadU64(rsp, VREG51_SYSENTER_CS_OFF);
+    snap.sysenter_esp = loadU64(rsp, VREG52_SYSENTER_ESP_OFF);
+    snap.sysenter_eip = loadU64(rsp, VREG53_SYSENTER_EIP_OFF);
+    snap.pat = loadU64(rsp, VREG54_PAT_OFF);
 
-    // DRs vregs 56..61 (DR0..DR3 not in GuestState — skipped; DR6/DR7 are).
-    gs.dr6 = loadU64(rsp, VREG60_DR6_OFF);
-    gs.dr7 = loadU64(rsp, VREG61_DR7_OFF);
+    snap.dr6 = loadU64(rsp, VREG60_DR6_OFF);
+    snap.dr7 = loadU64(rsp, VREG61_DR7_OFF);
 
-    // vreg 64 — pending intr/NMI injection. The VMM writes this when
-    // a PIC IRQ (e.g. PIT IRQ0 at vector 0x20 after Linux remaps the
-    // 8259) needs to be delivered into the guest, in configurations
-    // where the in-kernel LAPIC/IOAPIC isn't the routing path
-    // (`nolapic noapic` cmdline). The pre-VMRUN
-    // `deliverPendingInterrupts` hook honours `gs.pending_eventinj`
-    // alongside its LAPIC-IRR check, so the value flows straight
-    // through to the hardware event-injection field.
-    const intr = loadU64(rsp, VREG64_INTR_NMI_OFF);
-    if (intr != 0) gs.pending_eventinj = intr;
+    snap.intr_nmi = loadU64(rsp, VREG64_INTR_NMI_OFF);
+
+    return snap;
+}
+
+/// Project a `ReplyVregSnapshot` onto the vCPU's GuestState. Pure
+/// memory writes — no user-VA access, so safe under the sender's
+/// `_gen_lock`. Called from `port.consumeReply` after `snapshotReplyVregs`.
+///
+/// On first successful reply this also flips `arch_state.started = true`,
+/// arming the next `enterGuest` to actually execute VMLAUNCH/VMRUN with
+/// the supplied initial guest state.
+pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregSnapshot) void {
+    const arch_state = kvm_vcpu.archStateOf(vcpu_ec) orelse return;
+    const gs = &arch_state.guest_state;
+
+    gs.rax = snap.rax;
+    gs.rbx = snap.rbx;
+    gs.rcx = snap.rcx;
+    gs.rdx = snap.rdx;
+    gs.rbp = snap.rbp;
+    gs.rsi = snap.rsi;
+    gs.rdi = snap.rdi;
+    gs.rsp = snap.rsp;
+    gs.rip = snap.rip;
+    gs.r8 = snap.r8;
+    gs.r9 = snap.r9;
+    gs.r10 = snap.r10;
+    gs.r11 = snap.r11;
+    gs.r12 = snap.r12;
+    gs.r13 = snap.r13;
+    gs.r14 = snap.r14;
+    gs.r15 = snap.r15;
+    gs.rflags = snap.rflags;
+    gs.cr0 = snap.cr0;
+    gs.cr2 = snap.cr2;
+    gs.cr3 = snap.cr3;
+    gs.cr4 = snap.cr4;
+    gs.efer = snap.efer;
+
+    gs.cs = snap.cs;
+    gs.ds = snap.ds;
+    gs.es = snap.es;
+    gs.fs = snap.fs;
+    gs.gs = snap.gs;
+    gs.ss = snap.ss;
+    gs.tr = snap.tr;
+    gs.ldtr = snap.ldtr;
+
+    gs.gdtr_base = snap.gdtr_base;
+    gs.gdtr_limit = snap.gdtr_limit;
+    gs.idtr_base = snap.idtr_base;
+    gs.idtr_limit = snap.idtr_limit;
+
+    gs.star = snap.star;
+    gs.lstar = snap.lstar;
+    gs.cstar = snap.cstar;
+    gs.sfmask = snap.sfmask;
+    gs.kernel_gs_base = snap.kernel_gs_base;
+    gs.sysenter_cs = snap.sysenter_cs;
+    gs.sysenter_esp = snap.sysenter_esp;
+    gs.sysenter_eip = snap.sysenter_eip;
+    gs.pat = snap.pat;
+
+    gs.dr6 = snap.dr6;
+    gs.dr7 = snap.dr7;
+
+    if (snap.intr_nmi != 0) gs.pending_eventinj = snap.intr_nmi;
 
     arch_state.started = true;
 }

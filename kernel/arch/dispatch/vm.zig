@@ -233,14 +233,37 @@ pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
     };
 }
 
-/// Project the receiver's modified §[vm_exit_state] vregs back onto a
-/// vCPU's per-arch GuestState, gated by the originating EC's
-/// `write` cap. Called by `sched.port.consumeReply` when a vm_exit
-/// reply lands on a vCPU sender. Non-vCPU senders short-circuit
-/// inside the per-arch impl.
-pub fn applyReplyStateToVcpu(receiver: *ExecutionContext, vcpu_ec: *ExecutionContext) void {
+/// Plain-data snapshot of the receiver's §[vm_exit_state] vregs.
+/// Captured outside the sender EC's `_gen_lock` so a fault on the
+/// SMAP-bracketed user-stack reads can't strand the lock bit. Per-arch
+/// layout — only the matching arch's apply path consumes it.
+pub const ReplyVregSnapshot = switch (builtin.cpu.arch) {
+    .x86_64 => x64.vm_runloop.ReplyVregSnapshot,
+    .aarch64 => extern struct {}, // aarch64 KVM is not in the spec-v3 critical path
+    else => unreachable,
+};
+
+/// Snapshot the receiver's §[vm_exit_state] vregs into a kernel-stack
+/// buffer. Reads receiver-side state only (kernel iret frame + SMAP-
+/// bracketed user-stack loads). Run BEFORE acquiring the sender's
+/// `_gen_lock` so a page fault on the user reads can abort the syscall
+/// without leaking the sender lock bit.
+pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm_runloop.snapshotReplyVregs(receiver),
+        .aarch64 => .{},
+        else => unreachable,
+    };
+}
+
+/// Project a `ReplyVregSnapshot` onto a vCPU's per-arch GuestState,
+/// gated by the originating EC's `write` cap. Pure memory writes — no
+/// user-VA access, so safe under the sender's `_gen_lock`. Called by
+/// `sched.port.consumeReply` when a vm_exit reply lands on a vCPU
+/// sender. Non-vCPU senders short-circuit inside the per-arch impl.
+pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregSnapshot) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.vm_runloop.applyReplyStateToVcpu(receiver, vcpu_ec),
+        .x86_64 => x64.vm_runloop.applyReplyStateToVcpu(vcpu_ec, snap),
         .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
         else => unreachable,
     }

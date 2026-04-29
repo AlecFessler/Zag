@@ -642,21 +642,27 @@ pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
     // reply ops on that slot return E_ABANDONED rather than E_TERM.
     if (reply_caps.abandoned) return errors.E_ABANDONED;
 
+    // §[vm_exit_state] writeback snapshot: capture the receiver's
+    // user-stack vreg window BEFORE taking the sender lock. The reads
+    // are SMAP-bracketed and can fault on demand-paged user pages; if
+    // they did so under the sender lock, `memory.fault.handlePageFault`
+    // would abandon the syscall frame without releasing the lock bit
+    // and the next destroy walking that EC would deadlock. Snapshot is
+    // discarded for non-vCPU / no-write-cap senders.
+    const reply_snap = arch.vm.snapshotReplyVregs(caller);
+
     // IRQ-saving acquire: `consumeReply` runs with the sender's
-    // EC._gen_lock held, and `applyReplyStateToVcpu` performs ~488 B
-    // of SMAP-bracketed user-stack reads inside that window. If a
-    // timer IRQ fires mid-read with IRQs enabled, the timer ISR's
-    // scheduler dispatch acquires CD locks and lockdep records
-    // EC→CD against the destroy-side CD→EC = AB-BA cycle. Masking
-    // IRQs across the held window closes that race deterministically.
-    // Spec §[reply] writeback discipline; see also the IRQ-acquired
-    // class enforcement in `tools/check_gen_lock`.
+    // EC._gen_lock held; masking IRQs across the held window prevents
+    // the timer ISR's scheduler dispatch from registering an EC→CD
+    // edge that would invert the destroy-side CD→EC ordering. Spec
+    // §[reply] writeback discipline; see also the IRQ-acquired class
+    // enforcement in `tools/check_gen_lock`.
     const sender_lr = sender_ref.lockIrqSave(@src()) catch return errors.E_TERM;
     const sender = sender_lr.ptr;
     const sender_irq_state = sender_lr.irq_state;
     defer sender_ref.unlockIrqRestore(sender_irq_state);
 
-    consumeReply(entry, caller, sender);
+    consumeReply(entry, caller, sender, &reply_snap);
     return 0;
 }
 
@@ -783,6 +789,14 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     }
     sender_cd_ref.unlockIrqRestore(sender_cd_lr.irq_state);
 
+    // §[reply_transfer] test 14 vreg-14 (RIP) reload: harvest the
+    // SMAP-bracketed user-stack read NOW, before any sender lock, so a
+    // page fault on the user page can abort cleanly without leaking the
+    // sender's `_gen_lock` bit. The receiver (`caller`) is the running
+    // EC on this core, so CR3 already references its address space.
+    const receiver_frame = caller.iret_frame orelse caller.ctx;
+    const new_rip = arch.syscall.readUserVreg14(receiver_frame);
+
     // Phase 4 — caller's CD: clear `move = 1` source slots and consume
     // the reply slot. Same single-CD-at-a-time pattern.
     const cd_phase4_lr = caller_cd_ref.lockIrqSave(@src()) catch {
@@ -793,7 +807,7 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
         const sender2_lr = sender_ref.lockIrqSave(@src()) catch return errors.OK;
         const sender2 = sender2_lr.ptr;
         defer sender_ref.unlockIrqRestore(sender2_lr.irq_state);
-        deliverReplyTransferResume(caller, sender2, n, tstart);
+        deliverReplyTransferResume(caller, sender2, n, tstart, new_rip);
         return errors.OK;
     };
     const cd_phase4 = cd_phase4_lr.ptr;
@@ -823,7 +837,7 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     const sender2_lr = sender_ref.lockIrqSave(@src()) catch return errors.OK;
     const sender2 = sender2_lr.ptr;
     defer sender_ref.unlockIrqRestore(sender2_lr.irq_state);
-    deliverReplyTransferResume(caller, sender2, n, tstart);
+    deliverReplyTransferResume(caller, sender2, n, tstart, new_rip);
     return errors.OK;
 }
 
@@ -831,11 +845,17 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
 /// Mirrors `consumeReply` for GPR write-back, plus stages the
 /// §[event_state] syscall return word with `pair_count`/`tstart` so
 /// the iretq flush surfaces the spec-mandated values to the sender.
+///
+/// `new_rip` was harvested by the caller via `arch.syscall.readUserVreg14`
+/// BEFORE acquiring the sender's `_gen_lock` — the SMAP-bracketed user
+/// read can fault, and faulting under the sender lock would strand the
+/// lock bit. Pure memory writes here.
 fn deliverReplyTransferResume(
     caller: *ExecutionContext,
     sender: *ExecutionContext,
     pair_count: u8,
     tstart: u12,
+    new_rip: u64,
 ) void {
     // Stage the §[event_state] post-resume word for the sender. Field
     // positions mirror the recv-side composition: pair_count at bits
@@ -852,17 +872,12 @@ fn deliverReplyTransferResume(
     // write. Mirrors `consumeReply`: receiver's current syscall frame
     // holds the post-recv, pre-reply_transfer GPR values; copy them
     // into the sender's saved frame. Spec §[reply_transfer] test 14
-    // additionally pulls vreg 14 (RIP) from the receiver's user stack
-    // at `[user_rsp + 8]` and re-installs it onto the sender's saved
-    // RIP — the receiver may have rewritten the resume RIP between
-    // recv and reply_transfer. The receiver is the running EC on this
-    // core, so CR3 already references the receiver's address space and
-    // the user-stack read is safe via SMAP STAC/CLAC inside the helper.
+    // additionally re-installs vreg 14 (RIP) — the receiver may have
+    // rewritten the resume RIP between recv and reply_transfer.
     if (sender.originating_write_cap) {
         const sender_frame = sender.iret_frame orelse sender.ctx;
         const receiver_frame = caller.iret_frame orelse caller.ctx;
         arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
-        const new_rip = arch.syscall.readUserVreg14(receiver_frame);
         arch.syscall.setEventRip(sender_frame, new_rip);
     }
     execution_context.resumeFromReply(sender, sender.originating_write_cap);
@@ -1464,7 +1479,16 @@ fn mintReply(receiver_domain: *CapabilityDomain, sender: *ExecutionContext, xfer
 /// Resume the sender via the reply path, applying receiver's GPR
 /// modifications (gated by originating EC handle's `write` cap).
 /// Spec §[reply] tests 05/06.
-fn consumeReply(holder: *KernelHandle, receiver: *ExecutionContext, sender: *ExecutionContext) void {
+///
+/// `snap` was captured by the caller BEFORE acquiring the sender's
+/// `_gen_lock` so a fault on the receiver's SMAP-bracketed user-stack
+/// reads can't strand the lock bit. Apply is pure memory writes.
+fn consumeReply(
+    holder: *KernelHandle,
+    receiver: *ExecutionContext,
+    sender: *ExecutionContext,
+    snap: *const arch.vm.ReplyVregSnapshot,
+) void {
     _ = holder;
     // The write-cap snapshot was stamped onto `sender` at suspend time
     // (see `suspendOnPort`); any receiver-side modifications to the
@@ -1479,11 +1503,9 @@ fn consumeReply(holder: *KernelHandle, receiver: *ExecutionContext, sender: *Exe
         const receiver_frame = receiver.iret_frame orelse receiver.ctx;
         arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
     }
-    // Spec §[vm_exit_state] reply writeback for vCPUs. hyprvOS's libz
-    // routes recv/reply through a static `vm_exit_buf` that fits the
-    // full vreg window, so this writeback is now safe for vCPUs.
-    // Non-vCPU senders short-circuit inside the per-arch impl.
-    if (sender.originating_write_cap) arch.vm.applyReplyStateToVcpu(receiver, sender);
+    // Spec §[vm_exit_state] reply writeback for vCPUs. Non-vCPU senders
+    // short-circuit inside the per-arch impl.
+    if (sender.originating_write_cap) arch.vm.applyReplyStateToVcpu(sender, snap);
     execution_context.resumeFromReply(sender, sender.originating_write_cap);
 }
 
