@@ -151,7 +151,20 @@ fn renderFnText(
         return;
     }
 
+    var prev_block: i64 = -1;
     for (callees) |c| {
+        if (c.ast_node_id) |aid| {
+            var marker_buf = std.ArrayList(u8){};
+            var owning_block: i64 = -1;
+            try collectControlMarkers(db, a, aid, &marker_buf, &owning_block);
+            if (owning_block != prev_block and marker_buf.items.len > 0) {
+                var pad: usize = 0;
+                while (pad < indent + 2) : (pad += 1) try out.append(gpa, ' ');
+                try out.appendSlice(gpa, marker_buf.items);
+                try out.append(gpa, '\n');
+                prev_block = owning_block;
+            }
+        }
         try renderCallText(gpa, db, a, c, depth + 1, max_depth, visited, rendered, out);
     }
 }
@@ -227,7 +240,21 @@ fn compactFn(
     try rendered.put(fn_id, depth);
 
     const callees = try fetchCallees(db, a, fn_id);
-    for (callees) |c| try compactCall(gpa, db, a, c, depth + 1, max_depth, visited, rendered, out);
+    var prev_block: i64 = -1;
+    for (callees) |c| {
+        if (c.ast_node_id) |aid| {
+            var marker_buf = std.ArrayList(u8){};
+            var owning_block: i64 = -1;
+            try collectControlMarkers(db, a, aid, &marker_buf, &owning_block);
+            if (owning_block != prev_block and marker_buf.items.len > 0) {
+                try writeDepth(gpa, out, depth + 1);
+                try out.appendSlice(gpa, marker_buf.items);
+                try out.append(gpa, '\n');
+                prev_block = owning_block;
+            }
+        }
+        try compactCall(gpa, db, a, c, depth + 1, max_depth, visited, rendered, out);
+    }
 }
 
 fn compactCall(
@@ -302,6 +329,7 @@ const Callee = struct {
     callee_id: ?i64,
     target_name: []const u8,
     kind: []const u8,
+    ast_node_id: ?i64,
     /// True when the callee resolves to an entity that has 0 outgoing
     /// ir_calls AND is_ast_only — typical of compiler-inlined helpers.
     /// Drives the `@` fold tag.
@@ -314,7 +342,8 @@ fn fetchCallees(db: *sqlite.Db, a: std.mem.Allocator, caller_id: i64) ![]Callee 
         \\SELECT ic.callee_entity_id, ic.call_kind,
         \\       COALESCE(e.qualified_name, '<unresolved>') AS qname,
         \\       COALESCE(e.is_ast_only, 0) AS is_ast_only,
-        \\       (SELECT COUNT(*) FROM ir_call ic2 WHERE ic2.caller_entity_id = ic.callee_entity_id) AS out_count
+        \\       (SELECT COUNT(*) FROM ir_call ic2 WHERE ic2.caller_entity_id = ic.callee_entity_id) AS out_count,
+        \\       ic.ast_node_id
         \\FROM ir_call ic
         \\LEFT JOIN entity e ON e.id = ic.callee_entity_id
         \\WHERE ic.caller_entity_id = ?
@@ -329,14 +358,73 @@ fn fetchCallees(db: *sqlite.Db, a: std.mem.Allocator, caller_id: i64) ![]Callee 
         const qname = try a.dupe(u8, stmt.columnText(2) orelse "<unresolved>");
         const is_ast_only = stmt.columnInt(3) != 0;
         const out_count = stmt.columnInt(4);
+        const an_text = stmt.columnText(5);
+        const an_id: ?i64 = if (an_text == null) null else stmt.columnInt(5);
         try out.append(a, .{
             .callee_id = cid,
             .target_name = qname,
             .kind = kind,
+            .ast_node_id = an_id,
             .has_no_body = is_ast_only and out_count == 0,
         });
     }
     return out.toOwnedSlice(a);
+}
+
+/// Walk parent_id from `start_node` upward up to 8 levels, emit `?if`,
+/// `?else`, `*while`, `*for`, `>prong:<role>` markers for each enclosing
+/// control-flow ancestor. `owning_block` is set to the innermost ancestor
+/// node id so callers can tell when the structural context changed
+/// between consecutive callees. Marker text is appended to `buf`.
+fn collectControlMarkers(
+    db: *sqlite.Db,
+    a: std.mem.Allocator,
+    start_node: i64,
+    buf: *std.ArrayList(u8),
+    owning_block: *i64,
+) Error!void {
+    var cur: i64 = start_node;
+    var depth: u32 = 0;
+    while (depth < 8) : (depth += 1) {
+        var stmt = try db.prepare(
+            \\SELECT a.id, a.kind, a.parent_id, ae.role
+            \\  FROM ast_node a
+            \\  LEFT JOIN ast_edge ae ON ae.child_id = a.id
+            \\ WHERE a.id = ? LIMIT 1
+        , a);
+        defer stmt.finalize();
+        try stmt.bindInt(1, cur);
+        if (!try stmt.step()) return;
+        const kind = try a.dupe(u8, stmt.columnText(1) orelse "");
+        const parent_t = sqlite.c.sqlite3_column_type(stmt.raw, 2);
+        const parent_id: ?i64 = if (parent_t == sqlite.c.SQLITE_NULL) null else stmt.columnInt(2);
+        const role = if (stmt.columnText(3)) |r| try a.dupe(u8, r) else null;
+
+        if (std.mem.eql(u8, kind, "if")) {
+            if (buf.items.len > 0) try buf.append(a, ' ');
+            try buf.appendSlice(a, "?if");
+            owning_block.* = cur;
+        } else if (std.mem.eql(u8, kind, "else")) {
+            if (buf.items.len > 0) try buf.append(a, ' ');
+            try buf.appendSlice(a, "?else");
+            owning_block.* = cur;
+        } else if (std.mem.eql(u8, kind, "while") or std.mem.eql(u8, kind, "for")) {
+            if (buf.items.len > 0) try buf.append(a, ' ');
+            try buf.append(a, '*');
+            try buf.appendSlice(a, kind);
+            owning_block.* = cur;
+        } else if (std.mem.eql(u8, kind, "switch_prong")) {
+            if (buf.items.len > 0) try buf.append(a, ' ');
+            try buf.appendSlice(a, ">prong");
+            if (role) |r| if (r.len > 0) {
+                try buf.append(a, ':');
+                try buf.appendSlice(a, r);
+            };
+            owning_block.* = cur;
+        }
+        if (parent_id == null) break;
+        cur = parent_id.?;
+    }
 }
 
 fn resolveFnId(db: *sqlite.Db, a: std.mem.Allocator, qname: []const u8) !?i64 {
