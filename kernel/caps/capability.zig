@@ -411,9 +411,14 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
 
     switch (type_tag) {
         .capability_domain_self => {
-            // delete on the self-handle tears the domain down.
-            // Implementation lives in capdom.capability_domain.
-            capability_domain.releaseSelf(holder);
+            // SLOT_SELF tear-down is driven directly from
+            // `caps.derivation.deleteAndDetach`'s slot==0 branch so it
+            // can release `tree_mutex` and the CD `_gen_lock` between
+            // the destroy's phase 1 and phase 2. Reaching this arm
+            // means a caller routed a self-handle through `releaseHandle`
+            // bypassing that path — surface it loudly rather than
+            // silently leaking the domain.
+            @panic("releaseHandle on capability_domain_self: route via deleteAndDetach SLOT_SELF instead");
         },
         .capability_domain => {
             // System-lifetime: dropping an IDC handle does not destroy

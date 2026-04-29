@@ -106,33 +106,43 @@ pub fn revoke(caller_domain: ErasedSlabRef, handle: u64) i64 {
 /// copy-derivation tree, runs the per-type release, and clears the
 /// slot.
 pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
+    // SLOT_SELF (CD self-destruct) takes neither `tree_mutex` nor the
+    // CD lock across phase 2 of the destroy. Phase 1 still runs under
+    // both locks (timer disarm needs a stable handle table; the CD
+    // gen-lock is the destroy gate); the locks are dropped before the
+    // EC and VM tear-downs lock their own slab classes. Otherwise the
+    // (CD._gen_lock → EC._gen_lock) and (tree_mutex → EC._gen_lock)
+    // edges registered by the in-line destroys close an AB-BA cycle
+    // against any concurrent `port.recv` (CD → ...) or other delete /
+    // revoke path that takes `tree_mutex` after touching an EC.
+    if (slot == 0) {
+        const tree_irq = tree_mutex.lockIrqSave(@src());
+
+        const cd_lr = caller_domain.lockTypedIrqSave(CapabilityDomain) catch {
+            tree_mutex.unlockIrqRestore(tree_irq);
+            return errors.E_BADCAP;
+        };
+        const cd = cd_lr.ptr;
+
+        // `destroyPhase1` releases `cd._gen_lock` via `destroyLocked`
+        // before returning; restore the captured IRQ state manually
+        // because the deferred `unlockTypedIrqRestore` would assert
+        // `prev & 1 == 1` on a word whose lock bit was just cleared.
+        const deferred = capability_domain.releaseSelf(cd);
+        arch.cpu.restoreInterrupts(cd_lr.irq_state);
+
+        tree_mutex.unlockIrqRestore(tree_irq);
+
+        capability_domain.destroyPhase2(deferred);
+        return 0;
+    }
+
     const tree_irq = tree_mutex.lockIrqSave(@src());
     defer tree_mutex.unlockIrqRestore(tree_irq);
 
     const cd_lr = caller_domain.lockTypedIrqSave(CapabilityDomain) catch
         return errors.E_BADCAP;
     const cd = cd_lr.ptr;
-
-    // SLOT_SELF special case. The slot's type tag is
-    // `.capability_domain_self` — `capability.releaseHandle` routes to
-    // `capability_domain.releaseSelf`, which calls
-    // `destroyCapabilityDomain` -> `slab_instance.destroyLocked`. That
-    // clears the lock bit and bumps gen → even (freed) atomically, then
-    // frees the user/kernel table PMM blocks. After this, both the cd
-    // struct (now on the slab freelist) and the user_table/kernel_table
-    // memory are unsafe to touch:
-    //   - `clearAndFreeSlot` writes to `holder.user_table[slot]` (freed
-    //     PMM block) and `&holder.kernel_table[slot]` (freed PMM block).
-    //   - The deferred `unlockTypedIrqRestore` would assert
-    //     `prev & 1 == 1` on a gen-lock word whose lock bit was just
-    //     cleared by `destroyLocked` — assertion failure on debug builds.
-    // Bypass both for slot 0; restore the captured IRQ state manually
-    // so the kernel does not return to userspace with IRQs disabled.
-    if (slot == 0) {
-        capability.releaseHandle(cd, slot, undefined);
-        arch.cpu.restoreInterrupts(cd_lr.irq_state);
-        return 0;
-    }
     defer caller_domain.unlockTypedIrqRestore(CapabilityDomain, cd_lr.irq_state);
 
     const entry = capability.resolveHandleOnDomain(cd, slot, null) orelse

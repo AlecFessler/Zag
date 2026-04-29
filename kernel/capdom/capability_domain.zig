@@ -838,76 +838,75 @@ pub fn allocCapabilityDomain(
 /// + per-VAR unmap + slab destroy). These are smaller per-test than
 /// the table blocks and don't push the full-475-test runner past the
 /// PMM budget on a 1 GB QEMU instance.
-fn destroyCapabilityDomain(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) void {
-    const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
+/// Snapshot the destroy state captured under the CD's `_gen_lock` for
+/// later sibling-slab tear-down. Carrying this between `destroyPhase1`
+/// and `destroyPhase2` lets the caller release outer locks (CD's
+/// `_gen_lock`, `tree_mutex`) before the EC / VM destroys lock their
+/// own slab classes — without it, lockdep records `tree_mutex →
+/// EC._gen_lock` and `CD._gen_lock → EC._gen_lock` edges and any
+/// inverse path closes an AB-BA cycle.
+pub const DestroyDeferred = struct {
+    cd: *CapabilityDomain,
+    cd_gen: u63,
+    cd_addr_space_root: PAddr,
+    vm_ref: ?SlabRef(VirtualMachine),
+    user_buf: [*]u8,
+    kernel_buf: [*]u8,
+    addr_space_id: u16,
+    caller_ec: ?*ExecutionContext,
+};
 
-    // Disarm every Timer reachable from this domain's handle table
-    // BEFORE destroying the cd struct. A periodic timer that survives
-    // its owning domain's destroy keeps firing forever — each fire
-    // walks the CapabilityDomain slab via `forEachAlive` and pins a
-    // per-core wheel-heap slot. Disarm-only here (no slab destroy, no
-    // wheelRemove) avoids racing against other domains that hold a copy
-    // of the same timer handle and avoids the wheel_locks acquisition
-    // (which an IRQ-context fire on another core would contend against).
-    // Caller (`releaseSelf` via `deleteAndDetach` SLOT_SELF path) holds
-    // `cd._gen_lock`, so `cd.kernel_table` / `cd.user_table` are stable
-    // for this walk.
+/// Phase-1 destroy: runs WITH the CD's `_gen_lock` held by the caller.
+/// Disarms every Timer reachable through the domain's handle table,
+/// snapshots all cd.* fields the phase-2 tear-down needs, and releases
+/// the CD slab slot via `destroyLocked` (clears the lock bit + bumps
+/// gen → even in one store). On return the CD's `_gen_lock` is no
+/// longer held — the caller MUST drop any other locks (notably
+/// `caps.derivation.tree_mutex`) BEFORE invoking `destroyPhase2`.
+pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) DestroyDeferred {
     zag.sched.timer.disarmTimerHandlesInDomain(cd);
 
-    // Tear down every EC that was allocated against this domain (vCPU
-    // ECs created by `create_vcpu`, sub-ECs created by
-    // `create_execution_context`). The EC that called `delete(SLOT_SELF)`
-    // is `caller_ec` — its kstack frame is the one we are currently
-    // executing on and gets reaped lazily once the dispatcher iretq's
-    // off it. We pass the CD's addr_space_root directly because we hold
-    // the CD's _gen_lock — the EC destroy path's normal `ec.domain.lock()`
-    // would recurse on the same class and trip lockdep. ECs walked here
-    // include vCPU ECs whose `vm` ref points at `cd.vm` — destroy them
-    // BEFORE the VM tear-down below or vCPU `ec.vm.ptr` is dangling.
     const cd_gen = cd._gen_lock.currentGen();
-    zag.sched.execution_context.destroyEcsInDomain(cd, cd_gen, cd.addr_space_root, caller_ec);
+    const deferred = DestroyDeferred{
+        .cd = cd,
+        .cd_gen = cd_gen,
+        .cd_addr_space_root = cd.addr_space_root,
+        .vm_ref = cd.vm,
+        .user_buf = @ptrCast(cd.user_table),
+        .kernel_buf = @ptrCast(cd.kernel_table),
+        .addr_space_id = cd.addr_space_id,
+        .caller_ec = caller_ec,
+    };
 
-    // Tear down the optional per-domain VM. `destroyVm` frees the
-    // arch CtrlStateCell, the stage-2 root, and the VM slab slot, and
-    // clears `cd.vm = null`. Without this, every `create_virtual_machine`
-    // test leaks a VM slab slot + a 4 KiB host page — by ~iter 256 the
-    // VM slab is full.
-    if (cd.vm) |vm_ref| {
-        // self-alive: cd holds the VM ref for the VM's lifetime.
-        zag.capdom.virtual_machine.releaseHandle(vm_ref.ptr);
+    slab_instance.destroyLocked(cd, cd_gen);
+
+    return deferred;
+}
+
+/// Phase-2 destroy: runs with NO outer locks held. Tears down every
+/// EC bound to the destroyed domain, the optional per-domain VM, and
+/// releases the table-backing PMM blocks and the address-space ID.
+/// The visitor matches ECs by `ec.domain.ptr == cd && gen == cd_gen`;
+/// the gen check rejects any new CD that lands on the freed slab slot
+/// between phase 1 and phase 2.
+pub fn destroyPhase2(deferred: DestroyDeferred) void {
+    const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
+
+    zag.sched.execution_context.destroyEcsInDomain(
+        deferred.cd,
+        deferred.cd_gen,
+        deferred.cd_addr_space_root,
+        deferred.caller_ec,
+    );
+
+    if (deferred.vm_ref) |vm_slab_ref| {
+        zag.capdom.virtual_machine.releaseHandleAfterDomainDestroyed(vm_slab_ref.ptr);
     }
 
-    // Snapshot the table-block pointers before `destroyLocked` zeroes
-    // the cd struct. `destroyLockedInner`'s `zeroExceptGenLock` clears
-    // every field of `cd` except `_gen_lock`, so reads of
-    // `cd.user_table` / `cd.kernel_table` after destroy return null.
-    const user_buf: [*]u8 = @ptrCast(cd.user_table);
-    const kernel_buf: [*]u8 = @ptrCast(cd.kernel_table);
-    const addr_space_id = cd.addr_space_id;
+    pmm_mgr.freeBlock(deferred.user_buf[0..USER_TABLE_BYTES]);
+    pmm_mgr.freeBlock(deferred.kernel_buf[0..KERNEL_TABLE_BYTES]);
 
-    // Drop the slab slot FIRST. Caller (`derivation.deleteAndDetach`
-    // on the SLOT_SELF path) holds `cd._gen_lock` from `lockTyped`;
-    // `destroyLocked` flips gen → (gen+1) even and clears the lock
-    // bit in one release-store. After this point, `forEachAlive`
-    // visitors on other cores skip this slot via parity, so it is safe
-    // to free the table-backing PMM blocks below without UAF'ing a
-    // mid-walk visitor that observed gen=odd before our flip.
-    //
-    // `destroy` (the lock-the-gen variant) would re-enter `lockWithGen`
-    // and deadlock against the caller's lock; `destroyLocked` is the
-    // already-locked sibling and is what convention requires here.
-    const gen = cd._gen_lock.currentGen();
-    slab_instance.destroyLocked(cd, gen);
-
-    // Free table PMM blocks. These are the dominant per-domain
-    // allocations (96 KiB each at MAX_HANDLES_PER_DOMAIN = 4096).
-    pmm_mgr.freeBlock(user_buf[0..USER_TABLE_BYTES]);
-    pmm_mgr.freeBlock(kernel_buf[0..KERNEL_TABLE_BYTES]);
-
-    // Recycle the PCID/ASID. id 0 is the boot/kernel sentinel and
-    // never assigned to a domain, so the != 0 guard mirrors the
-    // pcid.free() precondition.
-    if (addr_space_id != 0) arch.paging.freeAddrSpaceId(addr_space_id);
+    if (deferred.addr_space_id != 0) arch.paging.freeAddrSpaceId(deferred.addr_space_id);
 }
 
 /// Pop the head of the free-slot list. Returns `null` (E_FULL) if the
@@ -1141,9 +1140,10 @@ pub fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64)
     return 0;
 }
 
-/// Public release-handle entry point invoked when `delete` is called
-/// on the domain's self-handle. Tears the domain down via
-/// `destroyCapabilityDomain`.
+/// Phase-1 entry for SLOT_SELF tear-down. The caller
+/// (`caps.derivation.deleteAndDetach`) holds `tree_mutex` and the CD's
+/// `_gen_lock`; this returns a `DestroyDeferred` capturing the work
+/// the caller must finish via `destroyPhase2` AFTER releasing both.
 ///
 /// `delete(SLOT_SELF)` runs on an EC bound to the very domain being
 /// destroyed (commonly the initial EC, which on test ELFs falls
@@ -1163,7 +1163,7 @@ pub fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64)
 /// further `createCapabilityDomain` syscalls hang on the failed
 /// allocBlock (no E_NOMEM is currently surfaced from that path —
 /// see TODO in allocCapabilityDomain).
-pub fn releaseSelf(cd: *CapabilityDomain) void {
+pub fn releaseSelf(cd: *CapabilityDomain) DestroyDeferred {
     // Park the calling EC before tearing the domain down. The caller
     // is the running EC of `cd` (delete(SLOT_SELF) is dispatched on
     // its own kernel stack); without this `parkSelfFaulted` it would
@@ -1176,12 +1176,10 @@ pub fn releaseSelf(cd: *CapabilityDomain) void {
     // `fireThreadFault` no-route fallback.
     //
     // Capture the caller EC BEFORE `parkSelfFaulted` clears it from
-    // `current_ec`; `destroyCapabilityDomain` must skip this EC when
-    // walking the domain's ECs to destroy (its kernel stack is the
-    // one we are currently executing on).
+    // `current_ec`; the phase-2 EC walk must skip this EC.
     const caller_ec = zag.sched.scheduler.currentEc();
     if (caller_ec) |ec| {
         zag.sched.execution_context.parkSelfFaulted(ec);
     }
-    destroyCapabilityDomain(cd, caller_ec);
+    return destroyPhase1(cd, caller_ec);
 }

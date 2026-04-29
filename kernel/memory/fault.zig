@@ -10,6 +10,7 @@ const pmm = zag.memory.pmm;
 const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
+const sync_debug = zag.utils.sync.debug;
 const var_range = zag.capdom.var_range;
 
 const MemoryPerms = zag.memory.address.MemoryPerms;
@@ -79,6 +80,16 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // memory_fault on the EC whose syscall triggered the access.
         const ec = scheduler.currentEc() orelse
             @panic("kernel page fault on user VA with no current EC");
+        // Drain the per-core lockdep held-stack: the original syscall
+        // (e.g. `reply` holds the sender EC's gen-lock across
+        // `applyReplyStateToVcpu`'s SMAP-bracketed user-stack reads)
+        // has its kernel frame abandoned by the yieldTo below, so the
+        // defer-driven `unlockIrqRestore` never runs. Stale acquire
+        // entries left on the per-core stack would otherwise pin those
+        // classes forever and close spurious AB-BA cycles against the
+        // next syscall on this core. The underlying lock bits in
+        // memory remain set — that is a separate (pre-existing) leak.
+        sync_debug.dropAllHeldOnAbandonedStack();
         port.fireMemoryFault(ec, @intFromEnum(accessSubcode(is_write, is_exec)), faulting_virt.addr);
         arch.cpu.enableInterrupts();
         scheduler.yieldTo(null);

@@ -130,6 +130,22 @@ pub fn release(lock_ptr: *const anyopaque) void {
     _ = releaseOn(stack, lock_ptr);
 }
 
+/// Drain the per-core lockdep held-stack. Call when a kernel stack
+/// frame is being abandoned without normal unwinding — e.g. when a
+/// page fault on a user VA inside a syscall fires a memory_fault
+/// event and yields, leaving the original syscall's defer chain
+/// unrun. Without this, lockdep keeps the stale acquire entries on
+/// the per-core stack and the next syscall on this core sees them as
+/// "held", spuriously closing AB-BA cycles against unrelated paths.
+pub fn dropAllHeldOnAbandonedStack() void {
+    if (!active) return;
+    if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
+    const core_id = arch.smp.coreID();
+    if (core_id >= MAX_CORES) return;
+    const stack = &held_stacks[@intCast(core_id)];
+    stack.depth = 0;
+}
+
 /// Panic if the current core has any SpinLock held. Wire this into scheduler
 /// block/yield entry points: holding a SpinLock across a context switch can
 /// deadlock the kernel — the next thread spinning on the same lock won't

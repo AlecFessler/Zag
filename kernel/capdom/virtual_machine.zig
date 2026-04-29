@@ -130,6 +130,22 @@ pub fn releaseHandle(vm: *VirtualMachine) void {
     destroyVm(vm);
 }
 
+/// Variant of `releaseHandle` for the `destroyCapabilityDomain` path:
+/// the owning CD slab slot has already been freed by the caller, so
+/// the `vm.domain.ptr.vm = null` back-pointer clear that `destroyVm`
+/// performs is omitted — that write would race a reallocation of the
+/// CD slot.
+pub fn releaseHandleAfterDomainDestroyed(vm: *VirtualMachine) void {
+    if (vm.policy_pf) |pf_ref| {
+        decPageFrameRef(pf_ref.ptr);
+        vm.policy_pf = null;
+    }
+    vm_dispatch.freeVmArchState(vm);
+    vm_dispatch.freeStage2Root(vm);
+    const gen = vm._gen_lock.currentGen();
+    slab_instance.destroy(vm, gen) catch {};
+}
+
 // ── External API ─────────────────────────────────────────────────────
 
 /// `create_virtual_machine` syscall handler. Spec §[virtual_machine].
