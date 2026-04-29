@@ -401,6 +401,18 @@ pub fn main() !void {
         \\WHERE caller.qualified_name = 'syscall.dispatch.dispatch'
         \\  AND callee.qualified_name LIKE 'syscall.%'
         \\  AND callee.kind = 'fn';
+        \\-- Fallback for DBs built without --ir (e.g. unit-test fixtures):
+        \\-- if the IR-driven insert produced zero syscall entries, fall back
+        \\-- to the file-path convention. Production builds with IR will have
+        \\-- already populated the precise set, so this is a no-op there.
+        \\INSERT INTO entry_point (entity_id, kind, label)
+        \\SELECT e.id, 'syscall', e.qualified_name
+        \\FROM entity e JOIN file f ON f.id = e.def_file_id
+        \\WHERE e.kind = 'fn'
+        \\  AND f.path LIKE 'syscall/%.zig'
+        \\  AND f.path NOT IN ('syscall/dispatch.zig', 'syscall/errors.zig',
+        \\                     'syscall/pmu.zig', 'syscall/syscall.zig')
+        \\  AND NOT EXISTS (SELECT 1 FROM entry_point ep WHERE ep.kind = 'syscall');
     ;
     try channel.send(.{ .raw_sql = entry_sql });
 
