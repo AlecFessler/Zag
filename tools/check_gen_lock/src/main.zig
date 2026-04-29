@@ -2168,7 +2168,23 @@ pub fn main() !u8 {
     var total_tracked: u32 = 0;
     for (per_entry_tracked) |l| total_tracked += @intCast(l.items.len);
 
-    if (args.summary) {
+    // When --rule filters to a per-entry rule (lock_no_release etc.) we still
+    // walk the entry list. When --rule filters to a non-per-entry rule
+    // (fat_pointer_field, ptr_bypass, etc.) we suppress the per-entry section
+    // entirely so the user only sees what they asked for.
+    const PER_ENTRY_RULES = [_][]const u8{
+        "lock_no_release", "no_lock_at_all", "unlock_outside_lock",
+        "no_release_on_exit",
+    };
+    const skip_per_entry = blk: {
+        if (args.rule_filter) |rf| {
+            for (PER_ENTRY_RULES) |r| if (mem.eql(u8, rf, r)) break :blk false;
+            break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (args.summary and !skip_per_entry) {
         // One line per entry, mirroring legacy: any entry with at least
         // one tracked ident OR at least one finding is shown.
         for (entries_by_qname.items, 0..) |entry, ei| {
@@ -2185,7 +2201,7 @@ pub fn main() !u8 {
             );
             total_errs += errs;
         }
-    } else {
+    } else if (!skip_per_entry) {
         // Default mode: per-entry headers with tracked listing, then any
         // findings under each entry.
         for (entries_by_qname.items, 0..) |entry, ei| {
@@ -2217,8 +2233,12 @@ pub fn main() !u8 {
         }
     }
 
-    // Bare-pointer findings.
-    if (bare_findings.items.len > 0) {
+    // Bare-pointer findings (rule = "fat_pointer_field").
+    const skip_fat = if (args.rule_filter) |rf|
+        !mem.eql(u8, rf, "fat_pointer_field")
+    else
+        false;
+    if (!skip_fat and bare_findings.items.len > 0) {
         try w.writeAll("\n");
         try w.print("Fat-pointer invariant violations ({d} bare *T fields for slab-backed T):\n", .{bare_findings.items.len});
         for (bare_findings.items) |f| {
@@ -2227,10 +2247,14 @@ pub fn main() !u8 {
             });
         }
     }
-    total_errs += @intCast(bare_findings.items.len);
+    if (!skip_fat) total_errs += @intCast(bare_findings.items.len);
 
-    // .ptr bypass.
-    if (ptr_findings.items.len > 0) {
+    // .ptr bypass (rule = "ptr_bypass").
+    const skip_bypass = if (args.rule_filter) |rf|
+        !mem.eql(u8, rf, "ptr_bypass")
+    else
+        false;
+    if (!skip_bypass and ptr_findings.items.len > 0) {
         try w.writeAll("\n");
         try w.print("SlabRef `.ptr` bypass ({d} sites):\n", .{ptr_findings.items.len});
         for (ptr_findings.items) |f| {
@@ -2239,7 +2263,7 @@ pub fn main() !u8 {
             try w.print("         {s}\n", .{f.context[0..trunc_len]});
         }
     }
-    total_errs += @intCast(ptr_findings.items.len);
+    if (!skip_bypass) total_errs += @intCast(ptr_findings.items.len);
 
     try w.writeAll("\n");
     try w.print("Summary: {d} entries, {d} tracked idents, {d} err, {d} info\n", .{
