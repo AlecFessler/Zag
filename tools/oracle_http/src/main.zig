@@ -161,23 +161,27 @@ fn handleRequest(
     if (std.mem.eql(u8, path, "/api/bin_addr2line")) return handlers.handleBinAddr2Line(allocator, request, query, registry);
     if (std.mem.eql(u8, path, "/api/bin_dataflow_reg")) return handlers.handleBinDataflowReg(allocator, request, query, registry);
 
-    // App-side / git plumbing — stubbed for now. Integration day will
-    // either port from the legacy server or supply implementations
-    // backed by `git -C <git_root>` shellouts.
-    if (std.mem.eql(u8, path, "/api/commits") or
-        std.mem.eql(u8, path, "/api/load_commit") or
-        std.mem.eql(u8, path, "/api/load_commit/status") or
-        std.mem.eql(u8, path, "/api/diff") or
-        std.mem.eql(u8, path, "/api/diff_files") or
-        std.mem.eql(u8, path, "/api/diff_hunks"))
-    {
-        _ = git_root; // kept in signature for future shellouts
-        return respondBytes(
-            request,
-            .not_implemented,
-            "text/plain; charset=utf-8",
-            "git-plumbing endpoint not yet wired up in oracle_http; legacy server still has it\n",
-        );
+    // Git-plumbing endpoints — these shell out to `git -C <git_root>`
+    // and don't read any DB. /api/load_commit is special: see the
+    // comment on handleLoadCommit for why it's now a presence check
+    // rather than a build orchestration call.
+    if (std.mem.eql(u8, path, "/api/commits")) {
+        return handlers.handleCommits(allocator, request, query, git_root);
+    }
+    if (std.mem.eql(u8, path, "/api/load_commit")) {
+        return handlers.handleLoadCommit(allocator, request, query, registry);
+    }
+    if (std.mem.eql(u8, path, "/api/load_commit/status")) {
+        return handlers.handleLoadCommitStatus(allocator, request, query, registry);
+    }
+    if (std.mem.eql(u8, path, "/api/diff")) {
+        return handlers.handleDiff(allocator, request, query, git_root);
+    }
+    if (std.mem.eql(u8, path, "/api/diff_files")) {
+        return handlers.handleDiffFiles(allocator, request, query, git_root);
+    }
+    if (std.mem.eql(u8, path, "/api/diff_hunks")) {
+        return handlers.handleDiffHunks(allocator, request, query, git_root);
     }
 
     // /api/review/* — out of scope for this rearchitecture (per spec).

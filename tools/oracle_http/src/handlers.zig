@@ -7,6 +7,7 @@
 
 const std = @import("std");
 
+const git = @import("git.zig");
 const registry_mod = @import("registry.zig");
 const sqlite = @import("sqlite.zig");
 const trace_mod = @import("trace.zig");
@@ -1307,4 +1308,197 @@ pub fn handleTrace(
         else => |e| return e,
     };
     return respondText(request, buf.items);
+}
+
+// ── /api/commits ──────────────────────────────────────────────────────────
+// Output formats (text + JSON) match the legacy callgraph daemon byte for
+// byte so any shell scripts the user wrote against /api/commits keep
+// working when they switch to oracle_http.
+
+pub fn handleCommits(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    git_root: []const u8,
+) !void {
+    var limit: u32 = git.DEFAULT_LIMIT;
+    var fmt: enum { json, text } = .json;
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        const val = pair[eq + 1 ..];
+        if (std.mem.eql(u8, key, "limit")) {
+            limit = std.fmt.parseInt(u32, val, 10) catch limit;
+        } else if (std.mem.eql(u8, key, "format")) {
+            if (std.mem.eql(u8, val, "text")) fmt = .text;
+            if (std.mem.eql(u8, val, "json")) fmt = .json;
+        }
+    }
+    if (limit == 0) limit = git.DEFAULT_LIMIT;
+    if (limit > git.MAX_LIMIT) limit = git.MAX_LIMIT;
+
+    const log_stdout = git.gitLog(allocator, git_root, limit) catch {
+        return respondBytes(request, .internal_server_error, "text/plain; charset=utf-8", "git log failed\n");
+    };
+    defer allocator.free(log_stdout);
+
+    var compat_set = git.buildEmitIrSet(allocator, git_root);
+    defer git.freeShaSet(allocator, &compat_set);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+
+    if (fmt == .text) {
+        try git.renderCommitsText(allocator, &out, log_stdout, &compat_set);
+        return respondText(request, out.items);
+    }
+    try git.renderCommitsJson(allocator, &out, log_stdout, &compat_set);
+    return respondJson(request, out.items);
+}
+
+// ── /api/load_commit{,/status} ────────────────────────────────────────────
+// In the new architecture the indexer runs offline and produces a
+// `<arch>-<sha>.db` file per commit; the daemon is a read-only consumer.
+// load_commit therefore CANNOT spawn a build — it just reports whether a
+// matching DB already exists in --db-dir. Response shape is intentionally
+// kept compatible with the legacy daemon (same JSON keys) so existing
+// clients don't crash, but `status` is one of:
+//   ready       — at least one <arch>-<sha>.db exists for this sha
+//   not_loaded  — no DB for this sha is present
+//   errored     — only on bad input
+// The legacy `building` state is unreachable here.
+
+pub fn handleLoadCommit(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    registry: *Registry,
+) !void {
+    return loadCommitStatus(allocator, request, query, registry);
+}
+
+pub fn handleLoadCommitStatus(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    registry: *Registry,
+) !void {
+    return loadCommitStatus(allocator, request, query, registry);
+}
+
+fn loadCommitStatus(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    registry: *Registry,
+) !void {
+    const sha = util.getQueryValue(query, "sha") orelse "";
+    if (!git.isValidSha(sha)) return respondBadRequest(request, "missing or invalid ?sha=\n");
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+
+    const commit_opt = registry.lookupCommit(sha);
+    const status: []const u8 = if (commit_opt != null) "ready" else "not_loaded";
+    const short = sha[0..@min(sha.len, 12)];
+
+    try out.appendSlice(allocator, "{\"sha\":");
+    try jsonStr(&out, allocator, sha);
+    try out.appendSlice(allocator, ",\"short\":");
+    try jsonStr(&out, allocator, short);
+    try out.appendSlice(allocator, ",\"status\":");
+    try jsonStr(&out, allocator, status);
+    try out.appendSlice(allocator, ",\"arches\":[");
+    if (commit_opt) |commit| {
+        var first = true;
+        var ait = commit.arches.keyIterator();
+        while (ait.next()) |k| {
+            if (!first) try out.append(allocator, ',');
+            first = false;
+            try jsonStr(&out, allocator, k.*);
+        }
+    }
+    try out.appendSlice(allocator, "],\"default_arch\":");
+    if (commit_opt) |commit| {
+        try jsonStr(&out, allocator, commit.default_arch);
+    } else {
+        try out.appendSlice(allocator, "\"\"");
+    }
+    try out.appendSlice(allocator, ",\"error\":null}");
+
+    return respondJson(request, out.items);
+}
+
+// ── /api/diff{,_files,_hunks} ─────────────────────────────────────────────
+// Simpler input shape than the legacy daemon (single ?sha=) because the
+// new clients only ever ask "what changed in commit X". Output is raw
+// `git show ...` for the text endpoints and a JSON `{files:[...]}` shape
+// for /api/diff_files.
+
+pub fn handleDiff(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    git_root: []const u8,
+) !void {
+    const sha = util.getQueryValue(query, "sha") orelse "";
+    if (!git.isValidSha(sha)) return respondBadRequest(request, "missing or invalid ?sha=\n");
+
+    const stdout = git.gitShowStat(allocator, git_root, sha) catch {
+        return respondBytes(request, .internal_server_error, "text/plain; charset=utf-8", "git show failed\n");
+    };
+    defer allocator.free(stdout);
+    return respondText(request, stdout);
+}
+
+pub fn handleDiffFiles(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    git_root: []const u8,
+) !void {
+    const sha = util.getQueryValue(query, "sha") orelse "";
+    if (!git.isValidSha(sha)) return respondBadRequest(request, "missing or invalid ?sha=\n");
+
+    const stdout = git.gitShowNames(allocator, git_root, sha) catch {
+        return respondBytes(request, .internal_server_error, "text/plain; charset=utf-8", "git show --name-only failed\n");
+    };
+    defer allocator.free(stdout);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"files\":[");
+    var first = true;
+    var line_it = std.mem.splitScalar(u8, stdout, '\n');
+    while (line_it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try jsonStr(&out, allocator, line);
+    }
+    try out.appendSlice(allocator, "]}");
+    return respondJson(request, out.items);
+}
+
+pub fn handleDiffHunks(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    git_root: []const u8,
+) !void {
+    const sha = util.getQueryValue(query, "sha") orelse "";
+    const path_param = util.getQueryValue(query, "path") orelse "";
+    if (!git.isValidSha(sha)) return respondBadRequest(request, "missing or invalid ?sha=\n");
+    if (path_param.len == 0) return respondBadRequest(request, "missing ?path=\n");
+
+    const decoded = try percentDecodeAlloc(allocator, path_param);
+    defer allocator.free(decoded);
+
+    const stdout = git.gitShowFileDiff(allocator, git_root, sha, decoded) catch {
+        return respondBytes(request, .internal_server_error, "text/plain; charset=utf-8", "git show <sha> -- <path> failed\n");
+    };
+    defer allocator.free(stdout);
+    return respondText(request, stdout);
 }

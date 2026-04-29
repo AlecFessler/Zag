@@ -9,6 +9,7 @@
 
 const std = @import("std");
 
+const git = @import("git.zig");
 const sqlite = @import("sqlite.zig");
 
 pub const DbEntry = struct {
@@ -24,9 +25,13 @@ pub const DbEntry = struct {
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     dbs: std.ArrayList(DbEntry),
+    /// Repo root used for git-plumbing tools (tmp_callgraph_commits).
+    /// Defaults to CWD; override at construction time. Lifetime-managed
+    /// by main; the registry just borrows the slice.
+    git_root: []const u8,
 
     pub fn init(gpa: std.mem.Allocator) Registry {
-        return .{ .gpa = gpa, .dbs = .{} };
+        return .{ .gpa = gpa, .dbs = .{}, .git_root = "." };
     }
 
     pub fn deinit(self: *Registry) void {
@@ -128,6 +133,10 @@ pub const Registry = struct {
         }
         if (std.mem.eql(u8, tool, "tmp_callgraph_bin_addr2line")) {
             try self.toolBinAddr2Line(al, args, out);
+            return true;
+        }
+        if (std.mem.eql(u8, tool, "tmp_callgraph_commits")) {
+            try self.toolCommits(al, args, out);
             return true;
         }
         return false;
@@ -773,6 +782,26 @@ pub const Registry = struct {
             .hide_library = hide_library,
             .hide_assertions = hide_assertions,
         });
+    }
+
+    /// `tmp_callgraph_commits` — output identical to oracle_http's
+    /// `/api/commits?format=text`. Shells out to `git log` against
+    /// `self.git_root` and decorates the output with `[stale]` markers.
+    fn toolCommits(self: *Registry, al: std.mem.Allocator, args: std.json.Value, out: *std.ArrayList(u8)) !void {
+        var limit: u32 = git.DEFAULT_LIMIT;
+        if (jsonInt(args, "limit")) |n| {
+            if (n > 0) limit = @intCast(@min(n, @as(i64, git.MAX_LIMIT)));
+        }
+        const log_stdout = git.gitLog(al, self.git_root, limit) catch {
+            try out.appendSlice(al, "git log failed\n");
+            return;
+        };
+        defer al.free(log_stdout);
+
+        var compat_set = git.buildEmitIrSet(al, self.git_root);
+        defer git.freeShaSet(al, &compat_set);
+
+        try git.renderCommitsText(al, out, log_stdout, &compat_set);
     }
 };
 

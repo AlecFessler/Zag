@@ -3,6 +3,8 @@
 //! CLI:
 //!   --db <path>        open a single oracle DB file
 //!   --db-dir <dir>     pick the newest *.db in <dir> (by mtime)
+//!   --git-root <dir>   repo root for git-plumbing tools
+//!                      (`tmp_callgraph_commits`); defaults to CWD
 //!
 //! At least one of --db / --db-dir is required. The daemon refuses to open
 //! a DB that doesn't have `meta('schema_complete','true')` — the indexer
@@ -32,6 +34,9 @@ pub fn main() !void {
     }
     var db_dir: ?[]const u8 = null;
     defer if (db_dir) |d| gpa.free(d);
+    var git_root: []const u8 = ".";
+    var git_root_owned: ?[]const u8 = null;
+    defer if (git_root_owned) |g| gpa.free(g);
 
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--db")) {
@@ -40,14 +45,20 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--db-dir")) {
             const v = args_it.next() orelse return error.MissingArg;
             db_dir = try gpa.dupe(u8, v);
+        } else if (std.mem.eql(u8, arg, "--git-root")) {
+            const v = args_it.next() orelse return error.MissingArg;
+            const dup = try gpa.dupe(u8, v);
+            git_root_owned = dup;
+            git_root = dup;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            std.debug.print("oracle_mcp --db <path> | --db-dir <dir>\n", .{});
+            std.debug.print("oracle_mcp --db <path> | --db-dir <dir> [--git-root <dir>]\n", .{});
             return;
         } else {
             std.debug.print("unknown arg: {s}\n", .{arg});
             return error.BadArgs;
         }
     }
+    registry.git_root = git_root;
 
     if (db_dir) |dir| {
         const newest = try newestDbInDir(gpa, dir);
