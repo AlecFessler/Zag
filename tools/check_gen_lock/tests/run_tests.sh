@@ -10,19 +10,28 @@
 #   // EXPECT: errors=N
 #
 # We materialize a temp tree shaped like `kernel/syscall/<fixture>.zig`
-# plus a `kernel/<slab>.zig` so the analyzer's hard-coded directory
-# detection accepts the entry points.
+# plus a `kernel/<slab>.zig`, then run the indexer over it to produce a
+# fixture.db, and finally run the analyzer with `--db fixture.db
+# --summary`. Per the rewrite, the analyzer reads from SQLite instead of
+# walking the source tree directly.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="$(cd -- "$TOOL_DIR/../.." && pwd)"
 FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 ANALYZER="$TOOL_DIR/zig-out/bin/check_gen_lock"
+INDEXER="$REPO_ROOT/tools/indexer/zig-out/bin/indexer"
 
 if [[ ! -x "$ANALYZER" ]]; then
     echo "Analyzer not built; running zig build first." >&2
     (cd "$TOOL_DIR" && zig build) >&2
+fi
+
+if [[ ! -x "$INDEXER" ]]; then
+    echo "Indexer not built; running zig build in tools/indexer first." >&2
+    (cd "$REPO_ROOT/tools/indexer" && zig build) >&2
 fi
 
 TMP_ROOT="$(mktemp -d -t check_gen_lock_test.XXXXXX)"
@@ -55,10 +64,17 @@ for fixture in "$FIXTURES_DIR"/*.zig; do
     fi
 
     cp "$fixture" "$TMP_ROOT/kernel/syscall/$name.zig"
-    out="$("$ANALYZER" --root "$TMP_ROOT/kernel" --summary 2>&1 || true)"
+    db_path="$TMP_ROOT/$name.db"
+    rm -f "$db_path" "$db_path.tmp"
+    # Build DB. The indexer expects to be run from the repo root for
+    # the `kernel/` path-prefix convention; here we emulate that by
+    # cd'ing into TMP_ROOT.
+    (cd "$TMP_ROOT" && "$INDEXER" --kernel-root kernel --out "$db_path" --arch x86_64 --commit-sha fixture) >/dev/null 2>&1
+    out="$("$ANALYZER" --db "$db_path" --summary 2>&1 || true)"
     rm "$TMP_ROOT/kernel/syscall/$name.zig"
+    rm -f "$db_path"
 
-    # If you want to debug an individual fixture, uncomment:
+    # Debug a single fixture by uncommenting:
     # echo "$out" | sed 's/^/  >>> /'
 
     err_count="$(echo "$out" | sed -n 's/.*err= *\([0-9]\+\).*/\1/p' | head -n 1)"

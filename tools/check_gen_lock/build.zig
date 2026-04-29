@@ -2,10 +2,6 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // ReleaseFast — the summary-based walker is deterministic (per-fn
-    // summaries are memoized by (recv, name) and folded at real source
-    // lines, so HashMap iteration order no longer affects per-entry
-    // finding counts the way inlining did).
     const optimize = b.standardOptimizeOption(.{
         .preferred_optimize_mode = .ReleaseFast,
     });
@@ -18,6 +14,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.linkLibC();
+    exe.linkSystemLibrary("sqlite3");
 
     b.installArtifact(exe);
 

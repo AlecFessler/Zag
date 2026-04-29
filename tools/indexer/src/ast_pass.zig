@@ -191,6 +191,39 @@ fn emitVarConst(
     const mut_text = w.tree.tokenSlice(vd.ast.mut_token);
     const kind: EntityKind = if (std.mem.eql(u8, mut_text, "const")) .const_ else .var_;
 
+    // Slab-backed detection for `pub const X = SecureSlab(T, N)`:
+    //   SecureSlab requires its T type to expose a `_gen_lock` field, so
+    //   T is the slab-backed entity. We detect this by walking the
+    //   initializer's bytes (cheap, the init expression is short) for the
+    //   pattern. Mark the alias entity itself (X) as slab-backed too —
+    //   that lets analyzers ask `is_slab_backed=1` and pick up both the
+    //   alias and the underlying type. A second pass (post-stage-2.5
+    //   SQL UPDATE in main.zig) marks T entities globally by short name.
+    var is_slab_alias: bool = false;
+    if (vd.ast.init_node.unwrap()) |init_node| {
+        const init_span = nodeByteSpan(w.tree, init_node);
+        const init_bytes = w.source[init_span.start..init_span.end];
+        if (std.mem.startsWith(u8, std.mem.trimLeft(u8, init_bytes, " \t\r\n"), "SecureSlab")) {
+            is_slab_alias = true;
+        }
+    }
+
+    // Slab-backed detection for struct-with-_gen_lock: peek the initializer
+    // members for a `_gen_lock` field. Done below before we append, so we
+    // can set is_slab_backed in one shot.
+    var is_slab_struct: bool = false;
+    if (vd.ast.init_node.unwrap()) |init_node| {
+        var buf: [2]Node.Index = undefined;
+        if (w.tree.fullContainerDecl(&buf, init_node)) |cd| {
+            for (cd.ast.members) |member| {
+                if (containerFieldNameIs(w.tree, member, "_gen_lock")) {
+                    is_slab_struct = true;
+                    break;
+                }
+            }
+        }
+    }
+
     try w.entities.append(w.palloc, .{
         .kind = kind,
         .qualified_name = qualified,
@@ -200,7 +233,7 @@ fn emitVarConst(
         .def_byte_end = span.end,
         .def_line = lc.line,
         .def_col = lc.col,
-        .is_slab_backed = false,
+        .is_slab_backed = is_slab_struct or is_slab_alias,
         .def_ast_node_id = node_id,
     });
 
@@ -223,6 +256,20 @@ fn emitVarConst(
             try walkExpr(w, init_node, node_id);
         }
     }
+}
+
+/// Returns true iff `member` is a `container_field` whose declared name
+/// matches `target`. Used to detect slab-backed structs (`_gen_lock` field).
+fn containerFieldNameIs(tree: *const Ast, member: Node.Index, target: []const u8) bool {
+    const tag = tree.nodeTag(member);
+    switch (tag) {
+        .container_field, .container_field_init, .container_field_align => {},
+        else => return false,
+    }
+    // The field name is the first token of the container_field node.
+    const first_tok = tree.firstToken(member);
+    const slice = tree.tokenSlice(first_tok);
+    return std.mem.eql(u8, slice, target);
 }
 
 // ── Expression traversal: descend through fn bodies, control flow, calls ──

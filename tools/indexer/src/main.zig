@@ -245,14 +245,25 @@ pub fn main() !void {
     }
 
     // ── Stage 5: entry_point discovery + entry_reaches BFS ────────────────
-    // Convention-based entry classification: fn entities in kernel/syscall/*,
-    // kernel/arch/<arch>/exceptions.zig, kernel/init/*. Vector / syscall_nr
-    // resolution is left to a follow-up slice.
+    // Convention-based entry classification:
+    //   - exception: fn in kernel/arch/<arch>/exceptions.zig whose short
+    //     name matches a fixed list of handler entry names. (genlock's
+    //     EXCEPTION_ENTRY_NAMES list — keeps the entry set narrow so
+    //     downstream consumers don't pick up helpers.)
+    //   - irq: fn in kernel/arch/<arch>/irq.zig named schedTimerHandler
+    //     (the timer-tick async entry).
+    //   - syscall: fn in kernel/syscall/<file>.zig where <file> is a
+    //     handler module (excludes dispatch / errors / pmu / syscall).
+    //   - boot: main.kEntry.
+    //
+    // Short-name comparison uses the qualified_name's last `.`-segment.
+    // We use SQL substr/instr to extract it without a temp table.
     const entry_sql: [:0]const u8 =
         \\INSERT INTO entry_point (entity_id, kind, label)
         \\SELECT e.id,
         \\    CASE
         \\        WHEN f.path LIKE 'arch/%/exceptions.zig' THEN 'exception'
+        \\        WHEN f.path LIKE 'arch/%/irq.zig' THEN 'irq'
         \\        WHEN f.path LIKE 'syscall/%.zig'
         \\             AND f.path NOT IN ('syscall/dispatch.zig', 'syscall/errors.zig',
         \\                                'syscall/pmu.zig', 'syscall/syscall.zig') THEN 'syscall'
@@ -263,13 +274,76 @@ pub fn main() !void {
         \\FROM entity e
         \\JOIN file f ON f.id = e.def_file_id
         \\WHERE e.kind = 'fn'
-        \\  AND (f.path LIKE 'arch/%/exceptions.zig'
-        \\       OR (f.path LIKE 'syscall/%.zig'
-        \\           AND f.path NOT IN ('syscall/dispatch.zig', 'syscall/errors.zig',
-        \\                              'syscall/pmu.zig', 'syscall/syscall.zig'))
-        \\       OR e.qualified_name = 'main.kEntry');
+        \\  AND (
+        \\      (f.path LIKE 'arch/%/exceptions.zig'
+        \\       AND (e.qualified_name LIKE '%.exceptionHandler'
+        \\            OR e.qualified_name LIKE '%.pageFaultHandler'
+        \\            OR e.qualified_name LIKE '%.handleSyncLowerEl'
+        \\            OR e.qualified_name LIKE '%.handleIrqLowerEl'
+        \\            OR e.qualified_name LIKE '%.handleSyncCurrentEl'
+        \\            OR e.qualified_name LIKE '%.handleIrqCurrentEl'
+        \\            OR e.qualified_name LIKE '%.handleUnexpected'
+        \\            OR e.qualified_name LIKE '%.dispatchIrq'
+        \\            OR e.qualified_name LIKE '%.schedTimerHandler'))
+        \\      OR (f.path LIKE 'arch/%/irq.zig'
+        \\          AND e.qualified_name LIKE '%.schedTimerHandler')
+        \\      OR (f.path LIKE 'syscall/%.zig'
+        \\          AND f.path NOT IN ('syscall/dispatch.zig', 'syscall/errors.zig',
+        \\                             'syscall/pmu.zig', 'syscall/syscall.zig'))
+        \\      OR e.qualified_name = 'main.kEntry'
+        \\  );
     ;
     try channel.send(.{ .raw_sql = entry_sql });
+
+    // Cross-module slab-backed propagation: a `pub const X = SecureSlab(T, N)`
+    // alias was marked is_slab_backed=1 in the AST pass; T may live in a
+    // different module. We extract T's short name from the alias entity's
+    // initializer source bytes and mark every entity whose qualified_name
+    // ends with `.<T>` as slab-backed too. This is the second prong of
+    // Gap #1 in the genlock plan — keeps slab-backed-type discovery
+    // consistent with the legacy tokenizer-based analyzer.
+    const slab_propagate_sql: [:0]const u8 =
+        \\WITH alias_inits AS (
+        \\    SELECT e.id AS alias_id,
+        \\           CAST(substr(f.source, e.def_byte_start + 1, e.def_byte_end - e.def_byte_start) AS TEXT) AS init_text
+        \\    FROM entity e
+        \\    JOIN file f ON f.id = e.def_file_id
+        \\    WHERE e.is_slab_backed = 1
+        \\),
+        \\extracted AS (
+        \\    SELECT alias_id,
+        \\           init_text,
+        \\           instr(init_text, 'SecureSlab(') AS open_pos
+        \\    FROM alias_inits
+        \\    WHERE instr(init_text, 'SecureSlab(') > 0
+        \\),
+        \\arg_text AS (
+        \\    SELECT alias_id,
+        \\           substr(init_text, open_pos + length('SecureSlab(')) AS rest
+        \\    FROM extracted
+        \\),
+        \\inner_name AS (
+        \\    SELECT alias_id,
+        \\           CASE
+        \\               WHEN instr(rest, ',') > 0 AND instr(rest, ',') < instr(rest, ')') THEN
+        \\                   trim(substr(rest, 1, instr(rest, ',') - 1))
+        \\               ELSE
+        \\                   trim(substr(rest, 1, instr(rest, ')') - 1))
+        \\           END AS t_name
+        \\    FROM arg_text
+        \\)
+        \\UPDATE entity
+        \\   SET is_slab_backed = 1
+        \\ WHERE id IN (
+        \\     SELECT e2.id
+        \\     FROM entity e2
+        \\     JOIN inner_name ON
+        \\         e2.qualified_name = inner_name.t_name
+        \\         OR e2.qualified_name LIKE '%.' || inner_name.t_name
+        \\     WHERE e2.kind IN ('const', 'var', 'type')
+        \\ );
+    ;
+    try channel.send(.{ .raw_sql = slab_propagate_sql });
 
     // Link ir_call → ast_node by matching (caller's file, site_line) to the
     // leftmost call/builtin_call AST node on that line within the caller's
