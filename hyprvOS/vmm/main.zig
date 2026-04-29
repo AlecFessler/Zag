@@ -91,7 +91,6 @@ var hlt_count: u64 = 0;
 var ept_count: u64 = 0;
 var intr_count: u64 = 0;
 var other_count: u64 = 0;
-var last_inject_ns: u64 = 0;
 
 pub fn main(cap_table_base: u64) void {
     log.init(cap_table_base);
@@ -448,31 +447,21 @@ noinline fn exitLoop() void {
         // has elapsed since the last fire.
         io.pitCheckIrq();
 
-        // Direct PIC injection. Linux booted under `nolapic noapic`
-        // reads its IRQ0 vector from the 8259 (Linux remaps the PIC
-        // to vectors 0x20-0x27 early in `setup_arch`). Stuff the
-        // configured vector into vreg 64 (vcpu_event_intr_nmi) — the
-        // kernel reply path forwards that into `gs.pending_eventinj`
-        // and the next entry honours it before VMRUN/VMLAUNCH.
-        // Throttle to 4ms (250Hz) to match the OLD VMM's
-        // `maybeInjectTimer` cadence — Linux's bzImage is built
-        // CONFIG_HZ=250 and this leaves ~4ms of interrupt-free
-        // runtime between fires, preventing IRET → re-inject livelock.
-        // Don't gate on `pic1_irq0_pending` — at this rate the PIT
-        // emulation isn't authoritative; we drive timer fires
-        // ourselves regardless of whatever divisor Linux programmed.
-        // (PIT counter reads still see the simulated countdown so
-        // `check_timer` gets a self-consistent reading.)
-        if ((state.rflags & (1 << 9)) != 0 and
-            state.vcpu_event_intr_nmi == 0 and
-            io.pic1_vector_base != 0x08)
-        {
-            const now_ns = syscall.timeMonotonic().v1;
-            if (now_ns -% last_inject_ns >= 4_000_000) {
-                last_inject_ns = now_ns;
-                const vector: u64 = io.pic1_vector_base;
-                state.vcpu_event_intr_nmi = vector | (1 << 31);
-            }
+        // Direct PIC injection. With Linux booted under `nolapic noapic`
+        // it ignores the in-kernel IOAPIC and reads its IRQ0 vector
+        // straight from the 8259 (Linux remaps it to 0x20 early in
+        // setup_arch). Stuff the pending vector into vreg 64
+        // (vcpu_event_intr_nmi) — the kernel reply path forwards that
+        // into `gs.pending_eventinj` and the next entry honours it
+        // before VMRUN/VMLAUNCH. Gate on guest IF=1 so we don't drop
+        // the fire while the guest is in a critical section; the
+        // `pic1_irq0_pending` flag is sticky across exits until we
+        // can deliver.
+        if (io.pic1_irq0_pending and (state.rflags & (1 << 9)) != 0 and state.vcpu_event_intr_nmi == 0) {
+            const vector: u64 = io.pic1_vector_base;
+            // SVM EVENTINJ format: vector | type=0 (external) | valid=1<<31.
+            state.vcpu_event_intr_nmi = vector | (1 << 31);
+            io.pic1_irq0_pending = false;
         }
 
         const reply_err = syscall.replyVmExit(r.reply_handle_id, state);
