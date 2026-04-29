@@ -213,7 +213,6 @@ pub fn main(cap_table_base: u64) void {
             collected += 1;
             batch_collected += 1;
         }
-        if (batch_recv_timed_out) break;
         batch_idx = batch_end;
     }
 
