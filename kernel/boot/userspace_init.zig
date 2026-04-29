@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
@@ -433,11 +434,17 @@ fn applyRelativeRelocations(
 
         for (relas) |rela| {
             const rtype: u32 = @truncate(rela.r_info);
-            // R_X86_64.RELATIVE (= 8) only. Other types (e.g. ABS64)
-            // require a symbol table walk, which the runner does not
-            // emit — its dynamic linker is the kernel and the runner
-            // is statically linked, so all live relocations are RELATIVE.
-            if (rtype != @intFromEnum(std.elf.R_X86_64.RELATIVE)) continue;
+            // R_X86_64.RELATIVE (= 8) / R_AARCH64.RELATIVE (= 1027) only.
+            // Other types (e.g. ABS64) require a symbol table walk, which
+            // the runner does not emit — its dynamic linker is the
+            // kernel and the runner is statically linked, so all live
+            // relocations are RELATIVE.
+            const relative_type: u32 = comptime switch (builtin.cpu.arch) {
+                .x86_64 => @intFromEnum(std.elf.R_X86_64.RELATIVE),
+                .aarch64 => @intFromEnum(std.elf.R_AARCH64.RELATIVE),
+                else => @compileError("unsupported arch"),
+            };
+            if (rtype != relative_type) continue;
 
             const slid_target = rela.r_offset + slide;
             const target_va = VAddr.fromInt(slid_target);

@@ -716,13 +716,9 @@ pub fn mapPageSized(
     cch: VarCacheType,
     perms: MemoryPerms,
 ) !void {
-    _ = addr_space_root;
-    _ = phys;
-    _ = virt;
-    _ = sz;
     _ = cch;
-    _ = perms;
-    @panic("not implemented");
+    std.debug.assert(sz == .sz_4k);
+    return mapPage(addr_space_root, phys, virt, perms, .user_data);
 }
 
 pub fn unmapPageSized(
@@ -730,10 +726,8 @@ pub fn unmapPageSized(
     virt: VAddr,
     sz: VarPageSize,
 ) ?PAddr {
-    _ = addr_space_root;
-    _ = virt;
-    _ = sz;
-    @panic("not implemented");
+    std.debug.assert(sz == .sz_4k);
+    return unmapPage(addr_space_root, virt);
 }
 
 /// Allocate a fresh user-half L0 page-table root (TTBR0_EL1 will point at
@@ -785,8 +779,12 @@ pub fn shootdownTlbRange(
     page_count: u32,
 ) void {
     _ = addr_space_id;
-    _ = virt;
-    _ = sz;
-    _ = page_count;
-    @panic("not implemented");
+    std.debug.assert(sz == .sz_4k);
+    // ARM ARM D5.9: TLBI VAE1IS broadcasts across the inner-shareable
+    // domain; no IPI fan-out required (unlike x86's per-core invlpg).
+    var i: u32 = 0;
+    while (i < page_count) {
+        tlbiVae1is(virt.addr + @as(u64, i) * paging.PAGE4K);
+        i += 1;
+    }
 }

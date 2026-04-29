@@ -154,8 +154,7 @@ pub fn createPageFrame(caller: *anyopaque, caps: u64, props: u64, pages: u64) i6
 /// Allocate a PageFrame slot + `page_count` pages of `sz` from PMM,
 /// refcount=1, mapcnt=0. Spec §[page_frame] create.
 fn allocPageFrame(sz: PageSize, page_count: u32) !*PageFrame {
-    const page_bytes: u64 = pageSizeBytes(sz);
-    const total_bytes: u64 = page_bytes * @as(u64, page_count);
+    const total_bytes: u64 = buddyAllocBytes(sz, page_count);
 
     const pmm_mgr = &(pmm.global_pmm orelse return error.OutOfMemory);
     const block = pmm_mgr.allocBlock(total_bytes) orelse return error.OutOfMemory;
@@ -188,7 +187,7 @@ fn destroyPageFrame(pf: *PageFrame) void {
     // PMM freeBlock expects a physmap virtual pointer (matches what
     // allocBlock returned); convert from the stored physical address.
     const phys_base = pf.phys_base;
-    const total_bytes = pageSizeBytes(pf.sz) * @as(u64, pf.page_count);
+    const total_bytes = buddyAllocBytes(pf.sz, pf.page_count);
     const expected_gen: u63 = @intCast(pf._gen_lock.currentGen());
 
     // Caller holds the gen-lock at expected_gen (per the inc/dec
@@ -239,6 +238,16 @@ inline fn pageSizeBytes(sz: PageSize) u64 {
         .sz_1g => 0x40000000,
         ._reserved => unreachable,
     };
+}
+
+/// Bytes the buddy allocator must reserve to cover `page_count` pages
+/// of `sz`. Buddy.allocBlock requires a power-of-two page count, so
+/// any non-power-of-two request is rounded up to the next power of two.
+/// Both alloc and free paths route through this helper so accounting
+/// stays consistent.
+inline fn buddyAllocBytes(sz: PageSize, page_count: u32) u64 {
+    const pages_pow2: u64 = std.math.ceilPowerOfTwoAssert(u64, page_count);
+    return pageSizeBytes(sz) * pages_pow2;
 }
 
 inline fn packField0(page_count: u32, sz: PageSize) u64 {

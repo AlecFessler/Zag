@@ -145,7 +145,14 @@ pub fn createCapabilityDomain(
 ) i64 {
     if (caps & ~CREATE_CAPS_MASK != 0) return errors.E_INVAL;
     if (elf_pf_slot & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;
+    // Spec §[create_capability_domain]: passed_handles uses an all-zero
+    // entry as end-of-list sentinel (matches the convention the kernel
+    // capdom layer follows). The aarch64 SVC ABI passes vregs 1..31 in
+    // x0..x30, so trailing reserved-vreg slots above the caller's last
+    // populated entry contain whatever the user-side syscall asm left
+    // in those GPRs. Stop reserved-bit validation at the first zero.
     for (passed_handles) |entry| {
+        if (entry == 0) break;
         if (entry & ~PASSED_HANDLE_MASK != 0) return errors.E_INVAL;
     }
 

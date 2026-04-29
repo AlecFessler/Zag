@@ -538,6 +538,17 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 @panic("syscall with no current EC");
             const ret = syscall_dispatch.dispatch(caller, syscall_word, regs_ptr[0..31]);
             ctx.regs.x0 = @bitCast(ret);
+
+            // Mirrors arch/x64/interrupts.zig syscallDispatch tail. If
+            // the dispatched handler suspended `caller` (recv / suspend
+            // / futex_wait), `current_ec` was cleared on this core. The
+            // exception trampoline would otherwise ERET back to the
+            // now-parked user EC; drive the scheduler instead so the
+            // next ready EC takes over (or we idle).
+            const core: u8 = @truncate(gic.coreID());
+            if (scheduler.coreIsIdle(core)) {
+                scheduler.run();
+            }
         },
 
         .data_abort_lower_el => {
