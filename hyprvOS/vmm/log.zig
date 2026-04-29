@@ -1,20 +1,95 @@
 /// Debug logging helpers for hyprvOS VMM.
-/// All output goes to Zag's serial console via the write syscall.
+///
+/// Spec v3 has no debug-write syscall. Output goes to COM1 (0x3F8/8) via
+/// the port-IO virtualization path: the bootloader hands the kernel a
+/// `device_region` for COM1 with `dev_type = port_io`; the kernel
+/// passes it into the root-service domain at create-time as a passed
+/// handle. We discover it by scanning the cap table, build an MMIO VAR
+/// over it via `map_mmio`, and 1-byte stores to the VAR's base address
+/// trap and emulate as `out (base_port + offset), al` per
+/// §[port_io_virtualization].
+///
+/// Initialized lazily by `init` from `_start`'s cap_table_base; until
+/// then, all print/hex/dec calls are no-ops. That's deliberate — the
+/// VMM may want to log VERY early (cap-table walk diagnostics) and we
+/// don't want to crash the path if init hasn't run yet.
 const lib = @import("lib");
 
+const caps = lib.caps;
 const syscall = lib.syscall;
 
+const HandleId = caps.HandleId;
+
+const COM1_BASE_PORT: u16 = 0x3F8;
+const COM1_PORT_COUNT: u16 = 8;
+
+var serial_base: ?[*]volatile u8 = null;
+
+/// Discover COM1 in the cap table, map an MMIO VAR over it, store the
+/// base for `print`/`hex*`/`dec` to use. Idempotent — repeated calls
+/// are no-ops once `serial_base` is set.
+pub fn init(cap_table_base: u64) void {
+    if (serial_base != null) return;
+    const dev = findCom1(cap_table_base) orelse return;
+
+    const var_caps_word = caps.VarCap{
+        .r = true,
+        .w = true,
+        .mmio = true,
+    };
+    const props: u64 = (1 << 5) | // cch = 1 (uc)
+        (0 << 3) | // sz = 0 (4 KiB)
+        0b011; // cur_rwx = r|w
+    const cvar = syscall.createVar(
+        @as(u64, var_caps_word.toU16()),
+        props,
+        1,
+        0,
+        0,
+    );
+    if (cvar.v1 != 0) return;
+    const var_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
+    const var_base: u64 = cvar.v2;
+
+    const mm = syscall.mapMmio(var_handle, dev);
+    if (mm.v1 != 0) return;
+
+    serial_base = @ptrFromInt(var_base);
+}
+
+fn findCom1(cap_table_base: u64) ?HandleId {
+    var slot: u32 = caps.SLOT_FIRST_PASSED;
+    while (slot < caps.HANDLE_TABLE_MAX) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() == .device_region) {
+            const dr = caps.deviceRegionFields(c);
+            if (dr.dev_type == .port_io and
+                dr.base_port == COM1_BASE_PORT and
+                dr.port_count == COM1_PORT_COUNT)
+            {
+                return @truncate(slot);
+            }
+        }
+        slot += 1;
+    }
+    return null;
+}
+
 pub fn print(msg: []const u8) void {
-    syscall.write(msg);
+    const b = serial_base orelse return;
+    var i: usize = 0;
+    while (i < msg.len) {
+        b[0] = msg[i];
+        i += 1;
+    }
 }
 
 const hex_chars = "0123456789ABCDEF";
 
 pub fn hex8(val: u8) void {
-    var buf: [2]u8 = undefined;
-    buf[0] = hex_chars[val >> 4];
-    buf[1] = hex_chars[val & 0xF];
-    syscall.write(&buf);
+    const b = serial_base orelse return;
+    b[0] = hex_chars[val >> 4];
+    b[0] = hex_chars[val & 0xF];
 }
 
 pub fn hex16(val: u16) void {
@@ -33,8 +108,9 @@ pub fn hex64(val: u64) void {
 }
 
 pub fn dec(val: u64) void {
+    const b = serial_base orelse return;
     if (val == 0) {
-        syscall.write("0");
+        b[0] = '0';
         return;
     }
     var buf: [20]u8 = undefined;
@@ -45,5 +121,8 @@ pub fn dec(val: u64) void {
         buf[i] = @truncate((v % 10) + '0');
         v /= 10;
     }
-    syscall.write(buf[i..20]);
+    while (i < 20) {
+        b[0] = buf[i];
+        i += 1;
+    }
 }
