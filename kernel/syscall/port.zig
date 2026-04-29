@@ -170,14 +170,14 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
     var entries: [PAIR_BUF_LEN]u64 = undefined;
     const n: usize = pair_count;
 
-    // Spec §[syscall_abi]: vreg N for 14 ≤ N ≤ 127 lives at
-    // `[rsp + (N-13)*8]` when the syscall executes. With pair_count
-    // = N entries occupy vregs [128-N..127] — i.e. offsets
-    // (128-N-13)*8 .. (127-13)*8 from the user RSP captured on syscall
-    // entry. SMAP gates the load.
+    // Spec §[syscall_abi]: vreg N for `firstStackVreg() ≤ N ≤ 127`
+    // lives at `[user_sp + (N - firstStackVreg() + 1) * 8]` when the
+    // syscall executes. With pair_count = N, entries occupy vregs
+    // `[128-N..127]` per §[handle_attachments]. SMAP/PAN gates the load.
     const user_rsp = cpu.userStackPointer(ec.ctx);
+    const first_stack_vreg = cpu.firstStackVreg();
     const first_vreg: u64 = 128 - @as(u64, n);
-    const first_off: u64 = (first_vreg - 13) * 8;
+    const first_off: u64 = (first_vreg - first_stack_vreg + 1) * 8;
 
     cpu.userAccessBegin();
     var i: usize = 0;

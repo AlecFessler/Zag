@@ -47,6 +47,7 @@ const zag = @import("zag");
 const cpu = zag.arch.aarch64.cpu;
 const fpu = zag.sched.fpu;
 const gic = zag.arch.aarch64.gic;
+const interrupts = zag.arch.aarch64.interrupts;
 const kprof_dump = zag.kprof.dump;
 const pmu = zag.arch.aarch64.pmu;
 const port = zag.sched.port;
@@ -539,13 +540,38 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             const ret = syscall_dispatch.dispatch(caller, syscall_word, regs_ptr[0..31]);
             ctx.regs.x0 = @bitCast(ret);
 
+            // Spec §[syscall_abi]: vreg 0 (`[user_sp + 0]`) carries the
+            // recv-success syscall return word — `port.deliverEvent`
+            // stages it in `pending_event_word` so the resume path can
+            // flush it once TTBR0 references the receiver's address
+            // space. The synchronous recv path (caller dequeued a
+            // queued sender without blocking) returns through this tail
+            // still in the caller's TTBR0, so flush here. Spec
+            // §[event_state] vreg 14 = the suspended EC's saved PC; on
+            // aarch64 vreg 14 is GPR-backed at x13 — write it into the
+            // caller's saved frame so ERET surfaces it. Mirrors
+            // arch/x64/interrupts.zig syscallDispatch.
+            const core: u8 = @truncate(gic.coreID());
+            if (caller.pending_event_word_valid and
+                scheduler.coreCurrentIs(core, caller))
+            {
+                interrupts.writeUserSyscallWord(ctx, caller.pending_event_word);
+                caller.pending_event_word = 0;
+                caller.pending_event_word_valid = false;
+
+                if (caller.pending_event_rip_valid) {
+                    interrupts.writeUserVreg14(ctx, caller.pending_event_rip);
+                    caller.pending_event_rip = 0;
+                    caller.pending_event_rip_valid = false;
+                }
+            }
+
             // Mirrors arch/x64/interrupts.zig syscallDispatch tail. If
             // the dispatched handler suspended `caller` (recv / suspend
             // / futex_wait), `current_ec` was cleared on this core. The
             // exception trampoline would otherwise ERET back to the
             // now-parked user EC; drive the scheduler instead so the
             // next ready EC takes over (or we idle).
-            const core: u8 = @truncate(gic.coreID());
             if (scheduler.coreIsIdle(core)) {
                 scheduler.run();
             }

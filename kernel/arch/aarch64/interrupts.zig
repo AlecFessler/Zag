@@ -51,6 +51,9 @@
 //! - ARM ARM D13.2.127: SPSR_EL1
 //! - ARM IHI 0055: AAPCS64 (calling convention)
 
+const zag = @import("zag");
+
+const cpu = zag.arch.aarch64.cpu;
 
 pub const Registers = extern struct {
     x0: u64,
@@ -146,6 +149,28 @@ pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
 /// sender. TTBR0 must reference the receiver's address space.
 pub fn readUserVreg14(ctx: *const ArchCpuContext) u64 {
     return @as(*u64, @ptrFromInt(ctx.sp_el0 + 8)).*;
+}
+
+/// Spec §[event_state]: vreg 14 carries the suspended EC's saved PC
+/// across both arches. On aarch64 vreg 14 is GPR-backed at x13 — write
+/// the saved PC into the receiver's saved x13 so the recv-time
+/// snapshot surfaces it. Mirrors x86-64's `[user_rsp + 8]` write but
+/// targets a register slot rather than a user page, so no PAN gate is
+/// needed and TTBR0 may reference any address space.
+pub fn writeUserVreg14(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.x13 = value;
+}
+
+/// Spec §[syscall_abi]: vreg 0 sits at `[user_sp + 0]` on the user
+/// stack — recv's success-return packs reply_handle_id / event_type /
+/// pair_count / tstart there per §[event_state]. TTBR0_EL1 must
+/// reference the EC's address space when called (the rendezvous wake
+/// path defers this write to `loadEcContextAndReturn` after the
+/// TTBR0 swap). PAN is cleared for the write.
+pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
+    cpu.panDisable();
+    @as(*u64, @ptrFromInt(ctx.sp_el0)).* = value;
+    cpu.panEnable();
 }
 
 /// Copy the §[event_state] GPR-backed vregs (vregs 1..31 on aarch64:

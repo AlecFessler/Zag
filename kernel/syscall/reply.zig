@@ -163,14 +163,16 @@ pub fn replyTransfer(caller: *anyopaque, syscall_word: u64, n: u8) i64 {
     if (reply_present and !has_xfer) return errors.E_PERM;
 
     // Read pair entries from the user stack. Spec §[syscall_abi]: vreg
-    // M for 14 ≤ M ≤ 127 lives at `[rsp + (M - 13) * 8]` when the
-    // syscall executes. Spec §[handle_attachments] places N entries at
-    // vregs `[128-N..127]`. SMAP gates the load via STAC/CLAC.
+    // M for `firstStackVreg() ≤ M ≤ 127` lives at
+    // `[user_sp + (M - firstStackVreg() + 1) * 8]` when the syscall
+    // executes. Spec §[handle_attachments] places N entries at vregs
+    // `[128-N..127]`. SMAP/PAN gates the load via userAccess{Begin,End}.
     var entries: [PAIR_BUF_LEN]u64 = undefined;
     const len: usize = n;
     const user_rsp = cpu.userStackPointer(ec.ctx);
+    const first_stack_vreg = cpu.firstStackVreg();
     const first_vreg: u64 = 128 - @as(u64, n);
-    const first_off: u64 = (first_vreg - 13) * 8;
+    const first_off: u64 = (first_vreg - first_stack_vreg + 1) * 8;
 
     cpu.userAccessBegin();
     var i: usize = 0;

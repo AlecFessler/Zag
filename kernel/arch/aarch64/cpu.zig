@@ -437,6 +437,28 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
         zag.arch.aarch64.paging.swapAddrSpace(new_root, dom.addr_space_id);
     }
 
+    // Spec §[syscall_abi]: flush the recv-deferred syscall word into
+    // user `[ec.ctx.sp_el0 + 0]` while we are guaranteed to be in the
+    // EC's address space. `port.deliverEvent` stages the value when the
+    // receiver is parked (rendezvous wake) — at that moment the kernel
+    // is still running in the sender's TTBR0, so the write must be
+    // deferred to the resume path. Flush after the TTBR0 swap above and
+    // before the ERET trampoline. Spec §[event_state] vreg 14 = saved
+    // PC; on aarch64 vreg 14 is GPR-backed at x13 — write into the
+    // saved frame so ERET surfaces it. Mirrors arch/x64/interrupts.zig
+    // switchTo.
+    if (ec.pending_event_word_valid) {
+        zag.arch.aarch64.interrupts.writeUserSyscallWord(ec.ctx, ec.pending_event_word);
+        ec.pending_event_word = 0;
+        ec.pending_event_word_valid = false;
+
+        if (ec.pending_event_rip_valid) {
+            zag.arch.aarch64.interrupts.writeUserVreg14(ec.ctx, ec.pending_event_rip);
+            ec.pending_event_rip = 0;
+            ec.pending_event_rip_valid = false;
+        }
+    }
+
     const ctx_addr: u64 = @intFromPtr(ec.ctx);
     asm volatile (
         \\mov x0, %[ctx]

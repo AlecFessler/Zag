@@ -421,6 +421,22 @@ pub fn userStackPointer(ctx: *const ArchCpuContext) u64 {
     };
 }
 
+/// Index of the first stack-backed vreg per spec §[syscall_abi]. x86-64:
+/// vregs 1..13 = GPRs, vreg 14 is the first `[rsp + ...]` slot. aarch64:
+/// vregs 1..31 = x0..x30, vreg 32 is the first `[sp + ...]` slot. The
+/// stack offset for any vreg N >= firstStackVreg() is
+/// `(N - firstStackVreg() + 1) * 8` from the syscall-time user SP —
+/// vreg 14 / 32 lands at `[sp + 8]`, vreg 127 at the top of the per-arch
+/// reserved frame. Used by §[handle_attachments] readers to locate the
+/// pair-entry band at vregs `[128-N..127]`.
+pub fn firstStackVreg() u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => 14,
+        .aarch64 => 32,
+        else => unreachable,
+    };
+}
+
 /// Halt the local core in an interrupts-enabled state until the next
 /// interrupt (HLT with IF=1 on x86-64, WFI with DAIF cleared on
 /// aarch64). Used by the per-core idle EC.
