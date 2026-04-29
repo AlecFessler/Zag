@@ -1023,6 +1023,18 @@ fn checkPtrBypasses(
 // `continue` aren't currently in the indexer's AST kind table — we
 // handle them by inspecting the source bytes of expression-leaf nodes.
 
+const DisciplineFinding = struct {
+    file_path: []const u8,
+    line: u32,
+    message: []const u8,
+};
+
+const PairingFinding = struct {
+    file_path: []const u8,
+    line: u32,
+    message: []const u8,
+};
+
 const ReleaseFinding = struct {
     entry_qname: []const u8,
     file_path: []const u8,
@@ -2074,6 +2086,11 @@ pub fn main() !u8 {
     var n_discipline: u32 = 0;
     var n_pairing: u32 = 0;
 
+    var discipline_findings: ArrayList(DisciplineFinding) = .empty;
+    defer discipline_findings.deinit(gpa);
+    var pairing_findings: ArrayList(PairingFinding) = .empty;
+    defer pairing_findings.deinit(gpa);
+
     var discipline_lines: ArrayList([]u8) = .empty;
     defer {
         for (discipline_lines.items) |l| gpa.free(l);
@@ -2105,6 +2122,12 @@ pub fn main() !u8 {
             .{ acq.file_path, acq.line, acq.fn_name, acq.method, acq.class_id },
         );
         try discipline_lines.append(gpa, ln);
+        const struct_msg = try std.fmt.allocPrint(
+            gpa,
+            "({s}) currently uses {s} on class {s} — needs IRQ-saving acquire variant",
+            .{ acq.fn_name, acq.method, acq.class_id },
+        );
+        try discipline_findings.append(gpa, .{ .file_path = acq.file_path, .line = acq.line, .message = struct_msg });
     }
 
     // Pairing: per-fn, walk acquire/release events in source-line order.
@@ -2152,12 +2175,20 @@ pub fn main() !u8 {
                         "  {s}:{d}  release={s} (acquire L{d} was {s} — IrqSave/Restore mismatch)\n",
                         .{ rel.file_path, rel.line, rel.method, acq.line, acq.method });
                     try pairing_lines.append(gpa, ln);
+                    const sm = try std.fmt.allocPrint(gpa,
+                        "release={s} (acquire L{d} was {s} — IrqSave/Restore mismatch)",
+                        .{ rel.method, acq.line, acq.method });
+                    try pairing_findings.append(gpa, .{ .file_path = rel.file_path, .line = rel.line, .message = sm });
                 } else if (!acq.is_irq_save and rel.is_irq_restore) {
                     n_pairing += 1;
                     const ln = try std.fmt.allocPrint(gpa,
                         "  {s}:{d}  release={s} (acquire L{d} was {s} — Plain/IrqRestore mismatch)\n",
                         .{ rel.file_path, rel.line, rel.method, acq.line, acq.method });
                     try pairing_lines.append(gpa, ln);
+                    const sm = try std.fmt.allocPrint(gpa,
+                        "release={s} (acquire L{d} was {s} — Plain/IrqRestore mismatch)",
+                        .{ rel.method, acq.line, acq.method });
+                    try pairing_findings.append(gpa, .{ .file_path = rel.file_path, .line = rel.line, .message = sm });
                 }
             }
         }
@@ -2314,7 +2345,14 @@ pub fn main() !u8 {
     // can serve them. We close the read-only handle and re-open R/W; SQLite
     // WAL allows concurrent readers.
     db.close();
-    writeGenlockFindings(gpa, db_path, bare_findings.items, ptr_findings.items, release_findings.items) catch |err| {
+    writeGenlockFindings(
+        gpa, db_path,
+        bare_findings.items,
+        ptr_findings.items,
+        release_findings.items,
+        discipline_findings.items,
+        pairing_findings.items,
+    ) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "warning: failed to write lint_finding rows: {s}\n", .{@errorName(err)}) catch "warning: lint_finding write failed\n";
         _ = std.fs.File.stderr().write(msg) catch {};
@@ -2330,6 +2368,8 @@ fn writeGenlockFindings(
     bare: []const BarePtrFinding,
     ptr: []const PtrBypassFinding,
     release: []const ReleaseFinding,
+    discipline: []const DisciplineFinding,
+    pairing: []const PairingFinding,
 ) !void {
     var rwdb = try sqlite.Db.openReadWrite(db_path, gpa);
     defer rwdb.close();
@@ -2421,6 +2461,12 @@ fn writeGenlockFindings(
     }
     for (release) |f| {
         try insert(&ins, &lookup, f.file_path, f.line, f.rule, f.message, reset, clear);
+    }
+    for (discipline) |f| {
+        try insert(&ins, &lookup, f.file_path, f.line, "irq_discipline", f.message, reset, clear);
+    }
+    for (pairing) |f| {
+        try insert(&ins, &lookup, f.file_path, f.line, "irq_pairing_mismatch", f.message, reset, clear);
     }
 
     try rwdb.exec("COMMIT");
