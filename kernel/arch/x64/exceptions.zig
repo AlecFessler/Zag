@@ -299,12 +299,12 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         // capability domain is alive across this PF handler.
         const domain = ec.domain.ptr;
         if (var_range.findVarCovering(domain, VAddr.fromInt(faulting_addr))) |v| {
-            v._gen_lock.lock(@src());
+            const v_irq = v._gen_lock.lockIrqSave(@src());
             const is_port_io = v.map == .mmio and
                 v.device != null and
                 // self-alive: device ref under v's gen-lock.
                 v.device.?.ptr.device_type == .port_io;
-            v._gen_lock.unlock();
+            v._gen_lock.unlockIrqRestore(v_irq);
             if (is_port_io) {
                 emulateVirtualBar(ctx, ec, v, faulting_addr, domain);
                 return;
@@ -346,12 +346,12 @@ fn emulateVirtualBar(
     // walk of the domain's vars[]. The DeviceRegion pointer is stable
     // for the kernel's lifetime once bound and `base_vaddr` is
     // immutable on the VAR, so the snapshot is safe to use unlocked.
-    v._gen_lock.lock(@src());
+    const v_irq = v._gen_lock.lockIrqSave(@src());
     // self-alive: device ref under v's gen-lock; the DeviceRegion is
     // stable for the kernel's lifetime once bound.
     const device: *DeviceRegion = v.device.?.ptr;
     const var_base_addr = v.base_vaddr.addr;
-    v._gen_lock.unlock();
+    v._gen_lock.unlockIrqRestore(v_irq);
 
     // Fetch instruction bytes from user RIP via the domain's page tables.
     const rip = ctx.rip;

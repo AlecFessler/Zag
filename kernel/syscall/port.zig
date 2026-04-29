@@ -57,9 +57,10 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
     const self_caps_word = Word0.caps(cd.user_table[0].word0);
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr.irq_state);
 
     const self_caps: CapabilityDomainCaps = @bitCast(self_caps_word);
     if (!self_caps.crpt) return errors.E_PERM;
@@ -116,7 +117,9 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const irq_state = lr.irq_state;
 
     // Spec §[suspend] gate order: [1] target validity (test 01) before
     // [2] port validity (test 02) before per-handle cap checks (tests
@@ -125,19 +128,19 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
     // bind) instead of E_BADCAP.
     const target_slot: u12 = @truncate(target);
     if (capability.resolveHandleOnDomain(cd, target_slot, .execution_context) == null) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
 
     const port_slot: u12 = @truncate(port);
     if (capability.resolveHandleOnDomain(cd, port_slot, .port) == null) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
     const ec_caps: EcCaps = @bitCast(Word0.caps(cd.user_table[target_slot].word0));
     const port_caps: PortCaps = @bitCast(Word0.caps(cd.user_table[port_slot].word0));
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(irq_state);
 
     if (!ec_caps.susp) return errors.E_PERM;
     if (!port_caps.bind) return errors.E_PERM;
@@ -214,8 +217,9 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
     // intra-list ordering, only that 02 fires on any invalid id, 03
     // on any cap-subset violation, etc.
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer cd_ref.unlock();
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    defer cd_ref.unlockIrqRestore(lr.irq_state);
 
     i = 0;
     while (i < n) {
@@ -333,16 +337,18 @@ pub fn recv(caller: *anyopaque, port: u64, timeout_ns: u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const irq_state = lr.irq_state;
 
     const port_slot: u12 = @truncate(port);
     if (capability.resolveHandleOnDomain(cd, port_slot, .port) == null) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
     const port_caps: PortCaps = @bitCast(Word0.caps(cd.user_table[port_slot].word0));
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(irq_state);
 
     if (!port_caps.recv) return errors.E_PERM;
 

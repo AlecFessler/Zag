@@ -351,7 +351,8 @@ pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64)
 
     const periodic_flag: bool = (flags & 1) != 0;
 
-    const t = lookup.timer_ref.lock(@src()) catch return E_BADCAP;
+    const tlr = lookup.timer_ref.lockIrqSave(@src()) catch return E_BADCAP;
+    const t = tlr.ptr;
     if (t.armed) wheelRemove(t);
     t.counter = 0;
     t.armed = true;
@@ -363,7 +364,7 @@ pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64)
     const counter = t.counter;
     const armed = t.armed;
     const periodic = t.periodic;
-    lookup.timer_ref.unlock();
+    lookup.timer_ref.unlockIrqRestore(tlr.irq_state);
 
     caller_domain.user_table[lookup.slot].field0 = counter;
     caller_domain.user_table[lookup.slot].field1 = encodeField1(armed, periodic);
@@ -381,9 +382,10 @@ pub fn timerCancel(caller: *anyopaque, handle: u64) i64 {
 
     if (!handleHasCancelCap(caller_domain, lookup.slot)) return E_PERM;
 
-    const t = lookup.timer_ref.lock(@src()) catch return E_BADCAP;
+    const tlr = lookup.timer_ref.lockIrqSave(@src()) catch return E_BADCAP;
+    const t = tlr.ptr;
     if (!t.armed) {
-        lookup.timer_ref.unlock();
+        lookup.timer_ref.unlockIrqRestore(tlr.irq_state);
         return E_INVAL;
     }
     wheelRemove(t);
@@ -391,7 +393,7 @@ pub fn timerCancel(caller: *anyopaque, handle: u64) i64 {
     t.counter = CANCELLED;
     const timer_gen = t._gen_lock.currentGen();
     const periodic = t.periodic;
-    lookup.timer_ref.unlock();
+    lookup.timer_ref.unlockIrqRestore(tlr.irq_state);
 
     propagateAndWake(t, timer_gen, CANCELLED);
     propagateField1(t, timer_gen, encodeField1(false, periodic));
@@ -425,10 +427,10 @@ fn destroyTimer(t: *Timer) void {
 
 /// Handle delete: decrement under `_gen_lock`; teardown at 0.
 pub fn decHandleRef(t: *Timer) void {
-    t._gen_lock.lock(@src());
+    const irq = t._gen_lock.lockIrqSave(@src());
     if (t.refcount > 0) t.refcount -= 1;
     const last = t.refcount == 0;
-    t._gen_lock.unlock();
+    t._gen_lock.unlockIrqRestore(irq);
     if (last) destroyTimer(t);
 }
 
@@ -478,12 +480,12 @@ pub fn disarmTimerHandlesInDomain(cd: *CapabilityDomain) void {
             .ptr = @ptrCast(@alignCast(obj_ptr)),
             .gen = entry.ref.gen,
         };
-        const t = ref.lock(@src()) catch {
+        const tlr = ref.lockIrqSave(@src()) catch {
             slot += 1;
             continue;
         };
-        t.armed = false;
-        ref.unlock();
+        tlr.ptr.armed = false;
+        ref.unlockIrqRestore(tlr.irq_state);
         slot += 1;
     }
 }
@@ -762,9 +764,9 @@ fn propagateField1Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) b
 
 fn callerDomain(caller: *anyopaque) ?*CapabilityDomain {
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const dom = ec.domain.lock(@src()) catch return null;
-    ec.domain.unlock();
-    return dom;
+    const dlr = ec.domain.lockIrqSave(@src()) catch return null;
+    ec.domain.unlockIrqRestore(dlr.irq_state);
+    return dlr.ptr;
 }
 
 /// Read the slot-0 self-handle `timer` cap bit. Spec §[capability_domain]
@@ -806,8 +808,8 @@ fn resolveTimerHandle(cd: *CapabilityDomain, handle: u64, expected: CapabilityTy
     const typed = capability.typedRef(Timer, kernel_entry.*) orelse return null;
     // Gen-validate by lock+immediately-unlock; real per-op locking
     // happens in the caller via `timer_ref.lock()` / `unlock()`.
-    _ = typed.lock(@src()) catch return null;
-    typed.unlock();
+    const tlr = typed.lockIrqSave(@src()) catch return null;
+    typed.unlockIrqRestore(tlr.irq_state);
     return .{ .timer_ref = typed, .slot = slot_id };
 }
 

@@ -62,8 +62,9 @@ pub fn bindEventRoute(caller: *anyopaque, target: u64, event_type: u64, port: u6
     const target_was_valid_handle, const rc = blk: {
         const ec_ptr: *ExecutionContext = @ptrCast(@alignCast(caller));
         const cd_ref = ec_ptr.domain;
-        const cd = cd_ref.lock(@src()) catch break :blk .{ false, errors.E_BADCAP };
-        defer cd_ref.unlock();
+        const lr = cd_ref.lockIrqSave(@src()) catch break :blk .{ false, errors.E_BADCAP };
+        const cd = lr.ptr;
+        defer cd_ref.unlockIrqRestore(lr.irq_state);
 
         const target_slot: u12 = @truncate(target);
         const ec_entry = capability.resolveHandleOnDomain(cd, target_slot, .execution_context) orelse
@@ -71,9 +72,10 @@ pub fn bindEventRoute(caller: *anyopaque, target: u64, event_type: u64, port: u6
 
         const target_ec_ref = capability.typedRef(ExecutionContext, ec_entry.*) orelse
             break :blk .{ false, errors.E_BADCAP };
-        const target_ec = target_ec_ref.lock(@src()) catch
+        const target_ec_lr = target_ec_ref.lockIrqSave(@src()) catch
             break :blk .{ false, errors.E_BADCAP };
-        defer target_ec_ref.unlock();
+        const target_ec = target_ec_lr.ptr;
+        defer target_ec_ref.unlockIrqRestore(target_ec_lr.irq_state);
 
         // Past this point, target named a real EC slot — even if a later
         // step errors, spec test 10 still requires the field0/field1
@@ -97,9 +99,10 @@ pub fn bindEventRoute(caller: *anyopaque, target: u64, event_type: u64, port: u6
 
         const target_port_ref = capability.typedRef(Port, port_entry.*) orelse
             break :blk .{ true, errors.E_BADCAP };
-        const target_port = target_port_ref.lock(@src()) catch
+        const target_port_lr = target_port_ref.lockIrqSave(@src()) catch
             break :blk .{ true, errors.E_BADCAP };
-        defer target_port_ref.unlock();
+        const target_port = target_port_lr.ptr;
+        defer target_port_ref.unlockIrqRestore(target_port_lr.irq_state);
 
         break :blk .{ true, port_mod.installEventRoute(target_ec, target_port, slot_idx) };
     };
@@ -143,8 +146,9 @@ pub fn clearEventRoute(caller: *anyopaque, target: u64, event_type: u64) i64 {
     const target_was_valid_handle, const rc = blk: {
         const ec_ptr: *ExecutionContext = @ptrCast(@alignCast(caller));
         const cd_ref = ec_ptr.domain;
-        const cd = cd_ref.lock(@src()) catch break :blk .{ false, errors.E_BADCAP };
-        defer cd_ref.unlock();
+        const lr = cd_ref.lockIrqSave(@src()) catch break :blk .{ false, errors.E_BADCAP };
+        const cd = lr.ptr;
+        defer cd_ref.unlockIrqRestore(lr.irq_state);
 
         const target_slot: u12 = @truncate(target);
         const ec_entry = capability.resolveHandleOnDomain(cd, target_slot, .execution_context) orelse
@@ -152,9 +156,10 @@ pub fn clearEventRoute(caller: *anyopaque, target: u64, event_type: u64) i64 {
 
         const target_ec_ref = capability.typedRef(ExecutionContext, ec_entry.*) orelse
             break :blk .{ false, errors.E_BADCAP };
-        const target_ec = target_ec_ref.lock(@src()) catch
+        const target_ec_lr = target_ec_ref.lockIrqSave(@src()) catch
             break :blk .{ false, errors.E_BADCAP };
-        defer target_ec_ref.unlock();
+        const target_ec = target_ec_lr.ptr;
+        defer target_ec_ref.unlockIrqRestore(target_ec_lr.irq_state);
 
         const ec_caps_word: u16 = Word0.caps(cd.user_table[target_slot].word0);
         const ec_caps: EcCaps = @bitCast(ec_caps_word);

@@ -96,9 +96,10 @@ pub fn createVar(
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
     const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0));
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr.irq_state);
 
     // Spec §[create_var] test 01: caller's self-handle must carry `crvr`.
     if (!self_caps.crvr) return errors.E_PERM;

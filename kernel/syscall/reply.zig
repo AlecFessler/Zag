@@ -73,9 +73,10 @@ pub fn reply(caller: *anyopaque, syscall_word: u64) i64 {
     const slot: u12 = @truncate(reply_handle);
 
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
     const entry_present = capability.resolveHandleOnDomain(cd, slot, .reply) != null;
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr.irq_state);
     if (!entry_present) return errors.E_BADCAP;
 
     return port.reply(ec, reply_handle);
@@ -142,7 +143,8 @@ pub fn replyTransfer(caller: *anyopaque, syscall_word: u64, n: u8) i64 {
     // handle* (per tests/reply_transfer_04 case B which uses
     // SLOT_SELF, an in-domain capability_domain entry).
     const cd_ref = ec.domain;
-    const cd_pre = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr_pre = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd_pre = lr_pre.ptr;
     const slot_occupied = capability.resolveHandleOnDomain(cd_pre, slot, null) != null;
     const reply_present = slot_occupied and
         capability.resolveHandleOnDomain(cd_pre, slot, .reply) != null;
@@ -152,7 +154,7 @@ pub fn replyTransfer(caller: *anyopaque, syscall_word: u64, n: u8) i64 {
         const reply_caps: ReplyCaps = @bitCast(caps_word);
         has_xfer = reply_caps.xfer;
     }
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr_pre.irq_state);
 
     // Test 01 — fires here iff the slot is unoccupied. An occupied
     // non-reply slot keeps going so test 04b can trip first.
@@ -199,13 +201,14 @@ pub fn replyTransfer(caller: *anyopaque, syscall_word: u64, n: u8) i64 {
     // port-layer install pass — capturing each source's ErasedSlabRef
     // here pins the underlying object across the upcoming reply ops
     // even if the source slot is later cleared on a `move = 1` path.
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr2 = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr2.ptr;
     if (validatePairEntrySources(cd, ec, pair_entries)) |err| {
         ec.pending_pair_count = 0;
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(lr2.irq_state);
         return err;
     }
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr2.irq_state);
 
     return port.replyTransfer(ec, reply_handle, n);
 }
@@ -324,14 +327,16 @@ pub fn ack(caller: *anyopaque, handle: u64) i64 {
     const slot: u12 = @truncate(handle);
 
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const cd_irq_state = lr.irq_state;
 
     const entry = capability.resolveHandleOnDomain(cd, slot, .device_region) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
     const dr_ref = capability.typedRef(DeviceRegion, entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
 
@@ -343,10 +348,11 @@ pub fn ack(caller: *anyopaque, handle: u64) i64 {
     const field1_kva: u64 = @intFromPtr(&cd.user_table[slot].field1);
     const field1_paddr = PAddr.fromInt(field1_kva);
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(cd_irq_state);
 
-    const dr = dr_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer dr_ref.unlock();
+    const drlr = dr_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const dr = drlr.ptr;
+    defer dr_ref.unlockIrqRestore(drlr.irq_state);
 
     const prior = device_region.ack(dr, field1_paddr);
     return @bitCast(prior);

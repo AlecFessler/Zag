@@ -133,8 +133,8 @@ pub const VirtualMemoryManager = struct {
     }
 
     pub fn findNode(self: *VirtualMemoryManager, vaddr: VAddr) ?SlabRef(VmNode) {
-        self.lock.lock(@src());
-        defer self.lock.unlock();
+        const irq = self.lock.lockIrqSave(@src());
+        defer self.lock.unlockIrqRestore(irq);
         return self.findNodeLocked(vaddr);
     }
 

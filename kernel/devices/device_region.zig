@@ -7,6 +7,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const irq = zag.arch.dispatch.irq;
 const secure_slab = zag.memory.allocators.secure_slab;
 const smp = zag.arch.dispatch.smp;
@@ -164,21 +165,23 @@ pub fn registerPortIo(base_port: u16, port_count: u16) !*DeviceRegion {
 /// through the standard `decHandleRef` which owns the teardown
 /// transition.
 pub fn releaseHandle(dr: *DeviceRegion) void {
-    dr._gen_lock.lock(@src());
-    decHandleRef(dr);
+    const irq_state = dr._gen_lock.lockIrqSave(@src());
+    decHandleRef(dr, irq_state);
 }
 
 /// Decrement the refcount. The decrementer-to-zero owns teardown:
 /// evicts the IRQ-table entry (if any), then destroys the slab slot.
-/// Caller must hold `dr._gen_lock`. On the zero-transition this
-/// function passes the held lock to `destroyLocked`, which bumps gen
-/// to the next even value and releases — avoiding the unlock/relock
-/// race window where a concurrent path could observe a still-odd gen.
-pub fn decHandleRef(dr: *DeviceRegion) void {
+/// Caller must hold `dr._gen_lock` (acquired via `lockIrqSave` and
+/// passing the captured IRQ state via `held_irq_state`). On the
+/// zero-transition this function passes the held lock to
+/// `destroyLocked`, which bumps gen to the next even value and
+/// releases — avoiding the unlock/relock race window where a
+/// concurrent path could observe a still-odd gen.
+pub fn decHandleRef(dr: *DeviceRegion, held_irq_state: u64) void {
     std.debug.assert(dr.refcount > 0);
     dr.refcount -= 1;
     if (dr.refcount != 0) {
-        dr._gen_lock.unlock();
+        dr._gen_lock.unlockIrqRestore(held_irq_state);
         return;
     }
 
@@ -192,6 +195,9 @@ pub fn decHandleRef(dr: *DeviceRegion) void {
 
     const gen = dr._gen_lock.currentGen();
     device_region_slab.destroyLocked(dr, gen);
+    // destroyLocked released the lock via setGenRelease without
+    // touching IRQ state — restore explicitly here.
+    arch.cpu.restoreInterrupts(held_irq_state);
 }
 
 /// O(1) reverse lookup keyed by the hardware IRQ source identifier the

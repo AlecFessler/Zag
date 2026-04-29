@@ -339,17 +339,19 @@ pub fn suspendFast(caller: *ExecutionContext, target: u64, port: u64) ?i64 {
     if (caller.vm != null) return null;
 
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return null;
+    const lr = cd_ref.lockIrqSave(@src()) catch return null;
+    const cd = lr.ptr;
+    const cd_irq_state = lr.irq_state;
 
     const target_slot: u12 = @truncate(target);
     const port_slot: u12 = @truncate(port);
 
     const target_entry = capability.resolveHandleOnDomain(cd, target_slot, .execution_context) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return null;
     };
     const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return null;
     };
 
@@ -357,32 +359,34 @@ pub fn suspendFast(caller: *ExecutionContext, target: u64, port: u64) ?i64 {
     // typed ref's ptr is the underlying object pointer; when it points
     // back at `caller` we can skip the cross-EC lock dance entirely.
     const target_ref = capability.typedRef(ExecutionContext, target_entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return null;
     };
     if (target_ref.ptr != caller) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return null;
     }
 
     const ec_caps: EcCaps = @bitCast(Word0.caps(cd.user_table[target_slot].word0));
     if (!ec_caps.susp) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return null;
     }
     const port_caps: PortCaps = @bitCast(Word0.caps(cd.user_table[port_slot].word0));
     if (!port_caps.bind) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return null;
     }
 
     const port_ref = capability.typedRef(Port, port_entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return null;
     };
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(cd_irq_state);
 
-    const p = port_ref.lock(@src()) catch return null;
+    const plr = port_ref.lockIrqSave(@src()) catch return null;
+    const p = plr.ptr;
+    const port_irq_state = plr.irq_state;
 
     // Only commit to the fast path when there's a receiver to hand off
     // to. The no-receiver branch (sender parks on the port) requires
@@ -390,7 +394,7 @@ pub fn suspendFast(caller: *ExecutionContext, target: u64, port: u64) ?i64 {
     // the slow path, so let the slow path own it — keeps this function
     // a single tight predicate→rendezvous path.
     if (p.waiter_kind != .receivers) {
-        port_ref.unlock();
+        port_ref.unlockIrqRestore(port_irq_state);
         return null;
     }
 
@@ -398,7 +402,7 @@ pub fn suspendFast(caller: *ExecutionContext, target: u64, port: u64) ?i64 {
     // the lock either directly (no-receiver path) or transitively via
     // `rendezvousWithReceiver` (success path, drops port before locking
     // receiver's CD to honor CD → Port).
-    return execution_context.suspendOnPort(caller, p, .suspension, 0, 0, ec_caps.write, ec_caps.read);
+    return execution_context.suspendOnPort(caller, p, .suspension, 0, 0, ec_caps.write, ec_caps.read, port_irq_state);
 }
 
 /// `suspend` syscall handler. Spec §[port].suspend.
@@ -410,43 +414,47 @@ pub fn suspendFast(caller: *ExecutionContext, target: u64, port: u64) ?i64 {
 /// so the two are interchangeable.
 pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const cd_irq_state = lr.irq_state;
 
     const target_slot: u12 = @truncate(target);
     const port_slot: u12 = @truncate(port);
 
     const target_entry = capability.resolveHandleOnDomain(cd, target_slot, .execution_context) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
     const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
 
     const ec_caps: EcCaps = @bitCast(Word0.caps(cd.user_table[target_slot].word0));
     if (!ec_caps.susp) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_PERM;
     }
 
     const target_ref = capability.typedRef(ExecutionContext, target_entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
     const port_ref = capability.typedRef(Port, port_entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(cd_irq_state);
 
-    const target_ec = target_ref.lock(@src()) catch return errors.E_BADCAP;
+    const tlr = target_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const target_ec = tlr.ptr;
+    const target_irq_state = tlr.irq_state;
     if (target_ec.vm != null) {
-        target_ref.unlock();
+        target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     }
     if (target_ec.state == .suspended_on_port) {
-        target_ref.unlock();
+        target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     }
     // Spec §[handle_attachments]: when the caller is suspending a
@@ -466,19 +474,20 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
         }
         caller.pending_pair_count = 0;
     }
-    target_ref.unlock();
+    target_ref.unlockIrqRestore(target_irq_state);
 
-    const p = port_ref.lock(@src()) catch return errors.E_BADCAP;
+    const plr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const p = plr.ptr;
     // `suspendOnPort` releases the port lock before returning (directly
     // on the no-receiver path, transitively via `rendezvousWithReceiver`
-    // on the success path) so we MUST NOT add `defer port_ref.unlock()`.
+    // on the success path) so we MUST NOT add `defer port_ref.unlockIrqRestore(...)`.
 
     // Snapshot the originating EC handle's `write` and `read` caps so
     // reply-time can decide whether receiver mutations apply (Spec
     // §[reply] tests 05/06) and so recv-time gates the suspended EC's
     // §[event_state] vregs 1..13 exposure (Spec §[suspend] test 10).
     // The caps were captured into `ec_caps` above under the domain lock.
-    return execution_context.suspendOnPort(target_ec, p, .suspension, 0, 0, ec_caps.write, ec_caps.read);
+    return execution_context.suspendOnPort(target_ec, p, .suspension, 0, 0, ec_caps.write, ec_caps.read, plr.irq_state);
 }
 
 /// `recv` syscall handler. Spec §[port].recv.
@@ -496,8 +505,9 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
 /// order note on `deliverEvent`.
 pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer cd_ref.unlock();
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    defer cd_ref.unlockIrqRestore(lr.irq_state);
 
     const port_slot: u12 = @truncate(port);
     const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse
@@ -505,11 +515,13 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     const port_ref = capability.typedRef(Port, port_entry.*) orelse
         return errors.E_BADCAP;
 
-    const p = port_ref.lock(@src()) catch return errors.E_BADCAP;
+    const plr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const p = plr.ptr;
+    const port_irq_state = plr.irq_state;
 
     if (p.waiter_kind == .senders) {
         const sender = popHighestPrioritySender(p) orelse {
-            port_ref.unlock();
+            port_ref.unlockIrqRestore(port_irq_state);
             return errors.E_CLOSED;
         };
         // Spec §[port].recv test 06: the receiver needs free slots
@@ -524,7 +536,7 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
             // it back so a future recv can match it.
             p.waiters.enqueue(sender);
             p.waiter_kind = .senders;
-            port_ref.unlock();
+            port_ref.unlockIrqRestore(port_irq_state);
             return errors.E_FULL;
         }
         // Drop the Port lock before deliverEvent — it needs receiver-CD
@@ -542,7 +554,7 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
         const port_caps_word: u16 = @truncate(Word0.caps(cd.user_table[port_slot].word0));
         const port_caps_typed: PortCaps = @bitCast(port_caps_word);
         const port_xfer = port_caps_typed.xfer;
-        port_ref.unlock();
+        port_ref.unlockIrqRestore(port_irq_state);
         return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, pair_count, port_xfer);
     }
 
@@ -550,7 +562,7 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     // bind-cap holders, no event_routes, and no events queued, return
     // E_CLOSED rather than blocking forever.
     if (p.send_refcount == 0 and p.event_route_count == 0) {
-        port_ref.unlock();
+        port_ref.unlockIrqRestore(port_irq_state);
         return errors.E_CLOSED;
     }
 
@@ -560,7 +572,7 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     // E_FULL up front rather than parking and discovering the failure
     // at rendezvous time (which would silently lose the wakeup).
     if (cd.free_count == 0) {
-        port_ref.unlock();
+        port_ref.unlockIrqRestore(port_irq_state);
         return errors.E_FULL;
     }
 
@@ -590,7 +602,7 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
         _ = addTimedRecvWaiter(caller);
     }
 
-    port_ref.unlock();
+    port_ref.unlockIrqRestore(port_irq_state);
 
     const core_id: u8 = @truncate(arch.smp.coreID());
     if (scheduler.coreCurrentIs(core_id, caller)) {
@@ -602,16 +614,18 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
 /// `reply` syscall handler. Spec §[reply].reply.
 pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const cd_irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(reply_handle);
     const entry = capability.resolveHandleOnDomain(cd, slot, .reply) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
 
     const sender_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
 
@@ -621,7 +635,7 @@ pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
 
     capability.clearAndFreeSlot(cd, slot, entry);
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(cd_irq_state);
 
     // Spec §[terminate] test 07: when terminate destroys the suspended
     // sender, it marks the reply handle's `abandoned` bit. Subsequent
@@ -685,19 +699,20 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     // discipline observed by `terminate` (which holds CD across an EC
     // lock and so registers the order CD → EC with lockdep). Holding
     // CD across an EC acquire here would otherwise invert that.
-    const cd_phase1 = caller_cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr_phase1 = caller_cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd_phase1 = lr_phase1.ptr;
     const entry = capability.resolveHandleOnDomain(cd_phase1, slot, .reply) orelse {
-        caller_cd_ref.unlock();
+        caller_cd_ref.unlockIrqRestore(lr_phase1.irq_state);
         return errors.E_BADCAP;
     };
     const sender_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
-        caller_cd_ref.unlock();
+        caller_cd_ref.unlockIrqRestore(lr_phase1.irq_state);
         return errors.E_BADCAP;
     };
     // Spec §[terminate] test 07: a reply handle whose suspended sender
     // was destroyed via terminate carries the `abandoned` bit.
     const reply_caps: ReplyCaps = @bitCast(Word0.caps(cd_phase1.user_table[slot].word0));
-    caller_cd_ref.unlock();
+    caller_cd_ref.unlockIrqRestore(lr_phase1.irq_state);
 
     if (reply_caps.abandoned) {
         // Spec §[reply_transfer] test 10 names E_TERM for the
@@ -708,11 +723,12 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
         // sender was destroyed via `terminate`, and reply_transfer
         // surfaces that as E_TERM. The reply slot is consumed in
         // either case so subsequent ops don't loop on the same id.
-        const cd_clear = caller_cd_ref.lock(@src()) catch return errors.E_TERM;
+        const cd_clear_lr = caller_cd_ref.lockIrqSave(@src()) catch return errors.E_TERM;
+        const cd_clear = cd_clear_lr.ptr;
         if (capability.resolveHandleOnDomain(cd_clear, slot, .reply)) |e| {
             capability.clearAndFreeSlot(cd_clear, slot, e);
         }
-        caller_cd_ref.unlock();
+        caller_cd_ref.unlockIrqRestore(cd_clear_lr.irq_state);
         caller.pending_pair_count = 0;
         return errors.E_TERM;
     }
@@ -724,26 +740,29 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     // the sender domain pointer doesn't dangle even with the EC lock
     // released. Holding the EC lock here while taking the CD lock
     // would invert the kernel-wide CD → EC order.
-    const sender = sender_ref.lock(@src()) catch {
-        const cd_clear = caller_cd_ref.lock(@src()) catch return errors.E_TERM;
+    const sender_lr = sender_ref.lockIrqSave(@src()) catch {
+        const cd_clear_lr = caller_cd_ref.lockIrqSave(@src()) catch return errors.E_TERM;
+        const cd_clear = cd_clear_lr.ptr;
         if (capability.resolveHandleOnDomain(cd_clear, slot, .reply)) |e| {
             capability.clearAndFreeSlot(cd_clear, slot, e);
         }
-        caller_cd_ref.unlock();
+        caller_cd_ref.unlockIrqRestore(cd_clear_lr.irq_state);
         caller.pending_pair_count = 0;
         return errors.E_TERM;
     };
+    const sender = sender_lr.ptr;
     const sender_cd_ref = sender.domain;
-    sender_ref.unlock();
+    sender_ref.unlockIrqRestore(sender_lr.irq_state);
 
     // Phase 3 — sender's CD: reserve N contiguous slots and install
     // each pair entry. CD-at-a-time: caller's CD is unlocked here, no
     // other lock is held.
-    const sender_cd = sender_cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const sender_cd_lr = sender_cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const sender_cd = sender_cd_lr.ptr;
     const tstart = capability_domain.allocContiguousFreeSlots(sender_cd, n) catch {
         // Test 11: [1] is NOT consumed and the caller's table is
         // unchanged on E_FULL.
-        sender_cd_ref.unlock();
+        sender_cd_ref.unlockIrqRestore(sender_cd_lr.irq_state);
         caller.pending_pair_count = 0;
         return errors.E_FULL;
     };
@@ -762,20 +781,22 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
             0,
         );
     }
-    sender_cd_ref.unlock();
+    sender_cd_ref.unlockIrqRestore(sender_cd_lr.irq_state);
 
     // Phase 4 — caller's CD: clear `move = 1` source slots and consume
     // the reply slot. Same single-CD-at-a-time pattern.
-    const cd_phase4 = caller_cd_ref.lock(@src()) catch {
+    const cd_phase4_lr = caller_cd_ref.lockIrqSave(@src()) catch {
         // Caller's CD is gone mid-transfer. The sender-side install
         // already committed; resume the sender so the test EC's death
         // doesn't strand a parked sender forever.
         caller.pending_pair_count = 0;
-        const sender2 = sender_ref.lock(@src()) catch return errors.OK;
-        defer sender_ref.unlock();
+        const sender2_lr = sender_ref.lockIrqSave(@src()) catch return errors.OK;
+        const sender2 = sender2_lr.ptr;
+        defer sender_ref.unlockIrqRestore(sender2_lr.irq_state);
         deliverReplyTransferResume(caller, sender2, n, tstart);
         return errors.OK;
     };
+    const cd_phase4 = cd_phase4_lr.ptr;
     k = 0;
     while (k < n) : (k += 1) {
         const stash = caller.pending_pair_entries[k];
@@ -788,7 +809,7 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     if (capability.resolveHandleOnDomain(cd_phase4, slot, .reply)) |reply_entry| {
         capability.clearAndFreeSlot(cd_phase4, slot, reply_entry);
     }
-    caller_cd_ref.unlock();
+    caller_cd_ref.unlockIrqRestore(cd_phase4_lr.irq_state);
 
     caller.pending_pair_count = 0;
 
@@ -799,8 +820,9 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     // the domain's lifetime, so they'll be reclaimed when the domain
     // dies). The reply handle is already consumed; surface OK so the
     // caller observes a clean transfer.
-    const sender2 = sender_ref.lock(@src()) catch return errors.OK;
-    defer sender_ref.unlock();
+    const sender2_lr = sender_ref.lockIrqSave(@src()) catch return errors.OK;
+    const sender2 = sender2_lr.ptr;
+    defer sender_ref.unlockIrqRestore(sender2_lr.irq_state);
     deliverReplyTransferResume(caller, sender2, n, tstart);
     return errors.OK;
 }
@@ -863,11 +885,16 @@ pub fn installEventRoute(ec: *ExecutionContext, port: *Port, slot_idx: u8) i64 {
         // positive. If the dec drove the prior port to teardown,
         // `destroyLocked` already released its lock — skip the
         // SlabRef-side unlock.
-        const prior = prior_ref.lockOrdered(PORT_REROUTE_GROUP, @src()) catch null;
-        if (prior) |pr| {
-            const destroyed = decEventRouteCount(pr);
-            if (!destroyed) prior_ref.unlock();
-        }
+        if (prior_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src())) |prior_lr| {
+            const destroyed = decEventRouteCount(prior_lr.ptr);
+            if (!destroyed) {
+                prior_ref.unlockIrqRestore(prior_lr.irq_state);
+            } else {
+                // Teardown path released the lock via setGenRelease without
+                // restoring IRQ state — do it manually here.
+                arch.cpu.restoreInterrupts(prior_lr.irq_state);
+            }
+        } else |_| {}
     }
     incEventRouteCount(port);
     ec.event_routes[slot_idx] = SlabRef(Port).init(port, port._gen_lock.currentGen());
@@ -891,12 +918,18 @@ const PORT_REROUTE_GROUP: u32 = 0x504F; // "PO"
 /// remaining holders.
 pub fn removeEventRoute(ec: *ExecutionContext, slot_idx: u8) i64 {
     const prior_ref = ec.event_routes[slot_idx] orelse return errors.E_NOENT;
-    const prior = prior_ref.lock(@src()) catch {
+    const prior_lr = prior_ref.lockIrqSave(@src()) catch {
         ec.event_routes[slot_idx] = null;
         return 0;
     };
-    const destroyed = decEventRouteCount(prior);
-    if (!destroyed) prior_ref.unlock();
+    const destroyed = decEventRouteCount(prior_lr.ptr);
+    if (!destroyed) {
+        prior_ref.unlockIrqRestore(prior_lr.irq_state);
+    } else {
+        // Teardown path released the lock via setGenRelease without
+        // restoring IRQ state — do it manually here.
+        arch.cpu.restoreInterrupts(prior_lr.irq_state);
+    }
     ec.event_routes[slot_idx] = null;
     return 0;
 }
@@ -914,10 +947,11 @@ fn fireRouted(
 ) bool {
     const slot_idx = execution_context.eventRouteSlot(event) orelse return false;
     const route_ref = ec.event_routes[slot_idx] orelse return false;
-    const port_ptr = route_ref.lock(@src()) catch return false;
+    const route_lr = route_ref.lockIrqSave(@src()) catch return false;
+    const port_ptr = route_lr.ptr;
     // `suspendOnPort` is responsible for releasing `port_ptr._gen_lock`
     // (it must drop Port before any receiver-CD acquisition to honor the
-    // canonical CD → Port order). We must NOT also `defer route_ref.unlock()`.
+    // canonical CD → Port order). We must NOT also `defer route_ref.unlockIrqRestore(...)`.
 
     // A route whose port has lost every bind-cap holder AND has no other
     // routes pointing at it survives only on the route's own increment.
@@ -934,7 +968,7 @@ fn fireRouted(
     // §[suspend] test 10 only zeroes the payload when the originating
     // handle explicitly lacks `read`, which the bind_event_route path
     // would record once plumbed through.
-    _ = execution_context.suspendOnPort(ec, port_ptr, event, subcode, addr, false, true);
+    _ = execution_context.suspendOnPort(ec, port_ptr, event, subcode, addr, false, true, route_lr.irq_state);
     return true;
 }
 
@@ -1014,9 +1048,10 @@ pub fn firePmuOverflow(ec: *ExecutionContext, counter_idx: u64) void {
 /// directly (not through `event_routes`). Spec §[vm_exit_state].
 pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
     const exit_port_ref = ec.exit_port orelse return;
-    const port_ptr = exit_port_ref.lock(@src()) catch return;
+    const exit_lr = exit_port_ref.lockIrqSave(@src()) catch return;
+    const port_ptr = exit_lr.ptr;
     // `suspendOnPort` releases the port lock before returning — see its
-    // contract. Do NOT add `defer exit_port_ref.unlock()` here.
+    // contract. Do NOT add `defer exit_port_ref.unlockIrqRestore(...)` here.
 
     // Stash payload[3] on the vCPU's arch state so `port.deliverEvent`
     // (and the rendezvous resume path) can pick it up at delivery time
@@ -1032,7 +1067,7 @@ pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
     // §[vm_exit_state] vregs are exposed and reply mutations are
     // committed back; per-vCPU cap-snapshot wiring lands when the
     // VMM-side handle is captured at create_vcpu time.
-    _ = execution_context.suspendOnPort(ec, port_ptr, .vm_exit, subcode, payload[0], true, true);
+    _ = execution_context.suspendOnPort(ec, port_ptr, .vm_exit, subcode, payload[0], true, true, exit_lr.irq_state);
 }
 
 // ── Internal API ─────────────────────────────────────────────────────
@@ -1134,12 +1169,17 @@ fn onHandleRelease(p: *Port, caps: u16) bool {
 /// Public release-handle entry point invoked from the cross-cutting
 /// `caps.capability.delete` path. Wraps `onHandleRelease`.
 pub fn releaseHandle(p: *Port, caps: u16) void {
-    p._gen_lock.lock(@src());
+    const irq_state = p._gen_lock.lockIrqSave(@src());
     const destroyed = onHandleRelease(p, caps);
     // `decSendRefcount`/`decRecvRefcount` already released the lock via
-    // `destroyLocked` on the teardown transition; only unlock when no
-    // decrement drove the port through teardown.
-    if (!destroyed) p._gen_lock.unlock();
+    // `destroyLocked` on the teardown transition. The teardown path bumps
+    // gen via setGenRelease without touching IRQ state, so restore it
+    // explicitly here. Otherwise `unlockIrqRestore` does both.
+    if (!destroyed) {
+        p._gen_lock.unlockIrqRestore(irq_state);
+    } else {
+        arch.cpu.restoreInterrupts(irq_state);
+    }
 }
 
 /// Wait queue ops — assert empty or matching kind, transition kind
@@ -1356,6 +1396,7 @@ pub fn rendezvousWithReceiver(
     event_type: EventType,
     subcode: u8,
     event_addr: u64,
+    port_irq_state: u64,
 ) bool {
     const receiver = popHighestPriorityReceiver(p) orelse return false;
     receiver.event_type = .none;
@@ -1376,9 +1417,9 @@ pub fn rendezvousWithReceiver(
     // acquisition would re-introduce the AB-BA cycle that lockdep
     // catches against the `delete → releaseHandle` path.
     const receiver_dom_ref = receiver.domain;
-    p._gen_lock.unlock();
+    p._gen_lock.unlockIrqRestore(port_irq_state);
 
-    const dom = receiver_dom_ref.lock(@src()) catch {
+    const domlr = receiver_dom_ref.lockIrqSave(@src()) catch {
         // Receiver's CD was torn down between the pop and our lock —
         // the receiver itself is doomed via the same teardown. Drop
         // the rendezvous; the sender remains parked (state already set
@@ -1386,7 +1427,8 @@ pub fn rendezvousWithReceiver(
         // port's last refcount drops, or be reaped at sender teardown.
         return true;
     };
-    defer receiver_dom_ref.unlock();
+    const dom = domlr.ptr;
+    defer receiver_dom_ref.unlockIrqRestore(domlr.irq_state);
 
     _ = deliverEvent(
         sender,

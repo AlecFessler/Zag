@@ -2795,10 +2795,17 @@ fn walkBody(
                 while (op_end < code.len and isIdentChar(code[op_end])) op_end += 1;
                 const op_name = code[op_start..op_end];
                 const is_lock = mem.eql(u8, op_name, "lock") or
-                    mem.eql(u8, op_name, "lockOrdered");
-                const is_unlock = mem.eql(u8, op_name, "unlock");
+                    mem.eql(u8, op_name, "lockOrdered") or
+                    mem.eql(u8, op_name, "lockIrqSave") or
+                    mem.eql(u8, op_name, "lockIrqSaveOrdered") or
+                    mem.eql(u8, op_name, "lockOrderedIrqSave");
+                const is_unlock = mem.eql(u8, op_name, "unlock") or
+                    mem.eql(u8, op_name, "unlockIrqRestore");
                 const is_lwg = mem.eql(u8, op_name, "lockWithGen") or
-                    mem.eql(u8, op_name, "lockWithGenOrdered");
+                    mem.eql(u8, op_name, "lockWithGenOrdered") or
+                    mem.eql(u8, op_name, "lockWithGenIrqSave") or
+                    mem.eql(u8, op_name, "lockWithGenIrqSaveOrdered") or
+                    mem.eql(u8, op_name, "lockWithGenOrderedIrqSave");
                 if ((is_lock or is_unlock or is_lwg) and env.map.contains(ident)) {
                     const is_defer = isDeferFor(code, ident);
                     const is_errdefer = !is_defer and isErrdeferFor(code, ident);
@@ -2821,32 +2828,53 @@ fn walkBody(
         }
 
         // SlabRef form: `ident.lock()` / `ident.unlock()` /
-        // `ident.lockOrdered()`. The Ordered variant is a lockdep escape
-        // for genuinely-independent same-class instances; for lock-op
-        // tracking purposes it is identical to plain `lock`.
+        // `ident.lockOrdered()` / IrqSave variants. The Ordered and
+        // IrqSave variants are lockdep / IRQ-discipline escapes; for
+        // lock-op tracking purposes they are identical to plain
+        // `lock` / `unlock`.
         {
             var pos: usize = 0;
             while (pos < code.len) {
                 const lock_p = mem.indexOf(u8, code[pos..], ".lock(");
                 const unlock_p = mem.indexOf(u8, code[pos..], ".unlock(");
                 const lock_ord_p = mem.indexOf(u8, code[pos..], ".lockOrdered(");
+                const lock_irq_p = mem.indexOf(u8, code[pos..], ".lockIrqSave(");
+                const lock_ord_irq_p = mem.indexOf(u8, code[pos..], ".lockOrderedIrqSave(");
+                const unlock_irq_p = mem.indexOf(u8, code[pos..], ".unlockIrqRestore(");
                 var hit: ?usize = null;
                 var op_name: []const u8 = "";
                 var skip: usize = 0;
                 // Pick whichever candidate appears earliest in the
                 // remaining slice. `.lock(` is a substring of
-                // `.lockOrdered(` so a naive `.lock(` match would
-                // misclassify the Ordered variant; preferring the
+                // `.lockOrdered(` / `.lockIrqSave(` / `.lockOrderedIrqSave(`
+                // and `.unlock(` is a substring of `.unlockIrqRestore(`,
+                // so a naive `.lock(` / `.unlock(` match would
+                // misclassify the longer variants; preferring the
                 // earlier (and longer when tied) match keeps each
                 // call site classified exactly once.
                 var earliest: usize = std.math.maxInt(usize);
                 if (lock_p) |p| earliest = @min(earliest, p);
                 if (unlock_p) |p| earliest = @min(earliest, p);
                 if (lock_ord_p) |p| earliest = @min(earliest, p);
-                if (lock_ord_p != null and lock_ord_p.? == earliest) {
+                if (lock_irq_p) |p| earliest = @min(earliest, p);
+                if (lock_ord_irq_p) |p| earliest = @min(earliest, p);
+                if (unlock_irq_p) |p| earliest = @min(earliest, p);
+                if (lock_ord_irq_p != null and lock_ord_irq_p.? == earliest) {
+                    hit = pos + lock_ord_irq_p.?;
+                    op_name = "lock";
+                    skip = ".lockOrderedIrqSave(".len;
+                } else if (lock_ord_p != null and lock_ord_p.? == earliest) {
                     hit = pos + lock_ord_p.?;
                     op_name = "lock";
                     skip = ".lockOrdered(".len;
+                } else if (lock_irq_p != null and lock_irq_p.? == earliest) {
+                    hit = pos + lock_irq_p.?;
+                    op_name = "lock";
+                    skip = ".lockIrqSave(".len;
+                } else if (unlock_irq_p != null and unlock_irq_p.? == earliest) {
+                    hit = pos + unlock_irq_p.?;
+                    op_name = "unlock";
+                    skip = ".unlockIrqRestore(".len;
                 } else if (lock_p != null and lock_p.? == earliest and
                     (unlock_p == null or lock_p.? <= unlock_p.?))
                 {
@@ -3005,7 +3033,12 @@ fn walkBody(
                                 if (!isAtomicMethodAt(code, cursor)) {
                                     const skip_as_lock =
                                         env.fat.contains(ident) and
-                                        (mem.eql(u8, tail, "lock") or mem.eql(u8, tail, "unlock")) and
+                                        (mem.eql(u8, tail, "lock") or
+                                            mem.eql(u8, tail, "unlock") or
+                                            mem.eql(u8, tail, "lockOrdered") or
+                                            mem.eql(u8, tail, "lockIrqSave") or
+                                            mem.eql(u8, tail, "lockOrderedIrqSave") or
+                                            mem.eql(u8, tail, "unlockIrqRestore")) and
                                         te < code.len and code[te] == '(';
                                     if (!skip_as_lock) {
                                         if (te < code.len and code[te] == '(') {

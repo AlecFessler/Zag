@@ -142,28 +142,31 @@ pub const ErasedSlabRef = extern struct {
     /// Reconstitute a typed `SlabRef(T)` and acquire its gen-lock.
     /// Returns `StaleHandle` if the slot has been freed since this
     /// reference was minted, or null on a structurally-empty link
-    /// (`ptr == null`). Caller pairs with `unlockTyped`.
-    pub fn lockTyped(self: ErasedSlabRef, comptime T: type) secure_slab.AccessError!*T {
+    /// IRQ-saving typed lock. Reconstructs the typed `SlabRef(T)` from
+    /// the erased fat pointer, then takes its gen-lock with IRQs masked.
+    /// Caller pairs with `unlockTypedIrqRestore` and threads the
+    /// returned IRQ state back.
+    pub fn lockTypedIrqSave(self: ErasedSlabRef, comptime T: type) secure_slab.AccessError!struct { ptr: *T, irq_state: u64 } {
         const raw = self.ptr orelse return error.StaleHandle;
         const ref = secure_slab.SlabRef(T){
             .ptr = @ptrCast(@alignCast(raw)),
             .gen = self.gen,
             ._pad = self._pad,
         };
-        return ref.lock(@src());
+        const lr = try ref.lockIrqSave(@src());
+        return .{ .ptr = lr.ptr, .irq_state = lr.irq_state };
     }
 
-    /// Release the lock acquired via `lockTyped`. Idempotent across
-    /// the typed/erased boundary — the underlying GenLock is identified
-    /// by `ptr` only.
-    pub fn unlockTyped(self: ErasedSlabRef, comptime T: type) void {
+    /// Release the lock acquired via `lockTypedIrqSave`. Restores the
+    /// captured IRQ state.
+    pub fn unlockTypedIrqRestore(self: ErasedSlabRef, comptime T: type, irq_state: u64) void {
         const raw = self.ptr orelse return;
         const ref = secure_slab.SlabRef(T){
             .ptr = @ptrCast(@alignCast(raw)),
             .gen = self.gen,
             ._pad = self._pad,
         };
-        ref.unlock();
+        ref.unlockIrqRestore(irq_state);
     }
 };
 
@@ -295,8 +298,9 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer cd_ref.unlock();
+    const cd_lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = cd_lr.ptr;
+    defer cd_ref.unlockIrqRestore(cd_lr.irq_state);
 
     const slot: u12 = @truncate(handle);
     const entry = resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
@@ -353,8 +357,9 @@ pub fn sync(caller: *anyopaque, handle: u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer cd_ref.unlock();
+    const cd_lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = cd_lr.ptr;
+    defer cd_ref.unlockIrqRestore(cd_lr.irq_state);
 
     const slot: u12 = @truncate(handle);
     const entry = resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
@@ -454,8 +459,9 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
             // the suspended sender is still waiting, resume them
             // with E_ABANDONED. Release handle."
             const ref = typedRef(ExecutionContext, entry.*) orelse return;
-            const sender = ref.lock(@src()) catch return;
-            defer ref.unlock();
+            const sender_lr = ref.lockIrqSave(@src()) catch return;
+            const sender = sender_lr.ptr;
+            defer ref.unlockIrqRestore(sender_lr.irq_state);
             port.resumeWithAbandoned(sender);
         },
         .virtual_machine => {

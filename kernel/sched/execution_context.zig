@@ -487,8 +487,9 @@ pub fn initSlab(
 /// `1..15` error range.
 pub fn self(caller: *ExecutionContext) i64 {
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer cd_ref.unlock();
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    defer cd_ref.unlockIrqRestore(lr.irq_state);
 
     var slot: u16 = 0;
     while (slot < capability.MAX_HANDLES_PER_DOMAIN) {
@@ -562,30 +563,32 @@ pub fn parkSelfFaulted(ec: *ExecutionContext) void {
 
 pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const cd_irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(target);
     const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
 
     const worker_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
 
     // Verify the slot still references a live EC. If the gen lock
     // refuses (slot's referenced EC was already destroyed), evict
     // the stale entry and surface E_TERM (spec test 05/06).
-    _ = worker_ref.lock(@src()) catch {
+    const wlr = worker_ref.lockIrqSave(@src()) catch {
         capability.clearAndFreeSlot(cd, slot, entry);
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_TERM;
     };
-    worker_ref.unlock();
+    worker_ref.unlockIrqRestore(wlr.irq_state);
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(cd_irq_state);
 
     destroyExecutionContext(worker_ref.ptr);
     return errors.OK;
@@ -626,35 +629,38 @@ pub fn setPriority(caller: *ExecutionContext, target: u64, new_priority: u64) i6
     if (new_priority > 3) return errors.E_INVAL;
 
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const cd_irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(target);
     const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
 
     const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
 
-    const target_ec = target_ref.lock(@src()) catch {
+    const tlr = target_ref.lockIrqSave(@src()) catch {
         // Stale handle — target EC was terminated. Evict the slot from
         // the caller's table and surface E_TERM (spec test 05).
         capability.clearAndFreeSlot(cd, slot, entry);
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_TERM;
     };
+    const target_ec = tlr.ptr;
 
     const new_pri: Priority = @enumFromInt(@as(u2, @intCast(new_priority)));
     target_ec.priority = new_pri;
-    target_ref.unlock();
+    target_ref.unlockIrqRestore(tlr.irq_state);
 
     // Refresh the handle's field0 snapshot (priority is bits 0-1).
     cd.user_table[slot].field0 = (cd.user_table[slot].field0 & ~@as(u64, 0x3)) | @intFromEnum(new_pri);
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(cd_irq_state);
     return errors.OK;
 }
 
@@ -679,35 +685,38 @@ pub fn setPriority(caller: *ExecutionContext, target: u64, new_priority: u64) i6
 /// next enqueue picks it up.
 pub fn setAffinity(caller: *ExecutionContext, target: u64, new_affinity: u64) i64 {
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const cd_irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(target);
     const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
 
     const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
 
-    const target_ec = target_ref.lock(@src()) catch {
+    const tlr = target_ref.lockIrqSave(@src()) catch {
         // Stale handle — target EC was terminated. Evict the slot from
         // the caller's table and surface E_TERM (spec test 05).
         capability.clearAndFreeSlot(cd, slot, entry);
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_TERM;
     };
+    const target_ec = tlr.ptr;
 
     target_ec.affinity = new_affinity;
-    target_ref.unlock();
+    target_ref.unlockIrqRestore(tlr.irq_state);
 
     // Refresh the handle's field1 snapshot (affinity occupies bits
     // 0-63 of field1).
     cd.user_table[slot].field1 = new_affinity;
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(cd_irq_state);
     return errors.OK;
 }
 
@@ -775,31 +784,35 @@ fn perfmonStartInner(caller: *ExecutionContext, target: u64, num_configs: u8, co
     // Resolve the target EC. The syscall wrapper has already validated
     // that the slot is a valid EC handle.
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const cd_irq_state = lr.irq_state;
     const slot: u12 = @truncate(target);
     const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
     const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
-    const target_ec = target_ref.lock(@src()) catch {
-        cd_ref.unlock();
+    const tlr = target_ref.lockIrqSave(@src()) catch {
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
-    cd_ref.unlock();
+    const target_ec = tlr.ptr;
+    const target_irq_state = tlr.irq_state;
+    cd_ref.unlockIrqRestore(cd_irq_state);
 
     // Spec test 07: target must be the calling EC OR currently suspended.
     if (target_ec != caller and target_ec.state != .suspended_on_port) {
-        target_ref.unlock();
+        target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_BUSY;
     }
 
     // Lazy-allocate per-EC PerfmonState and program hardware.
     const ps = ensurePerfmonState(target_ec) catch {
-        target_ref.unlock();
+        target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_NOMEM;
     };
 
@@ -848,7 +861,7 @@ fn perfmonStartInner(caller: *ExecutionContext, target: u64, num_configs: u8, co
     } else {
         arch.pmu.pmuConfigureState(&ps.arch_state, decoded[0..pair_count]);
     }
-    target_ref.unlock();
+    target_ref.unlockIrqRestore(target_irq_state);
     if (program_err) return errors.E_INVAL;
     return errors.OK;
 }
@@ -862,38 +875,44 @@ pub fn perfmonRead(caller: *ExecutionContext, target: u64) i64 {
 
 fn perfmonReadInner(caller: *ExecutionContext, target: u64) i64 {
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const cd_irq_state = lr.irq_state;
     const slot: u12 = @truncate(target);
     const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
     const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
-    const target_ec = target_ref.lock(@src()) catch {
-        cd_ref.unlock();
+    const tlr = target_ref.lockIrqSave(@src()) catch {
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
-    cd_ref.unlock();
+    const target_ec = tlr.ptr;
+    const target_irq_state = tlr.irq_state;
+    cd_ref.unlockIrqRestore(cd_irq_state);
 
     // Spec test 03: perfmon was not started on the target EC.
     const ps_ref = target_ec.perfmon_state orelse {
-        target_ref.unlock();
+        target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     };
 
     // Spec test 04: target must be the calling EC OR currently suspended.
     if (target_ec != caller and target_ec.state != .suspended_on_port) {
-        target_ref.unlock();
+        target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_BUSY;
     }
 
-    const ps = ps_ref.lock(@src()) catch {
-        target_ref.unlock();
+    const pslr = ps_ref.lockIrqSave(@src()) catch {
+        target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     };
+    const ps = pslr.ptr;
+    const ps_irq_state = pslr.irq_state;
 
     // For the calling EC the hardware counters are running live; the
     // cached `ps.arch_state.values` was last refreshed by the most
@@ -928,8 +947,8 @@ fn perfmonReadInner(caller: *ExecutionContext, target: u64) i64 {
     }
     arch.syscall.setEventStateGprs(caller.ctx, gprs);
 
-    ps_ref.unlock();
-    target_ref.unlock();
+    ps_ref.unlockIrqRestore(ps_irq_state);
+    target_ref.unlockIrqRestore(target_irq_state);
     // Return value sets vreg 1 (rax). gprs[0] above wrote vreg 1 too,
     // but the syscall epilogue overwrites rax with this return —
     // both paths agree on `sample.counters[0]`.
@@ -945,39 +964,45 @@ pub fn perfmonStop(caller: *ExecutionContext, target: u64) i64 {
 
 fn perfmonStopInner(caller: *ExecutionContext, target: u64) i64 {
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const cd_irq_state = lr.irq_state;
     const slot: u12 = @truncate(target);
     const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
     const target_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
-    const target_ec = target_ref.lock(@src()) catch {
-        cd_ref.unlock();
+    const tlr = target_ref.lockIrqSave(@src()) catch {
+        cd_ref.unlockIrqRestore(cd_irq_state);
         return errors.E_BADCAP;
     };
-    cd_ref.unlock();
+    const target_ec = tlr.ptr;
+    const target_irq_state = tlr.irq_state;
+    cd_ref.unlockIrqRestore(cd_irq_state);
 
     // Spec test 03: perfmon was not started on the target EC.
     if (target_ec.perfmon_state == null) {
-        target_ref.unlock();
+        target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     }
 
     // Spec test 04: target must be the calling EC OR currently suspended.
     if (target_ec != caller and target_ec.state != .suspended_on_port) {
-        target_ref.unlock();
+        target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_BUSY;
     }
 
     const ps_ref = target_ec.perfmon_state.?;
-    const ps = ps_ref.lock(@src()) catch {
-        target_ref.unlock();
+    const pslr = ps_ref.lockIrqSave(@src()) catch {
+        target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     };
+    const ps = pslr.ptr;
+    const ps_irq_state = pslr.irq_state;
     if (target_ec == caller) {
         arch.pmu.pmuStop(&ps.arch_state);
     } else {
@@ -985,9 +1010,9 @@ fn perfmonStopInner(caller: *ExecutionContext, target: u64) i64 {
     }
     ps.active_counters = 0;
     ps.has_threshold = 0;
-    ps_ref.unlock();
+    ps_ref.unlockIrqRestore(ps_irq_state);
     releasePerfmonState(target_ec);
-    target_ref.unlock();
+    target_ref.unlockIrqRestore(target_irq_state);
     return errors.OK;
 }
 
@@ -1000,8 +1025,9 @@ fn perfmonStopInner(caller: *ExecutionContext, target: u64) i64 {
 fn refreshHandleSnapshot(caller: *ExecutionContext, target: u64) void {
     if (target & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return;
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return;
-    defer cd_ref.unlock();
+    const lr = cd_ref.lockIrqSave(@src()) catch return;
+    const cd = lr.ptr;
+    defer cd_ref.unlockIrqRestore(lr.irq_state);
     const slot: u12 = @truncate(target);
     const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse return;
     capability.refreshSnapshot(cd, slot, entry);
@@ -1025,12 +1051,14 @@ const PERFMON_CONFIG_RESERVED_MASK: u64 = ~(PERFMON_CONFIG_EVENT_MASK | PERFMON_
 /// ec enqueued on port wait queue) must be identical to what the fast
 /// path produces, so the two are interchangeable.
 ///
-/// Lock contract: caller MUST hold `port._gen_lock` on entry.
-/// `suspendOnPort` ALWAYS releases that lock before returning — either
-/// directly (no-receiver path) or transitively via
+/// Lock contract: caller MUST hold `port._gen_lock` (acquired via
+/// `lockIrqSave*`) on entry, passing the captured IRQ state through
+/// `irq_state`. `suspendOnPort` ALWAYS releases that lock before
+/// returning — either directly (no-receiver path) or transitively via
 /// `rendezvousWithReceiver` (which drops Port before locking the
-/// receiver's CD to honor the canonical CD → Port order). Callers
-/// must NOT keep their own `defer port_ref.unlock()`.
+/// receiver's CD to honor the canonical CD → Port order). Both release
+/// paths use `unlockIrqRestore(irq_state)`. Callers must NOT keep
+/// their own `defer port_ref.unlockIrqRestore(...)`.
 pub fn suspendOnPort(
     ec: *ExecutionContext,
     port: *Port,
@@ -1039,9 +1067,10 @@ pub fn suspendOnPort(
     addr: u64,
     originating_write_cap: bool,
     originating_read_cap: bool,
+    irq_state: u64,
 ) i64 {
     if (ec.vm != null and event != .vm_exit) {
-        port._gen_lock.unlock();
+        port._gen_lock.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
     std.debug.assert(ec.state == .running or ec.state == .ready);
@@ -1086,7 +1115,7 @@ pub fn suspendOnPort(
     // path so it can take the receiver's CD lock without inverting the
     // canonical CD → Port order. On `false` it leaves Port held.
     if (port.waiter_kind == .receivers) {
-        if (zag.sched.port.rendezvousWithReceiver(ec, port, event, subcode, addr)) {
+        if (zag.sched.port.rendezvousWithReceiver(ec, port, event, subcode, addr, irq_state)) {
             const core_id: u8 = @truncate(arch.smp.coreID());
             if (scheduler.coreCurrentIs(core_id, ec)) {
                 scheduler.clearCurrentEc(core_id);
@@ -1107,7 +1136,7 @@ pub fn suspendOnPort(
     if (scheduler.coreCurrentIs(core_id, ec)) {
         scheduler.clearCurrentEc(core_id);
     }
-    port._gen_lock.unlock();
+    port._gen_lock.unlockIrqRestore(irq_state);
     return 0;
 }
 
@@ -1148,8 +1177,9 @@ pub fn abandonPendingReply(ec: *ExecutionContext) void {
         // Re-validate the domain through the SlabRef before mutating
         // its user_table — terminate may race against destroy of the
         // receiver's domain.
-        if (dom_ref.lock(@src())) |dom| {
-            defer dom_ref.unlock();
+        if (dom_ref.lockIrqSave(@src())) |domlr| {
+            const dom = domlr.ptr;
+            defer dom_ref.unlockIrqRestore(domlr.irq_state);
             const slot = ec.pending_reply_slot;
             const word0 = dom.user_table[slot].word0;
             const tag = zag.caps.capability.Word0.typeTag(word0);
@@ -1410,11 +1440,12 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
         scheduler.removeFromQueue(ec);
     } else if (ec.state == .suspended_on_port) {
         if (ec.suspend_port) |port_ref| {
-            const port_ptr = port_ref.lock(@src()) catch null;
-            if (port_ptr) |p| {
+            const portlr = port_ref.lockIrqSave(@src()) catch null;
+            if (portlr) |plr| {
+                const p = plr.ptr;
                 _ = p.waiters.remove(ec);
                 if (p.waiters.isEmpty()) p.waiter_kind = .none;
-                port_ref.unlock();
+                port_ref.unlockIrqRestore(plr.irq_state);
             }
         }
     }
@@ -1453,11 +1484,12 @@ pub fn destroyExecutionContext(ec: *ExecutionContext) void {
         scheduler.removeFromQueue(ec);
     } else if (ec.state == .suspended_on_port) {
         if (ec.suspend_port) |port_ref| {
-            const port_ptr = port_ref.lock(@src()) catch null;
-            if (port_ptr) |p| {
+            const portlr = port_ref.lockIrqSave(@src()) catch null;
+            if (portlr) |plr| {
+                const p = plr.ptr;
                 _ = p.waiters.remove(ec);
                 if (p.waiters.isEmpty()) p.waiter_kind = .none;
-                port_ref.unlock();
+                port_ref.unlockIrqRestore(plr.irq_state);
             }
         }
     }
@@ -1471,8 +1503,9 @@ pub fn destroyExecutionContext(ec: *ExecutionContext) void {
     }
 
     const dom_root = blk: {
-        const d = ec.domain.lock(@src()) catch break :blk null;
-        defer ec.domain.unlock();
+        const dlr = ec.domain.lockIrqSave(@src()) catch break :blk null;
+        const d = dlr.ptr;
+        defer ec.domain.unlockIrqRestore(dlr.irq_state);
         break :blk d.addr_space_root;
     };
 
@@ -1492,9 +1525,9 @@ pub fn destroyExecutionContext(ec: *ExecutionContext) void {
 /// Lazy-allocate `perfmon_state` on first perfmon_start.
 fn ensurePerfmonState(ec: *ExecutionContext) !*PerfmonState {
     if (ec.perfmon_state) |ref| {
-        const p = ref.lock(@src()) catch unreachable;
-        ref.unlock();
-        return p;
+        const reflr = ref.lockIrqSave(@src()) catch unreachable;
+        ref.unlockIrqRestore(reflr.irq_state);
+        return reflr.ptr;
     }
     const ref = try perfmon_mod.slab_instance.create();
     ec.perfmon_state = ref;

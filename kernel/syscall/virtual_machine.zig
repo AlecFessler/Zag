@@ -73,7 +73,8 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
 
     const self_word0 = cd.user_table[0].word0;
     const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(self_word0));
@@ -82,7 +83,7 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
     const pf_slot: u12 = @truncate(policy_page_frame);
     const pf_resolved = capability.resolveHandleOnDomain(cd, pf_slot, .page_frame) != null;
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr.irq_state);
 
     if (!self_caps.crvm) return errors.E_PERM;
 
@@ -165,7 +166,8 @@ pub fn createVcpu(
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
 
     const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(cd.user_table[0].word0));
     // pri ceiling lives in the self-handle's caps word, bits 14-15
@@ -185,7 +187,7 @@ pub fn createVcpu(
         @as(u16, 0);
     const port_caps: PortCaps = @bitCast(port_caps_word);
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr.irq_state);
 
     if (!self_caps.crec) return errors.E_PERM;
     if (@as(u8, requested_pri) > @as(u8, pri_ceiling)) return errors.E_PERM;
@@ -226,12 +228,13 @@ pub fn mapGuest(caller: *anyopaque, vm: u64, pairs: []const u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
 
     const vm_slot: u12 = @truncate(vm);
     const vm_resolved = capability.resolveHandleOnDomain(cd, vm_slot, .virtual_machine) != null;
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr.irq_state);
 
     if (!vm_resolved) return errors.E_BADCAP;
 
@@ -261,12 +264,13 @@ pub fn unmapGuest(caller: *anyopaque, vm: u64, page_frames: []const u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
 
     const vm_slot: u12 = @truncate(vm);
     const vm_resolved = capability.resolveHandleOnDomain(cd, vm_slot, .virtual_machine) != null;
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr.irq_state);
 
     if (!vm_resolved) return errors.E_BADCAP;
 
@@ -305,7 +309,8 @@ pub fn vmSetPolicy(caller: *anyopaque, syscall_word: u64, vm: u64, entries: []co
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
 
     const vm_slot: u12 = @truncate(vm);
     const vm_entry = capability.resolveHandleOnDomain(cd, vm_slot, .virtual_machine);
@@ -315,7 +320,7 @@ pub fn vmSetPolicy(caller: *anyopaque, syscall_word: u64, vm: u64, entries: []co
         @as(u16, 0);
     const vm_caps: VmCaps = @bitCast(vm_caps_word);
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr.irq_state);
 
     if (vm_entry == null) return errors.E_BADCAP;
     if (!vm_caps.policy) return errors.E_PERM;
@@ -351,12 +356,13 @@ pub fn vmInjectIrq(caller: *anyopaque, vm: u64, irq_num: u64, assert: u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
 
     const vm_slot: u12 = @truncate(vm);
     const vm_resolved = capability.resolveHandleOnDomain(cd, vm_slot, .virtual_machine) != null;
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(lr.irq_state);
 
     if (!vm_resolved) return errors.E_BADCAP;
 

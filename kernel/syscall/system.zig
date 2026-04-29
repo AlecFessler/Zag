@@ -371,8 +371,9 @@ fn doPowerAction(caller: *anyopaque, action: PowerAction) i64 {
 fn readSelfCaps(caller: *anyopaque) ?CapabilityDomainCaps {
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return null;
-    defer cd_ref.unlock();
+    const lr = cd_ref.lockIrqSave(@src()) catch return null;
+    const cd = lr.ptr;
+    defer cd_ref.unlockIrqRestore(lr.irq_state);
     const caps_bits = Word0.caps(cd.user_table[0].word0);
     return @bitCast(caps_bits);
 }

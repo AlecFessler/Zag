@@ -310,8 +310,8 @@ pub fn mapPf(caller: *ExecutionContext, var_handle: u64, pairs: []const u64) i64
     const slot: u12 = @truncate(var_handle & 0xFFF);
     const v = resolveVar(domain, slot) orelse return errors.E_BADCAP;
 
-    v._gen_lock.lock(@src());
-    defer v._gen_lock.unlock();
+    const v_irq = v._gen_lock.lockIrqSave(@src());
+    defer v._gen_lock.unlockIrqRestore(v_irq);
     defer refreshVarSnapshot(domain, slot, v);
 
     const caps_word: u16 = Word0.caps(domain.user_table[slot].word0);
@@ -411,8 +411,8 @@ pub fn mapMmio(caller: *ExecutionContext, var_handle: u64, device_region: u64) i
     const var_slot: u12 = @truncate(var_handle & 0xFFF);
     const v = resolveVar(domain, var_slot) orelse return errors.E_BADCAP;
 
-    v._gen_lock.lock(@src());
-    defer v._gen_lock.unlock();
+    const v_irq = v._gen_lock.lockIrqSave(@src());
+    defer v._gen_lock.unlockIrqRestore(v_irq);
     defer refreshVarSnapshot(domain, var_slot, v);
 
     const caps_word: u16 = Word0.caps(domain.user_table[var_slot].word0);
@@ -474,8 +474,8 @@ pub fn unmap(caller: *ExecutionContext, var_handle: u64, selectors: []const u64)
     const slot: u12 = @truncate(var_handle & 0xFFF);
     const v = resolveVar(domain, slot) orelse return errors.E_BADCAP;
 
-    v._gen_lock.lock(@src());
-    defer v._gen_lock.unlock();
+    const v_irq = v._gen_lock.lockIrqSave(@src());
+    defer v._gen_lock.unlockIrqRestore(v_irq);
     defer refreshVarSnapshot(domain, slot, v);
 
     if (v.map == .unmapped) return errors.E_INVAL;
@@ -531,8 +531,8 @@ pub fn remap(caller: *ExecutionContext, var_handle: u64, new_cur_rwx: u64) i64 {
     const slot: u12 = @truncate(var_handle & 0xFFF);
     const v = resolveVar(domain, slot) orelse return errors.E_BADCAP;
 
-    v._gen_lock.lock(@src());
-    defer v._gen_lock.unlock();
+    const v_irq = v._gen_lock.lockIrqSave(@src());
+    defer v._gen_lock.unlockIrqRestore(v_irq);
     defer refreshVarSnapshot(domain, slot, v);
 
     if (v.map == .unmapped or v.map == .mmio) return errors.E_INVAL;
@@ -623,8 +623,8 @@ pub fn snapshot(caller: *ExecutionContext, target_var: u64, source_var: u64) i64
     if (t_caps.restart_policy != @intFromEnum(RestartPolicy.snapshot)) return errors.E_INVAL;
     if (s_caps.restart_policy != @intFromEnum(RestartPolicy.preserve)) return errors.E_INVAL;
 
-    target._gen_lock.lock(@src());
-    defer target._gen_lock.unlock();
+    const target_irq = target._gen_lock.lockIrqSave(@src());
+    defer target._gen_lock.unlockIrqRestore(target_irq);
 
     const t_size = @as(u64, target.page_count) * pageSizeBytes(target.sz);
     const s_size = @as(u64, source.page_count) * pageSizeBytes(source.sz);
@@ -647,8 +647,8 @@ pub fn idcRead(caller: *ExecutionContext, var_handle: u64, offset: u64, count: u
     const var_caps: VarCaps = @bitCast(caps_word);
     if (!var_caps.r) return errors.E_PERM;
 
-    v._gen_lock.lock(@src());
-    defer v._gen_lock.unlock();
+    const v_irq = v._gen_lock.lockIrqSave(@src());
+    defer v._gen_lock.unlockIrqRestore(v_irq);
 
     const sz_bytes = pageSizeBytes(v.sz);
     const var_size = @as(u64, v.page_count) * sz_bytes;
@@ -719,8 +719,8 @@ pub fn idcWrite(
     const var_caps: VarCaps = @bitCast(caps_word);
     if (!var_caps.w) return errors.E_PERM;
 
-    v._gen_lock.lock(@src());
-    defer v._gen_lock.unlock();
+    const v_irq = v._gen_lock.lockIrqSave(@src());
+    defer v._gen_lock.unlockIrqRestore(v_irq);
 
     const sz_bytes = pageSizeBytes(v.sz);
     const var_size = @as(u64, v.page_count) * sz_bytes;
@@ -1086,8 +1086,8 @@ fn demandAlloc(v: *VAR, offset: u64) i64 {
 /// in `domain` and dispatches per `map`. Spec §[var] demand transition.
 pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx: u3) i64 {
     const v = findVarCovering(domain, fault_vaddr) orelse return errors.E_BADADDR;
-    v._gen_lock.lock(@src());
-    defer v._gen_lock.unlock();
+    const v_irq = v._gen_lock.lockIrqSave(@src());
+    defer v._gen_lock.unlockIrqRestore(v_irq);
 
     if ((access_rwx & ~v.cur_rwx) != 0) return errors.E_PERM;
 

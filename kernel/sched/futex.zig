@@ -189,8 +189,9 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         // — the EC cannot have been freed while this node is still in
         // our bucket. The gen-locked SlabRef is for tooling uniformity
         // and the implicit liveness assertion.
-        const ec = node.ec.lock(@src()) catch continue;
-        node.ec.unlock();
+        const ec_lr = node.ec.lockIrqSave(@src()) catch continue;
+        const ec = ec_lr.ptr;
+        node.ec.unlockIrqRestore(ec_lr.irq_state);
 
         // wake_index is the offset of this node in the EC's
         // wait_nodes array — the index of the address in the original

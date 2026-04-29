@@ -151,7 +151,9 @@ pub fn createCapabilityDomain(
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const irq_state = lr.irq_state;
 
     // CRCD lives in the self-handle's cap word at slot 0. Lock the
     // domain just long enough to read the cap and validate the elf
@@ -160,7 +162,7 @@ pub fn createCapabilityDomain(
     const self_caps_word = Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0);
     const self_caps: CapabilityDomainCaps = @bitCast(self_caps_word);
     if (!self_caps.crcd) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
 
@@ -171,7 +173,7 @@ pub fn createCapabilityDomain(
     // monotonic-rights invariant.
     const requested_self_caps: u16 = @truncate(caps & 0xFFFF);
     if (requested_self_caps & ~self_caps_word != 0) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
 
@@ -205,7 +207,7 @@ pub fn createCapabilityDomain(
         requested_var_rmax > caller_var_rmax or
         (requested_bools & ~caller_bools) != 0)
     {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
 
@@ -221,13 +223,13 @@ pub fn createCapabilityDomain(
     const caller_port_ceiling: u8 = @truncate((caller_field0 >> 56) & 0xFF);
     const requested_port_ceiling: u8 = @truncate((ceilings_inner >> 48) & 0xFF);
     if (requested_port_ceiling & ~caller_port_ceiling != 0) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
 
     const elf_slot: u12 = @truncate(elf_pf_slot);
     if (capability.resolveHandleOnDomain(cd, elf_slot, .page_frame) == null) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
 
@@ -243,12 +245,12 @@ pub fn createCapabilityDomain(
         if (entry == 0) break;
         const src_slot: u12 = @truncate(entry & 0xFFF);
         if (capability.resolveHandleOnDomain(cd, src_slot, null) == null) {
-            cd_ref.unlock();
+            cd_ref.unlockIrqRestore(irq_state);
             return errors.E_BADCAP;
         }
     }
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(irq_state);
 
     return capability_domain.createCapabilityDomain(
         ec,
@@ -338,11 +340,13 @@ fn acquireDispatch(caller: *anyopaque, target: u64, kind: AcquireKind) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(target);
     if (capability.resolveHandleOnDomain(cd, slot, .capability_domain) == null) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
 
@@ -351,7 +355,7 @@ fn acquireDispatch(caller: *anyopaque, target: u64, kind: AcquireKind) i64 {
         .aqec => idc_caps.aqec,
         .aqvr => idc_caps.aqvr,
     };
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(irq_state);
     if (!has_cap) return errors.E_PERM;
 
     return switch (kind) {

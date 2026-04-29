@@ -38,6 +38,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const capability = zag.caps.capability;
 const capability_domain = zag.capdom.capability_domain;
 const errors = zag.syscall.errors;
@@ -77,12 +78,13 @@ pub fn revoke(caller_domain: ErasedSlabRef, handle: u64) i64 {
 
     const slot: u12 = @truncate(handle);
 
-    tree_mutex.lock(@src());
-    defer tree_mutex.unlock();
+    const tree_irq = tree_mutex.lockIrqSave(@src());
+    defer tree_mutex.unlockIrqRestore(tree_irq);
 
-    const cd = caller_domain.lockTyped(CapabilityDomain) catch
+    const cd_lr = caller_domain.lockTypedIrqSave(CapabilityDomain) catch
         return errors.E_BADCAP;
-    defer caller_domain.unlockTyped(CapabilityDomain);
+    const cd = cd_lr.ptr;
+    defer caller_domain.unlockTypedIrqRestore(CapabilityDomain, cd_lr.irq_state);
 
     const entry = capability.resolveHandleOnDomain(cd, slot, null) orelse
         return errors.E_BADCAP;
@@ -104,11 +106,12 @@ pub fn revoke(caller_domain: ErasedSlabRef, handle: u64) i64 {
 /// copy-derivation tree, runs the per-type release, and clears the
 /// slot.
 pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
-    tree_mutex.lock(@src());
-    defer tree_mutex.unlock();
+    const tree_irq = tree_mutex.lockIrqSave(@src());
+    defer tree_mutex.unlockIrqRestore(tree_irq);
 
-    const cd = caller_domain.lockTyped(CapabilityDomain) catch
+    const cd_lr = caller_domain.lockTypedIrqSave(CapabilityDomain) catch
         return errors.E_BADCAP;
+    const cd = cd_lr.ptr;
 
     // SLOT_SELF special case. The slot's type tag is
     // `.capability_domain_self` — `capability.releaseHandle` routes to
@@ -120,15 +123,17 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
     // memory are unsafe to touch:
     //   - `clearAndFreeSlot` writes to `holder.user_table[slot]` (freed
     //     PMM block) and `&holder.kernel_table[slot]` (freed PMM block).
-    //   - The deferred `unlockTyped` would assert `prev & 1 == 1` on a
-    //     gen-lock word whose lock bit was just cleared by
-    //     `destroyLocked` — assertion failure on debug builds.
-    // Bypass both for slot 0.
+    //   - The deferred `unlockTypedIrqRestore` would assert
+    //     `prev & 1 == 1` on a gen-lock word whose lock bit was just
+    //     cleared by `destroyLocked` — assertion failure on debug builds.
+    // Bypass both for slot 0; restore the captured IRQ state manually
+    // so the kernel does not return to userspace with IRQs disabled.
     if (slot == 0) {
         capability.releaseHandle(cd, slot, undefined);
+        arch.cpu.restoreInterrupts(cd_lr.irq_state);
         return 0;
     }
-    defer caller_domain.unlockTyped(CapabilityDomain);
+    defer caller_domain.unlockTypedIrqRestore(CapabilityDomain, cd_lr.irq_state);
 
     const entry = capability.resolveHandleOnDomain(cd, slot, null) orelse
         return errors.E_BADCAP;
@@ -206,9 +211,15 @@ fn detachForDelete(
 /// `unlockEntrySkip` can release the same lock + apply the same
 /// `held` skip rule. The actual `*CapabilityDomain` stays internal to
 /// `lockEntrySkip`'s walk; callers reach the entry through `.entry`.
+/// `irq_state` carries the IRQ state captured at acquire time when a
+/// fresh gen-lock was taken (i.e. `same_held == false`); it is
+/// undefined when the held-skip rule applied (the caller already
+/// holds an outer lockIrqSave).
 const LockedEntry = struct {
     dom_ref: ErasedSlabRef,
     entry: *KernelHandle,
+    irq_state: u64 = 0,
+    same_held: bool = false,
 };
 
 /// Lock the holder domain of a tree link and return a pointer to the
@@ -222,26 +233,28 @@ fn lockEntrySkip(link: HandleLink, held: ?*CapabilityDomain) ?LockedEntry {
     if (link.domain.ptr == null) return null;
 
     const same_held = held != null and link.domain.ptr == @as(*anyopaque, @ptrCast(held.?));
-    const dom: *CapabilityDomain = if (same_held)
-        held.?
-    else
-        (link.domain.lockTyped(CapabilityDomain) catch return null);
+    var irq_state: u64 = 0;
+    const dom: *CapabilityDomain = if (same_held) held.? else blk: {
+        const lr = link.domain.lockTypedIrqSave(CapabilityDomain) catch return null;
+        irq_state = lr.irq_state;
+        break :blk lr.ptr;
+    };
 
     if (@as(u16, link.slot) >= capability.MAX_HANDLES_PER_DOMAIN) {
-        if (!same_held) link.domain.unlockTyped(CapabilityDomain);
+        if (!same_held) link.domain.unlockTypedIrqRestore(CapabilityDomain, irq_state);
         return null;
     }
     const entry = &dom.kernel_table[@as(u12, @intCast(link.slot))];
     if (entry.ref.ptr == null) {
-        if (!same_held) link.domain.unlockTyped(CapabilityDomain);
+        if (!same_held) link.domain.unlockTypedIrqRestore(CapabilityDomain, irq_state);
         return null;
     }
-    return .{ .dom_ref = link.domain, .entry = entry };
+    return .{ .dom_ref = link.domain, .entry = entry, .irq_state = irq_state, .same_held = same_held };
 }
 
 fn unlockEntrySkip(le: LockedEntry, held: ?*CapabilityDomain) void {
     if (held != null and le.dom_ref.ptr == @as(*anyopaque, @ptrCast(held.?))) return;
-    le.dom_ref.unlockTyped(CapabilityDomain);
+    le.dom_ref.unlockTypedIrqRestore(CapabilityDomain, le.irq_state);
 }
 
 /// Walk a sibling chain rooted at `head`, releasing each subtree DFS.
@@ -270,11 +283,16 @@ fn popSibling(head: *HandleLink, caller_dom: *CapabilityDomain) ?HandleLink {
     if (popped.domain.ptr == null) return null;
 
     const same_caller = popped.domain.ptr == @as(*anyopaque, @ptrCast(caller_dom));
-    const dom: *CapabilityDomain = if (same_caller) caller_dom else (popped.domain.lockTyped(CapabilityDomain) catch {
-        head.* = .{};
-        return null;
-    });
-    defer if (!same_caller) popped.domain.unlockTyped(CapabilityDomain);
+    var popped_irq_state: u64 = 0;
+    const dom: *CapabilityDomain = if (same_caller) caller_dom else blk: {
+        const lr = popped.domain.lockTypedIrqSave(CapabilityDomain) catch {
+            head.* = .{};
+            return null;
+        };
+        popped_irq_state = lr.irq_state;
+        break :blk lr.ptr;
+    };
+    defer if (!same_caller) popped.domain.unlockTypedIrqRestore(CapabilityDomain, popped_irq_state);
 
     if (@as(u16, popped.slot) >= capability.MAX_HANDLES_PER_DOMAIN) {
         head.* = .{};
@@ -302,8 +320,13 @@ fn releaseSubtree(root: HandleLink, caller_dom: *CapabilityDomain) void {
     if (root.domain.ptr == null) return;
 
     const same_caller = root.domain.ptr == @as(*anyopaque, @ptrCast(caller_dom));
-    const dom: *CapabilityDomain = if (same_caller) caller_dom else (root.domain.lockTyped(CapabilityDomain) catch return);
-    defer if (!same_caller) root.domain.unlockTyped(CapabilityDomain);
+    var root_irq_state: u64 = 0;
+    const dom: *CapabilityDomain = if (same_caller) caller_dom else blk: {
+        const lr = root.domain.lockTypedIrqSave(CapabilityDomain) catch return;
+        root_irq_state = lr.irq_state;
+        break :blk lr.ptr;
+    };
+    defer if (!same_caller) root.domain.unlockTypedIrqRestore(CapabilityDomain, root_irq_state);
 
     if (@as(u16, root.slot) >= capability.MAX_HANDLES_PER_DOMAIN) return;
     const slot: u12 = @intCast(root.slot);

@@ -111,16 +111,18 @@ pub fn createExecutionContext(
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const irq_state = lr.irq_state;
 
     const self_caps_word = Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0);
     const self_caps: CapabilityDomainCaps = @bitCast(self_caps_word);
     if (!self_caps.crec) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
     if (requested_priority > self_caps.pri) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
 
@@ -141,7 +143,7 @@ pub fn createExecutionContext(
     if (target == 0) {
         const new_caps_low: u8 = @truncate(new_caps & 0xFF);
         if (new_caps_low & ~ec_inner_ceiling != 0) {
-            cd_ref.unlock();
+            cd_ref.unlockIrqRestore(irq_state);
             return errors.E_PERM;
         }
     }
@@ -157,7 +159,7 @@ pub fn createExecutionContext(
     const requested_restart_policy: u2 = @truncate((new_caps >> 8) & 0x3);
     const ec_restart_max: u2 = @truncate((cd.user_table[SELF_HANDLE_SLOT].field1 >> 16) & 0x3);
     if (requested_restart_policy > ec_restart_max) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
 
@@ -168,26 +170,25 @@ pub fn createExecutionContext(
     // surface only exercises the self-IDC shape (slot 2 minted by the
     // runner points back at the caller's own domain), so for now bail
     // E_BADCAP on a non-self-IDC to keep the unimplemented path loud.
-    var target_cd: *CapabilityDomain = cd;
     if (target != 0) {
         const idc_slot: u12 = @truncate(target);
         const idc_entry = capability.resolveHandleOnDomain(cd, idc_slot, .capability_domain) orelse {
-            cd_ref.unlock();
+            cd_ref.unlockIrqRestore(irq_state);
             return errors.E_BADCAP;
         };
         const idc_caps: IdcCaps = @bitCast(Word0.caps(cd.user_table[idc_slot].word0));
         if (!idc_caps.crec) {
-            cd_ref.unlock();
+            cd_ref.unlockIrqRestore(irq_state);
             return errors.E_PERM;
         }
 
         const target_ref_ptr = idc_entry.ref.ptr orelse {
-            cd_ref.unlock();
+            cd_ref.unlockIrqRestore(irq_state);
             return errors.E_BADCAP;
         };
-        target_cd = @ptrCast(@alignCast(target_ref_ptr));
-        if (target_cd != cd) {
-            cd_ref.unlock();
+        const target_cd_ptr: *CapabilityDomain = @ptrCast(@alignCast(target_ref_ptr));
+        if (target_cd_ptr != cd) {
+            cd_ref.unlockIrqRestore(irq_state);
             return errors.E_BADCAP;
         }
 
@@ -197,26 +198,29 @@ pub fn createExecutionContext(
         // with zeros in 8-15, so any cap bit at index 8 or above is
         // outside it — except `restart_policy` (bits 8-9) which is
         // bounded by the caller's `restart_policy_ceiling` above.
-        const ec_outer_ceiling: u16 = @truncate(target_cd.user_table[0].field1 & 0xFF);
+        // (target_cd == cd is enforced just above; read through `cd`
+        // so the gen-lock analyzer can verify the access is covered
+        // by the live cd_ref lock.)
+        const ec_outer_ceiling: u16 = @truncate(cd.user_table[0].field1 & 0xFF);
         const restart_policy_mask: u16 = 0b11 << 8;
         if ((new_caps & ~ec_outer_ceiling) & ~restart_policy_mask != 0) {
-            cd_ref.unlock();
+            cd_ref.unlockIrqRestore(irq_state);
             return errors.E_PERM;
         }
 
         // Spec §[execution_context] test 05: target_caps must be a
         // subset of the target domain's `ec_inner_ceiling` (self-handle
         // field0 bits 0-7). Same 16-bit-extension rule as test 04.
-        const ec_inner_ceiling_target: u16 = @truncate(target_cd.user_table[0].field0 & 0xFF);
+        const ec_inner_ceiling_target: u16 = @truncate(cd.user_table[0].field0 & 0xFF);
         if ((target_caps & ~ec_inner_ceiling_target) & ~restart_policy_mask != 0) {
-            cd_ref.unlock();
+            cd_ref.unlockIrqRestore(irq_state);
             return errors.E_PERM;
         }
     }
 
     const priority_enum: Priority = @enumFromInt(requested_priority);
     const new_ec = execution_context.allocExecutionContext(
-        target_cd,
+        cd,
         VAddr.fromInt(entry),
         @intCast(stack_pages),
         affinity_mask,
@@ -224,7 +228,7 @@ pub fn createExecutionContext(
         null,
         null,
     ) catch {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_NOMEM;
     };
 
@@ -249,7 +253,7 @@ pub fn createExecutionContext(
                 0,
                 0,
             ) catch {
-                cd_ref.unlock();
+                cd_ref.unlockIrqRestore(irq_state);
                 return errors.E_FULL;
             };
         }
@@ -261,7 +265,7 @@ pub fn createExecutionContext(
             0,
             0,
         ) catch {
-            cd_ref.unlock();
+            cd_ref.unlockIrqRestore(irq_state);
             return errors.E_FULL;
         };
     };
@@ -274,26 +278,27 @@ pub fn createExecutionContext(
 
     // Target-side handle (only when [4] != 0). Spec test 12 mandates
     // the target domain receives an additional handle with caps =
-    // `target_caps`. With self-IDC the target domain is `cd` itself,
-    // so use mintHandleAlwaysNew to allocate a fresh slot rather than
+    // `target_caps`. With self-IDC the target domain is `cd` itself
+    // (cross-domain target_cd != cd is bailed E_BADCAP above), so use
+    // mintHandleAlwaysNew on `cd` to allocate a fresh slot rather than
     // coalescing onto the caller-side handle just minted above.
     if (target != 0) {
         const target_slot = capability_domain.mintHandleAlwaysNew(
-            target_cd,
+            cd,
             new_ec_ref,
             .execution_context,
             target_caps,
             0,
             0,
         ) catch {
-            cd_ref.unlock();
+            cd_ref.unlockIrqRestore(irq_state);
             return errors.E_FULL;
         };
-        target_cd.user_table[target_slot].field0 = @intFromEnum(priority_enum);
-        target_cd.user_table[target_slot].field1 = affinity_mask;
+        cd.user_table[target_slot].field0 = @intFromEnum(priority_enum);
+        cd.user_table[target_slot].field1 = affinity_mask;
     }
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(irq_state);
 
     // Enqueue the new EC on a core that satisfies its affinity mask so
     // it becomes runnable. Without this enqueue, a yield targeting the
@@ -368,16 +373,18 @@ pub fn terminate(caller: *anyopaque, target: u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(target);
     if (capability.resolveHandleOnDomain(cd, slot, .execution_context) == null) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
 
     const ec_caps: EcCaps = @bitCast(Word0.caps(cd.user_table[slot].word0));
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(irq_state);
     if (!ec_caps.term) return errors.E_PERM;
 
     return execution_context.terminate(ec, target);
@@ -483,17 +490,19 @@ pub fn priority(caller: *anyopaque, target: u64, new_priority: u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(target);
     if (capability.resolveHandleOnDomain(cd, slot, .execution_context) == null) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
 
     const ec_caps: EcCaps = @bitCast(Word0.caps(cd.user_table[slot].word0));
     const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0));
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(irq_state);
 
     if (!ec_caps.spri) return errors.E_PERM;
     if (new_priority > self_caps.pri) return errors.E_PERM;
@@ -534,16 +543,18 @@ pub fn affinity(caller: *anyopaque, target: u64, new_affinity: u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(target);
     if (capability.resolveHandleOnDomain(cd, slot, .execution_context) == null) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
 
     const ec_caps: EcCaps = @bitCast(Word0.caps(cd.user_table[slot].word0));
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(irq_state);
     if (!ec_caps.saff) return errors.E_PERM;
 
     return execution_context.setAffinity(ec, target, new_affinity);
@@ -586,10 +597,12 @@ pub fn affinity(caller: *anyopaque, target: u64, new_affinity: u64) i64 {
 pub fn perfmonInfo(caller: *anyopaque) i64 {
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    const irq_state = lr.irq_state;
 
     const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0));
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(irq_state);
     if (!self_caps.pmu) return errors.E_PERM;
 
     return execution_context.perfmonInfo(ec);
@@ -698,20 +711,22 @@ fn checkPmuTarget(caller: *anyopaque, target: u64) PmuResolveError!*ExecutionCon
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return error.BadHandle;
+    const lr = cd_ref.lockIrqSave(@src()) catch return error.BadHandle;
+    const cd = lr.ptr;
+    const irq_state = lr.irq_state;
 
     const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0));
     if (!self_caps.pmu) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return error.NoPmuCap;
     }
 
     const slot: u12 = @truncate(target);
     if (capability.resolveHandleOnDomain(cd, slot, .execution_context) == null) {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(irq_state);
         return error.BadHandle;
     }
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(irq_state);
 
     return ec;
 }

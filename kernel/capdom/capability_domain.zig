@@ -476,8 +476,9 @@ fn patchInitialIretFrame(
 ///     spawns a multi-EC domain through acquire_ecs.
 pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer cd_ref.unlock();
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    defer cd_ref.unlockIrqRestore(lr.irq_state);
 
     // Re-resolve the IDC handle's referenced domain. acquireDispatch
     // already validated the slot's type tag and the aqec cap; we need
@@ -615,8 +616,9 @@ inline fn packHandleWord(slot: u12, caps_word: u16) u64 {
 /// are excluded — see §[acquire_vars] [test 07].
 pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer cd_ref.unlock();
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    defer cd_ref.unlockIrqRestore(lr.irq_state);
 
     // Re-resolve the IDC handle's referenced domain. acquireDispatch
     // already validated the slot's type tag and the aqvr cap.

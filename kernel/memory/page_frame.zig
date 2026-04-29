@@ -10,6 +10,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const capability = zag.caps.capability;
 const capability_domain = zag.capdom.capability_domain;
 const errors = zag.syscall.errors;
@@ -207,17 +208,19 @@ fn destroyPageFrame(pf: *PageFrame) void {
 /// Handle delete: decrement refcount under `_gen_lock`; if both
 /// refcount and mapcnt are zero, calls `destroyPageFrame`.
 fn decHandleRef(pf: *PageFrame) void {
-    pf._gen_lock.lock(@src());
+    const irq = pf._gen_lock.lockIrqSave(@src());
     if (pf.refcount > 0) pf.refcount -= 1;
     const reached_zero = pf.refcount == 0 and pf.mapcnt == 0;
     if (!reached_zero) {
-        pf._gen_lock.unlock();
+        pf._gen_lock.unlockIrqRestore(irq);
         return;
     }
     // Lock stays held — destroyPageFrame routes through
     // SecureSlab.destroyLocked which expects the gen-lock held and
-    // releases it as part of the gen bump.
+    // releases it as part of the gen bump. The teardown bumps gen via
+    // setGenRelease without restoring IRQ state; do it manually here.
     destroyPageFrame(pf);
+    arch.cpu.restoreInterrupts(irq);
 }
 
 /// Public release-handle entry point invoked from the cross-cutting

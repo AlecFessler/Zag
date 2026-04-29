@@ -127,7 +127,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     // wanted, gate it on a runtime flag rather than a default-on log.
 
     const dom_ref = ec.domain;
-    const dom = dom_ref.lock(@src()) catch {
+    const dom_lr = dom_ref.lockIrqSave(@src()) catch {
         // Domain torn down between exception entry and here — fire
         // memory_fault so the no-route fallback retires the EC.
         port.fireMemoryFault(ec, @intFromEnum(MemoryFaultSubcode.unmapped), faulting_virt.addr);
@@ -139,9 +139,10 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         if (scheduler.currentEc() == null) scheduler.run();
         return;
     };
+    const dom = dom_lr.ptr;
 
     const rc = var_range.handlePageFault(dom, faulting_virt, accessRwx(is_write, is_exec));
-    dom_ref.unlock();
+    dom_ref.unlockIrqRestore(dom_lr.irq_state);
 
     // Spec v3 var_range.handlePageFault returns 0 on a resolved fault
     // (demand alloc, MMIO/port-IO virtualization, etc.). Any non-zero

@@ -11,6 +11,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const arch_smp = zag.arch.dispatch.smp;
 const capability = zag.caps.capability;
 const cd_mod = zag.capdom.capability_domain;
@@ -138,8 +139,9 @@ pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64
 
     const requested_caps: u16 = @truncate(caps);
 
-    const domain = caller.domain.lock(@src()) catch return errors.E_BADCAP;
-    defer caller.domain.unlock();
+    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const domain = dlr.ptr;
+    defer caller.domain.unlockIrqRestore(dlr.irq_state);
 
     // Spec: handle is non-transferable, exactly one per domain.
     if (domain.vm != null) return errors.E_FULL;
@@ -228,8 +230,9 @@ pub fn createVcpu(
     const requested_caps: u16 = @truncate(caps);
     const requested_priority: Priority = @enumFromInt(@as(u2, @truncate((caps >> 32) & 0x3)));
 
-    const domain = caller.domain.lock(@src()) catch return errors.E_BADCAP;
-    defer caller.domain.unlock();
+    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const domain = dlr.ptr;
+    defer caller.domain.unlockIrqRestore(dlr.irq_state);
 
     const self_caps_struct: cd_mod.CapabilityDomainCaps = @bitCast(readSelfCaps(domain));
     if (!self_caps_struct.crec) return errors.E_PERM;
@@ -288,8 +291,9 @@ pub fn mapGuest(caller: *ExecutionContext, vm_handle: u64, pairs: []const u64) i
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
     if (pairs.len == 0 or pairs.len % 2 != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.lock(@src()) catch return errors.E_BADCAP;
-    defer caller.domain.unlock();
+    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const domain = dlr.ptr;
+    defer caller.domain.unlockIrqRestore(dlr.irq_state);
 
     const vm = lookupVirtualMachine(domain, @truncate(vm_handle)) orelse
         return errors.E_BADCAP;
@@ -348,8 +352,9 @@ pub fn unmapGuest(caller: *ExecutionContext, vm_handle: u64, page_frames: []cons
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
     if (page_frames.len == 0) return errors.E_INVAL;
 
-    const domain = caller.domain.lock(@src()) catch return errors.E_BADCAP;
-    defer caller.domain.unlock();
+    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const domain = dlr.ptr;
+    defer caller.domain.unlockIrqRestore(dlr.irq_state);
 
     const vm = lookupVirtualMachine(domain, @truncate(vm_handle)) orelse
         return errors.E_BADCAP;
@@ -377,8 +382,9 @@ pub fn vmInjectIrq(
 ) i64 {
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.lock(@src()) catch return errors.E_BADCAP;
-    defer caller.domain.unlock();
+    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const domain = dlr.ptr;
+    defer caller.domain.unlockIrqRestore(dlr.irq_state);
 
     const slot: u12 = @truncate(vm_handle);
     const vm = lookupVirtualMachine(domain, slot) orelse return errors.E_BADCAP;
@@ -408,8 +414,9 @@ pub fn applyVmPolicyTable(
 ) i64 {
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.lock(@src()) catch return errors.E_BADCAP;
-    defer caller.domain.unlock();
+    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const domain = dlr.ptr;
+    defer caller.domain.unlockIrqRestore(dlr.irq_state);
 
     const slot: u12 = @truncate(vm_handle);
     _ = lookupHandle(domain, slot, .virtual_machine) orelse return errors.E_BADCAP;
@@ -677,35 +684,39 @@ fn pageFramePerms(caps_bits: PageFrameCaps) MemoryPerms {
 /// the lock so the gen-bump on slot release cannot race with a
 /// concurrent acquire.
 fn incPageFrameRef(pf: *PageFrame) void {
-    pf._gen_lock.lock(@src());
-    defer pf._gen_lock.unlock();
+    const irq = pf._gen_lock.lockIrqSave(@src());
+    defer pf._gen_lock.unlockIrqRestore(irq);
     pf.refcount +|= 1;
 }
 
 fn decPageFrameRef(pf: *PageFrame) void {
-    pf._gen_lock.lock(@src());
+    const irq = pf._gen_lock.lockIrqSave(@src());
     if (pf.refcount > 0) pf.refcount -= 1;
     if (pf.refcount == 0 and pf.mapcnt == 0) {
         destroyPageFrame(pf);
+        // Teardown released the lock via setGenRelease without
+        // restoring IRQ state — restore manually here.
+        arch.cpu.restoreInterrupts(irq);
         return;
     }
-    pf._gen_lock.unlock();
+    pf._gen_lock.unlockIrqRestore(irq);
 }
 
 fn incPageFrameMap(pf: *PageFrame) void {
-    pf._gen_lock.lock(@src());
-    defer pf._gen_lock.unlock();
+    const irq = pf._gen_lock.lockIrqSave(@src());
+    defer pf._gen_lock.unlockIrqRestore(irq);
     pf.mapcnt +|= 1;
 }
 
 fn decPageFrameMap(pf: *PageFrame) void {
-    pf._gen_lock.lock(@src());
+    const irq = pf._gen_lock.lockIrqSave(@src());
     if (pf.mapcnt > 0) pf.mapcnt -= 1;
     if (pf.refcount == 0 and pf.mapcnt == 0) {
         destroyPageFrame(pf);
+        arch.cpu.restoreInterrupts(irq);
         return;
     }
-    pf._gen_lock.unlock();
+    pf._gen_lock.unlockIrqRestore(irq);
 }
 
 /// Final teardown — caller has observed both `refcount` and `mapcnt`

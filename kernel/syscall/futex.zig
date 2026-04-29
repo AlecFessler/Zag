@@ -25,8 +25,9 @@ const MAX_PAIRS: usize = zag.sched.execution_context.MAX_FUTEX_ADDRS_PER_EC;
 /// 8-byte field. (Capability slots are 24 bytes and never straddle
 /// a page boundary, so a single page walk suffices.)
 fn resolveCallerVa(caller: *ExecutionContext, vaddr: u64) ?PAddr {
-    const dom = caller.domain.lock(@src()) catch return null;
-    defer caller.domain.unlock();
+    const lr = caller.domain.lockIrqSave(@src()) catch return null;
+    const dom = lr.ptr;
+    defer caller.domain.unlockIrqRestore(lr.irq_state);
     const PAGE_MASK: u64 = 0xFFF;
     const page_base = paging.resolveVaddr(
         dom.addr_space_root,
@@ -39,8 +40,9 @@ fn resolveCallerVa(caller: *ExecutionContext, vaddr: u64) ?PAddr {
 /// 32-37) from the caller's domain self-handle. Spec §[capability_domain]
 /// outer-ceiling encoding.
 fn readSelfFutWaitMax(domain_ref: SlabRef(CapabilityDomain)) u8 {
-    const dom = domain_ref.lock(@src()) catch return 0;
-    defer domain_ref.unlock();
+    const lr = domain_ref.lockIrqSave(@src()) catch return 0;
+    const dom = lr.ptr;
+    defer domain_ref.unlockIrqRestore(lr.irq_state);
     const f1 = dom.user_table[0].field1;
     return @truncate((f1 >> 32) & 0x3F);
 }
@@ -48,8 +50,9 @@ fn readSelfFutWaitMax(domain_ref: SlabRef(CapabilityDomain)) u8 {
 /// Read the slot-0 self-handle `fut_wake` cap bit. Spec §[capability_domain]
 /// self-handle cap layout — `fut_wake` at bit 11 of the cap word.
 fn readSelfHasFutWake(domain_ref: SlabRef(CapabilityDomain)) bool {
-    const dom = domain_ref.lock(@src()) catch return false;
-    defer domain_ref.unlock();
+    const lr = domain_ref.lockIrqSave(@src()) catch return false;
+    const dom = lr.ptr;
+    defer domain_ref.unlockIrqRestore(lr.irq_state);
     const caps_word: u16 = zag.caps.capability.Word0.caps(dom.user_table[0].word0);
     return (caps_word & (1 << 11)) != 0;
 }
