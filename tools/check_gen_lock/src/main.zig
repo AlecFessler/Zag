@@ -82,12 +82,12 @@ const IRQ_RESTORE_RELEASE_METHODS = [_][]const u8{ "unlockIrqRestore" };
 const LOCK_TYPE_NAMES = [_][]const u8{ "SpinLock", "GenLock" };
 
 const BARE_PTR_FIELD_EXEMPT_FILES = [_][]const u8{
-    "memory/allocators/secure_slab.zig",
-    "memory/allocators/allocators.zig",
+    "kernel/memory/allocators/secure_slab.zig",
+    "kernel/memory/allocators/allocators.zig",
 };
 
 const PTR_BYPASS_EXEMPT_FILES = [_][]const u8{
-    "memory/allocators/secure_slab.zig",
+    "kernel/memory/allocators/secure_slab.zig",
 };
 
 const TEST_FIXTURE_TYPES = [_][]const u8{"TestT"};
@@ -272,7 +272,16 @@ fn loadFiles(db: *sqlite.Db, st: *State) !void {
         const id: u32 = @intCast(stmt.columnInt(0));
         const path = stmt.columnText(1) orelse continue;
         const src = stmt.columnBlob(2) orelse "";
-        const path_dup = try a.dupe(u8, path);
+        // Indexer stores paths relative to the kernel root (e.g.
+        // `syscall/var.zig`). Prepend `kernel/` when missing so the
+        // analyzer's diagnostic locations match the legacy analyzer's
+        // repo-relative format. Fixtures pass paths with no prefix
+        // through this same path; their expected `kernel/` prefix is
+        // restored here.
+        const path_dup = if (mem.startsWith(u8, path, "kernel/"))
+            try a.dupe(u8, path)
+        else
+            try std.fmt.allocPrint(a, "kernel/{s}", .{path});
         const src_dup = try a.dupe(u8, src);
         try st.files.append(st.gpa, .{ .id = id, .path = path_dup, .source = src_dup });
     }
@@ -544,6 +553,319 @@ fn containsSelfAlive(line_text: []const u8) bool {
     return false;
 }
 
+// ── Per-entry slab-typed local tracker ─────────────────────────────────
+//
+// For each entry-point fn, walk its var_decl AST nodes (in source order)
+// and record locals whose declared type or RHS chain resolves to a
+// slab-backed type. This drives the `tracked= N` summary column and the
+// `tracked: name:Type, ...` per-entry header to match the legacy
+// analyzer's output. The tracker is intentionally simpler than legacy's
+// full SlabEnv walk — it only models patterns that legacy actually
+// surfaces in the kernel today:
+//
+//   1. `const x: *T = ...` / `const x: SlabRef(T) = ...` — annotation
+//      parses via parseTypeRef into a slab-backed T.
+//   2. `const x = <head>.<field>` where <head> is already tracked and
+//      the (head_type, field) pair is fat-yielding (DEFAULT_FIELD_CHAINS).
+//   3. `const x = <head>.lock(...)` / `... .lock(@src()) catch ...`
+//      where <head> is already tracked — the locked alias yields the
+//      same slab type.
+//   4. `const x = <head>.<variant>.lock(...)` where <variant> is a
+//      KernelObject union variant (UNION_VARIANTS).
+//
+// Returned in source order so the per-entry header preserves the
+// declaration sequence.
+
+const TrackedIdent = struct {
+    name: []const u8, // arena-owned
+    ty: []const u8, // arena-owned (slab-backed type short name)
+};
+
+const UnionVariantEntry = struct { variant: []const u8, ty: []const u8 };
+const UNION_VARIANTS = [_]UnionVariantEntry{
+    .{ .variant = "execution_context", .ty = "ExecutionContext" },
+    .{ .variant = "capability_domain", .ty = "CapabilityDomain" },
+    .{ .variant = "var_range", .ty = "VAR" },
+    .{ .variant = "page_frame", .ty = "PageFrame" },
+    .{ .variant = "device_region", .ty = "DeviceRegion" },
+    .{ .variant = "virtual_machine", .ty = "VirtualMachine" },
+    .{ .variant = "vcpu", .ty = "VCpu" },
+    .{ .variant = "port", .ty = "Port" },
+    .{ .variant = "timer", .ty = "Timer" },
+};
+
+const DefaultFieldChainEntry = struct {
+    owner: []const u8,
+    field: []const u8,
+    ty: []const u8,
+};
+const DEFAULT_FIELD_CHAINS = [_]DefaultFieldChainEntry{
+    // ExecutionContext.
+    .{ .owner = "ExecutionContext", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "ExecutionContext", .field = "next", .ty = "ExecutionContext" },
+    .{ .owner = "ExecutionContext", .field = "prev", .ty = "ExecutionContext" },
+    .{ .owner = "ExecutionContext", .field = "suspend_port", .ty = "Port" },
+    .{ .owner = "ExecutionContext", .field = "pending_reply_domain", .ty = "CapabilityDomain" },
+    .{ .owner = "ExecutionContext", .field = "vm", .ty = "VirtualMachine" },
+    .{ .owner = "ExecutionContext", .field = "exit_port", .ty = "Port" },
+    .{ .owner = "ExecutionContext", .field = "perfmon_state", .ty = "PerfmonState" },
+    // VAR.
+    .{ .owner = "VAR", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "VAR", .field = "pf", .ty = "PageFrame" },
+    .{ .owner = "VAR", .field = "device", .ty = "DeviceRegion" },
+    .{ .owner = "VAR", .field = "snapshot_source", .ty = "VAR" },
+    // VirtualMachine.
+    .{ .owner = "VirtualMachine", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "VirtualMachine", .field = "policy_pf", .ty = "PageFrame" },
+    .{ .owner = "VirtualMachine", .field = "pf", .ty = "PageFrame" },
+    // VCpu.
+    .{ .owner = "VCpu", .field = "vm", .ty = "Vm" },
+};
+
+fn lookupUnionVariant(name: []const u8) ?[]const u8 {
+    for (UNION_VARIANTS) |e| {
+        if (mem.eql(u8, e.variant, name)) return e.ty;
+    }
+    return null;
+}
+
+fn lookupDefaultFieldChain(owner: []const u8, field: []const u8) ?[]const u8 {
+    for (DEFAULT_FIELD_CHAINS) |e| {
+        if (mem.eql(u8, e.owner, owner) and mem.eql(u8, e.field, field)) return e.ty;
+    }
+    return null;
+}
+
+// Strip trailing `catch ...` / `orelse ...` postfix from an RHS so the
+// chain we inspect is the operand expression. Also strips a trailing
+// `;` (text-line scan includes the statement terminator).
+fn stripVarDeclPostfix(rhs: []const u8) []const u8 {
+    var s = trimAscii(rhs);
+    if (s.len > 0 and s[s.len - 1] == ';') s = trimAscii(s[0 .. s.len - 1]);
+    var depth: i32 = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '(' or c == '[' or c == '{') depth += 1;
+        if (c == ')' or c == ']' or c == '}') depth -= 1;
+        if (depth != 0) continue;
+        if (i + 6 <= s.len and mem.eql(u8, s[i .. i + 6], " catch")) {
+            return trimAscii(s[0..i]);
+        }
+        if (i + 7 <= s.len and mem.eql(u8, s[i .. i + 7], " orelse")) {
+            return trimAscii(s[0..i]);
+        }
+    }
+    return s;
+}
+
+// Per-entry tracker. Scans raw source lines inside the entry's byte
+// range for `const NAME` / `var NAME` declarations and records each
+// local's resolved slab-backed type, in source order. Reads raw text
+// (not the AST) because the indexer's var_decl pass doesn't descend
+// into labeled blocks (`blk: { ... }`) or destructuring assignments,
+// and several entries declare their tracked locals there. Only records
+// the first occurrence of any name.
+fn collectTrackedIdents(
+    db: *sqlite.Db,
+    st: *State,
+    entry: *const Entity,
+    out: *ArrayList(TrackedIdent),
+) !void {
+    _ = db;
+    const a = st.arena.allocator();
+    var env = StringHashMap([]const u8).init(st.gpa);
+    defer env.deinit();
+
+    const f = fileById(st, entry.file_id) orelse return;
+    const src = f.source;
+    if (entry.byte_end > src.len or entry.byte_start >= entry.byte_end) return;
+    const body = src[entry.byte_start..entry.byte_end];
+
+    // Walk lines.
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i <= body.len) : (i += 1) {
+        const at_eol = (i == body.len) or (body[i] == '\n');
+        if (!at_eol) continue;
+        const raw_line = body[line_start..i];
+        line_start = i + 1;
+
+        // Strip same-line `//` comment.
+        const stripped = blk: {
+            if (mem.indexOf(u8, raw_line, "//")) |idx| break :blk raw_line[0..idx];
+            break :blk raw_line;
+        };
+        const trimmed = trimAscii(stripped);
+        if (trimmed.len == 0) continue;
+        // Find `const ` / `var ` after optional leading destructure list.
+        // Simple form `const NAME[: TYPE] = INIT`; destructure form
+        // `const A, const B = INIT` — handled by scanning each comma-
+        // separated entry.
+        try scanDeclLine(a, st, &env, trimmed, out);
+    }
+}
+
+fn scanDeclLine(
+    arena_a: Allocator,
+    st: *State,
+    env: *StringHashMap([]const u8),
+    trimmed: []const u8,
+    out: *ArrayList(TrackedIdent),
+) !void {
+    // Identify the `=` separator at depth 0. Anything before it that
+    // matches `const X[: T]` or `var X[: T]` (possibly comma-separated)
+    // contributes a candidate name + annotation. The shared RHS is
+    // everything past the `=`.
+    var depth: i32 = 0;
+    var eq_idx: ?usize = null;
+    var i: usize = 0;
+    while (i < trimmed.len) : (i += 1) {
+        const c = trimmed[i];
+        if (c == '(' or c == '[' or c == '{') depth += 1;
+        if (c == ')' or c == ']' or c == '}') depth -= 1;
+        if (depth != 0) continue;
+        if (c == '=') {
+            // Skip `==` `=>`.
+            if (i + 1 < trimmed.len and (trimmed[i + 1] == '=')) {
+                i += 1;
+                continue;
+            }
+            if (i + 1 < trimmed.len and trimmed[i + 1] == '>') {
+                i += 1;
+                continue;
+            }
+            eq_idx = i;
+            break;
+        }
+    }
+    if (eq_idx == null) return;
+    const lhs = trimAscii(trimmed[0..eq_idx.?]);
+    const rhs = trimAscii(trimmed[eq_idx.? + 1 ..]);
+
+    // Walk LHS as comma-separated declarators.
+    var pos: usize = 0;
+    while (pos < lhs.len) {
+        // Find next `,` at depth 0.
+        var j: usize = pos;
+        var d: i32 = 0;
+        while (j < lhs.len) : (j += 1) {
+            const c = lhs[j];
+            if (c == '(' or c == '[' or c == '{') d += 1;
+            if (c == ')' or c == ']' or c == '}') d -= 1;
+            if (d == 0 and c == ',') break;
+        }
+        const part = trimAscii(lhs[pos..j]);
+        pos = j + 1;
+        if (part.len == 0) continue;
+
+        var p = part;
+        if (mem.startsWith(u8, p, "pub ")) p = trimAscii(p[3..]);
+        if (mem.startsWith(u8, p, "comptime ")) p = trimAscii(p[8..]);
+        if (mem.startsWith(u8, p, "const ")) {
+            p = trimAscii(p[6..]);
+        } else if (mem.startsWith(u8, p, "var ")) {
+            p = trimAscii(p[4..]);
+        } else continue;
+        if (p.len == 0 or !isIdentStart(p[0])) continue;
+        var name_end: usize = 0;
+        while (name_end < p.len and isIdentChar(p[name_end])) name_end += 1;
+        const name = p[0..name_end];
+        var rest = trimAscii(p[name_end..]);
+        var ann: ?[]const u8 = null;
+        if (rest.len > 0 and rest[0] == ':') {
+            ann = trimAscii(rest[1..]);
+        }
+        try classifyDecl(arena_a, st, env, name, ann, rhs, out);
+    }
+}
+
+fn classifyDecl(
+    arena_a: Allocator,
+    st: *State,
+    env: *StringHashMap([]const u8),
+    name: []const u8,
+    ann: ?[]const u8,
+    rhs: []const u8,
+    out: *ArrayList(TrackedIdent),
+) !void {
+    if (env.contains(name)) return;
+
+    var resolved: ?[]const u8 = null;
+
+    if (ann) |an| {
+        if (parseTypeRef(an)) |inner| {
+            if (st.slab_types.contains(inner)) resolved = inner;
+        }
+    }
+
+    if (resolved == null) {
+        const rhs_plain = stripVarDeclPostfix(rhs);
+        if (mem.indexOfScalar(u8, rhs_plain, '.')) |dot| {
+            const head = rhs_plain[0..dot];
+            const tail_full = rhs_plain[dot + 1 ..];
+            if (isIdentRun(head)) {
+                const head_ty_opt = env.get(head);
+                // `<head>.lock(...)` → head_ty.
+                if (mem.startsWith(u8, tail_full, "lock(") and
+                    endsWithBalancedParen(tail_full))
+                {
+                    if (head_ty_opt) |ht| resolved = ht;
+                }
+                // `<head>.<seg>` field access (no further dots in tail).
+                if (resolved == null and isIdentRun(tail_full)) {
+                    if (head_ty_opt) |ht| {
+                        if (lookupDefaultFieldChain(ht, tail_full)) |ty| {
+                            if (st.slab_types.contains(ty)) resolved = ty;
+                        }
+                    }
+                }
+                // `<head>.<seg>.lock(...)` → variant's slab type.
+                if (resolved == null and mem.indexOfScalar(u8, tail_full, '.') != null) {
+                    const dot2 = mem.indexOfScalar(u8, tail_full, '.').?;
+                    const variant = tail_full[0..dot2];
+                    const after = tail_full[dot2 + 1 ..];
+                    if (isIdentRun(variant) and
+                        mem.startsWith(u8, after, "lock(") and
+                        endsWithBalancedParen(after))
+                    {
+                        if (lookupUnionVariant(variant)) |vt| {
+                            if (st.slab_types.contains(vt)) resolved = vt;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (resolved) |rt| {
+        const name_dup = try arena_a.dupe(u8, name);
+        const ty_dup = try arena_a.dupe(u8, rt);
+        try env.put(name_dup, ty_dup);
+        try out.append(st.gpa, .{ .name = name_dup, .ty = ty_dup });
+    }
+}
+
+fn isIdentRun(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (!isIdentStart(s[0])) return false;
+    for (s) |c| if (!isIdentChar(c)) return false;
+    return true;
+}
+
+fn endsWithBalancedParen(s: []const u8) bool {
+    if (s.len == 0 or s[s.len - 1] != ')') return false;
+    var depth: i32 = 0;
+    for (s) |c| {
+        if (c == '(') depth += 1;
+        if (c == ')') {
+            depth -= 1;
+            if (depth < 0) return false;
+        }
+    }
+    return depth == 0;
+}
+
 fn checkPtrBypasses(
     db: *sqlite.Db,
     st: *State,
@@ -554,20 +876,54 @@ fn checkPtrBypasses(
     for (st.files.items) |f| {
         if (inList(f.path, &PTR_BYPASS_EXEMPT_FILES)) continue;
         const src = f.source;
-        // Walk lines.
+        // Walk lines. Maintain a small state machine over contiguous `//`
+        // comment blocks so a `// self-alive` annotation in the lines
+        // immediately above a `.ptr` access exempts that access — not
+        // just an annotation on the same line. The legacy analyzer
+        // checks the comment block above; matching that here drops ~18
+        // false positives in sched/timer.zig and similar sites.
         var line_no: u32 = 1;
         var line_start: usize = 0;
         var i: usize = 0;
+        var in_comment_block = false;
+        var block_has_self_alive = false;
         while (i <= src.len) : (i += 1) {
             const at_eol = (i == src.len) or (src[i] == '\n');
             if (!at_eol) continue;
             const raw_line = src[line_start..i];
+            const trimmed = trimAscii(raw_line);
+            const is_comment = mem.startsWith(u8, trimmed, "//");
+            const is_blank = trimmed.len == 0;
+            // Track contiguous `//`-comment block above the next code
+            // line. A blank line breaks the block (legacy behavior).
+            if (is_comment) {
+                in_comment_block = true;
+                if (mem.indexOf(u8, trimmed, "self-alive") != null) {
+                    block_has_self_alive = true;
+                }
+                line_no += 1;
+                line_start = i + 1;
+                continue;
+            }
+            if (is_blank) {
+                in_comment_block = false;
+                block_has_self_alive = false;
+                line_no += 1;
+                line_start = i + 1;
+                continue;
+            }
+            const just_left_block = in_comment_block;
+            const block_self_alive = block_has_self_alive;
+            in_comment_block = false;
+            block_has_self_alive = false;
             // Skip comment (cheap stripped: anything past `//`).
             const stripped_line = blk: {
                 if (mem.indexOf(u8, raw_line, "//")) |idx| break :blk raw_line[0..idx];
                 break :blk raw_line;
             };
-            if (containsSelfAlive(raw_line)) {
+            if (containsSelfAlive(raw_line) or
+                (just_left_block and block_self_alive))
+            {
                 line_no += 1;
                 line_start = i + 1;
                 continue;
@@ -1581,8 +1937,17 @@ pub fn main() !u8 {
         try entries_by_qname.append(gpa, e);
     }
 
-    for (entries_by_qname.items) |entry| {
+    // Per-entry tracked-ident lists, indexed parallel to entries_by_qname.
+    var per_entry_tracked = try gpa.alloc(ArrayList(TrackedIdent), entries_by_qname.items.len);
+    defer {
+        for (per_entry_tracked) |*l| l.deinit(gpa);
+        gpa.free(per_entry_tracked);
+    }
+    for (per_entry_tracked) |*l| l.* = .empty;
+
+    for (entries_by_qname.items, 0..) |entry, ei| {
         try analyzeEntryRelease(&db, &st, entry, &release_findings);
+        try collectTrackedIdents(&db, &st, entry, &per_entry_tracked[ei]);
     }
 
     // ── IRQ-discipline ────────────────────────────────────────────────
@@ -1785,34 +2150,55 @@ pub fn main() !u8 {
 
     // ── Output ────────────────────────────────────────────────────────
     var total_errs: u32 = 0;
+    var total_tracked: u32 = 0;
+    for (per_entry_tracked) |l| total_tracked += @intCast(l.items.len);
 
-    // Per-entry release findings.
-    for (release_findings.items) |rf| {
-        if (args.rule_filter) |rf_filter| {
-            if (!mem.eql(u8, rf_filter, rf.rule)) continue;
-        }
-        if (!args.summary) {
-            try w.print("\n=== {s}\n", .{rf.entry_qname});
-            try w.print("    [ERR ] L{d}: {s}\n", .{ rf.line, rf.message });
-        }
-        total_errs += 1;
-    }
-    // For summary mode, emit one line per entry that has findings.
-    // Mirroring the legacy analyzer: entries with no env-tracked idents
-    // and no findings are silently skipped, so the runner's `head -n1`
-    // pattern lands on the total `Summary:` line for clean fixtures.
     if (args.summary) {
-        for (entries_by_qname.items) |entry| {
+        // One line per entry, mirroring legacy: any entry with at least
+        // one tracked ident OR at least one finding is shown.
+        for (entries_by_qname.items, 0..) |entry, ei| {
             var errs: u32 = 0;
             for (release_findings.items) |rf| {
                 if (mem.eql(u8, rf.entry_qname, entry.qname)) errs += 1;
             }
-            if (errs == 0) continue;
+            const tracked_count: u32 = @intCast(per_entry_tracked[ei].items.len);
+            if (tracked_count == 0 and errs == 0) continue;
             const sn = shortName(entry.qname);
             try w.print(
                 "{s:<34}tracked={d:>2}  err={d:>2}  info={d:>2}  [{s}:{d}]\n",
-                .{ sn, @as(u32, 0), errs, @as(u32, 0), pathOfFile(&st, entry.file_id), entry.line },
+                .{ sn, tracked_count, errs, @as(u32, 0), pathOfFile(&st, entry.file_id), entry.line },
             );
+            total_errs += errs;
+        }
+    } else {
+        // Default mode: per-entry headers with tracked listing, then any
+        // findings under each entry.
+        for (entries_by_qname.items, 0..) |entry, ei| {
+            try w.print("\n=== {s}  [{s}:{d}]\n", .{
+                shortName(entry.qname),
+                pathOfFile(&st, entry.file_id),
+                entry.line,
+            });
+            const tracked = per_entry_tracked[ei].items;
+            if (tracked.len == 0) {
+                try w.writeAll("    (no slab-typed idents tracked)\n");
+            } else {
+                try w.writeAll("    tracked: ");
+                for (tracked, 0..) |ti, i| {
+                    if (i != 0) try w.writeAll(", ");
+                    try w.print("{s}:{s}", .{ ti.name, ti.ty });
+                }
+                try w.writeAll("\n");
+            }
+            // Findings emitted under this entry.
+            for (release_findings.items) |rf| {
+                if (args.rule_filter) |rf_filter| {
+                    if (!mem.eql(u8, rf_filter, rf.rule)) continue;
+                }
+                if (!mem.eql(u8, rf.entry_qname, entry.qname)) continue;
+                try w.print("    [ERR ] L{d}: {s}\n", .{ rf.line, rf.message });
+                total_errs += 1;
+            }
         }
     }
 
@@ -1843,7 +2229,7 @@ pub fn main() !u8 {
     try w.writeAll("\n");
     try w.print("Summary: {d} entries, {d} tracked idents, {d} err, {d} info\n", .{
         entries_by_qname.items.len,
-        @as(u32, 0),
+        total_tracked,
         total_errs,
         @as(u32, 0),
     });
