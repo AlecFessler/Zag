@@ -27,8 +27,7 @@ const Args = struct {
     /// `<basename>.` (e.g. `routerOS.nic`). Stages 3 (IR) and 4 (bin)
     /// are kernel-only and skip these trees; stage 5 entry-point SQL
     /// filters on kernel-only file paths so non-kernel entities are not
-    /// rooted as entries. Repeatable. The legacy `--extra-token-root`
-    /// flag is accepted as an alias for back-compat with older invokers.
+    /// rooted as entries. Repeatable.
     extra_source_roots: std.ArrayList([]const u8) = .empty,
     n_jobs: u32 = 0, // 0 → auto-detect
 
@@ -50,9 +49,7 @@ const Args = struct {
                 a.ir_path = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
             } else if (std.mem.eql(u8, arg, "--elf")) {
                 a.elf_path = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
-            } else if (std.mem.eql(u8, arg, "--extra-source-root") or
-                std.mem.eql(u8, arg, "--extra-token-root"))
-            {
+            } else if (std.mem.eql(u8, arg, "--extra-source-root")) {
                 const v = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
                 try a.extra_source_roots.append(allocator, v);
             } else if (std.mem.eql(u8, arg, "--jobs")) {
@@ -67,7 +64,6 @@ const Args = struct {
                     \\  --ir <path>                  pre-opt LLVM IR file (zig-out/kernel.<arch>.ll)
                     \\  --elf <path>                 final kernel ELF for DWARF + objdump (zig-out/kernel.<arch>.elf)
                     \\  --extra-source-root <dir>    extra source tree to fully ingest (entity+ast); repeatable
-                    \\  --extra-token-root <dir>     legacy alias for --extra-source-root
                     \\  --jobs <n>                   default: ncpu
                     \\
                 , .{});
