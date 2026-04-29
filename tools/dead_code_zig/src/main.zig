@@ -509,8 +509,6 @@ fn collectFindings(
     db: *sqlite.Db,
     target: []const u8,
 ) ![]Finding {
-    _ = target;
-
     // Precompute entity simple-names into a temp table so the alive-set
     // query can join against them without resorting to non-portable string
     // ops (SQLite has no `reverse` / "find-last-of" builtin).
@@ -533,24 +531,57 @@ fn collectFindings(
     }
     try db.exec("CREATE INDEX entity_simple_name_idx ON entity_simple_name(name)");
 
-    // Source-set scope: every file in the DB EXCEPT
-    //   * tests/ and redteam/ (excluded everywhere)
-    //   * extra-token-root files (paths with a known non-target prefix);
-    //     these were ingested as cross-references only.
-    // The kernel walker is rooted at `--kernel-root kernel` so kernel
-    // file paths have no `kernel/` prefix; rule them in via "no
-    // routerOS/hyprvOS/bootloader/tools/tests prefix".
+    // Materialize the per-target file scope into a temp table. The path
+    // scheme is asymmetric: the kernel walker is rooted at `--kernel-root
+    // kernel` so kernel paths have NO `kernel/` prefix; non-kernel
+    // `--extra-source-root` walks prefix paths with the tree's basename
+    // (e.g. `routerOS/foo.zig`). So:
+    //   * --target kernel       → exclude every known non-kernel prefix.
+    //   * --target routerOS     → require the `routerOS/` prefix.
+    //   * --target hyprvOS      → require the `hyprvOS/` prefix.
+    //   * --target bootloader   → require the `bootloader/` prefix.
+    // tests/ and redteam/ are excluded for every target (the alive-set
+    // CTE pulls them in as references via the source-set seed below).
+    try db.exec("CREATE TEMP TABLE target_files_tmp (id INTEGER PRIMARY KEY)");
+    {
+        const filter_sql: []const u8 = if (mem.eql(u8, target, "kernel"))
+            "INSERT INTO target_files_tmp SELECT id FROM file" ++
+                " WHERE path NOT GLOB '*/tests/*'" ++
+                "   AND path NOT GLOB '*/redteam/*'" ++
+                "   AND path NOT GLOB 'routerOS/*'" ++
+                "   AND path NOT GLOB 'hyprvOS/*'" ++
+                "   AND path NOT GLOB 'bootloader/*'" ++
+                "   AND path NOT GLOB 'tools/*'" ++
+                "   AND path NOT GLOB 'tests/*'"
+        else if (mem.eql(u8, target, "routerOS"))
+            "INSERT INTO target_files_tmp SELECT id FROM file" ++
+                " WHERE path GLOB 'routerOS/*'" ++
+                "   AND path NOT GLOB '*/tests/*'" ++
+                "   AND path NOT GLOB '*/redteam/*'"
+        else if (mem.eql(u8, target, "hyprvOS"))
+            "INSERT INTO target_files_tmp SELECT id FROM file" ++
+                " WHERE path GLOB 'hyprvOS/*'" ++
+                "   AND path NOT GLOB '*/tests/*'" ++
+                "   AND path NOT GLOB '*/redteam/*'"
+        else if (mem.eql(u8, target, "bootloader"))
+            "INSERT INTO target_files_tmp SELECT id FROM file" ++
+                " WHERE path GLOB 'bootloader/*'" ++
+                "   AND path NOT GLOB '*/tests/*'" ++
+                "   AND path NOT GLOB '*/redteam/*'"
+        else {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "unsupported --target: {s}\n", .{target}) catch "unsupported --target\n";
+            _ = std.fs.File.stderr().write(msg) catch {};
+            std.process.exit(2);
+        };
+        const sentinel = try a.dupeZ(u8, filter_sql);
+        try db.exec(sentinel);
+    }
+
     const sql =
         \\WITH RECURSIVE
         \\  target_files(id) AS (
-        \\    SELECT id FROM file
-        \\     WHERE path NOT GLOB '*/tests/*'
-        \\       AND path NOT GLOB '*/redteam/*'
-        \\       AND path NOT GLOB 'routerOS/*'
-        \\       AND path NOT GLOB 'hyprvOS/*'
-        \\       AND path NOT GLOB 'bootloader/*'
-        \\       AND path NOT GLOB 'tools/*'
-        \\       AND path NOT GLOB 'tests/*'
+        \\    SELECT id FROM target_files_tmp
         \\  ),
         \\  field_names(name) AS (
         \\    SELECT DISTINCT t2.text
@@ -593,10 +624,11 @@ fn collectFindings(
         \\        JOIN file f ON f.id = e.def_file_id
         \\       WHERE INSTR(SUBSTR(f.source, e.def_byte_start + 1, e.def_byte_end - e.def_byte_start), 'export ') > 0
         \\    UNION
-        \\      -- Closure: alias targets (and back-edges).
+        \\      -- Closure: alias targets. Forward-only — `pub const X = a.b.C;`
+        \\      -- means using X also uses C, but using C doesn't pull in
+        \\      -- every alias of C (the legacy tool only marks the chain
+        \\      -- HEAD via an explicit `markLive` per use, not the inverse).
         \\      SELECT a.target_entity_id FROM const_alias a JOIN alive ON a.entity_id = alive.id
-        \\    UNION
-        \\      SELECT a.entity_id FROM const_alias a JOIN alive ON a.target_entity_id = alive.id
         \\    UNION
         \\      -- Closure: type references (struct field types, fn params, returns).
         \\      SELECT etr.referred_entity_id FROM entity_type_ref etr JOIN alive ON etr.referrer_entity_id = alive.id
@@ -617,18 +649,37 @@ fn collectFindings(
         \\        JOIN field_names fn ON fn.name = esn.name
         \\       WHERE e.kind IN ('field','variant','fn')
         \\    UNION
-        \\      -- Bare-identifier mention heuristic for top-level decls.
-        \\      -- Mirrors the prior tool's "decl is alive iff some chain
-        \\      -- resolves through its name" semantics.
+        \\      -- Bare-identifier mention heuristic for `pub` top-level
+        \\      -- decls and types/fns/namespaces. The prior tool resolved
+        \\      -- chains semantically per-file via @import edges; we
+        \\      -- approximate with bare-name token presence anywhere
+        \\      -- outside the def itself. Causes some false-negative
+        \\      -- divergence vs legacy on routerOS/hyprvOS where two
+        \\      -- different `pub fn foo` decls share the same simple
+        \\      -- name (one in tree, one in tests/libz).
         \\      SELECT esn.entity_id FROM entity_simple_name esn
         \\        JOIN entity e ON e.id = esn.entity_id
-        \\       WHERE e.kind IN ('const','var','type','fn','namespace')
+        \\       WHERE (e.kind IN ('type','fn','namespace')
+        \\              OR (e.kind IN ('const','var') AND e.is_pub = 1))
         \\         AND EXISTS (
         \\           SELECT 1 FROM token t
         \\            WHERE t.kind = 'identifier'
         \\              AND t.text = esn.name
         \\              AND (t.file_id <> e.def_file_id
         \\                   OR t.byte_start < e.def_byte_start
+        \\                   OR t.byte_start >= e.def_byte_end)
+        \\         )
+        \\    UNION
+        \\      SELECT esn.entity_id FROM entity_simple_name esn
+        \\        JOIN entity e ON e.id = esn.entity_id
+        \\       WHERE e.kind IN ('const','var')
+        \\         AND e.is_pub = 0
+        \\         AND EXISTS (
+        \\           SELECT 1 FROM token t
+        \\            WHERE t.kind = 'identifier'
+        \\              AND t.text = esn.name
+        \\              AND t.file_id = e.def_file_id
+        \\              AND (t.byte_start < e.def_byte_start
         \\                   OR t.byte_start >= e.def_byte_end)
         \\         )
         \\  )
@@ -743,19 +794,19 @@ pub fn main() !void {
         std.process.exit(2);
     }
 
-    // The oracle DB only emits entities for the kernel tree today. routerOS,
-    // hyprvOS, and bootloader source files are ingested as tokens only — no
-    // entities, so dead-code detection cannot run against them. Until the
-    // indexer is extended to do per-tree entity emission, those targets stay
-    // on the legacy tools/dead_code_zig binary (the precommit harness picks
-    // the right binary per target).
-    if (!std.mem.eql(u8, target_name, "kernel")) {
+    // Validate the target name early. `collectFindings` re-checks before
+    // building the path-filter SQL, but failing here gives a tidier error
+    // than a parse error from inside `db.exec`.
+    if (!(std.mem.eql(u8, target_name, "kernel") or
+        std.mem.eql(u8, target_name, "routerOS") or
+        std.mem.eql(u8, target_name, "hyprvOS") or
+        std.mem.eql(u8, target_name, "bootloader")))
+    {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf,
-            "--target {s} is not yet supported by the oracle-DB analyzer (kernel only).\n" ++
-                "Use the legacy `dead_code_zig {s}` until indexer multi-tree support lands.\n",
-            .{ target_name, target_name },
-        ) catch "non-kernel target unsupported\n";
+            "unsupported --target: {s} (expected kernel | routerOS | hyprvOS | bootloader)\n",
+            .{target_name},
+        ) catch "unsupported --target\n";
         _ = std.fs.File.stderr().write(msg) catch {};
         std.process.exit(2);
     }
