@@ -69,6 +69,7 @@ pub fn resolve(
                 .def_line = e.def_line,
                 .def_col = e.def_col,
                 .is_slab_backed = e.is_slab_backed,
+                .is_pub = e.is_pub,
             });
             const id = next_id;
             next_id += 1;

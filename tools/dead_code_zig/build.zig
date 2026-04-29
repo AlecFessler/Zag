@@ -14,6 +14,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.linkSystemLibrary("sqlite3");
+    exe.linkLibC();
 
     b.installArtifact(exe);
 

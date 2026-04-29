@@ -7,6 +7,7 @@ pub const EntityKind = enum {
     const_,
     var_,
     field,
+    variant,
     namespace,
 
     pub fn toString(self: EntityKind) []const u8 {
@@ -16,6 +17,7 @@ pub const EntityKind = enum {
             .const_ => "const",
             .var_ => "var",
             .field => "field",
+            .variant => "variant",
             .namespace => "namespace",
         };
     }
@@ -57,9 +59,30 @@ pub const ProvisionalEntity = struct {
     def_line: u32,
     def_col: u32,
     is_slab_backed: bool,
+    is_pub: bool,
     /// Global id of the ast_node this decl was emitted from. Stage 2.5
     /// back-fills `ast_node.entity_id = entity.id` for this node.
     def_ast_node_id: u64,
+};
+
+/// Provisional alias emitted by the AST pass. Stage 2.5 resolves
+/// `target_chain` against the alias's module's import graph and emits
+/// a `const_alias` row when the chain terminates in a known entity.
+pub const ProvisionalAlias = struct {
+    alias_qname: []const u8,
+    alias_module_id: u32,
+    target_chain: []const []const u8,
+};
+
+/// Provisional type reference emitted by the AST pass for chain-shaped
+/// type expressions. Stage 2.5 resolves `target_chain` and emits
+/// `entity_type_ref` rows.
+pub const ProvisionalTypeRef = struct {
+    referrer_qname: []const u8,
+    referrer_module_id: u32,
+    target_chain: []const []const u8,
+    /// 'field_type' | 'param_type' | 'return_type'
+    role: []const u8,
 };
 
 pub const AstNodeRow = struct {

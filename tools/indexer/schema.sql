@@ -61,6 +61,7 @@ CREATE TABLE entity (
     generic_parent_id INTEGER REFERENCES entity(id),       -- NULL for non-monomorphized
     is_ast_only       INTEGER NOT NULL DEFAULT 0,          -- LLVM/front-end inlined every callsite
     is_slab_backed    INTEGER NOT NULL DEFAULT 0,          -- struct contains _gen_lock: GenLock
+    is_pub            INTEGER NOT NULL DEFAULT 0,          -- top-level `pub` visibility
     UNIQUE (module_id, kind, qualified_name)
 );
 CREATE INDEX entity_qname_idx          ON entity(qualified_name);
@@ -235,6 +236,17 @@ CREATE TABLE const_alias (
     entity_id        INTEGER PRIMARY KEY REFERENCES entity(id),
     target_entity_id INTEGER NOT NULL REFERENCES entity(id)
 );
+
+-- Resolved type-expression references: `struct { x: Bar }`, `fn f(p: Foo) Baz`, etc.
+-- Populated for chain-shaped type expressions whose terminal qname resolves to a known entity.
+-- Used by the dead-code analyzer to track type uses without leaning on the loose name-heuristic.
+CREATE TABLE entity_type_ref (
+    referrer_entity_id INTEGER NOT NULL REFERENCES entity(id),
+    referred_entity_id INTEGER NOT NULL REFERENCES entity(id),
+    role TEXT NOT NULL,  -- 'field_type' | 'param_type' | 'return_type'
+    PRIMARY KEY (referrer_entity_id, referred_entity_id, role)
+);
+CREATE INDEX entity_type_ref_referred_idx ON entity_type_ref(referred_entity_id);
 
 -- ── ANALYZER FINDINGS (write-back surface for genlock, dead_code, redteam, …) ──
 CREATE TABLE lint_finding (
