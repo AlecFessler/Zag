@@ -111,12 +111,62 @@
 //   7: inserted slot's handle type is not execution_context.
 //   8: inserted slot's caps != entry.caps verbatim (0x06).
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+fn dummyEntry() callconv(.c) noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
+}
+
+fn suspendWithOneAttachmentX64(word: u64, w_handle: u64, port_handle: u64, pair_word: u64) u64 {
+    var ret_v1: u64 = undefined;
+    asm volatile (
+        \\ subq $912, %%rsp
+        \\ movq %%rdx, 904(%%rsp)
+        \\ pushq %%rcx
+        \\ syscall
+        \\ addq $920, %%rsp
+        : [ret] "={rax}" (ret_v1),
+        : [word] "{rcx}" (word),
+          [v1in] "{rax}" (w_handle),
+          [v2in] "{rbx}" (port_handle),
+          [pair] "{rdx}" (pair_word),
+        : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
+    return ret_v1;
+}
+
+fn suspendWithOneAttachmentArm(word: u64, w_handle: u64, port_handle: u64, pair_word: u64) u64 {
+    var ret_v1: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #784
+        \\ str %[pair], [sp, #768]
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ add sp, sp, #784
+        : [ret] "={x0}" (ret_v1),
+        : [word] "r" (word),
+          [v1in] "{x0}" (w_handle),
+          [v2in] "{x1}" (port_handle),
+          [pair] "r" (pair_word),
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+    return ret_v1;
+}
 
 pub fn main(cap_table_base: u64) void {
     // Step 1: mint the result port with bind+recv+xfer. xfer is the
@@ -143,7 +193,7 @@ pub fn main(cap_table_base: u64) void {
         .restart_policy = 0,
     };
     const w_caps_word: u64 = @as(u64, w_caps.toU16());
-    const entry: u64 = @intFromPtr(&testing.dummyEntry);
+    const entry: u64 = @intFromPtr(&dummyEntry);
     const cec_w = syscall.createExecutionContext(
         w_caps_word,
         entry,
@@ -209,24 +259,11 @@ pub fn main(cap_table_base: u64) void {
     // pair_count = 1 in bits 12-19. Other bits reserved = 0.
     const suspend_word: u64 = syscall.buildWord(.@"suspend", syscall.extraCount(1));
 
-    // v1 captures the syscall return code (vreg 1 = rax). suspend
-    // returns OK on success; the test rejects any other code. The
-    // pair entry is loaded into rdx ahead of the stack reservation
-    // so it survives across the rsp adjust without needing the
-    // compiler to allocate another register.
-    var ret_v1: u64 = undefined;
-    asm volatile (
-        \\ subq $912, %%rsp
-        \\ movq %%rdx, 904(%%rsp)
-        \\ pushq %%rcx
-        \\ syscall
-        \\ addq $920, %%rsp
-        : [ret] "={rax}" (ret_v1),
-        : [word] "{rcx}" (suspend_word),
-          [v1in] "{rax}" (@as(u64, w_handle)),
-          [v2in] "{rbx}" (@as(u64, port_handle)),
-          [pair] "{rdx}" (pair_word),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
+    const ret_v1: u64 = switch (builtin.cpu.arch) {
+        .x86_64 => suspendWithOneAttachmentX64(suspend_word, @as(u64, w_handle), @as(u64, port_handle), pair_word),
+        .aarch64 => suspendWithOneAttachmentArm(suspend_word, @as(u64, w_handle), @as(u64, port_handle), pair_word),
+        else => @compileError("unsupported arch"),
+    };
 
     if (ret_v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);

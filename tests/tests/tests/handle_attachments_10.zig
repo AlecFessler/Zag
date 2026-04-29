@@ -143,6 +143,7 @@
 //   9: PF_B's caps lost the `copy` bit after resume (partial mutation
 //      of the source on the copy path)
 
+const builtin = @import("builtin");
 const std = @import("std");
 const lib = @import("lib");
 
@@ -165,7 +166,13 @@ fn deleterEntry() callconv(.c) noreturn {
     const id_u32 = @atomicLoad(u32, &deleter_port_id, .acquire);
     const id: u12 = @truncate(id_u32);
     _ = syscall.delete(id);
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
 }
 
 // Issue `suspend` with two pair entries in vregs 126 and 127. libz's
@@ -185,43 +192,14 @@ fn deleterEntry() callconv(.c) noreturn {
 //
 // Total pad = 920 bytes (1 word + 114 vregs * 8). On return rax holds
 // vreg 1 (= the syscall's status code per §[error_codes]).
-fn suspendWithTwoAttachments(
-    target_ec: u64,
-    port: u12,
+fn suspendWithTwoAttachmentsX64(
+    word: u64,
+    v1: u64,
+    v2: u64,
     entry_a: u64,
     entry_b: u64,
 ) u64 {
-    // §[syscall_abi]: syscall_num = 34 = `suspend`. extraCount(2) puts
-    // pair_count = 2 in bits 12-19 of the word.
-    const word: u64 = syscall.buildWord(.@"suspend", syscall.extraCount(2));
-    const v1: u64 = target_ec;
-    const v2: u64 = @as(u64, port);
-
     var rax_out: u64 = undefined;
-
-    // The asm block:
-    //   1. pre-load all inputs into call-clobbered scratch registers
-    //      (r8/r9/r10/r12/r13) so they survive the stack-pointer move
-    //   2. sub rsp, 920            — reserve the full vreg pad
-    //   3. zero-fill [rsp + 0 .. rsp + 904) via a rep stosq counted in
-    //      qwords (113 qwords = word slot + vregs 14..125). rdi/rcx/rax
-    //      are all clobbered by stosq.
-    //   4. write entry_a at [rsp + 904] (vreg 126)
-    //   5. write entry_b at [rsp + 912] (vreg 127)
-    //   6. write the syscall word at [rsp + 0]
-    //   7. load rax/rbx/rcx with v1/v2/word
-    //   8. syscall
-    //   9. add rsp, 920            — collapse the pad
-    //
-    // Inputs are passed via register constraints rather than memory
-    // operands — `subq $920, %%rsp` would otherwise invalidate any
-    // RSP-relative memory operand the compiler chose to back the local
-    // input variables with. Pinning each input to a specific
-    // call-clobbered register that is NOT consumed by the syscall ABI
-    // (rax/rbx/rcx are reserved for v1/v2/word) keeps the values intact
-    // across the RSP move.
-    //
-    // rax holds the suspend's status on resume (vreg 1).
     asm volatile (
         \\ subq $920, %%rsp
         \\ movq %%rsp, %%rdi
@@ -245,6 +223,56 @@ fn suspendWithTwoAttachments(
         : .{ .rbx = true, .rcx = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r11 = true, .r14 = true, .r15 = true, .memory = true, .cc = true });
 
     return rax_out;
+}
+
+fn suspendWithTwoAttachmentsArm(
+    word: u64,
+    v1: u64,
+    v2: u64,
+    entry_a: u64,
+    entry_b: u64,
+) u64 {
+    // aarch64 high-vreg layout: vreg N at [sp + (N-31)*8] for 32 ≤ N ≤ 127.
+    // vreg 126 = [sp + 760]; vreg 127 = [sp + 768]. Reserve 784 bytes
+    // (16-byte aligned) covering [sp+0] (word) through [sp+776].
+    var x0_out: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #784
+        \\ str %[ea], [sp, #760]
+        \\ str %[eb], [sp, #768]
+        \\ str %[w], [sp]
+        \\ svc #0
+        \\ add sp, sp, #784
+        : [out_x0] "={x0}" (x0_out),
+        : [w] "r" (word),
+          [iv1] "{x0}" (v1),
+          [iv2] "{x1}" (v2),
+          [ea] "r" (entry_a),
+          [eb] "r" (entry_b),
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+
+    return x0_out;
+}
+
+fn suspendWithTwoAttachments(
+    target_ec: u64,
+    port: u12,
+    entry_a: u64,
+    entry_b: u64,
+) u64 {
+    const word: u64 = syscall.buildWord(.@"suspend", syscall.extraCount(2));
+    const v1: u64 = target_ec;
+    const v2: u64 = @as(u64, port);
+    return switch (builtin.cpu.arch) {
+        .x86_64 => suspendWithTwoAttachmentsX64(word, v1, v2, entry_a, entry_b),
+        .aarch64 => suspendWithTwoAttachmentsArm(word, v1, v2, entry_a, entry_b),
+        else => @compileError("unsupported arch"),
+    };
 }
 
 pub fn main(cap_table_base: u64) void {

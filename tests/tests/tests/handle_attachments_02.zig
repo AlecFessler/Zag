@@ -35,6 +35,7 @@
 // Assertion
 //   v1 == E_BADCAP  (assertion id 1)
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -44,21 +45,10 @@ const testing = lib.testing;
 
 const SUSPEND_NUM: u64 = @intFromEnum(syscall.SyscallNum.@"suspend");
 
-// Reserve 114 stack slots for vregs 14..127 (912 bytes). The syscall
-// word slot at rsp+0 is added by the trailing `pushq %rcx`, so the
-// pre-push frame covers exactly the 114 high-vreg slots and the
-// post-push frame matches the v3 vreg layout (syscall word at
-// `[rsp + 0]`, vreg 127 at `[rsp + 912]` per §[syscall_abi]).
 const STACK_PAD_BYTES: u64 = 912;
-// Pre-push offset of vreg 127 within the 912-byte pad: the topmost
-// quadword slot at offset (127 - 14) * 8 = 904. After `pushq %rcx`
-// shifts everything by 8, the slot lands at `[rsp + 912]`.
 const VREG127_PRE_PUSH_OFFSET: u64 = (127 - 14) * 8; // = 904
 
-fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
-    // Syscall word: bits 0-11 = syscall_num, bits 12-19 = pair_count = 1.
-    const word: u64 = (SUSPEND_NUM & 0xFFF) | (@as(u64, 1) << 12);
-
+fn suspendWithOnePairAtV127X64(word: u64, target: u64, port: u64, entry: u64) syscall.Regs {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
     var ov3: u64 = undefined;
@@ -95,8 +85,8 @@ fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
         : [word] "{rcx}" (word),
           [pad] "i" (STACK_PAD_BYTES),
           [entry] "r" (entry),
-          [iv1] "{rax}" (@as(u64, target)),
-          [iv2] "{rbx}" (@as(u64, port)),
+          [iv1] "{rax}" (target),
+          [iv2] "{rbx}" (port),
         : .{ .rcx = true, .r11 = true, .memory = true });
 
     return .{
@@ -113,6 +103,76 @@ fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
         .v11 = ov11,
         .v12 = ov12,
         .v13 = ov13,
+    };
+}
+
+fn suspendWithOnePairAtV127Arm(word: u64, target: u64, port: u64, entry: u64) syscall.Regs {
+    // aarch64: vreg 127 = [sp + (127-31)*8] = [sp + 768]. Reserve
+    // 784 bytes (16-byte aligned) so [sp+0]=word and [sp+768]=vreg 127.
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #784
+        \\ str %[entry], [sp, #768]
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ add sp, sp, #784
+        : [v1] "={x0}" (ov1),
+          [v2] "={x1}" (ov2),
+          [v3] "={x2}" (ov3),
+          [v4] "={x3}" (ov4),
+          [v5] "={x4}" (ov5),
+          [v6] "={x5}" (ov6),
+          [v7] "={x6}" (ov7),
+          [v8] "={x7}" (ov8),
+          [v9] "={x8}" (ov9),
+          [v10] "={x9}" (ov10),
+          [v11] "={x10}" (ov11),
+          [v12] "={x11}" (ov12),
+          [v13] "={x12}" (ov13),
+        : [word] "r" (word),
+          [entry] "r" (entry),
+          [iv1] "{x0}" (target),
+          [iv2] "{x1}" (port),
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
+             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
+             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
+             .x29 = true, .x30 = true, .memory = true });
+
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
+}
+
+fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
+    const word: u64 = (SUSPEND_NUM & 0xFFF) | (@as(u64, 1) << 12);
+    return switch (builtin.cpu.arch) {
+        .x86_64 => suspendWithOnePairAtV127X64(word, @as(u64, target), @as(u64, port), entry),
+        .aarch64 => suspendWithOnePairAtV127Arm(word, @as(u64, target), @as(u64, port), entry),
+        else => @compileError("unsupported arch"),
     };
 }
 

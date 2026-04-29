@@ -56,6 +56,7 @@
 //   1: suspend with the move=0 / no-copy entry returned something other
 //      than E_PERM.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -63,36 +64,7 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
-
-    // §[handle_attachments] entry encoding: id in bits 0-11, caps in
-    // bits 16-31, move in bit 32; reserved bands all zero. caps = 0 is
-    // a trivial subset of the source's {xfer, bind}, so test 03 is
-    // neutralized; move = 0 is precisely what test 05 targets.
-    const entry = caps.PairEntry{
-        .id = caps.SLOT_FIRST_PASSED,
-        .caps = 0,
-        .move = false,
-    };
-    const entry_word: u64 = entry.toU64();
-
-    // Syscall word: num = .suspend (id 34) in bits 0-11, pair_count = 1
-    // in bits 12-19, all other bits zero.
-    const word: u64 = syscall.buildWord(.@"suspend", syscall.extraCount(1));
-
-    const ec_handle: u64 = caps.SLOT_INITIAL_EC;
-    const port_handle: u64 = caps.SLOT_FIRST_PASSED;
-
-    // High-vreg attachment path. Pad the stack with 920 bytes (115
-    // qwords) so vreg 127 lands at [rsp + 912] and vreg 0 (the syscall
-    // word) lands at [rsp + 0] when the kernel reads them. Inputs:
-    //   rax = vreg 1  ([1] = target EC)
-    //   rbx = vreg 2  ([2] = port)
-    //   rcx = syscall word (clobbered by `syscall` to return RIP; we
-    //         materialize it onto the stack at offset 0 first)
-    //   r10 = scratch holding the entry word; we spill it to [rsp+912]
-    //         before the syscall runs.
+fn issueSuspendOneAttachmentX64(word: u64, ec_handle: u64, port_handle: u64, entry_word: u64) u64 {
     var rax_out: u64 = undefined;
     asm volatile (
         \\ subq $920, %%rsp
@@ -106,6 +78,51 @@ pub fn main(cap_table_base: u64) void {
           [iv2] "{rbx}" (port_handle),
           [entry] "r" (entry_word),
         : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
+    return rax_out;
+}
+
+fn issueSuspendOneAttachmentArm(word: u64, ec_handle: u64, port_handle: u64, entry_word: u64) u64 {
+    var x0_out: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #784
+        \\ str %[entry], [sp, #768]
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ add sp, sp, #784
+        : [x0_out] "={x0}" (x0_out),
+        : [word] "r" (word),
+          [iv1] "{x0}" (ec_handle),
+          [iv2] "{x1}" (port_handle),
+          [entry] "r" (entry_word),
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+    return x0_out;
+}
+
+pub fn main(cap_table_base: u64) void {
+    _ = cap_table_base;
+
+    const entry = caps.PairEntry{
+        .id = caps.SLOT_FIRST_PASSED,
+        .caps = 0,
+        .move = false,
+    };
+    const entry_word: u64 = entry.toU64();
+
+    const word: u64 = syscall.buildWord(.@"suspend", syscall.extraCount(1));
+
+    const ec_handle: u64 = caps.SLOT_INITIAL_EC;
+    const port_handle: u64 = caps.SLOT_FIRST_PASSED;
+
+    const rax_out: u64 = switch (builtin.cpu.arch) {
+        .x86_64 => issueSuspendOneAttachmentX64(word, ec_handle, port_handle, entry_word),
+        .aarch64 => issueSuspendOneAttachmentArm(word, ec_handle, port_handle, entry_word),
+        else => @compileError("unsupported arch"),
+    };
 
     if (rax_out != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(1);

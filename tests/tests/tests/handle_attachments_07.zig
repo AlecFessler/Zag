@@ -50,6 +50,7 @@
 //   2: vreg 1 != E_INVAL after the suspend (kernel did not reject the
 //      duplicate-source pair as required).
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -59,31 +60,11 @@ const testing = lib.testing;
 
 const SUSPEND_NUM: u64 = 34;
 
-// Builds the syscall word with pair_count = N in bits 12-19.
 fn buildSuspendWord(pair_count: u8) u64 {
     return SUSPEND_NUM | (@as(u64, pair_count) << 12);
 }
 
-// Issues `suspend` with two pair entries laid out at vregs 126 and 127.
-// Reserves a 920-byte pad on the stack so that:
-//   [rsp + 0]   = syscall word (vreg 0)
-//   [rsp + 8]   = vreg 14
-//   ...
-//   [rsp + 904] = vreg 126
-//   [rsp + 912] = vreg 127
-// Returns the kernel's vreg 1 (raw u64) which on the error path here
-// carries the error code per §[error_codes].
-//
-// Register pressure note: every general-purpose register the syscall
-// path touches must either be a fixed input/output or a clobber. We
-// bind word and entry to specific input registers (rdx, rsi) by using
-// the same paired-register pattern `issueRawCaptureWord` uses for the
-// syscall word — input "{reg}" + dummy output "={reg}" — so the
-// compiler reserves them across the asm block without leaving us with
-// no scratch for the stack stores. The remaining vreg-snapshot regs
-// are listed as discarded outputs to mirror libz's existing shape.
-fn suspendWithDupPair(target: u12, port: u12, entry: u64) u64 {
-    const word = buildSuspendWord(2);
+fn suspendWithDupPairX64(word: u64, target: u64, port: u64, entry: u64) u64 {
     var ov1: u64 = undefined;
     var d_v2: u64 = undefined;
     var d_v3: u64 = undefined;
@@ -117,12 +98,47 @@ fn suspendWithDupPair(target: u12, port: u12, entry: u64) u64 {
           [v11] "={r13}" (d_v11),
           [v12] "={r14}" (d_v12),
           [v13] "={r15}" (d_v13),
-        : [iv1] "{rax}" (@as(u64, target)),
-          [iv2] "{rbx}" (@as(u64, port)),
+        : [iv1] "{rax}" (target),
+          [iv2] "{rbx}" (port),
           [word] "{rdx}" (word),
           [entry] "{rsi}" (entry),
         : .{ .rcx = true, .r11 = true, .memory = true });
     return ov1;
+}
+
+fn suspendWithDupPairArm(word: u64, target: u64, port: u64, entry: u64) u64 {
+    // aarch64 high-vreg layout: vreg N at [sp + (N-31)*8] for 32 ≤ N ≤ 127.
+    // vreg 126 = [sp + 760]; vreg 127 = [sp + 768]. Reserve 784 bytes
+    // (16-byte aligned) covering [sp+0] (word) through [sp+776].
+    var ov1: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #784
+        \\ str %[entry], [sp, #760]
+        \\ str %[entry], [sp, #768]
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ add sp, sp, #784
+        : [v1] "={x0}" (ov1),
+        : [iv1] "{x0}" (target),
+          [iv2] "{x1}" (port),
+          [word] "r" (word),
+          [entry] "r" (entry),
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+    return ov1;
+}
+
+fn suspendWithDupPair(target: u12, port: u12, entry: u64) u64 {
+    const word = buildSuspendWord(2);
+    return switch (builtin.cpu.arch) {
+        .x86_64 => suspendWithDupPairX64(word, @as(u64, target), @as(u64, port), entry),
+        .aarch64 => suspendWithDupPairArm(word, @as(u64, target), @as(u64, port), entry),
+        else => @compileError("unsupported arch"),
+    };
 }
 
 pub fn main(cap_table_base: u64) void {

@@ -51,6 +51,7 @@
 //   3: suspend with a move=1 entry referencing a source lacking
 //      `move` returned a value other than E_PERM.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -60,16 +61,9 @@ const testing = lib.testing;
 
 const SUSPEND_NUM: u64 = @intFromEnum(syscall.SyscallNum.@"suspend");
 
-// Reserve 114 stack slots for vregs 14..127 (114 qwords = 912 bytes),
-// then `pushq` the syscall word so vreg 127 lands at `[rsp + 912]` and
-// the word at `[rsp + 0]` when the syscall executes. Cleanup pops 920
-// bytes total. Mirrors handle_attachments_02 / 03.
 const STACK_PAD_BYTES: u64 = 912;
 
-fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
-    // Syscall word: bits 0-11 = syscall_num, bits 12-19 = pair_count = 1.
-    const word: u64 = (SUSPEND_NUM & 0xFFF) | (@as(u64, 1) << 12);
-
+fn suspendWithOnePairAtV127X64(word: u64, target: u64, port: u64, entry: u64) syscall.Regs {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
     var ov3: u64 = undefined;
@@ -106,8 +100,8 @@ fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
         : [word] "{rcx}" (word),
           [pad] "i" (STACK_PAD_BYTES),
           [entry] "r" (entry),
-          [iv1] "{rax}" (@as(u64, target)),
-          [iv2] "{rbx}" (@as(u64, port)),
+          [iv1] "{rax}" (target),
+          [iv2] "{rbx}" (port),
         : .{ .rcx = true, .r11 = true, .memory = true });
 
     return .{
@@ -124,6 +118,74 @@ fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
         .v11 = ov11,
         .v12 = ov12,
         .v13 = ov13,
+    };
+}
+
+fn suspendWithOnePairAtV127Arm(word: u64, target: u64, port: u64, entry: u64) syscall.Regs {
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #784
+        \\ str %[entry], [sp, #768]
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ add sp, sp, #784
+        : [v1] "={x0}" (ov1),
+          [v2] "={x1}" (ov2),
+          [v3] "={x2}" (ov3),
+          [v4] "={x3}" (ov4),
+          [v5] "={x4}" (ov5),
+          [v6] "={x5}" (ov6),
+          [v7] "={x6}" (ov7),
+          [v8] "={x7}" (ov8),
+          [v9] "={x8}" (ov9),
+          [v10] "={x9}" (ov10),
+          [v11] "={x10}" (ov11),
+          [v12] "={x11}" (ov12),
+          [v13] "={x12}" (ov13),
+        : [word] "r" (word),
+          [entry] "r" (entry),
+          [iv1] "{x0}" (target),
+          [iv2] "{x1}" (port),
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
+             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
+             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
+             .x29 = true, .x30 = true, .memory = true });
+
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
+}
+
+fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
+    const word: u64 = (SUSPEND_NUM & 0xFFF) | (@as(u64, 1) << 12);
+    return switch (builtin.cpu.arch) {
+        .x86_64 => suspendWithOnePairAtV127X64(word, @as(u64, target), @as(u64, port), entry),
+        .aarch64 => suspendWithOnePairAtV127Arm(word, @as(u64, target), @as(u64, port), entry),
+        else => @compileError("unsupported arch"),
     };
 }
 
