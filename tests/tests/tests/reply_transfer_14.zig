@@ -103,12 +103,26 @@
 //   12: branch-B — yield-poll observed the sentinel (RIP modification
 //                  was applied even without write cap)
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+// Local halt-forever entry. libz `testing.dummyEntry` uses bare `hlt`,
+// which only assembles on x86. Arch-dispatched twin keeps the test
+// compiling on aarch64.
+fn localDummyEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported target architecture"),
+        }
+    }
+}
 
 // Sentinel and observation slots. Both ECs share the test domain's
 // address space, so these globals are the side channel from each W's
@@ -135,25 +149,55 @@ export var result_1: u64 = BASELINE;
 export var result_2: u64 = BASELINE;
 
 fn altEntry1() callconv(.naked) noreturn {
-    asm volatile (
-        \\ movabsq %[sentinel], %%rax
-        \\ movq %%rax, result_1(%%rip)
-        \\ 1: hlt
-        \\ jmp 1b
-        :
-        : [sentinel] "i" (SENTINEL),
-    );
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\ movabsq %[sentinel], %%rax
+            \\ movq %%rax, result_1(%%rip)
+            \\ 1: hlt
+            \\ jmp 1b
+            :
+            : [sentinel] "i" (SENTINEL),
+        ),
+        .aarch64 => asm volatile (
+            \\ movz x0, #0xF00D
+            \\ movk x0, #0xDEAD, lsl #16
+            \\ movk x0, #0xCAFE, lsl #32
+            \\ movk x0, #0xBEEF, lsl #48
+            \\ adrp x1, result_1
+            \\ add x1, x1, :lo12:result_1
+            \\ str x0, [x1]
+            \\ 1: wfi
+            \\ b 1b
+            ::
+        ),
+        else => @compileError("unsupported target architecture"),
+    }
 }
 
 fn altEntry2() callconv(.naked) noreturn {
-    asm volatile (
-        \\ movabsq %[sentinel], %%rax
-        \\ movq %%rax, result_2(%%rip)
-        \\ 1: hlt
-        \\ jmp 1b
-        :
-        : [sentinel] "i" (SENTINEL),
-    );
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\ movabsq %[sentinel], %%rax
+            \\ movq %%rax, result_2(%%rip)
+            \\ 1: hlt
+            \\ jmp 1b
+            :
+            : [sentinel] "i" (SENTINEL),
+        ),
+        .aarch64 => asm volatile (
+            \\ movz x0, #0xF00D
+            \\ movk x0, #0xDEAD, lsl #16
+            \\ movk x0, #0xCAFE, lsl #32
+            \\ movk x0, #0xBEEF, lsl #48
+            \\ adrp x1, result_2
+            \\ add x1, x1, :lo12:result_2
+            \\ str x0, [x1]
+            \\ 1: wfi
+            \\ b 1b
+            ::
+        ),
+        else => @compileError("unsupported target architecture"),
+    }
 }
 
 // Combined recv + reply_transfer with a single-vreg state modification.
@@ -208,61 +252,102 @@ fn recvAndReplyTransferWithRipMod(
     //   [rsp + 16..40]      — RFLAGS / RSP / FS / GS (left as recv'd)
     //   [rsp + 912] vreg 127 — pair entry attachment for reply_transfer
 
-    asm volatile (
-        \\ subq $920, %%rsp
-        // ─── PHASE 1 — recv ───────────────────────────────────────────
-        // Install recv syscall word (35) at vreg 0.
-        \\ movq $35, (%%rsp)
-        // vreg 1 = port handle.
-        \\ movq asm_io+0(%%rip), %%rax
-        \\ syscall
-        // Stash recv status (vreg 1 = rax).
-        \\ movq %%rax, asm_io+24(%%rip)
-        // Save the returned syscall word (carries reply_handle_id) for
-        // post-recv consumption.
-        \\ movq (%%rsp), %%r11
-        // Bail out if recv failed — reply_transfer would be undefined.
-        // Numeric local labels (1f / 2f) survive the inline-asm-as-
-        // function-template inlining the compiler does at each call
-        // site (each instantiation gets fresh resolution against the
-        // local `1` and `2` labels).
-        \\ testq %%rax, %%rax
-        \\ jne 1f
-        // ─── PHASE 2 — modify state, reply_transfer ───────────────────
-        // vreg 14 = RIP at [rsp + 8] := new_rip.
-        \\ movq asm_io+8(%%rip), %%rax
-        \\ movq %%rax, 8(%%rsp)
-        // vreg 127 = pair entry at [rsp + 912].
-        \\ movq asm_io+16(%%rip), %%rax
-        \\ movq %%rax, 912(%%rsp)
-        // reply_transfer syscall word: build at runtime so the
-        // reply_handle_id ends up in bits 20-31 per the new ABI.
-        // Extract rid from the saved recv word (bits 32..43 per §[recv]
-        // return layout): mask bits 32-43 in place (using a 64-bit
-        // immediate via movabsq because the constant exceeds the
-        // 32-bit-imm sign-extension range), then `shrq $12` to slide
-        // those 12 bits down to occupy bits 20-31. OR in the
-        // syscall_num (39) and pair_count constants (1<<12 = 4096) =
-        // 4135.
-        \\ movq %%r11, %%rax
-        \\ movabsq $0xFFF00000000, %%rcx
-        \\ andq %%rcx, %%rax
-        \\ shrq $12, %%rax
-        \\ orq $4135, %%rax
-        \\ movq %%rax, (%%rsp)
-        \\ syscall
-        \\ movq %%rax, asm_io+32(%%rip)
-        \\ jmp 2f
-        \\ 1:
-        // Synthesize a nonzero xfer_status so the caller can tell the
-        // reply_transfer never ran. Picked outside the spec error
-        // range (16..) so it is not confusable with a real E_*.
-        \\ movq $-1, asm_io+32(%%rip)
-        \\ 2:
-        \\ addq $920, %%rsp
-        :
-        :
-        : .{ .rax = true, .rbx = true, .rcx = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\ subq $920, %%rsp
+            // ─── PHASE 1 — recv ───────────────────────────────────────────
+            \\ movq $35, (%%rsp)
+            \\ movq asm_io+0(%%rip), %%rax
+            \\ syscall
+            \\ movq %%rax, asm_io+24(%%rip)
+            \\ movq (%%rsp), %%r11
+            \\ testq %%rax, %%rax
+            \\ jne 1f
+            // ─── PHASE 2 — modify state, reply_transfer ───────────────────
+            \\ movq asm_io+8(%%rip), %%rax
+            \\ movq %%rax, 8(%%rsp)
+            \\ movq asm_io+16(%%rip), %%rax
+            \\ movq %%rax, 912(%%rsp)
+            \\ movq %%r11, %%rax
+            \\ movabsq $0xFFF00000000, %%rcx
+            \\ andq %%rcx, %%rax
+            \\ shrq $12, %%rax
+            \\ orq $4135, %%rax
+            \\ movq %%rax, (%%rsp)
+            \\ syscall
+            \\ movq %%rax, asm_io+32(%%rip)
+            \\ jmp 2f
+            \\ 1:
+            \\ movq $-1, asm_io+32(%%rip)
+            \\ 2:
+            \\ addq $920, %%rsp
+            :
+            :
+            : .{ .rax = true, .rbx = true, .rcx = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true }),
+        .aarch64 => asm volatile (
+            // 784-byte pad: vreg 0 at [sp+0], vregs 32..127 at
+            // [sp+8..768]. On aarch64 vregs 1..31 ride in x0..x30 (so
+            // vreg 14 = x13 — modified directly between phases).
+            \\ sub sp, sp, #784
+            // ─── PHASE 1 — recv ───────────────────────────────────────────
+            // syscall word = 35 (recv), no extra fields.
+            \\ mov x9, #35
+            \\ str x9, [sp]
+            // vreg 1 (port) = x0; vreg 2 unused for our purposes.
+            \\ adrp x9, asm_io
+            \\ add x9, x9, :lo12:asm_io
+            \\ ldr x0, [x9, #0]
+            \\ svc #0
+            // Stash recv status (vreg 1 = x0).
+            \\ adrp x9, asm_io
+            \\ add x9, x9, :lo12:asm_io
+            \\ str x0, [x9, #24]
+            // Save returned syscall word (carries reply_handle_id) for
+            // post-recv consumption.
+            \\ ldr x10, [sp]
+            // Bail if recv failed.
+            \\ cbnz x0, 1f
+            // ─── PHASE 2 — modify state, reply_transfer ───────────────────
+            // vreg 14 = x13 := new_rip. (On aarch64 vreg 14 is in a
+            // GPR rather than on the stack — write the register
+            // directly between phases.)
+            \\ adrp x9, asm_io
+            \\ add x9, x9, :lo12:asm_io
+            \\ ldr x13, [x9, #8]
+            // vreg 127 = [sp + 768] := pair entry.
+            \\ ldr x11, [x9, #16]
+            \\ str x11, [sp, #768]
+            // reply_transfer syscall word: extract rid from saved
+            // recv word (bits 32-43), shift down by 12 so it sits in
+            // bits 20-31, then OR in syscall_num (39) | (1 << 12) =
+            // 4135.
+            \\ ubfx x12, x10, #32, #12
+            \\ lsl x12, x12, #20
+            \\ mov x14, #4135
+            \\ orr x12, x12, x14
+            \\ str x12, [sp]
+            \\ svc #0
+            \\ adrp x9, asm_io
+            \\ add x9, x9, :lo12:asm_io
+            \\ str x0, [x9, #32]
+            \\ b 2f
+            \\ 1:
+            \\ adrp x9, asm_io
+            \\ add x9, x9, :lo12:asm_io
+            \\ mov x12, #-1
+            \\ str x12, [x9, #32]
+            \\ 2:
+            \\ add sp, sp, #784
+            :
+            :
+            : .{ .x0 = true, .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+                 .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true,
+                 .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
+                 .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true,
+                 .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true,
+                 .memory = true }),
+        else => @compileError("unsupported target architecture"),
+    }
 
     return .{
         .recv_status = asm_io.recv_status,
@@ -361,7 +446,7 @@ pub fn main(cap_table_base: u64) void {
         // — the test EC always outranks an idle sibling on the run
         // queue.
         const ec_caps_word: u64 = @as(u64, w1_caps.toU16()) | (@as(u64, 1) << 32);
-        const entry: u64 = @intFromPtr(&testing.dummyEntry);
+        const entry: u64 = @intFromPtr(&localDummyEntry);
         const cec = syscall.createExecutionContext(
             ec_caps_word,
             entry,
@@ -441,7 +526,7 @@ pub fn main(cap_table_base: u64) void {
         // missing `write` cap, W2 must be capable of running for the
         // sentinel-distinct baseline to be falsified.
         const ec_caps_word: u64 = @as(u64, w2_caps.toU16()) | (@as(u64, 1) << 32);
-        const entry: u64 = @intFromPtr(&testing.dummyEntry);
+        const entry: u64 = @intFromPtr(&localDummyEntry);
         const cec = syscall.createExecutionContext(
             ec_caps_word,
             entry,

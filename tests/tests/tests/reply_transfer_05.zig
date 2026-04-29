@@ -72,6 +72,7 @@
 //   4: recv did not return OK
 //   5: reply_transfer returned something other than E_BADCAP
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -79,11 +80,23 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Inline-asm reply_transfer for N=1. The single pair entry is placed
-// at vreg 127 ([rsp + 912] at syscall time). The pad is allocated with
-// `subq $912, %rsp` so vreg 14 lands at [rsp + 8] post-push, matching
-// the libz vreg layout. Returns the kernel's vreg 1 (rax) — the error
-// code or 0 on success.
+// Local halt-forever entry. libz `testing.dummyEntry` uses bare `hlt`,
+// which only assembles on x86. Mirror it here with arch dispatch so
+// the test EC compiles on aarch64 too.
+fn localDummyEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported target architecture"),
+        }
+    }
+}
+
+// Inline-asm reply_transfer for N=1. The single pair entry is placed at
+// vreg 127. On x86 vreg 127 = [rsp + 912]; on aarch64 vreg 127 =
+// [sp + 768]. Returns the kernel's vreg 1 (rax/x0) — the error code or
+// 0 on success.
 fn replyTransferOneEntry(reply_handle_id: u12, pair_entry: u64) u64 {
     // Spec §[syscall_abi] / §[reply_transfer]: syscall_num in bits 0-11;
     // pair_count `N` in bits 12-19; reply_handle_id in bits 20-31. N=1.
@@ -91,18 +104,42 @@ fn replyTransferOneEntry(reply_handle_id: u12, pair_entry: u64) u64 {
         ((@as(u64, 1) & 0xFF) << 12) |
         ((@as(u64, reply_handle_id) & 0xFFF) << 20);
 
-    var ov1: u64 = undefined;
-    asm volatile (
-        \\ subq $912, %%rsp
-        \\ movq %[entry], 904(%%rsp)
-        \\ pushq %%rcx
-        \\ syscall
-        \\ addq $920, %%rsp
-        : [v1] "={rax}" (ov1),
-        : [word] "{rcx}" (word),
-          [entry] "{rdi}" (pair_entry),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-    return ov1;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            var ov1: u64 = undefined;
+            asm volatile (
+                \\ subq $912, %%rsp
+                \\ movq %[entry], 904(%%rsp)
+                \\ pushq %%rcx
+                \\ syscall
+                \\ addq $920, %%rsp
+                : [v1] "={rax}" (ov1),
+                : [word] "{rcx}" (word),
+                  [entry] "{rdi}" (pair_entry),
+                : .{ .rcx = true, .r11 = true, .memory = true });
+            return ov1;
+        },
+        .aarch64 => {
+            var ov1: u64 = undefined;
+            asm volatile (
+                \\ sub sp, sp, #784
+                \\ str %[word], [sp]
+                \\ str %[entry], [sp, #768]
+                \\ svc #0
+                \\ add sp, sp, #784
+                : [v1] "={x0}" (ov1),
+                : [word] "r" (word),
+                  [entry] "r" (pair_entry),
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+            return ov1;
+        },
+        else => @compileError("unsupported target architecture"),
+    }
 }
 
 pub fn main(cap_table_base: u64) void {
@@ -133,7 +170,7 @@ pub fn main(cap_table_base: u64) void {
         .restart_policy = 0,
     };
     const ec_caps_word: u64 = @as(u64, w_caps.toU16());
-    const entry: u64 = @intFromPtr(&testing.dummyEntry);
+    const entry: u64 = @intFromPtr(&localDummyEntry);
     const cec = syscall.createExecutionContext(
         ec_caps_word,
         entry,

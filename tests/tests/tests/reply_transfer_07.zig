@@ -69,12 +69,70 @@
 //   5: reply_transfer returned something other than E_PERM (the spec
 //      assertion under test).
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+// Local halt-forever entry. libz `testing.dummyEntry` uses bare `hlt`,
+// which only assembles on x86. Arch-dispatched twin keeps the test
+// compiling on aarch64.
+fn localDummyEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported target architecture"),
+        }
+    }
+}
+
+// Issue reply_transfer with N=1 and one pair entry at vreg 127.
+// On x86 vreg 127 = [rsp + 912]; on aarch64 vreg 127 = [sp + 768].
+fn replyTransferOnePair(reply_handle_id: u12, pair_entry: u64) u64 {
+    const word: u64 = 39 |
+        (@as(u64, 1) << 12) |
+        ((@as(u64, reply_handle_id) & 0xFFF) << 20);
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            var rax: u64 = undefined;
+            asm volatile (
+                \\ subq $920, %%rsp
+                \\ movq %%rcx, (%%rsp)
+                \\ movq %[entry], 912(%%rsp)
+                \\ syscall
+                \\ addq $920, %%rsp
+                : [rax] "={rax}" (rax),
+                : [word] "{rcx}" (word),
+                  [entry] "{rdi}" (pair_entry),
+                : .{ .rcx = true, .r11 = true, .memory = true });
+            return rax;
+        },
+        .aarch64 => {
+            var x0_out: u64 = undefined;
+            asm volatile (
+                \\ sub sp, sp, #784
+                \\ str %[word], [sp]
+                \\ str %[entry], [sp, #768]
+                \\ svc #0
+                \\ add sp, sp, #784
+                : [v1] "={x0}" (x0_out),
+                : [word] "r" (word),
+                  [entry] "r" (pair_entry),
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+            return x0_out;
+        },
+        else => @compileError("unsupported target architecture"),
+    }
+}
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
@@ -107,7 +165,7 @@ pub fn main(cap_table_base: u64) void {
         .restart_policy = 0,
     };
     const ec_caps_word: u64 = @as(u64, w_caps.toU16());
-    const entry: u64 = @intFromPtr(&testing.dummyEntry);
+    const entry: u64 = @intFromPtr(&localDummyEntry);
     const cec = syscall.createExecutionContext(
         ec_caps_word,
         entry,
@@ -159,30 +217,7 @@ pub fn main(cap_table_base: u64) void {
     };
     const pair_u64: u64 = pair.toU64();
 
-    // syscall_num = 39 (reply_transfer); N = 1 in bits 12-19;
-    // reply_handle_id in bits 20-31. Per §[reply_transfer] (new ABI)
-    // the reply handle id rides in the syscall word; the sole pair
-    // entry rides in vreg 127. Vreg 127 lives at [rsp + (127-13)*8] =
-    // [rsp + 912] when the kernel reads the stack frame, so we reserve
-    // 920 bytes (syscall word at offset 0, pair entry at offset 912),
-    // syscall, then unwind. libz's replyTransfer panics on N > 0; the
-    // open-coded path here is the documented workaround (sibling
-    // reply_transfer_06 uses the same shape).
-    const word: u64 = 39 |
-        (@as(u64, 1) << 12) |
-        ((@as(u64, reply_handle_id) & 0xFFF) << 20);
-    var rax: u64 = undefined;
-    asm volatile (
-        \\ subq $920, %%rsp
-        \\ movq %%rcx, (%%rsp)
-        \\ movq %[entry], 912(%%rsp)
-        \\ syscall
-        \\ addq $920, %%rsp
-        : [rax] "={rax}" (rax),
-        : [word] "{rcx}" (word),
-          [entry] "{rdi}" (pair_u64),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-
+    const rax = replyTransferOnePair(reply_handle_id, pair_u64);
     if (rax != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(5);
         return;

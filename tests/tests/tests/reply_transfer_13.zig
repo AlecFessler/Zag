@@ -105,12 +105,26 @@
 //   8: post-call probe found donor C released
 //      (move=0 source incorrectly removed)
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+// Local halt-forever entry. libz `testing.dummyEntry` uses bare `hlt`,
+// which only assembles on x86. Arch-dispatched twin keeps the test
+// compiling on aarch64.
+fn localDummyEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported target architecture"),
+        }
+    }
+}
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
@@ -141,7 +155,7 @@ pub fn main(cap_table_base: u64) void {
         .restart_policy = 0,
     };
     const ec_caps_word: u64 = @as(u64, w_caps.toU16());
-    const entry: u64 = @intFromPtr(&testing.dummyEntry);
+    const entry: u64 = @intFromPtr(&localDummyEntry);
     const cec = syscall.createExecutionContext(
         ec_caps_word,
         entry,
@@ -266,19 +280,46 @@ pub fn main(cap_table_base: u64) void {
     var scratch: [3]u64 = .{ syscall_word, pair_m, pair_c };
 
     var rax_out: u64 = undefined;
-    asm volatile (
-        \\ subq $920, %%rsp
-        \\ movq 0(%%rdx), %%rcx
-        \\ movq %%rcx, 0(%%rsp)
-        \\ movq 8(%%rdx), %%rcx
-        \\ movq %%rcx, 904(%%rsp)
-        \\ movq 16(%%rdx), %%rcx
-        \\ movq %%rcx, 912(%%rsp)
-        \\ syscall
-        \\ addq $920, %%rsp
-        : [out_rax] "={rax}" (rax_out),
-        : [base] "{rdx}" (&scratch),
-        : .{ .rcx = true, .rdx = true, .r11 = true, .memory = true });
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            asm volatile (
+                \\ subq $920, %%rsp
+                \\ movq 0(%%rdx), %%rcx
+                \\ movq %%rcx, 0(%%rsp)
+                \\ movq 8(%%rdx), %%rcx
+                \\ movq %%rcx, 904(%%rsp)
+                \\ movq 16(%%rdx), %%rcx
+                \\ movq %%rcx, 912(%%rsp)
+                \\ syscall
+                \\ addq $920, %%rsp
+                : [out_rax] "={rax}" (rax_out),
+                : [base] "{rdx}" (&scratch),
+                : .{ .rcx = true, .rdx = true, .r11 = true, .memory = true });
+        },
+        .aarch64 => {
+            // aarch64: vreg 126 = [sp + 760], vreg 127 = [sp + 768];
+            // reserve 784 bytes. scratch[0]=word, [1]=pair_m, [2]=pair_c.
+            asm volatile (
+                \\ sub sp, sp, #784
+                \\ ldr x13, [%[base], #0]
+                \\ str x13, [sp]
+                \\ ldr x13, [%[base], #8]
+                \\ str x13, [sp, #760]
+                \\ ldr x13, [%[base], #16]
+                \\ str x13, [sp, #768]
+                \\ svc #0
+                \\ add sp, sp, #784
+                : [out] "={x0}" (rax_out),
+                : [base] "r" (&scratch),
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        },
+        else => @compileError("unsupported target architecture"),
+    }
 
     if (rax_out != @intFromEnum(errors.Error.OK)) {
         testing.fail(6);

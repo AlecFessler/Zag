@@ -103,12 +103,26 @@
 //   7: reply_transfer on the now-marked handle returned something
 //      other than E_TERM
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+// Local halt-forever entry. libz `testing.dummyEntry` uses bare `hlt`,
+// which only assembles on x86. Arch-dispatched twin keeps the test
+// compiling on aarch64.
+fn localDummyEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported target architecture"),
+        }
+    }
+}
 
 // Inline-asm reply_transfer wrapper. libz syscall.replyTransfer panics
 // because the high-vreg pair-entry path (vregs [128-N..127]) requires a
@@ -135,37 +149,55 @@ fn replyTransferOneEntry(reply_handle: u12, pair_entry: u64) errors.Error {
         ((@as(u64, 1) & 0xFF) << 12) |
         ((@as(u64, reply_handle) & 0xFFF) << 20);
 
-    var ov1: u64 = undefined;
-    asm volatile (
-    // Reserve 920 bytes: 8 for the syscall word at [rsp+0], plus
-    // 114 * 8 = 912 for vregs 14..127 starting at [rsp+8].
-    \\ subq $920, %%rsp
-    // Zero vregs 14..126 (offsets 8..904, exclusive of 912). The
-    // kernel reads only vregs [128-N..127] = [127] for N=1, so
-    // strict zeroing is defensive — keep the lower stack pad
-    // deterministic so a future bump to N>1 catches stale data.
-    \\ movq %%rsp, %%rdx
-    \\ addq $8, %%rdx
-    \\ movq $113, %%rcx
-    \\ 1:
-    \\ movq $0, (%%rdx)
-    \\ addq $8, %%rdx
-    \\ decq %%rcx
-    \\ jnz 1b
-    // Vreg 127 = [rsp+912] = the pair entry.
-    \\ movq %[pair], 912(%%rsp)
-    // Vreg 0 = [rsp+0] = syscall word (carries reply_handle_id).
-    \\ movq %[word], (%%rsp)
-    // The kernel reads the reply_handle_id out of the syscall word
-    // (bits 20-31). After SYSRET the kernel writes the error code
-    // back into rax (vreg 1), which we capture in ov1.
-    \\ syscall
-    \\ addq $920, %%rsp
-        : [v1] "={rax}" (ov1),
-        : [word] "r" (word),
-          [pair] "r" (pair_entry),
-        : .{ .rcx = true, .rdx = true, .r11 = true, .memory = true });
-    return @enumFromInt(ov1);
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            var ov1: u64 = undefined;
+            asm volatile (
+                \\ subq $920, %%rsp
+                \\ movq %%rsp, %%rdx
+                \\ addq $8, %%rdx
+                \\ movq $113, %%rcx
+                \\ 1:
+                \\ movq $0, (%%rdx)
+                \\ addq $8, %%rdx
+                \\ decq %%rcx
+                \\ jnz 1b
+                \\ movq %[pair], 912(%%rsp)
+                \\ movq %[word], (%%rsp)
+                \\ syscall
+                \\ addq $920, %%rsp
+                : [v1] "={rax}" (ov1),
+                : [word] "r" (word),
+                  [pair] "r" (pair_entry),
+                : .{ .rcx = true, .rdx = true, .r11 = true, .memory = true });
+            return @enumFromInt(ov1);
+        },
+        .aarch64 => {
+            // aarch64: vreg 127 = [sp + 768]; reserve 784 bytes.
+            var x0_out: u64 = undefined;
+            asm volatile (
+                \\ sub sp, sp, #784
+                \\ mov x13, sp
+                \\ mov x14, #97
+                \\1: str xzr, [x13]
+                \\ add x13, x13, #8
+                \\ subs x14, x14, #1
+                \\ b.ne 1b
+                \\ str %[pair], [sp, #768]
+                \\ str %[word], [sp]
+                \\ svc #0
+                \\ add sp, sp, #784
+                : [v1] "={x0}" (x0_out),
+                : [word] "r" (word),
+                  [pair] "r" (pair_entry),
+                : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
+                     .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
+                     .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
+                     .x29 = true, .x30 = true, .memory = true });
+            return @enumFromInt(x0_out);
+        },
+        else => @compileError("unsupported target architecture"),
+    }
 }
 
 pub fn main(cap_table_base: u64) void {
@@ -199,7 +231,7 @@ pub fn main(cap_table_base: u64) void {
     // priority/target_caps default to 0 which stays inside the runner
     // pri ceiling (3) and is irrelevant when target = self.
     const w_caps_word: u64 = @as(u64, w_caps.toU16());
-    const entry: u64 = @intFromPtr(&testing.dummyEntry);
+    const entry: u64 = @intFromPtr(&localDummyEntry);
     const w_cec = syscall.createExecutionContext(
         w_caps_word,
         entry,

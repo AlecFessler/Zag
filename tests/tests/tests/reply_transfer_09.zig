@@ -81,12 +81,26 @@
 //      self handle, never used for replies).
 //   5: reply_transfer returned something other than E_INVAL.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+// Local halt-forever entry. libz `testing.dummyEntry` uses bare `hlt`,
+// which only assembles on x86. Arch-dispatched twin keeps the test
+// compiling on aarch64.
+fn localDummyEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported target architecture"),
+        }
+    }
+}
 
 // Issue reply_transfer with N=2 pair entries placed at vregs 126/127.
 // Returns the kernel's error word from rax (vreg 1).
@@ -108,25 +122,46 @@ fn issueReplyTransferDup(reply_id: u12, entry: u64) u64 {
         (@as(u64, 2) << 12) |
         ((@as(u64, reply_id) & 0xFFF) << 20);
 
-    var rax_out: u64 = undefined;
-    asm volatile (
-    // Reserve 920 bytes: 8 for the syscall word at [rsp+0], plus
-    // 114 * 8 = 912 for vregs 14..127 starting at [rsp+8]. Vreg 126
-    // = [rsp + (126-13)*8] = [rsp+904]; vreg 127 = [rsp+912]. Write
-    // the word and the two pair-entry slots directly (no `pushq`)
-    // so post-allocation offsets coincide with the spec-mandated
-    // vreg offsets without an intervening 8-byte shift.
-    \\ subq $920, %%rsp
-    \\ movq %%rcx, (%%rsp)
-    \\ movq %[entry], 904(%%rsp)
-    \\ movq %[entry], 912(%%rsp)
-    \\ syscall
-    \\ addq $920, %%rsp
-        : [rax] "={rax}" (rax_out),
-        : [word] "{rcx}" (word),
-          [entry] "r" (entry),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-    return rax_out;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            var rax_out: u64 = undefined;
+            asm volatile (
+                \\ subq $920, %%rsp
+                \\ movq %%rcx, (%%rsp)
+                \\ movq %[entry], 904(%%rsp)
+                \\ movq %[entry], 912(%%rsp)
+                \\ syscall
+                \\ addq $920, %%rsp
+                : [rax] "={rax}" (rax_out),
+                : [word] "{rcx}" (word),
+                  [entry] "r" (entry),
+                : .{ .rcx = true, .r11 = true, .memory = true });
+            return rax_out;
+        },
+        .aarch64 => {
+            // aarch64 high-vreg layout: vreg 126 = [sp + 760],
+            // vreg 127 = [sp + 768]. Reserve 784 bytes.
+            var x0_out: u64 = undefined;
+            asm volatile (
+                \\ sub sp, sp, #784
+                \\ str %[word], [sp]
+                \\ str %[entry], [sp, #760]
+                \\ str %[entry], [sp, #768]
+                \\ svc #0
+                \\ add sp, sp, #784
+                : [v1] "={x0}" (x0_out),
+                : [word] "r" (word),
+                  [entry] "r" (entry),
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+            return x0_out;
+        },
+        else => @compileError("unsupported target architecture"),
+    }
 }
 
 pub fn main(cap_table_base: u64) void {
@@ -161,7 +196,7 @@ pub fn main(cap_table_base: u64) void {
         .restart_policy = 0,
     };
     const caps_word: u64 = @as(u64, ec_caps.toU16());
-    const entry: u64 = @intFromPtr(&testing.dummyEntry);
+    const entry: u64 = @intFromPtr(&localDummyEntry);
     const cec = syscall.createExecutionContext(
         caps_word,
         entry,

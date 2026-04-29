@@ -92,6 +92,7 @@
 //   2: Case B — pair entry with reserved bit 12 set returned something
 //      other than E_INVAL.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -100,12 +101,6 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 const REPLY_TRANSFER_NUM: u64 = @intFromEnum(syscall.SyscallNum.reply_transfer);
-
-// Reserve 115 stack slots above the syscall word so vreg 127 reaches
-// `[rsp + 912]`. The pad covers vregs 14..127 (114 slots) plus the
-// syscall word at rsp+0 (1 slot), totalling 920 bytes — the smallest
-// 16-byte-aligned frame that satisfies the v3 vreg layout.
-const STACK_PAD_BYTES: u64 = 920;
 
 // Issue reply_transfer with a hand-crafted syscall word and a single
 // pair entry placed at vreg 127. Used by case B to deliver a valid
@@ -119,58 +114,100 @@ fn replyTransferWithOnePairAtV127(reply_handle: u12, entry: u64) syscall.Regs {
         (@as(u64, 1) << 12) |
         ((@as(u64, reply_handle) & 0xFFF) << 20);
 
-    var ov1: u64 = undefined;
-    var ov2: u64 = undefined;
-    var ov3: u64 = undefined;
-    var ov4: u64 = undefined;
-    var ov5: u64 = undefined;
-    var ov6: u64 = undefined;
-    var ov7: u64 = undefined;
-    var ov8: u64 = undefined;
-    var ov9: u64 = undefined;
-    var ov10: u64 = undefined;
-    var ov11: u64 = undefined;
-    var ov12: u64 = undefined;
-    var ov13: u64 = undefined;
-    asm volatile (
-        \\ subq %[pad], %%rsp
-        \\ movq %%rcx, (%%rsp)
-        \\ movq %[entry], 912(%%rsp)
-        \\ syscall
-        \\ addq %[pad], %%rsp
-        : [v1] "={rax}" (ov1),
-          [v2] "={rbx}" (ov2),
-          [v3] "={rdx}" (ov3),
-          [v4] "={rbp}" (ov4),
-          [v5] "={rsi}" (ov5),
-          [v6] "={rdi}" (ov6),
-          [v7] "={r8}" (ov7),
-          [v8] "={r9}" (ov8),
-          [v9] "={r10}" (ov9),
-          [v10] "={r12}" (ov10),
-          [v11] "={r13}" (ov11),
-          [v12] "={r14}" (ov12),
-          [v13] "={r15}" (ov13),
-        : [word] "{rcx}" (word),
-          [pad] "i" (STACK_PAD_BYTES),
-          [entry] "r" (entry),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-
-    return .{
-        .v1 = ov1,
-        .v2 = ov2,
-        .v3 = ov3,
-        .v4 = ov4,
-        .v5 = ov5,
-        .v6 = ov6,
-        .v7 = ov7,
-        .v8 = ov8,
-        .v9 = ov9,
-        .v10 = ov10,
-        .v11 = ov11,
-        .v12 = ov12,
-        .v13 = ov13,
-    };
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            var ov1: u64 = undefined;
+            var ov2: u64 = undefined;
+            var ov3: u64 = undefined;
+            var ov4: u64 = undefined;
+            var ov5: u64 = undefined;
+            var ov6: u64 = undefined;
+            var ov7: u64 = undefined;
+            var ov8: u64 = undefined;
+            var ov9: u64 = undefined;
+            var ov10: u64 = undefined;
+            var ov11: u64 = undefined;
+            var ov12: u64 = undefined;
+            var ov13: u64 = undefined;
+            asm volatile (
+                \\ subq $920, %%rsp
+                \\ movq %%rcx, (%%rsp)
+                \\ movq %[entry], 912(%%rsp)
+                \\ syscall
+                \\ addq $920, %%rsp
+                : [v1] "={rax}" (ov1),
+                  [v2] "={rbx}" (ov2),
+                  [v3] "={rdx}" (ov3),
+                  [v4] "={rbp}" (ov4),
+                  [v5] "={rsi}" (ov5),
+                  [v6] "={rdi}" (ov6),
+                  [v7] "={r8}" (ov7),
+                  [v8] "={r9}" (ov8),
+                  [v9] "={r10}" (ov9),
+                  [v10] "={r12}" (ov10),
+                  [v11] "={r13}" (ov11),
+                  [v12] "={r14}" (ov12),
+                  [v13] "={r15}" (ov13),
+                : [word] "{rcx}" (word),
+                  [entry] "r" (entry),
+                : .{ .rcx = true, .r11 = true, .memory = true });
+            return .{
+                .v1 = ov1, .v2 = ov2, .v3 = ov3, .v4 = ov4, .v5 = ov5,
+                .v6 = ov6, .v7 = ov7, .v8 = ov8, .v9 = ov9, .v10 = ov10,
+                .v11 = ov11, .v12 = ov12, .v13 = ov13,
+            };
+        },
+        .aarch64 => {
+            // aarch64 high-vreg layout: vreg N (32..127) lives at
+            // [sp + (N-31)*8]. vreg 127 = [sp + 768]. Reserve 784 bytes
+            // (16-byte aligned, covers vreg 0 at [sp+0] and vregs 32..127
+            // at [sp+8..768]).
+            var ov1: u64 = undefined;
+            var ov2: u64 = undefined;
+            var ov3: u64 = undefined;
+            var ov4: u64 = undefined;
+            var ov5: u64 = undefined;
+            var ov6: u64 = undefined;
+            var ov7: u64 = undefined;
+            var ov8: u64 = undefined;
+            var ov9: u64 = undefined;
+            var ov10: u64 = undefined;
+            var ov11: u64 = undefined;
+            var ov12: u64 = undefined;
+            var ov13: u64 = undefined;
+            asm volatile (
+                \\ sub sp, sp, #784
+                \\ str %[word], [sp]
+                \\ str %[entry], [sp, #768]
+                \\ svc #0
+                \\ add sp, sp, #784
+                : [v1] "={x0}" (ov1),
+                  [v2] "={x1}" (ov2),
+                  [v3] "={x2}" (ov3),
+                  [v4] "={x3}" (ov4),
+                  [v5] "={x4}" (ov5),
+                  [v6] "={x5}" (ov6),
+                  [v7] "={x6}" (ov7),
+                  [v8] "={x7}" (ov8),
+                  [v9] "={x8}" (ov9),
+                  [v10] "={x9}" (ov10),
+                  [v11] "={x10}" (ov11),
+                  [v12] "={x11}" (ov12),
+                  [v13] "={x12}" (ov13),
+                : [word] "r" (word),
+                  [entry] "r" (entry),
+                : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
+                     .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
+                     .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
+                     .x29 = true, .x30 = true, .memory = true });
+            return .{
+                .v1 = ov1, .v2 = ov2, .v3 = ov3, .v4 = ov4, .v5 = ov5,
+                .v6 = ov6, .v7 = ov7, .v8 = ov8, .v9 = ov9, .v10 = ov10,
+                .v11 = ov11, .v12 = ov12, .v13 = ov13,
+            };
+        },
+        else => @compileError("unsupported target architecture"),
+    }
 }
 
 // Issue reply_transfer with a hand-crafted syscall word and no pair
@@ -180,16 +217,38 @@ fn replyTransferWithOnePairAtV127(reply_handle: u12, entry: u64) syscall.Regs {
 // shape but accepts an arbitrary `word` so the caller can pin every
 // bit — including reserved bits the typed wrappers would never set.
 fn issueRawReplyTransfer(word: u64) u64 {
-    var ov1: u64 = undefined;
-    asm volatile (
-        \\ subq $16, %%rsp
-        \\ movq %%rcx, (%%rsp)
-        \\ syscall
-        \\ addq $16, %%rsp
-        : [v1] "={rax}" (ov1),
-        : [word] "{rcx}" (word),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-    return ov1;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            var ov1: u64 = undefined;
+            asm volatile (
+                \\ subq $16, %%rsp
+                \\ movq %%rcx, (%%rsp)
+                \\ syscall
+                \\ addq $16, %%rsp
+                : [v1] "={rax}" (ov1),
+                : [word] "{rcx}" (word),
+                : .{ .rcx = true, .r11 = true, .memory = true });
+            return ov1;
+        },
+        .aarch64 => {
+            var ov1: u64 = undefined;
+            asm volatile (
+                \\ sub sp, sp, #16
+                \\ str %[word], [sp]
+                \\ svc #0
+                \\ add sp, sp, #16
+                : [v1] "={x0}" (ov1),
+                : [word] "r" (word),
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+            return ov1;
+        },
+        else => @compileError("unsupported target architecture"),
+    }
 }
 
 pub fn main(cap_table_base: u64) void {

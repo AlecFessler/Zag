@@ -78,6 +78,7 @@
 //      from the entry's caps (handle missing or caps did not land
 //      verbatim)
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -106,7 +107,11 @@ fn siblingEntry() callconv(.c) noreturn {
     // racing the test EC; the test EC writes the globals AFTER it
     // captures the returned EC handle.
     while (@atomicLoad(u32, &g_ready, .acquire) == 0) {
-        asm volatile ("pause" ::: .{ .memory = true });
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
+            .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
+            else => @compileError("unsupported target architecture"),
+        }
     }
 
     const port_id: u64 = g_port_handle_id;
@@ -114,41 +119,78 @@ fn siblingEntry() callconv(.c) noreturn {
 
     // Self-suspend on the port. syscall_num = 34 (suspend), no pair
     // attachments from the sender side. Capture the post-resume syscall
-    // word out of rcx so we can read pair_count / tstart.
+    // word so we can read pair_count / tstart.
     const word_in: u64 = @intFromEnum(syscall.SyscallNum.@"suspend");
     var word_out: u64 = undefined;
-    var rax_out: u64 = undefined;
-    var rbx_out: u64 = undefined;
-    asm volatile (
-        \\ pushq %%rcx
-        \\ syscall
-        \\ popq %%rcx
-        : [wo] "={rcx}" (word_out),
-          [v1o] "={rax}" (rax_out),
-          [v2o] "={rbx}" (rbx_out),
-        : [wi] "{rcx}" (word_in),
-          [v1i] "{rax}" (self_ec_id),
-          [v2i] "{rbx}" (port_id),
-        : .{
-            .rdx = true,
-            .rbp = true,
-            .rsi = true,
-            .rdi = true,
-            .r8 = true,
-            .r9 = true,
-            .r10 = true,
-            .r11 = true,
-            .r12 = true,
-            .r13 = true,
-            .r14 = true,
-            .r15 = true,
-            .memory = true,
-        });
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            var rax_out: u64 = undefined;
+            var rbx_out: u64 = undefined;
+            asm volatile (
+                \\ pushq %%rcx
+                \\ syscall
+                \\ popq %%rcx
+                : [wo] "={rcx}" (word_out),
+                  [v1o] "={rax}" (rax_out),
+                  [v2o] "={rbx}" (rbx_out),
+                : [wi] "{rcx}" (word_in),
+                  [v1i] "{rax}" (self_ec_id),
+                  [v2i] "{rbx}" (port_id),
+                : .{
+                    .rdx = true,
+                    .rbp = true,
+                    .rsi = true,
+                    .rdi = true,
+                    .r8 = true,
+                    .r9 = true,
+                    .r10 = true,
+                    .r11 = true,
+                    .r12 = true,
+                    .r13 = true,
+                    .r14 = true,
+                    .r15 = true,
+                    .memory = true,
+                });
+        },
+        .aarch64 => {
+            // Self-suspend: vreg 0 = syscall word at [sp+0],
+            // vreg 1 = x0 = self EC handle, vreg 2 = x1 = port handle.
+            // Capture post-resume word from [sp+0]. Reserve 16 bytes
+            // (16-byte aligned, no high vregs needed).
+            var x0_out: u64 = undefined;
+            var x1_out: u64 = undefined;
+            asm volatile (
+                \\ sub sp, sp, #16
+                \\ str %[wi], [sp]
+                \\ svc #0
+                \\ ldr %[wo], [sp]
+                \\ add sp, sp, #16
+                : [wo] "=&r" (word_out),
+                  [v1o] "={x0}" (x0_out),
+                  [v2o] "={x1}" (x1_out),
+                : [wi] "r" (word_in),
+                  [v1i] "{x0}" (self_ec_id),
+                  [v2i] "{x1}" (port_id),
+                : .{ .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true,
+                     .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true,
+                     .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true,
+                     .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true,
+                     .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true,
+                     .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        },
+        else => @compileError("unsupported target architecture"),
+    }
 
     @atomicStore(u64, &g_sibling_observed_word, word_out, .release);
     @atomicStore(u32, &g_sibling_done, 1, .release);
 
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfe"),
+            else => @compileError("unsupported target architecture"),
+        }
+    }
 }
 
 pub fn main(cap_table_base: u64) void {
@@ -257,20 +299,43 @@ pub fn main(cap_table_base: u64) void {
         ((@as(u64, reply_handle_id) & 0xFFF) << 20);
 
     var rt_v1_out: u64 = undefined;
-    asm volatile (
-        \\ subq $912, %%rsp
-        \\ movq %[entry], 904(%%rsp)
-        \\ pushq %%rcx
-        \\ syscall
-        \\ addq $920, %%rsp
-        : [v1o] "={rax}" (rt_v1_out),
-        : [wi] "{rcx}" (word),
-          [entry] "r" (entry_u64),
-        : .{
-            .rcx = true,
-            .r11 = true,
-            .memory = true,
-        });
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            asm volatile (
+                \\ subq $912, %%rsp
+                \\ movq %[entry], 904(%%rsp)
+                \\ pushq %%rcx
+                \\ syscall
+                \\ addq $920, %%rsp
+                : [v1o] "={rax}" (rt_v1_out),
+                : [wi] "{rcx}" (word),
+                  [entry] "r" (entry_u64),
+                : .{
+                    .rcx = true,
+                    .r11 = true,
+                    .memory = true,
+                });
+        },
+        .aarch64 => {
+            // aarch64: vreg 127 = [sp + 768]; reserve 784 bytes.
+            asm volatile (
+                \\ sub sp, sp, #784
+                \\ str %[word], [sp]
+                \\ str %[entry], [sp, #768]
+                \\ svc #0
+                \\ add sp, sp, #784
+                : [v1o] "={x0}" (rt_v1_out),
+                : [word] "r" (word),
+                  [entry] "r" (entry_u64),
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        },
+        else => @compileError("unsupported target architecture"),
+    }
 
     if (rt_v1_out != @intFromEnum(errors.Error.OK)) {
         testing.fail(6);
@@ -291,7 +356,11 @@ pub fn main(cap_table_base: u64) void {
     //    safe — both ECs are bound to this domain on the same scheduler;
     //    the kernel will schedule the sibling.
     while (@atomicLoad(u32, &g_sibling_done, .acquire) == 0) {
-        asm volatile ("pause" ::: .{ .memory = true });
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
+            .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
+            else => @compileError("unsupported target architecture"),
+        }
     }
     const sibling_word = @atomicLoad(u64, &g_sibling_observed_word, .acquire);
 

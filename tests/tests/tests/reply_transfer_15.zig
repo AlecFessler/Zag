@@ -114,6 +114,7 @@
 //   8: resumed_marker did not equal RESUMED_MAGIC after yield(W),
 //      i.e., W never ran — the sender was not actually resumed
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -135,7 +136,11 @@ var resumed_marker: u64 = 0;
 fn siblingEntry() callconv(.c) noreturn {
     @atomicStore(u64, &resumed_marker, RESUMED_MAGIC, .seq_cst);
     while (true) {
-        asm volatile ("pause" ::: .{ .memory = true });
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
+            .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
+            else => @compileError("unsupported target architecture"),
+        }
     }
 }
 
@@ -166,18 +171,43 @@ fn replyTransferOne(reply_handle_id: u12, pair_entry: u64) u64 {
     const word: u64 = (@as(u64, 39) & 0xFFF) |
         (@as(u64, 1) << 12) |
         ((@as(u64, reply_handle_id) & 0xFFF) << 20);
-    var v1_out: u64 = undefined;
-    asm volatile (
-        \\ subq $920, %%rsp
-        \\ pushq %%rcx
-        \\ movq %%rdi, 912(%%rsp)
-        \\ syscall
-        \\ addq $928, %%rsp
-        : [v1] "={rax}" (v1_out),
-        : [pair] "{rdi}" (pair_entry),
-          [word] "{rcx}" (word),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-    return v1_out;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            var v1_out: u64 = undefined;
+            asm volatile (
+                \\ subq $920, %%rsp
+                \\ pushq %%rcx
+                \\ movq %%rdi, 912(%%rsp)
+                \\ syscall
+                \\ addq $928, %%rsp
+                : [v1] "={rax}" (v1_out),
+                : [pair] "{rdi}" (pair_entry),
+                  [word] "{rcx}" (word),
+                : .{ .rcx = true, .r11 = true, .memory = true });
+            return v1_out;
+        },
+        .aarch64 => {
+            // aarch64: vreg 127 = [sp + 768]; reserve 784 bytes.
+            var x0_out: u64 = undefined;
+            asm volatile (
+                \\ sub sp, sp, #784
+                \\ str %[word], [sp]
+                \\ str %[pair], [sp, #768]
+                \\ svc #0
+                \\ add sp, sp, #784
+                : [v1] "={x0}" (x0_out),
+                : [word] "r" (word),
+                  [pair] "r" (pair_entry),
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+            return x0_out;
+        },
+        else => @compileError("unsupported target architecture"),
+    }
 }
 
 pub fn main(cap_table_base: u64) void {
