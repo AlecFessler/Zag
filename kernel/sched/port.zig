@@ -265,8 +265,9 @@ pub fn createPort(caller: *ExecutionContext, caps: u64) i64 {
     const port_caps: PortCaps = @bitCast(@as(u16, @truncate(caps)));
 
     const cd_ref = caller.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
-    defer cd_ref.unlock();
+    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = lr.ptr;
+    defer cd_ref.unlockIrqRestore(lr.irq_state);
 
     if (cd.free_count == 0) return errors.E_FULL;
 
@@ -627,8 +628,19 @@ pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
     // reply ops on that slot return E_ABANDONED rather than E_TERM.
     if (reply_caps.abandoned) return errors.E_ABANDONED;
 
-    const sender = sender_ref.lock(@src()) catch return errors.E_TERM;
-    defer sender_ref.unlock();
+    // IRQ-saving acquire: `consumeReply` runs with the sender's
+    // EC._gen_lock held, and `applyReplyStateToVcpu` performs ~488 B
+    // of SMAP-bracketed user-stack reads inside that window. If a
+    // timer IRQ fires mid-read with IRQs enabled, the timer ISR's
+    // scheduler dispatch acquires CD locks and lockdep records
+    // EC→CD against the destroy-side CD→EC = AB-BA cycle. Masking
+    // IRQs across the held window closes that race deterministically.
+    // Spec §[reply] writeback discipline; see also the IRQ-acquired
+    // class enforcement in `tools/check_gen_lock`.
+    const sender_lr = sender_ref.lockIrqSave(@src()) catch return errors.E_TERM;
+    const sender = sender_lr.ptr;
+    const sender_irq_state = sender_lr.irq_state;
+    defer sender_ref.unlockIrqRestore(sender_irq_state);
 
     consumeReply(entry, caller, sender);
     return 0;
