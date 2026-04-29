@@ -42,26 +42,25 @@
 //! - ARM ARM D13.2.37: ESR_EL1
 //! - ARM ARM D13.2.40: FAR_EL1
 
-const std = @import("std");
 const zag = @import("zag");
 
-const aarch64_paging = zag.arch.aarch64.paging;
 const cpu = zag.arch.aarch64.cpu;
 const fpu = zag.sched.fpu;
 const gic = zag.arch.aarch64.gic;
 const kprof_dump = zag.kprof.dump;
 const pmu = zag.arch.aarch64.pmu;
+const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const serial = zag.arch.aarch64.serial;
+const sync_debug = zag.utils.sync.debug;
 const syscall_dispatch = zag.syscall.dispatch;
+const var_range = zag.capdom.var_range;
+
+const VAddr = zag.memory.address.VAddr;
 
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
-const FaultReason = zag.perms.permissions.FaultReason;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PageFaultContext = zag.arch.aarch64.interrupts.PageFaultContext;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const Thread = zag.sched.thread.Thread;
-const VAddr = zag.memory.address.VAddr;
-const VmNode = zag.memory.vmm.VmNode;
 
 /// ARM ARM D13.2.37 -- ESR_EL1 Exception Class field, bits [31:26].
 /// Identifies the reason for the exception that was taken to EL1.
@@ -98,6 +97,27 @@ fn extractEc(esr: u64) ExceptionClass {
 fn isWriteFault(esr: u64) bool {
     return (esr >> 6) & 1 == 1;
 }
+
+/// Stable sub-code values delivered alongside a `thread_fault` event
+/// (spec §[event_type] line 1841: arithmetic / illegal_instruction /
+/// alignment / stack_overflow). Numeric values are an arch contract
+/// shared with userspace fault handlers; the spec leaves the mapping
+/// to the implementation, so these are the kernel-internal canonical
+/// encodings.
+const ThreadFaultSubcode = enum(u8) {
+    illegal_instruction = 0,
+    alignment_fault = 1,
+    protection_fault = 2,
+    arithmetic = 3,
+    stack_overflow = 4,
+};
+
+/// Sub-code delivered alongside a `breakpoint` event (spec §[event_type]
+/// line 1842: software or hardware breakpoint trap).
+const BreakpointSubcode = enum(u8) {
+    software = 0,
+    hardware = 1,
+};
 
 // ── Exception Vector Table ──────────────────────────────────────────────
 //
@@ -390,85 +410,159 @@ fn readFarEl1() u64 {
 ///   EC=0x15 (SVC64): syscall -- dispatch to syscall handler.
 ///   EC=0x24 (Data Abort from lower EL): page fault -- dispatch to fault handler.
 ///   EC=0x20 (Instruction Abort from lower EL): page fault -- dispatch to fault handler.
-///   Others: kill the faulting process with an appropriate FaultReason.
+///   Others: route via `port.fireThreadFault` / `port.fireBreakpoint`.
+/// Intercept a data-abort that hit a userspace port-IO VAR (no PTEs
+/// installed → every access faults) and forward the access to the
+/// underlying port-IO device. Returns `true` when the fault was
+/// handled; the caller skips the generic page-fault router and ERETs.
+///
+/// The data abort syndrome (ESR_EL1.ISS) provides:
+///   ISS[24]   = ISV (instruction syndrome valid) — required for decode
+///   ISS[23:22] = SAS (size: 0=byte, 1=hword, 2=word, 3=dword)
+///   ISS[20:16] = SRT (Xt register holding the value, for stores)
+///   ISS[6]    = WnR (write=1)
+/// ARM ARM DDI 0487 §D13.2.37 ESR_EL1 (Data Abort).
+///
+/// On aarch64 the platform has no real port-IO bus; we route the
+/// emulated access into the kernel's PL011 driver when the device's
+/// declared base_port matches COM1 (0x3F8). This is the minimal
+/// surface needed to land the test runner's `[runner] starting`
+/// banner — full I/O port emulation will replace this when a generic
+/// in-kernel I/O bus arrives.
+fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
+    const ec_ptr = scheduler.currentEc() orelse return false;
+    const domain = ec_ptr.domain.ptr;
+    const fault_va = VAddr.fromInt(readFarEl1());
+
+    const v = var_range.findVarCovering(domain, fault_va) orelse return false;
+
+    const v_irq = v._gen_lock.lockIrqSave(@src());
+    const is_port_io = v.map == .mmio and v.device != null and
+        v.device.?.ptr.device_type == .port_io;
+    v._gen_lock.unlockIrqRestore(v_irq);
+    if (!is_port_io) return false;
+
+    const iss: u32 = @truncate(esr & 0x1FFFFFF);
+    const isv = (iss >> 24) & 1;
+
+    var srt: u5 = 0;
+    var sas: u32 = 0;
+    var wnr: u32 = 0;
+
+    if (isv != 0) {
+        wnr = (iss >> 6) & 1;
+        sas = (iss >> 22) & 0b11;
+        srt = @truncate((iss >> 16) & 0x1F);
+    } else {
+        // QEMU TCG does not populate ISV for software-generated data
+        // aborts. Decode the faulting instruction by hand. The runner's
+        // serial output is a chain of `strb wN, [xM]` (STR (immediate
+        // unsigned offset), 8-bit). DDI 0487 §C6.2.300 STRB (immediate)
+        // unsigned offset: bits [31:22]=0011_1001_00, bits [21:10]=imm12,
+        // bits [9:5]=Rn, bits [4:0]=Rt.
+        const insn_ptr: *const u32 = @ptrFromInt(ctx.elr_el1);
+        const insn = insn_ptr.*;
+        const top10 = (insn >> 22) & 0x3FF;
+        if (top10 != 0b00_1110_0100) return false; // not strb-imm-uoff
+        wnr = 1;
+        sas = 0; // byte
+        srt = @truncate(insn & 0x1F);
+    }
+
+    if (wnr == 0) return false; // reads not yet implemented
+
+    // Read the source register's value. AAPCS64 packs 31 GP regs as
+    // x0..x30 in our `Registers` extern struct in declaration order.
+    const regs_ptr: [*]const u64 = @ptrCast(&ctx.regs);
+    const value: u64 = if (srt < 31) regs_ptr[srt] else 0;
+
+    // Compute the offset within the port range. PL011 forwarding only
+    // looks at the low byte of `value`; multi-byte stores get split.
+    const dev = v.device.?.ptr;
+    const base_port = dev.access.port_io.base_port;
+    const port_offset_u64 = fault_va.addr - v.base_vaddr.addr;
+    const port_offset: u16 = @truncate(port_offset_u64);
+    const io_port: u16 = base_port + port_offset;
+
+    // Width per SAS (ARM ARM §D13.2.37 SAS table).
+    const width: u8 = switch (sas) {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        else => 8,
+    };
+
+    // Forward COM1 byte writes (port 0x3F8 + tx-data offset 0) into the
+    // PL011 driver. Other ports / widths are currently dropped on the
+    // floor — sufficient for runner banner output. The PL011 register
+    // map differs from the 8250 (COM1), so even byte writes to UART
+    // control/IER/etc. ports must NOT be forwarded blindly.
+    if (io_port == 0x3F8 and width == 1) {
+        const byte_buf = [_]u8{@as(u8, @truncate(value))};
+        serial.printRaw(byte_buf[0..1]);
+    }
+
+    // Advance ELR_EL1 past the faulting instruction. AArch64 fixed-
+    // length instructions are 4 bytes.
+    ctx.elr_el1 += 4;
+    return true;
+}
+
 fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     const esr = readEsrEl1();
     const ec = extractEc(esr);
-    if (ec != .svc_aarch64) zag.arch.dispatch.boot.print("K: syncLowerEl ec={d} elr=0x{x}\n", .{ @intFromEnum(ec), ctx.elr_el1 });
 
     switch (ec) {
         // Lazy-FPU trap. CPACR_EL1.FPEN was clamped to 0b01 (trap EL0)
-        // by switchTo when this thread last got dispatched (because it
+        // by switchTo when this EC last got dispatched (because it
         // wasn't the last FPU owner on this core). Userspace's first
         // FP/SIMD instruction trapped here — swap state and return so
         // the instruction re-executes.
         .sve_simd_fp_access => {
-            const thread = scheduler.currentThread() orelse
-                @panic("FP/SIMD trap with no current thread");
-            fpu.handleTrap(thread);
+            const ec_ptr = scheduler.currentEc() orelse
+                @panic("FP/SIMD trap with no current EC");
+            fpu.handleTrap(ec_ptr);
             return;
         },
 
         .svc_aarch64 => {
-            const result = syscall_dispatch.dispatch(ctx);
-            // IPC recv handlers may have already populated x0 with reply
-            // word 0 via copyIpcPayload; on aarch64 that register doubles
-            // as the syscall return, so we must not overwrite it here.
-            if (!result.skip_ret_write) {
-                ctx.regs.x0 = @bitCast(result.ret);
-                // x6 doubles as the IPC metadata register. On an error
-                // return from ipc_call/ipc_send the kernel never wrote a
-                // fresh meta, so x6 still holds the caller's *input*
-                // meta — which on aarch64 makes an errno in x0
-                // indistinguishable from a zero-word successful reply
-                // (both leave "x0 has a valid integer" plus "nonzero
-                // meta"). Zero x6 on the error path so userspace can
-                // unambiguously tell errno from reply payload. Never
-                // touch it on the success path: successful IPC handlers
-                // either set skip_ret_write (word_count>=1) or return
-                // E_OK after already writing fresh meta via
-                // setIpcMetadata (word_count==0).
-                if (result.ret < 0) ctx.regs.x6 = 0;
+            // Spec §[syscall_abi] aarch64 ABI:
+            //   - syscall_word at vreg 0 = `[sp_el0 + 0]` (user stack).
+            //   - args[0..31] map to vregs 1..31 = x0..x30. Registers
+            //     is an extern struct of 31 u64s declared in x0..x30
+            //     order so we point the slice straight at it.
+            //   - return: i64 → x0 (vreg 1).
+            const regs_ptr: [*]const u64 = @ptrCast(&ctx.regs);
+            const syscall_word: u64 = @as(*const u64, @ptrFromInt(ctx.sp_el0)).*;
+            const caller = scheduler.currentEc() orelse
+                @panic("syscall with no current EC");
+            const ret = syscall_dispatch.dispatch(caller, syscall_word, regs_ptr[0..31]);
+            ctx.regs.x0 = @bitCast(ret);
+
+            // Mirrors arch/x64/interrupts.zig syscallDispatch tail. If
+            // the dispatched handler suspended `caller` (recv / suspend
+            // / futex_wait), `current_ec` was cleared on this core. The
+            // exception trampoline would otherwise ERET back to the
+            // now-parked user EC; drive the scheduler instead so the
+            // next ready EC takes over (or we idle).
+            const core: u8 = @truncate(gic.coreID());
+            if (scheduler.coreIsIdle(core)) {
+                scheduler.run();
             }
-            ctx.regs.x1 = result.ret2;
         },
 
         .data_abort_lower_el => {
-            const is_write = isWriteFault(esr);
-            const far = readFarEl1();
-
-            // Intercept virtual_bar faults before the generic fault path.
-            // Virtual BAR regions intentionally have no PTEs installed; on
-            // aarch64 we synthesize a zero read / drop the write, advance
-            // ELR_EL1, and return to userspace. This mirrors the x86 port
-            // I/O emulation path but without a real PIO bus.
-            //
-            // Gate the lookup on a user fault that is NOT a present-page
-            // permission fault. Data abort ISS[5:0] DFSC field (ARM ARM
-            // D13.2.37, Table D13-33): 0b0001xx = translation fault
-            // (bottom bits encode level), which is exactly what a virtual
-            // BAR mapping produces because it has no PTE installed. Any
-            // other DFSC (permission / access flag / alignment / sync
-            // external abort) cannot come from a vbar node, so skip the
-            // lookup entirely to keep the hot path lean.
-            if (scheduler.currentThread()) |thread| {
-                // self-alive: currentThread() runs on this core.
-                const proc = thread.process.ptr;
-                if (proc.vmm.findNode(VAddr.fromInt(far))) |node_ref| {
-                    const node = node_ref.lock() catch return;
-                    const is_virtual_bar = node.kind == .virtual_bar;
-                    node_ref.unlock();
-                    if (is_virtual_bar) {
-                        emulateVirtualBar(ctx, node_ref, far, proc);
-                        return;
-                    }
-                }
-            }
+            // Intercept port-IO virtual_bar faults from userspace before
+            // the generic handler routes them through the var_range
+            // page-fault dispatch (whose port_io decoder is currently
+            // a stub on aarch64). Spec §[port_io_virtualization].
+            // Mirrors the arch.x64.exceptions pageFaultHandler shortcut.
+            if (interceptPortIoFault(ctx, esr)) return;
 
             const pf_ctx = PageFaultContext{
-                .faulting_address = far,
+                .faulting_address = readFarEl1(),
                 .is_kernel_privilege = false,
-                .is_write = is_write,
+                .is_write = isWriteFault(esr),
                 .is_exec = false,
                 .rip = ctx.elr_el1,
                 .user_ctx = ctx,
@@ -489,15 +583,19 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
         },
 
         .pc_alignment => {
-            faultOrKillUser(ctx, .alignment_fault, readFarEl1());
+            deliverThreadFault(.alignment_fault, readFarEl1());
         },
 
         .sp_alignment => {
-            faultOrKillUser(ctx, .alignment_fault, ctx.sp_el0);
+            deliverThreadFault(.alignment_fault, ctx.sp_el0);
         },
 
-        .breakpoint_lower_el, .brk_instruction => {
-            faultOrKillUser(ctx, .breakpoint, ctx.elr_el1);
+        .breakpoint_lower_el => {
+            deliverBreakpoint(.hardware);
+        },
+
+        .brk_instruction => {
+            deliverBreakpoint(.software);
         },
 
         .software_step_lower_el, .watchpoint_lower_el => {
@@ -510,14 +608,13 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // instruction encodings, which includes `udf` (permanently-
             // undefined) and other UNDEFINED encodings that ARM treats
             // as an undefined-instruction exception. This is the direct
-            // aarch64 analogue of x86 #UD (invalid opcode), so report it
-            // as `illegal_instruction` to match the cross-arch fault
-            // taxonomy in perms/permissions.zig.
-            faultOrKillUser(ctx, .illegal_instruction, ctx.elr_el1);
+            // aarch64 analogue of x86 #UD (invalid opcode), so report
+            // it as `illegal_instruction` per spec §[event_type].
+            deliverThreadFault(.illegal_instruction, ctx.elr_el1);
         },
 
         else => {
-            faultOrKillUser(ctx, .protection_fault, ctx.elr_el1);
+            deliverThreadFault(.protection_fault, ctx.elr_el1);
         },
     }
 }
@@ -529,6 +626,15 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// ICC_IAR1_EL1), dispatches to the registered device handler, and
 /// signals end-of-interrupt (ICC_EOIR1_EL1).
 fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
+    // lockdep: hardware took the IRQ vector with PSTATE.I masked
+    // (ARM ARM D1.10.4 — async exceptions auto-mask on entry), so any
+    // lock acquired beneath here is in async-IRQ-handler context. The
+    // synchronous-exception siblings (handleSyncLowerEl / handleSyncCurrentEl)
+    // intentionally don't enter this state — they run on top of whatever
+    // IRQ discipline the interrupted code chose.
+    sync_debug.enterIrqContext();
+    defer sync_debug.exitIrqContext();
+
     const intid = gic.acknowledgeInterrupt();
 
     // INTIDs 1020-1023 are all spurious / reserved (IHI 0069H §2.2.1,
@@ -594,6 +700,12 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// Handler for IRQ from Current EL (kernel-mode).
 /// ARM ARM D1.10.2, offset 0x280.
 fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
+    // lockdep: see handleIrqLowerEl. The kernel-mode IRQ vector is just as
+    // much an async-IRQ-handler entry — the interrupted code may have been
+    // holding any locks at all when the IRQ landed.
+    sync_debug.enterIrqContext();
+    defer sync_debug.exitIrqContext();
+
     const intid = gic.acknowledgeInterrupt();
 
     if (gic.isSpurious(intid)) return;
@@ -612,6 +724,12 @@ fn handleUnexpected(ctx: *ArchCpuContext) callconv(.c) void {
     @panic("Unexpected exception vector taken");
 }
 
+/// Origin of an IRQ entry — names whether the interrupted context was
+/// running at EL0 (user) or EL1 (kernel). Recorded in case the callee
+/// needs to attribute time, but the per-core scheduler tick currently
+/// derives that itself from `current_ec`.
+const IrqOrigin = enum { user, kernel };
+
 /// Dispatch a GIC interrupt to the appropriate handler.
 /// The INTID namespace (IHI 0069H, Section 2.2):
 ///   0-15:    SGI (Software Generated Interrupts / IPIs)
@@ -620,9 +738,10 @@ fn handleUnexpected(ctx: *ArchCpuContext) callconv(.c) void {
 ///
 /// PPI 30 is the non-secure EL1 physical timer interrupt (ARM ARM
 /// D11.2.4); this is the scheduler's preemption tick. It is routed
-/// directly to `sched.schedTimerHandler`, equivalent of the x64
-/// LAPIC-timer IDT vector.
-fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.PrivilegePerm) void {
+/// directly to `scheduler.preempt`, equivalent of the x64 LAPIC-timer
+/// IDT vector.
+fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
+    _ = origin;
     switch (intid) {
         // SGI 0 — scheduler IPI raised by `triggerSchedulerInterrupt` on
         // aarch64 (see `arch/dispatch.zig sched_ipi_vector`). Used by both
@@ -644,29 +763,25 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
             if (gic.coreID() == 0) {
                 gic.maybeBroadcastSchedTick();
             }
-            const sched_ctx = scheduler.SchedInterruptContext{
-                .privilege = privilege,
-                .thread_ctx = ctx,
-            };
-            scheduler.schedTimerHandler(sched_ctx);
+            scheduler.preempt();
         },
         // SGI 1 — kprof-dump IPI. Park until the dumper bumps the epoch.
         1 => {
             kprof_dump.parkForDump();
         },
         // SGI 2 — lazy-FPU cross-core flush. The requesting core wrote
-        // the target thread into this core's mailbox; we save the FPU
-        // regs into the thread's `fpu_state` if we still own them, then
-        // ack so the requester unblocks. See `cpu.fpuFlushIpi`.
+        // the target EC into this core's mailbox; we save the FPU regs
+        // into the EC's `fpu_state` if we still own them, then ack so
+        // the requester unblocks. See `cpu.fpuFlushIpi`.
         2 => {
             const core_idx: u8 = @truncate(gic.coreID());
             const slot = &cpu.fpu_flush_mailbox[core_idx];
             if (@atomicLoad(?*anyopaque, &slot.requested_thread, .acquire)) |opq| {
-                // self-alive: the requesting core pins the target thread
+                // self-alive: the requesting core pins the target EC
                 // across the IPI and waits for ack before releasing it;
                 // we cannot observe a freed slot here.
-                const thread: *Thread = @ptrCast(@alignCast(opq));
-                fpu.flushIpiHandler(thread);
+                const target: *ExecutionContext = @ptrCast(@alignCast(opq));
+                fpu.flushIpiHandler(target);
             }
             slot.ackDone();
         },
@@ -679,11 +794,7 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
             // EL0. The receiving core treats it as an ordinary
             // scheduler tick. See gic.zig `broadcastSchedTick` for
             // the full diagnosis and spec citations.
-            const sched_ctx = scheduler.SchedInterruptContext{
-                .privilege = privilege,
-                .thread_ctx = ctx,
-            };
-            scheduler.schedTimerHandler(sched_ctx);
+            scheduler.preempt();
         },
         23 => {
             // PMU overflow PPI. ARM ARM DDI 0487 K.a §D13.3.1 documents
@@ -697,7 +808,7 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
         },
         27, 30 => {
             // EL1 timer preemption tick. Mask the firing line while we
-            // run the scheduler tick; schedTimerHandler re-arms via
+            // run the scheduler tick; the scheduler re-arms via
             // `armInterruptTimer`, which writes ENABLE=1, IMASK=0 and
             // thereby unmasks the timer again. Without masking first,
             // ISTATUS stays asserted and the GIC would immediately
@@ -754,11 +865,7 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
             if (gic.coreID() == 0) {
                 gic.maybeBroadcastSchedTick();
             }
-            const sched_ctx = scheduler.SchedInterruptContext{
-                .privilege = privilege,
-                .thread_ctx = ctx,
-            };
-            scheduler.schedTimerHandler(sched_ctx);
+            scheduler.preempt();
         },
         else => {
             serial.print("K: IRQ intid={d} (unhandled)\n", .{intid});
@@ -766,155 +873,22 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
     }
 }
 
-/// Attempt to notify the process's fault handler; if none is registered,
-/// kill the process. Used for userspace synchronous exceptions that are
-/// not syscalls or page faults (e.g. alignment, illegal instruction).
-fn faultOrKillUser(ctx: *ArchCpuContext, reason: FaultReason, fault_addr: u64) void {
-    const thread = scheduler.currentThread() orelse
-        @panic("user exception with no current thread");
-    // self-alive: currentThread() is this core's running thread.
-    const proc = thread.process.ptr;
-    serial.print("K: EXCEPTION pid={d} EC reason={d} addr=0x{x}\n", .{
-        proc.pid, @intFromEnum(reason), fault_addr,
-    });
-    if (proc.faultBlock(thread, reason, fault_addr, ctx.elr_el1, ctx)) {
-        cpu.enableInterrupts();
-        scheduler.yield();
-        return;
-    }
-    proc.kill(reason);
+/// Look up the running EC, fire a `thread_fault` event with `subcode`
+/// and `payload`, then yield. Spec §[event_type] row 2.
+fn deliverThreadFault(subcode: ThreadFaultSubcode, payload: u64) void {
+    const ec = scheduler.currentEc() orelse
+        @panic("user thread fault with no current EC");
+    port.fireThreadFault(ec, @intFromEnum(subcode), payload);
     cpu.enableInterrupts();
-    while (true) cpu.halt();
+    scheduler.yieldTo(null);
 }
 
-/// Emulate a userspace access to a virtual BAR mapping on aarch64.
-///
-/// Virtual BAR VM nodes (kernel/memory/vmm.zig, `memVirtualBarMap`) stand
-/// in for the x86 PIO BAR that backs the AHCI/SMBus placeholder devices
-/// the test rig uses. On x86 each access faults in with the decoder path
-/// in kernel/arch/x64/exceptions.zig (`emulateVirtualBar`); on aarch64
-/// there is no PIO bus, so we simply satisfy reads with zero, discard
-/// writes, bounds-check against port_count, and advance ELR_EL1 past the
-/// 4-byte A64 load/store. Non-decodable instructions kill with
-/// protection_fault (the aarch64 analogue of the x86 "non-MOV" case).
-///
-/// ARM ARM C4.1.66 — "Load/store register (unsigned immediate)" encoding
-/// (the shape Zig emits for `*volatile u8` reads/writes):
-///   size[31:30] | 111 | V[26] | 01 | opc[23:22] | imm12[21:10] | Rn | Rt
-/// V=0 selects integer (not SIMD/FP). opc[0]=0 means store, opc[0]=1
-/// means load. size={00,01,10,11} gives {1,2,4,8} byte access widths.
-fn emulateVirtualBar(
-    ctx: *ArchCpuContext,
-    node_ref: SlabRef(VmNode),
-    far: u64,
-    proc: anytype,
-) void {
-    const node = node_ref.lock() catch return;
-    defer node_ref.unlock();
-    const device = node.deviceRegion().?;
-
-    const decoded = decodeA64LoadStore(ctx, proc) orelse {
-        proc.kill(.protection_fault);
-        cpu.enableInterrupts();
-        while (true) cpu.halt();
-    };
-
-    const port_offset = far - node.start.addr;
-    if (port_offset + decoded.access_size > device.access.port_io.port_count) {
-        const reason: FaultReason = if (decoded.is_write) .invalid_write else .invalid_read;
-        proc.kill(reason);
-        cpu.enableInterrupts();
-        while (true) cpu.halt();
-    }
-
-    // aarch64 has no real PIO bus backing the placeholder device: reads
-    // return 0, writes are discarded. The test rig only exercises
-    // trap-emulate-advance semantics, not register-level fidelity.
-    if (!decoded.is_write) {
-        writeContextGpr(ctx, decoded.rt, 0);
-    }
-
-    // A64 instructions are always 4 bytes (ARM ARM B1.2); advance past
-    // the faulting load/store so it is not replayed on ERET.
-    ctx.elr_el1 += 4;
-}
-
-const DecodedLoadStore = struct {
-    rt: u8,
-    access_size: u64,
-    is_write: bool,
-};
-
-/// Fetch and decode the faulting A64 instruction via the process's page
-/// tables. Only the "Load/store register (unsigned immediate)" integer
-/// family is recognised — that is what Zig emits for `*volatile uN`
-/// accesses at constant offsets. Returns null on a SIMD/FP access, an
-/// unrecognised encoding, or an untranslatable RIP.
-fn decodeA64LoadStore(ctx: *const ArchCpuContext, proc: anytype) ?DecodedLoadStore {
-    const rip = ctx.elr_el1;
-    const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
-    const phys = aarch64_paging.resolveVaddr(proc.addr_space_root, rip_page) orelse return null;
-    const physmap = VAddr.fromPAddr(phys, null).addr + (rip & 0xFFF);
-    const insn: u32 = @as(*const u32, @ptrFromInt(physmap)).*;
-
-    // Unsigned-immediate LDR/STR family: bits [29:27]=0b111, bits [25:24]=01.
-    // Bit 26 (V) = 1 selects SIMD/FP; reject.
-    if (((insn >> 27) & 0b111) != 0b111) return null;
-    if (((insn >> 24) & 0b11) != 0b01) return null;
-    if (((insn >> 26) & 0x1) != 0) return null;
-
-    const size: u32 = (insn >> 30) & 0b11;
-    const opc: u32 = (insn >> 22) & 0b11;
-    const rt: u8 = @truncate(insn & 0x1F);
-
-    // opc[0]=0 → store, opc[0]=1 → load (C6.2.123 / C6.2.218). sign-
-    // extending loads (opc=10/11 with size<11) are treated uniformly.
-    const is_write = (opc & 0x1) == 0;
-
-    const access_size: u64 = @as(u64, 1) << @intCast(size);
-
-    return .{
-        .rt = rt,
-        .access_size = access_size,
-        .is_write = is_write,
-    };
-}
-
-/// Write a 64-bit value to a GPR in ArchCpuContext by A64 register index.
-/// Index 31 is the zero register (WZR/XZR) — writes discarded.
-fn writeContextGpr(ctx: *ArchCpuContext, reg: u8, value: u64) void {
-    switch (reg) {
-        0 => ctx.regs.x0 = value,
-        1 => ctx.regs.x1 = value,
-        2 => ctx.regs.x2 = value,
-        3 => ctx.regs.x3 = value,
-        4 => ctx.regs.x4 = value,
-        5 => ctx.regs.x5 = value,
-        6 => ctx.regs.x6 = value,
-        7 => ctx.regs.x7 = value,
-        8 => ctx.regs.x8 = value,
-        9 => ctx.regs.x9 = value,
-        10 => ctx.regs.x10 = value,
-        11 => ctx.regs.x11 = value,
-        12 => ctx.regs.x12 = value,
-        13 => ctx.regs.x13 = value,
-        14 => ctx.regs.x14 = value,
-        15 => ctx.regs.x15 = value,
-        16 => ctx.regs.x16 = value,
-        17 => ctx.regs.x17 = value,
-        18 => ctx.regs.x18 = value,
-        19 => ctx.regs.x19 = value,
-        20 => ctx.regs.x20 = value,
-        21 => ctx.regs.x21 = value,
-        22 => ctx.regs.x22 = value,
-        23 => ctx.regs.x23 = value,
-        24 => ctx.regs.x24 = value,
-        25 => ctx.regs.x25 = value,
-        26 => ctx.regs.x26 = value,
-        27 => ctx.regs.x27 = value,
-        28 => ctx.regs.x28 = value,
-        29 => ctx.regs.x29 = value,
-        30 => ctx.regs.x30 = value,
-        else => {}, // 31 = XZR / WZR
-    }
+/// Look up the running EC, fire a `breakpoint` event with `subcode`,
+/// then yield. Spec §[event_type] row 3.
+fn deliverBreakpoint(subcode: BreakpointSubcode) void {
+    const ec = scheduler.currentEc() orelse
+        @panic("user breakpoint with no current EC");
+    port.fireBreakpoint(ec, @intFromEnum(subcode));
+    cpu.enableInterrupts();
+    scheduler.yieldTo(null);
 }

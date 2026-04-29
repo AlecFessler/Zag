@@ -29,6 +29,18 @@
 //!      line. Callee-internal locals stay internal to the callee — no
 //!      inline expansion, no synthetic line counter.
 //!
+//!   5. Per-path release coverage — for every lock event in an entry
+//!      body, every reachable control-flow exit between the lock and
+//!      its release (return / return error / try error propagation /
+//!      break / continue / fall-through to scope-end) must be covered
+//!      by either an explicit unlock reached on the same path, a
+//!      `defer ref.unlock(...)` registered before the exit (depth-
+//!      aware), or — for error-flavor exits — an
+//!      `errdefer ref.unlock(...)`. `@panic`/`unreachable` are
+//!      treated as `noreturn` and impose no obligation. Branch-local
+//!      unlocks are pruned when control leaves the branch's scope, so
+//!      sibling branches (e.g. switch arms) cannot reuse them.
+//!
 //! Exit status nonzero iff any err-severity findings are emitted.
 
 const std = @import("std");
@@ -51,7 +63,9 @@ const TokenTag = std.zig.Token.Tag;
 const LOCK_OPS = [_][]const u8{
     "lock",
     "unlock",
+    "lockOrdered",
     "lockWithGen",
+    "lockWithGenOrdered",
     "currentGen",
     "setGenRelease",
 };
@@ -62,35 +76,87 @@ const SELF_ALIVE_HELPERS = [_][]const u8{
 };
 
 // KernelObject union-variant field names, keyed to their slab type.
+// Spec-v3: handle table entries reference slab objects through these
+// variant names on the typed-union side of `capability.ErasedSlabRef`.
 const UnionVariantEntry = struct { variant: []const u8, ty: []const u8 };
 const UNION_VARIANTS = [_]UnionVariantEntry{
-    .{ .variant = "thread", .ty = "Thread" },
-    .{ .variant = "process", .ty = "Process" },
-    .{ .variant = "dead_process", .ty = "Process" },
-    .{ .variant = "shared_memory", .ty = "SharedMemory" },
+    .{ .variant = "execution_context", .ty = "ExecutionContext" },
+    .{ .variant = "capability_domain", .ty = "CapabilityDomain" },
+    .{ .variant = "var_range", .ty = "VAR" },
+    .{ .variant = "page_frame", .ty = "PageFrame" },
     .{ .variant = "device_region", .ty = "DeviceRegion" },
-    .{ .variant = "vm", .ty = "Vm" },
+    .{ .variant = "virtual_machine", .ty = "VirtualMachine" },
+    .{ .variant = "vcpu", .ty = "VCpu" },
+    .{ .variant = "port", .ty = "Port" },
+    .{ .variant = "timer", .ty = "Timer" },
 };
 
+// Static `<owner>.<field>` chain → slab type map. Used for two slightly
+// different inferences:
+//   1. `const x = <head_typed_as_owner>.<field>` declares `x` with the
+//      slab type stored in `ty`, so downstream `x.lock(...)` /
+//      `x.<lock_field>.lock()` chains classify.
+//   2. `const y = <head>.<field>.lock(...)` chains: when the chain
+//      walker can't resolve the leading ident, the trailing
+//      `<field>.lock()` still names the locked slab type via this map.
+// Every entry mirrors a SlabRef(T) field on a slab-backed struct in
+// the kernel (`grep -n 'SlabRef(' kernel/...`). Entries are duplicated
+// from FAT_YIELDING_FIELDS but here paired with the inner T so the
+// type can flow into env.map.
 const DefaultFieldChainEntry = struct { owner: []const u8, field: []const u8, ty: []const u8 };
 const DEFAULT_FIELD_CHAINS = [_]DefaultFieldChainEntry{
-    .{ .owner = "Thread", .field = "process", .ty = "Process" },
-    .{ .owner = "Thread", .field = "pmu_state", .ty = "PmuState" },
-    .{ .owner = "VCpu", .field = "process", .ty = "Process" },
+    // ExecutionContext.
+    .{ .owner = "ExecutionContext", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "ExecutionContext", .field = "next", .ty = "ExecutionContext" },
+    .{ .owner = "ExecutionContext", .field = "prev", .ty = "ExecutionContext" },
+    .{ .owner = "ExecutionContext", .field = "suspend_port", .ty = "Port" },
+    .{ .owner = "ExecutionContext", .field = "pending_reply_domain", .ty = "CapabilityDomain" },
+    .{ .owner = "ExecutionContext", .field = "vm", .ty = "VirtualMachine" },
+    .{ .owner = "ExecutionContext", .field = "exit_port", .ty = "Port" },
+    .{ .owner = "ExecutionContext", .field = "perfmon_state", .ty = "PerfmonState" },
+    // VAR.
+    .{ .owner = "VAR", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "VAR", .field = "pf", .ty = "PageFrame" },
+    .{ .owner = "VAR", .field = "device", .ty = "DeviceRegion" },
+    .{ .owner = "VAR", .field = "snapshot_source", .ty = "VAR" },
+    // VirtualMachine.
+    .{ .owner = "VirtualMachine", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "VirtualMachine", .field = "policy_pf", .ty = "PageFrame" },
+    .{ .owner = "VirtualMachine", .field = "pf", .ty = "PageFrame" },
+    // VCpu.
     .{ .owner = "VCpu", .field = "vm", .ty = "Vm" },
-    .{ .owner = "Vm", .field = "proc", .ty = "Process" },
 };
 
+// Fields whose declared type is `SlabRef(T)` / `?SlabRef(T)`. Reading
+// such a field yields a fat ref, so the LHS of `<x> = <head>.<field>`
+// gets `is_fat = true`. The list mirrors every `SlabRef(_)` field on a
+// slab-backed struct in the kernel; updating this requires re-scanning
+// the kernel for `SlabRef(...)` field decls when the schema changes.
 const FatFieldEntry = struct { owner: []const u8, field: []const u8 };
 const FAT_YIELDING_FIELDS = [_]FatFieldEntry{
-    .{ .owner = "Thread", .field = "process" },
-    .{ .owner = "Thread", .field = "next" },
-    .{ .owner = "Thread", .field = "ipc_server" },
-    .{ .owner = "Thread", .field = "pmu_state" },
-    .{ .owner = "VCpu", .field = "process" },
+    // ExecutionContext (kernel/sched/execution_context.zig).
+    .{ .owner = "ExecutionContext", .field = "domain" },
+    .{ .owner = "ExecutionContext", .field = "next" },
+    .{ .owner = "ExecutionContext", .field = "prev" },
+    .{ .owner = "ExecutionContext", .field = "suspend_port" },
+    .{ .owner = "ExecutionContext", .field = "pending_reply_domain" },
+    .{ .owner = "ExecutionContext", .field = "vm" },
+    .{ .owner = "ExecutionContext", .field = "exit_port" },
+    .{ .owner = "ExecutionContext", .field = "perfmon_state" },
+    // VAR (kernel/capdom/var_range.zig).
+    .{ .owner = "VAR", .field = "domain" },
+    .{ .owner = "VAR", .field = "pf" },
+    .{ .owner = "VAR", .field = "device" },
+    .{ .owner = "VAR", .field = "snapshot_source" },
+    // VirtualMachine (kernel/capdom/virtual_machine.zig).
+    .{ .owner = "VirtualMachine", .field = "domain" },
+    .{ .owner = "VirtualMachine", .field = "policy_pf" },
+    .{ .owner = "VirtualMachine", .field = "pf" },
+    // VCpu (kernel/arch/x64/kvm/vcpu.zig + aarch64 mirror).
     .{ .owner = "VCpu", .field = "vm" },
-    .{ .owner = "VCpu", .field = "thread" },
-    .{ .owner = "Process", .field = "vm" },
+    // Timer (kernel/sched/timer.zig — the `timer_ref` field on
+    // TimerWheelEntry / wheel slot points back at the slab Timer).
+    .{ .owner = "TimerWheelEntry", .field = "timer_ref" },
 };
 
 const EXCEPTION_ENTRY_NAMES = [_][]const u8{
@@ -102,13 +168,23 @@ const EXCEPTION_ENTRY_NAMES = [_][]const u8{
     "handleIrqCurrentEl",
     "handleUnexpected",
     "dispatchIrq",
-    "faultOrKillUser",
     "schedTimerHandler",
 };
 
 const ExtraRoot = struct { rel_path: []const u8, fn_name: []const u8 };
 const EXTRA_ROOTS = [_]ExtraRoot{
-    .{ .rel_path = "kernel/sched/scheduler.zig", .fn_name = "schedTimerHandler" },
+    .{ .rel_path = "kernel/arch/x64/irq.zig", .fn_name = "schedTimerHandler" },
+};
+
+// Files under kernel/syscall/ that DON'T host userspace-reachable
+// syscall handlers — they re-export modules, host the dispatch
+// trampoline, define error codes, or carry shared type definitions.
+// `pub fn` declarations here are not entry points.
+const SYSCALL_DIR_NON_HANDLER_FILES = [_][]const u8{
+    "kernel/syscall/dispatch.zig",
+    "kernel/syscall/errors.zig",
+    "kernel/syscall/pmu.zig",
+    "kernel/syscall/syscall.zig",
 };
 
 const SlabReturnHelperEntry = struct { name: []const u8, ty: []const u8 };
@@ -135,6 +211,16 @@ const PTR_BYPASS_EXEMPT_FILES = [_][]const u8{
 };
 
 const TEST_FIXTURE_TYPES = [_][]const u8{"TestT"};
+
+// Field types recognized as locks. A field `foo: SpinLock` or
+// `foo: GenLock` on any struct is treated as a lock-class field whose
+// class identity is `"<StructName>.<field_name>"`. Additional lock
+// abstractions can be added here; the analyzer treats the class as
+// opaque beyond the struct-field → class mapping.
+const LOCK_TYPE_NAMES = [_][]const u8{
+    "SpinLock",
+    "GenLock",
+};
 
 // -----------------------------------------------------------------
 // Small helper types
@@ -548,6 +634,7 @@ const EventKind = enum {
     lock,
     unlock,
     defer_unlock,
+    errdefer_unlock,
     lock_with_gen,
 };
 
@@ -557,7 +644,52 @@ const Event = struct {
     seq: u32, // per-entry insertion order
     tail: []const u8 = "", // method / field name for access events
     slab_type: []const u8 = "",
+    // For lock/unlock/defer_unlock/errdefer_unlock events, the brace depth
+    // at the source line where the op (or `defer`/`errdefer` keyword)
+    // appeared. Used by the per-path release checker to decide whether a
+    // (err)defer's protection scope still covers a given exit point.
+    // For folded callee events (cross-function summary apply) this stays
+    // 0; the path checker treats unknown-depth as innermost-scope-safe.
+    depth: i32 = 0,
+    // For lock events: true when the lock call appeared as the operand
+    // of a same-line `catch` (`x.lock() catch { ... }`). The catch
+    // block runs ONLY on the lock-failure path, where nothing was
+    // actually acquired — so exits inside that catch block don't
+    // need an unlock. The path-aware release checker uses this flag
+    // to skip exits at depth > lock.depth until execution falls back
+    // to lock.depth (i.e. past the catch-block's closing brace).
+    in_catch: bool = false,
 };
+
+// Function-exit (control-flow) events. Separate from the per-ident
+// timeline because they don't bind to a particular slab ident — they
+// describe where control leaves the function (or an enclosing loop).
+// The per-path release checker walks the merged event timeline of an
+// ident together with these exit markers to decide whether each path
+// from a given lock event to the function exit is covered by either an
+// explicit unlock OR a still-in-scope (err)defer-unlock.
+const ExitKind = enum {
+    return_normal, // bare `return` or `return <value>` (non-error)
+    return_error, // `return error.X` — error-path exit
+    throw, // `try <expr>` — implicit error-path exit on the error union
+    break_stmt, // `break` (loop / labeled-block exit)
+    continue_stmt, // `continue`
+    panic_or_unreachable, // `@panic(...)` / `unreachable` — no unwinding required
+    scope_close, // synthetic: brace_depth dropped to this value at this
+                 // line. The path-aware release checker uses these to
+                 // prune branch-local unlocks whose containing scope has
+                 // exited (so sibling branches can't reuse them).
+};
+
+const ExitEvent = struct {
+    kind: ExitKind,
+    src_line: u32,
+    depth: i32,
+    seq: u32,
+};
+
+const ExitEventList = ArrayList(ExitEvent);
+
 
 // -----------------------------------------------------------------
 // Helpers: typed string predicates
@@ -583,6 +715,19 @@ fn rstrip(s: []const u8) []const u8 {
     var b: usize = s.len;
     while (b > 0 and ascii.isWhitespace(s[b - 1])) b -= 1;
     return s[0..b];
+}
+
+// Strip `?`, `*`, `const ` to bottom out at the bare type identifier.
+fn typeNameFromFieldType(ft: []const u8) []const u8 {
+    var t = trimAscii(ft);
+    if (t.len == 0) return t;
+    if (t[0] == '?') t = trimAscii(t[1..]);
+    if (t.len == 0) return t;
+    if (t[0] == '*') t = trimAscii(t[1..]);
+    if (mem.startsWith(u8, t, "const ")) t = trimAscii(t["const ".len..]);
+    var e: usize = 0;
+    while (e < t.len and isIdentChar(t[e])) e += 1;
+    return t[0..e];
 }
 
 // Remove trailing `orelse ...`, `.?`, `catch ...`, parenthesized casts.
@@ -764,6 +909,7 @@ const StructField = struct {
     field_name: []const u8, // borrowed
     field_type: []const u8, // borrowed (stripped code slice of the type)
 };
+
 
 // Walks a file's tokens finding lines where a struct field appears at
 // brace-depth >= 1 and paren-depth == 0. For each such line, we emit
@@ -1241,7 +1387,8 @@ fn findEntryPoints(
 ) !void {
     for (files, tokens_per_file) |sf, toks| {
         const rel = sf.rel_path;
-        const is_syscall_dir = mem.startsWith(u8, rel, "kernel/syscall/");
+        const is_syscall_dir = mem.startsWith(u8, rel, "kernel/syscall/") and
+            !inList(rel, &SYSCALL_DIR_NON_HANDLER_FILES);
         const is_x64_except = mem.eql(u8, rel, "kernel/arch/x64/exceptions.zig");
         const is_arm_except = mem.eql(u8, rel, "kernel/arch/aarch64/exceptions.zig");
         const is_extra_root = blk: {
@@ -1256,7 +1403,10 @@ fn findEntryPoints(
             var start_i_mut: usize = i;
             if (i > 0 and toks[i - 1].tag == .keyword_pub) start_i_mut = i - 1;
             const start_i = start_i_mut;
-            // Only pub fn for sys*; any fn for exception list.
+            // Spec-v3 syscall handlers are every `pub fn` in
+            // kernel/syscall/<file>.zig (excluding dispatch/error/type
+            // helper files); exception/IRQ handlers may be plain `fn`
+            // (handed to the IDT/exception-vector tables by name).
             const is_pub = start_i != i;
             const header = parseFnHeaderAt(toks, start_i) orelse continue;
             const name = tokSlice(sf, toks[header.name_tok_idx]);
@@ -1273,7 +1423,7 @@ fn findEntryPoints(
             }
 
             var accept = false;
-            if (is_syscall_dir and is_pub and mem.startsWith(u8, name, "sys")) accept = true;
+            if (is_syscall_dir and is_pub) accept = true;
             if ((is_x64_except or is_arm_except) and inList(name, &EXCEPTION_ENTRY_NAMES)) accept = true;
             if (is_extra_root) {
                 for (EXTRA_ROOTS) |r| if (mem.eql(u8, r.rel_path, rel) and mem.eql(u8, r.fn_name, name)) {
@@ -1430,18 +1580,36 @@ const SlabEnv = struct {
     map: StringStringMap,
     fat: SliceSet,
     self_alive: SliceSet,
+    // Broader type-of ident registry — covers NON-slab locals too.
+    // Used by the lock-ordering analyzer to resolve `<ident>.<lock_field>.lock()`
+    // into a `<StructType>.<lock_field>` class when the ident isn't
+    // slab-typed but does have a known struct type (method receiver,
+    // non-slab fn param, etc.). Entries are interned.
+    all_types: StringStringMap,
+    // For spec-v3 syscall entries: the name of the entry's first param
+    // when its type is `*anyopaque` (always `caller` in the current
+    // kernel, but recorded by name so a future rename or alternate
+    // spelling Just Works). When set, the decl walker treats
+    // `@ptrCast(@alignCast(<this>))` as a self-alive RHS — the syscall
+    // ABI hands the kernel a pointer to the running EC and the running
+    // EC cannot be reaped while the syscall body executes. Empty for
+    // exception/IRQ entries and for helper bodies (summary walks).
+    caller_param: []const u8,
 
     fn init(gpa: Allocator) SlabEnv {
         return .{
             .map = StringStringMap.init(gpa),
             .fat = SliceSet.init(gpa),
             .self_alive = SliceSet.init(gpa),
+            .all_types = StringStringMap.init(gpa),
+            .caller_param = "",
         };
     }
     fn deinit(self: *SlabEnv) void {
         self.map.deinit();
         self.fat.deinit();
         self.self_alive.deinit();
+        self.all_types.deinit();
     }
 };
 
@@ -1496,6 +1664,7 @@ const ParamEventKind = enum {
     lock,
     unlock,
     defer_unlock,
+    errdefer_unlock,
     lock_with_gen,
 };
 
@@ -1739,6 +1908,36 @@ fn isFreshAlloc(rhs: []const u8, slab_types: *const SlabTypeMap) bool {
     return false;
 }
 
+// Spec-v3 syscall caller-cast detector. Matches the canonical
+// `@ptrCast(@alignCast(<caller>))` pattern (modulo whitespace and an
+// optional trailing `;`/`,`) where `<caller>` is the syscall entry's
+// `caller: *anyopaque` first parameter. The kernel guarantees that
+// pointer references the running ExecutionContext for the duration
+// of the syscall, so the LHS local is self-alive without needing a
+// gen-lock op. Returns false when caller_param is empty (e.g. summary
+// walks of helper bodies, exception entries) — only entry analysis
+// surfaces the `caller_param` name.
+fn isCallerSelfCast(rhs: []const u8, caller_param: []const u8) bool {
+    if (caller_param.len == 0) return false;
+    var s = trimAscii(rhs);
+    if (s.len > 0 and s[s.len - 1] == ';') s = trimAscii(s[0 .. s.len - 1]);
+    if (s.len > 0 and s[s.len - 1] == ',') s = trimAscii(s[0 .. s.len - 1]);
+
+    // Strip leading `@ptrCast(`.
+    const ptr_open = "@ptrCast(";
+    if (!mem.startsWith(u8, s, ptr_open)) return false;
+    if (!mem.endsWith(u8, s, ")")) return false;
+    var inner = trimAscii(s[ptr_open.len .. s.len - 1]);
+
+    // Strip leading `@alignCast(`.
+    const align_open = "@alignCast(";
+    if (!mem.startsWith(u8, inner, align_open)) return false;
+    if (!mem.endsWith(u8, inner, ")")) return false;
+    inner = trimAscii(inner[align_open.len .. inner.len - 1]);
+
+    return mem.eql(u8, inner, caller_param);
+}
+
 // Heuristic: is RHS a bare chain `<ident>.ptr` with head in self_alive?
 fn isPtrOfFresh(rhs: []const u8, self_alive: *const SliceSet) !bool {
     const chain = trimAscii(rhs);
@@ -1972,6 +2171,11 @@ const EmitCtx = struct {
     seq: *u32,
     param_set: *const SliceSet,
     emit_param_only: bool,
+    // Optional sink for exit events. nullable because summary-builds
+    // don't have a meaningful path-check use for them (callers fold
+    // per-param events in linear order without re-establishing the
+    // callee's branch structure).
+    exits: ?*ExitEventList = null,
 };
 
 fn emitEvent(
@@ -1983,6 +2187,33 @@ fn emitEvent(
     tail: []const u8,
     slab_type: []const u8,
 ) !void {
+    return emitEventDepth(gpa, ec, ident, kind, src_line, tail, slab_type, 0);
+}
+
+fn emitEventDepth(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    ident: []const u8,
+    kind: EventKind,
+    src_line: u32,
+    tail: []const u8,
+    slab_type: []const u8,
+    depth: i32,
+) !void {
+    return emitEventDepthCatch(gpa, ec, ident, kind, src_line, tail, slab_type, depth, false);
+}
+
+fn emitEventDepthCatch(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    ident: []const u8,
+    kind: EventKind,
+    src_line: u32,
+    tail: []const u8,
+    slab_type: []const u8,
+    depth: i32,
+    in_catch: bool,
+) !void {
     if (ec.emit_param_only and !ec.param_set.contains(ident)) return;
     const gop = try ec.events.getOrPut(ident);
     if (!gop.found_existing) gop.value_ptr.* = EventList.empty;
@@ -1993,6 +2224,47 @@ fn emitEvent(
         .seq = ec.seq.*,
         .tail = tail,
         .slab_type = slab_type,
+        .depth = depth,
+        .in_catch = in_catch,
+    });
+}
+
+// Detect that `code` contains a `.lock(` followed by a failure
+// handler (`catch` / `orelse`) that opens a multi-line BLOCK on the
+// same physical line. The block form (`x.lock() catch { ... }`) needs
+// the in_catch flag because the failure-path code lives at depth >
+// lock.depth and would otherwise look like a real path that should
+// release. The single-expression form (`x.lock() orelse return -2`)
+// has its failure-path exit suppressed in scanExits via the
+// `catch_no_block_pos` mechanism, so the lock event itself does NOT
+// need in_catch — none of the on-failure exits make it into the
+// timeline at all.
+fn lockHasCatchOnLine(code: []const u8) bool {
+    if (mem.indexOf(u8, code, ".lock(") == null) return false;
+    if (mem.indexOf(u8, code, " catch {") != null) return true;
+    if (mem.indexOf(u8, code, " catch{") != null) return true;
+    if (mem.indexOf(u8, code, " orelse {") != null) return true;
+    if (mem.indexOf(u8, code, " orelse{") != null) return true;
+    // Block form with `|err|` capture: `x.lock() catch |e| { ... }`.
+    if (mem.indexOf(u8, code, " catch |") != null and
+        mem.indexOf(u8, code, "{") != null) return true;
+    return false;
+}
+
+fn emitExit(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    kind: ExitKind,
+    src_line: u32,
+    depth: i32,
+) !void {
+    const sink = ec.exits orelse return;
+    ec.seq.* += 1;
+    try sink.append(gpa, .{
+        .kind = kind,
+        .src_line = src_line,
+        .depth = depth,
+        .seq = ec.seq.*,
     });
 }
 
@@ -2054,11 +2326,20 @@ fn getOrBuildSummary(
             const ty_i = try ctx.pool.intern(ty);
             param_types[pi] = ty_i;
             try env.map.put(interned, ty_i);
+            try env.all_types.put(interned, ty_i);
             if (mem.indexOf(u8, pp.type_str, "SlabRef") != null) try env.fat.add(interned);
             try param_set.add(interned);
             continue;
         };
         param_types[pi] = "";
+        // Non-slab param: track bare type name so receiver chains
+        // through this ident can classify plain SpinLock/GenLock
+        // fields (e.g. `self.perm_lock.lock()` with `self: *Process`).
+        const bare = typeNameFromFieldType(pp.type_str);
+        if (bare.len > 0) {
+            const bare_i = try ctx.pool.intern(bare);
+            try env.all_types.put(interned, bare_i);
+        }
     }
 
     var events_map = EventMap.init(ctx.gpa);
@@ -2094,6 +2375,7 @@ fn getOrBuildSummary(
                     .lock => .lock,
                     .unlock => .unlock,
                     .defer_unlock => .defer_unlock,
+                    .errdefer_unlock => .errdefer_unlock,
                     .lock_with_gen => .lock_with_gen,
                 },
                 .param_idx = pi,
@@ -2142,6 +2424,7 @@ fn foldSummary(
             .lock => .lock,
             .unlock => .unlock,
             .defer_unlock => .defer_unlock,
+            .errdefer_unlock => .errdefer_unlock,
             .lock_with_gen => .lock_with_gen,
         };
         const slab_ty = env.map.get(arg) orelse "";
@@ -2294,7 +2577,13 @@ fn walkBody(
                 if (mem.indexOfScalar(u8, rhs_plain, '.')) |dotp| {
                     const head = rhs_plain[0..dotp];
                     const tail = rhs_plain[dotp + 1 ..];
-                    if (mem.eql(u8, tail, "lock()")) {
+                    // SlabRef.lock takes a `SrcLoc` arg in spec-v3; match
+                    // any `lock(...)` shape (`lock()`, `lock(@src())`,
+                    // `lock(some.src)`) by checking the prefix + balanced
+                    // close paren.
+                    const is_lock_call = mem.startsWith(u8, tail, "lock(") and
+                        mem.endsWith(u8, tail, ")");
+                    if (is_lock_call) {
                         var all_ident_h = head.len > 0;
                         for (head) |c| if (!isIdentChar(c)) { all_ident_h = false; break; };
                         if (all_ident_h and env.fat.contains(head)) {
@@ -2308,6 +2597,76 @@ fn walkBody(
             if (lock_alias_ref) |lr| {
                 if (env.map.get(lr)) |lrty| {
                     if (ctx.slab_types.contains(lrty)) resolved = lrty;
+                }
+            }
+            // Chained-SlabRef .lock() RHS: `const x = <chain>.<variant>.lock() catch ...`
+            // where <variant> is a known fat-yielding field (UNION_VARIANTS
+            // or FAT_YIELDING_FIELDS). The .lock() returns *T of the
+            // resolved slab type; record that on x so downstream
+            // `x.<lock_field>.lock()` chains classify. Also self-alive
+            // the local — the programmer is responsible for bracketing
+            // the *chain's* lock/unlock, and x aliases that lock's
+            // protected region. (Same semantic as the existing
+            // lock_alias_ref path for plain-ident chains.)
+            var chained_lock_alias = false;
+            if (resolved == null) {
+                const rhs_cs = stripPostfix(dp.rhs);
+                // Match `<chain>.lock(...)` where `<chain>` is a pure
+                // ident-dot chain and `(...)` is the trailing balanced
+                // call. spec-v3 SlabRef.lock takes a SrcLoc, so the arg
+                // list isn't always literally empty.
+                const chain_opt: ?[]const u8 = blk: {
+                    if (!mem.endsWith(u8, rhs_cs, ")")) break :blk null;
+                    const lock_open = ".lock(";
+                    const lp_opt = mem.lastIndexOf(u8, rhs_cs, lock_open);
+                    if (lp_opt == null) break :blk null;
+                    const lp = lp_opt.?;
+                    // The substring from `lp+1` to end should be exactly
+                    // one balanced `lock(...)`; equivalently the paren
+                    // depth must hit 0 only at the final `)`.
+                    var depth: i32 = 0;
+                    var k: usize = lp + lock_open.len - 1; // points at `(`
+                    while (k < rhs_cs.len) : (k += 1) {
+                        const c = rhs_cs[k];
+                        if (c == '(') depth += 1;
+                        if (c == ')') {
+                            depth -= 1;
+                            if (depth == 0 and k != rhs_cs.len - 1) break :blk null;
+                        }
+                    }
+                    if (depth != 0) break :blk null;
+                    break :blk rhs_cs[0..lp];
+                };
+                if (chain_opt) |chain| {
+                    // chain must be all idents + dots.
+                    var all_chain = chain.len > 0;
+                    for (chain) |c| if (!isIdentChar(c) and c != '.') {
+                        all_chain = false;
+                        break;
+                    };
+                    if (all_chain) {
+                        const last_seg_start = (mem.lastIndexOfScalar(u8, chain, '.') orelse 0) + 1;
+                        const last_seg = chain[last_seg_start..];
+                        if (lookupUnionVariant(last_seg)) |ty| {
+                            if (ctx.slab_types.contains(ty)) {
+                                resolved = ty;
+                                chained_lock_alias = true;
+                            }
+                        }
+                        if (resolved == null) {
+                            for (FAT_YIELDING_FIELDS) |e| {
+                                if (!mem.eql(u8, e.field, last_seg)) continue;
+                                for (DEFAULT_FIELD_CHAINS) |d| {
+                                    if (mem.eql(u8, d.field, last_seg) and ctx.slab_types.contains(d.ty)) {
+                                        resolved = d.ty;
+                                        chained_lock_alias = true;
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             if (resolved == null and dp.ann.len > 0) {
@@ -2373,11 +2732,28 @@ fn walkBody(
                     became_self_alive = true;
                 }
             }
+            if (!became_self_alive) {
+                if (isCallerSelfCast(dp.rhs, env.caller_param)) {
+                    try env.self_alive.add(dp.name);
+                    became_self_alive = true;
+                }
+            }
 
             if (resolved) |rt| {
-                try env.map.put(dp.name, try ctx.pool.intern(rt));
+                const rt_i = try ctx.pool.intern(rt);
+                try env.map.put(dp.name, rt_i);
+                try env.all_types.put(dp.name, rt_i);
                 if (is_fat) try env.fat.add(dp.name);
-                if (lock_alias_ref != null) try env.self_alive.add(dp.name);
+                if (lock_alias_ref != null or chained_lock_alias) try env.self_alive.add(dp.name);
+            } else if (dp.ann.len > 0) {
+                // Non-slab annotation — record bare type in all_types so
+                // plain SpinLock/GenLock field accesses through this local
+                // can classify. `*PerCoreState`, `Vmm`, `*const Foo`, etc.
+                const bare = typeNameFromFieldType(dp.ann);
+                if (bare.len > 0) {
+                    const bare_i = try ctx.pool.intern(bare);
+                    try env.all_types.put(dp.name, bare_i);
+                }
             }
 
             if (!became_self_alive) {
@@ -2418,18 +2794,31 @@ fn walkBody(
                 var op_end = op_start;
                 while (op_end < code.len and isIdentChar(code[op_end])) op_end += 1;
                 const op_name = code[op_start..op_end];
-                const is_lock = mem.eql(u8, op_name, "lock");
-                const is_unlock = mem.eql(u8, op_name, "unlock");
-                const is_lwg = mem.eql(u8, op_name, "lockWithGen");
+                const is_lock = mem.eql(u8, op_name, "lock") or
+                    mem.eql(u8, op_name, "lockOrdered") or
+                    mem.eql(u8, op_name, "lockIrqSave") or
+                    mem.eql(u8, op_name, "lockIrqSaveOrdered") or
+                    mem.eql(u8, op_name, "lockOrderedIrqSave");
+                const is_unlock = mem.eql(u8, op_name, "unlock") or
+                    mem.eql(u8, op_name, "unlockIrqRestore");
+                const is_lwg = mem.eql(u8, op_name, "lockWithGen") or
+                    mem.eql(u8, op_name, "lockWithGenOrdered") or
+                    mem.eql(u8, op_name, "lockWithGenIrqSave") or
+                    mem.eql(u8, op_name, "lockWithGenIrqSaveOrdered") or
+                    mem.eql(u8, op_name, "lockWithGenOrderedIrqSave");
                 if ((is_lock or is_unlock or is_lwg) and env.map.contains(ident)) {
                     const is_defer = isDeferFor(code, ident);
+                    const is_errdefer = !is_defer and isErrdeferFor(code, ident);
                     const kind: EventKind = if (is_defer and is_unlock)
                         .defer_unlock
+                    else if (is_errdefer and is_unlock)
+                        .errdefer_unlock
                     else if (is_lock) .lock
                     else if (is_unlock) .unlock
                     else .lock_with_gen;
                     const ident_i = try ctx.pool.intern(ident);
-                    try emitEvent(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "");
+                    const in_catch = (kind == .lock or kind == .lock_with_gen) and lockHasCatchOnLine(code);
+                    try emitEventDepthCatch(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "", brace_depth, in_catch);
                     if (is_defer and is_unlock) {
                         try pending_defers.append(gpa, .{ .ident = ident_i, .fire_at_depth = brace_depth });
                     }
@@ -2438,16 +2827,57 @@ fn walkBody(
             }
         }
 
-        // SlabRef form: `ident.lock()` / `ident.unlock()`.
+        // SlabRef form: `ident.lock()` / `ident.unlock()` /
+        // `ident.lockOrdered()` / IrqSave variants. The Ordered and
+        // IrqSave variants are lockdep / IRQ-discipline escapes; for
+        // lock-op tracking purposes they are identical to plain
+        // `lock` / `unlock`.
         {
             var pos: usize = 0;
             while (pos < code.len) {
                 const lock_p = mem.indexOf(u8, code[pos..], ".lock(");
                 const unlock_p = mem.indexOf(u8, code[pos..], ".unlock(");
+                const lock_ord_p = mem.indexOf(u8, code[pos..], ".lockOrdered(");
+                const lock_irq_p = mem.indexOf(u8, code[pos..], ".lockIrqSave(");
+                const lock_ord_irq_p = mem.indexOf(u8, code[pos..], ".lockOrderedIrqSave(");
+                const unlock_irq_p = mem.indexOf(u8, code[pos..], ".unlockIrqRestore(");
                 var hit: ?usize = null;
                 var op_name: []const u8 = "";
                 var skip: usize = 0;
-                if (lock_p != null and (unlock_p == null or lock_p.? < unlock_p.?)) {
+                // Pick whichever candidate appears earliest in the
+                // remaining slice. `.lock(` is a substring of
+                // `.lockOrdered(` / `.lockIrqSave(` / `.lockOrderedIrqSave(`
+                // and `.unlock(` is a substring of `.unlockIrqRestore(`,
+                // so a naive `.lock(` / `.unlock(` match would
+                // misclassify the longer variants; preferring the
+                // earlier (and longer when tied) match keeps each
+                // call site classified exactly once.
+                var earliest: usize = std.math.maxInt(usize);
+                if (lock_p) |p| earliest = @min(earliest, p);
+                if (unlock_p) |p| earliest = @min(earliest, p);
+                if (lock_ord_p) |p| earliest = @min(earliest, p);
+                if (lock_irq_p) |p| earliest = @min(earliest, p);
+                if (lock_ord_irq_p) |p| earliest = @min(earliest, p);
+                if (unlock_irq_p) |p| earliest = @min(earliest, p);
+                if (lock_ord_irq_p != null and lock_ord_irq_p.? == earliest) {
+                    hit = pos + lock_ord_irq_p.?;
+                    op_name = "lock";
+                    skip = ".lockOrderedIrqSave(".len;
+                } else if (lock_ord_p != null and lock_ord_p.? == earliest) {
+                    hit = pos + lock_ord_p.?;
+                    op_name = "lock";
+                    skip = ".lockOrdered(".len;
+                } else if (lock_irq_p != null and lock_irq_p.? == earliest) {
+                    hit = pos + lock_irq_p.?;
+                    op_name = "lock";
+                    skip = ".lockIrqSave(".len;
+                } else if (unlock_irq_p != null and unlock_irq_p.? == earliest) {
+                    hit = pos + unlock_irq_p.?;
+                    op_name = "unlock";
+                    skip = ".unlockIrqRestore(".len;
+                } else if (lock_p != null and lock_p.? == earliest and
+                    (unlock_p == null or lock_p.? <= unlock_p.?))
+                {
                     hit = pos + lock_p.?;
                     op_name = "lock";
                     skip = ".lock(".len;
@@ -2462,25 +2892,112 @@ fn walkBody(
                 if (at >= 2 and code[at - 2] == '.' and code[at - 1] == '?') {
                     leader_end = at - 2;
                 }
+                // Walk back through idents AND dots to capture full
+                // receiver chain. Plain-ident case still works (chain
+                // with no dots); chain case picks up patterns like
+                // `entry.object.thread.lock()` where the final segment
+                // is a known fat-yielding field.
                 var sidx: usize = leader_end;
-                while (sidx > 0 and isIdentChar(code[sidx - 1])) sidx -= 1;
+                while (sidx > 0) {
+                    const c = code[sidx - 1];
+                    if (isIdentChar(c) or c == '.') {
+                        sidx -= 1;
+                    } else break;
+                }
                 if (sidx == leader_end) { pos = at + skip; continue; }
-                const ident = code[sidx..leader_end];
-                if (env.map.contains(ident) and env.fat.contains(ident)) {
-                    const is_defer = isDeferForFat(code, ident);
-                    const kind: EventKind = if (is_defer and mem.eql(u8, op_name, "unlock"))
-                        .defer_unlock
-                    else if (mem.eql(u8, op_name, "lock")) .lock
-                    else .unlock;
-                    const ident_i = try ctx.pool.intern(ident);
-                    try emitEvent(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "");
-                    if (is_defer and mem.eql(u8, op_name, "unlock")) {
-                        try pending_defers.append(gpa, .{ .ident = ident_i, .fire_at_depth = brace_depth });
+                const full = code[sidx..leader_end];
+                // Plain-ident fast path.
+                if (mem.indexOfScalar(u8, full, '.') == null) {
+                    const ident = full;
+                    if (env.map.contains(ident) and env.fat.contains(ident)) {
+                        const is_defer = isDeferForFat(code, ident);
+                        const is_errdefer = !is_defer and isErrdeferForFat(code, ident);
+                        const kind: EventKind = if (is_defer and mem.eql(u8, op_name, "unlock"))
+                            .defer_unlock
+                        else if (is_errdefer and mem.eql(u8, op_name, "unlock"))
+                            .errdefer_unlock
+                        else if (mem.eql(u8, op_name, "lock")) .lock
+                        else .unlock;
+                        const ident_i = try ctx.pool.intern(ident);
+                        const in_catch = kind == .lock and lockHasCatchOnLine(code);
+                        try emitEventDepthCatch(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "", brace_depth, in_catch);
+                        if (is_defer and mem.eql(u8, op_name, "unlock")) {
+                            try pending_defers.append(gpa, .{ .ident = ident_i, .fire_at_depth = brace_depth });
+                        }
                     }
+                    pos = at + skip;
+                    continue;
+                }
+                // Chain case: last segment must be a known fat-yielding
+                // field (UNION_VARIANTS covers KernelObject slots like
+                // `.object.thread`, `.object.process`; FAT_YIELDING_FIELDS
+                // covers direct struct-field fat refs like `thread.process`,
+                // `vcpu.thread`). The slab type carried by the event comes
+                // from whichever table matched.
+                const last_seg_start = (mem.lastIndexOfScalar(u8, full, '.') orelse 0) + 1;
+                const last_seg = full[last_seg_start..];
+                var chain_slab_ty: []const u8 = "";
+                if (lookupUnionVariant(last_seg)) |ty| chain_slab_ty = ty;
+                if (chain_slab_ty.len == 0) {
+                    for (FAT_YIELDING_FIELDS) |e| {
+                        if (mem.eql(u8, e.field, last_seg)) {
+                            // Field can belong to multiple owners but all
+                            // our current entries yield the same slab type
+                            // per tail name (e.g. "process" always yields
+                            // Process). Resolve via DEFAULT_FIELD_CHAINS.
+                            for (DEFAULT_FIELD_CHAINS) |d| {
+                                if (mem.eql(u8, d.field, last_seg)) {
+                                    chain_slab_ty = d.ty;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (chain_slab_ty.len == 0) {
+                    pos = at + skip;
+                    continue;
+                }
+                // Chain as synthetic ident; different sites on different
+                // chains get distinct idents, but all carry the same
+                // slab_type so the pair extractor treats them as the
+                // same lock class. This is precisely what catches
+                // same-type-two-instance deadlocks (two `.lock()` calls
+                // on different chain expressions that both resolve to
+                // Thread — the classic two-lock self-deadlock).
+                const chain_i = try ctx.pool.intern(full);
+                const ty_i = try ctx.pool.intern(chain_slab_ty);
+                // `defer <chain>.unlock()` — detect by scanning for
+                // `defer ` before the chain start on the same line. This
+                // matters for the lock-order simulator: popping on the
+                // defer statement rather than at scope exit would make
+                // the chain's lock look released at the defer line,
+                // hiding any nested same-type acquire downstream.
+                // Distinguish `defer ` from `errdefer `. The `errdefer` form
+                // matches because it ends in `defer ` too — but the leading
+                // `err` is an identifier suffix, so test for it explicitly.
+                const has_defer_prefix = mem.indexOf(u8, code[0..sidx], "defer ") != null;
+                const has_errdefer_prefix = mem.indexOf(u8, code[0..sidx], "errdefer ") != null;
+                const is_defer_chain = has_defer_prefix and !has_errdefer_prefix;
+                const is_errdefer_chain = has_errdefer_prefix;
+                const kind: EventKind = if (mem.eql(u8, op_name, "lock"))
+                    .lock
+                else if (is_defer_chain)
+                    .defer_unlock
+                else if (is_errdefer_chain)
+                    .errdefer_unlock
+                else
+                    .unlock;
+                const in_catch = kind == .lock and lockHasCatchOnLine(code);
+                try emitEventDepthCatch(gpa, ec, chain_i, kind, src_line, "", ty_i, brace_depth, in_catch);
+                if (is_defer_chain and mem.eql(u8, op_name, "unlock")) {
+                    try pending_defers.append(gpa, .{ .ident = chain_i, .fire_at_depth = brace_depth });
                 }
                 pos = at + skip;
             }
         }
+
 
         // Access + call-site scanning.
         const atomic_spans = try atomicCallSpans(gpa, code);
@@ -2516,7 +3033,12 @@ fn walkBody(
                                 if (!isAtomicMethodAt(code, cursor)) {
                                     const skip_as_lock =
                                         env.fat.contains(ident) and
-                                        (mem.eql(u8, tail, "lock") or mem.eql(u8, tail, "unlock")) and
+                                        (mem.eql(u8, tail, "lock") or
+                                            mem.eql(u8, tail, "unlock") or
+                                            mem.eql(u8, tail, "lockOrdered") or
+                                            mem.eql(u8, tail, "lockIrqSave") or
+                                            mem.eql(u8, tail, "lockOrderedIrqSave") or
+                                            mem.eql(u8, tail, "unlockIrqRestore")) and
                                         te < code.len and code[te] == '(';
                                     if (!skip_as_lock) {
                                         if (te < code.len and code[te] == '(') {
@@ -2550,6 +3072,11 @@ fn walkBody(
             while (p < code.len) {
                 if (!isIdentStart(code[p])) { p += 1; continue; }
                 if (p > 0 and (isIdentChar(code[p - 1]) or code[p - 1] == '.')) { p += 1; continue; }
+                // Builtin calls `@intCast(...)` etc. — when the scanner
+                // skipped past '@' it lands on the bare builtin name;
+                // reject it here so we don't misread the first parenthesized
+                // expr as a "call on the builtin."
+                if (p > 0 and code[p - 1] == '@') { p += 1; continue; }
                 var e = p;
                 while (e < code.len and (isIdentChar(code[e]) or code[e] == '.')) e += 1;
                 const fq = code[p..e];
@@ -2641,6 +3168,46 @@ fn walkBody(
             if (mem.eql(u8, fc.fn_name, "destroy") and leaderIsSlabModule(fc.leader)) {
                 continue;
             }
+            // `<slab_module>.destroyLocked(<ident>, <gen>)` is the caller-
+            // holds-gen-lock sink: the allocator releases the lock bit as
+            // part of the gen bump, so there is no (and must be no) trailing
+            // `unlock()`. Skip emitting an access event on the first arg,
+            // and synthesize an unlock event for any fat ident used in the
+            // args (typically `<ref>.gen`) so bracketCheck sees the lock
+            // released right after the last access, rather than flagging a
+            // missing tight-following unlock.
+            if (mem.eql(u8, fc.fn_name, "destroyLocked") and leaderIsSlabModule(fc.leader)) {
+                const args_start = fc.open_p + 1;
+                var rp = args_start;
+                var depth: i32 = 1;
+                while (rp < code.len and depth > 0) : (rp += 1) {
+                    if (code[rp] == '(') depth += 1;
+                    if (code[rp] == ')') depth -= 1;
+                    if (depth == 0) break;
+                }
+                const args_end = rp;
+                if (args_end <= code.len and args_start <= args_end) {
+                    var sp: usize = args_start;
+                    while (sp < args_end) {
+                        if (!isIdentStart(code[sp])) { sp += 1; continue; }
+                        if (sp > 0 and (isIdentChar(code[sp - 1]) or code[sp - 1] == '.')) { sp += 1; continue; }
+                        var se = sp;
+                        while (se < args_end and isIdentChar(code[se])) se += 1;
+                        const aid = code[sp..se];
+                        if (se + 4 <= args_end and code[se] == '.' and
+                            mem.eql(u8, code[se + 1 .. se + 4], "gen") and
+                            (se + 4 == args_end or !isIdentChar(code[se + 4])))
+                        {
+                            if (env.fat.contains(aid)) {
+                                const aid_i = try ctx.pool.intern(aid);
+                                try emitEvent(gpa, ec, aid_i, .unlock, src_line, "", env.map.get(aid) orelse "");
+                            }
+                        }
+                        sp = se;
+                    }
+                }
+                continue;
+            }
             const summary_opt = try getOrBuildSummary(ctx, recv_ty, fc.fn_name);
             if (summary_opt == null) {
                 const ident_i = try ctx.pool.intern(fc.first_arg);
@@ -2655,7 +3222,16 @@ fn walkBody(
             try foldSummary(ctx, summary, caller_args.items, env, ec, src_line);
         }
 
+        // Exit-event scan: run BEFORE end-of-line brace bookkeeping so
+        // the exit event records the depth INSIDE the block where it
+        // appears (a `return` on a line that closes its block via `}`
+        // still belongs to the inner depth). The path-aware release
+        // checker uses this depth to decide whether a still-active
+        // (err)defer at scope D ≤ exit-depth covers the exit.
+        try scanExits(gpa, ec, code, src_line, brace_depth);
+
         // End-of-line brace tracking + defer fires.
+        const depth_before = brace_depth;
         var in_str = false;
         var esc = false;
         for (code) |c| {
@@ -2666,11 +3242,20 @@ fn walkBody(
             if (c == '{') brace_depth += 1;
             if (c == '}') brace_depth -= 1;
         }
+        if (brace_depth < depth_before) {
+            // Emit scope-close markers for the per-path checker. We
+            // emit one marker at the FINAL depth — the checker treats
+            // it as "any branch_unlock at depth > brace_depth is now
+            // out of scope and must be pruned." This is sufficient
+            // because the checker's pruning step only cares about the
+            // shallowest depth reached.
+            try emitExit(gpa, ec, .scope_close, src_line, brace_depth);
+        }
         var i: isize = @as(isize, @intCast(pending_defers.items.len)) - 1;
         while (i >= 0) : (i -= 1) {
             const pd = pending_defers.items[@intCast(i)];
             if (brace_depth < pd.fire_at_depth) {
-                try emitEvent(gpa, ec, pd.ident, .unlock, src_line, "", env.map.get(pd.ident) orelse "");
+                try emitEventDepth(gpa, ec, pd.ident, .unlock, src_line, "", env.map.get(pd.ident) orelse "", brace_depth);
                 _ = pending_defers.orderedRemove(@intCast(i));
             }
         }
@@ -2681,7 +3266,188 @@ fn walkBody(
     // scope exit at the closing brace releases the defer.
     while (pending_defers.items.len > 0) {
         const pd = pending_defers.pop().?;
-        try emitEvent(gpa, ec, pd.ident, .unlock, body_end_line, "", env.map.get(pd.ident) orelse "");
+        try emitEventDepth(gpa, ec, pd.ident, .unlock, body_end_line, "", env.map.get(pd.ident) orelse "", brace_depth);
+    }
+}
+
+// Scan one stripped code line for control-flow exit markers and emit
+// an ExitEvent for each. The path-aware release checker consumes these
+// to decide whether each lock event is matched on every reachable
+// path. Recognized markers (in priority order):
+//
+//   * `return error.<X>` / `return ErrorSet.<X>` → return_error
+//   * `return` (with or without a value) → return_normal
+//   * `break` (`break :label`, `break <value>`) → break_stmt
+//   * `continue` → continue_stmt
+//   * `unreachable` / `@panic(...)` → panic_or_unreachable
+//   * any number of `try ` occurrences (each one is an implicit
+//     error-path exit on the contained expression's error union) →
+//     throw events, one per `try`
+//
+// `panic_or_unreachable` is recorded but the per-path checker treats
+// it as a no-op exit (the runtime aborts; no unwinding obligation).
+fn scanExits(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    code: []const u8,
+    src_line: u32,
+    depth: i32,
+) !void {
+    if (ec.exits == null) return;
+    const t = trimAscii(code);
+    // Skip lines that are clearly comments / blank.
+    if (t.len == 0) return;
+
+    // First emit one throw per `try ` occurrence — these are
+    // independent of any return on the same line.
+    {
+        var pos: usize = 0;
+        while (pos < t.len) {
+            const idx_opt = mem.indexOf(u8, t[pos..], "try ");
+            if (idx_opt == null) break;
+            const abs = pos + idx_opt.?;
+            // Must be at start-of-token (preceded by whitespace, `(`, `[`,
+            // `{`, `,`, `=`, or beginning of string).
+            const ok_prev = abs == 0 or
+                ascii.isWhitespace(t[abs - 1]) or
+                t[abs - 1] == '(' or t[abs - 1] == '[' or
+                t[abs - 1] == '{' or t[abs - 1] == ',' or
+                t[abs - 1] == '=' or t[abs - 1] == '|';
+            if (ok_prev) {
+                try emitExit(gpa, ec, .throw, src_line, depth);
+            }
+            pos = abs + 4;
+        }
+    }
+
+    // Look for return / break / continue / unreachable / @panic
+    // tokens anywhere on the line at top-paren depth — covers both
+    // statement-leading uses and inline forms like `if (x) return y;`.
+    // We scan the line with crude tokenization (no string/char awareness
+    // beyond the comment-stripped view; the analyzer has already
+    // blanked comments and the test relies on Zig's syntactic uniformity).
+    //
+    // Exception: an exit token positioned AFTER `<expr>.lock() catch ` or
+    // `... orelse ` (no `{` opening a block) belongs to the failure-path
+    // operand — it only fires when the lock attempt fails. Suppress it;
+    // the path-aware checker would otherwise count the failure-path
+    // return as a leak even though no lock was acquired on that path.
+    const catch_no_block_pos: ?usize = blk: {
+        const handlers = [_]struct { kw: []const u8, len: usize }{
+            .{ .kw = "catch ", .len = 6 },
+            .{ .kw = "orelse ", .len = 7 },
+        };
+        var earliest: ?usize = null;
+        for (handlers) |h| {
+            var sp: usize = 0;
+            while (sp < t.len) {
+                const idx = mem.indexOf(u8, t[sp..], h.kw) orelse break;
+                const abs = sp + idx;
+                if (abs > 0 and isIdentChar(t[abs - 1])) {
+                    sp = abs + h.len;
+                    continue;
+                }
+                var look = abs + h.len;
+                // Optional `|err|` capture (only on `catch`).
+                if (look < t.len and t[look] == '|') {
+                    const close = mem.indexOfScalarPos(u8, t, look + 1, '|') orelse {
+                        sp = abs + h.len;
+                        continue;
+                    };
+                    look = close + 1;
+                    while (look < t.len and ascii.isWhitespace(t[look])) look += 1;
+                }
+                if (look < t.len and t[look] == '{') {
+                    // Block form — exits inside the block are visible at
+                    // depth+1 and handled by the in_catch_skip logic on
+                    // the lock event itself.
+                    sp = abs + h.len;
+                    continue;
+                }
+                if (earliest == null or look < earliest.?) earliest = look;
+                break;
+            }
+        }
+        break :blk earliest;
+    };
+
+    var p: usize = 0;
+    while (p < t.len) {
+        const c = t[p];
+        if (!isIdentStart(c) and c != '@') {
+            p += 1;
+            continue;
+        }
+        // Don't re-trigger inside the middle of an identifier.
+        if (p > 0 and isIdentChar(t[p - 1])) {
+            p += 1;
+            continue;
+        }
+        var e = p;
+        if (c == '@') {
+            e += 1;
+            while (e < t.len and isIdentChar(t[e])) e += 1;
+        } else {
+            while (e < t.len and isIdentChar(t[e])) e += 1;
+        }
+        const word = t[p..e];
+
+        const after_catch = catch_no_block_pos != null and p >= catch_no_block_pos.?;
+        if (mem.eql(u8, word, "return")) {
+            if (after_catch) {
+                p = e;
+                continue;
+            }
+            // Tail starts at `e`; check whether anywhere up to the
+            // statement terminator (`;` at this depth) we see `error.`
+            // — if so, this is an error-path return.
+            const tail = t[e..];
+            const is_err = mem.indexOf(u8, tail, "error.") != null;
+            const kind: ExitKind = if (is_err) .return_error else .return_normal;
+            try emitExit(gpa, ec, kind, src_line, depth);
+            // Don't `return` from scanExits — there could be a `try`
+            // earlier on the line that we already emitted; keep
+            // scanning so `if (try x()) return;` reports both.
+            p = e;
+            continue;
+        }
+        if (mem.eql(u8, word, "break")) {
+            if (after_catch) {
+                p = e;
+                continue;
+            }
+            try emitExit(gpa, ec, .break_stmt, src_line, depth);
+            p = e;
+            continue;
+        }
+        if (mem.eql(u8, word, "continue")) {
+            if (after_catch) {
+                p = e;
+                continue;
+            }
+            try emitExit(gpa, ec, .continue_stmt, src_line, depth);
+            p = e;
+            continue;
+        }
+        if (mem.eql(u8, word, "unreachable")) {
+            if (after_catch) {
+                p = e;
+                continue;
+            }
+            try emitExit(gpa, ec, .panic_or_unreachable, src_line, depth);
+            p = e;
+            continue;
+        }
+        if (mem.eql(u8, word, "@panic")) {
+            if (after_catch) {
+                p = e;
+                continue;
+            }
+            try emitExit(gpa, ec, .panic_or_unreachable, src_line, depth);
+            p = e;
+            continue;
+        }
+        p = e;
     }
 }
 
@@ -2708,6 +3474,12 @@ fn isDeferFor(code: []const u8, ident: []const u8) bool {
     while (search_pos < code.len) {
         const p = mem.indexOf(u8, code[search_pos..], "defer ") orelse break;
         const abs = search_pos + p;
+        // Reject `errdefer` — it ends in "defer " too but the leading
+        // `err` makes it a different keyword (only error-paths fire).
+        if (abs >= 3 and mem.eql(u8, code[abs - 3 .. abs], "err")) {
+            search_pos = abs + 6;
+            continue;
+        }
         const rest = trimAscii(code[abs + 6 ..]);
         if (rest.len >= ident.len and
             mem.eql(u8, rest[0..ident.len], ident) and
@@ -2720,12 +3492,56 @@ fn isDeferFor(code: []const u8, ident: []const u8) bool {
     return false;
 }
 
-// Helper: detect `defer <ident>(\.\?)?\.`.
+// Helper: detect `errdefer <ident>._gen_lock.` earlier on this line.
+// Mirrors isDeferFor but matches `errdefer ` instead of `defer `.
+fn isErrdeferFor(code: []const u8, ident: []const u8) bool {
+    var search_pos: usize = 0;
+    while (search_pos < code.len) {
+        const p = mem.indexOf(u8, code[search_pos..], "errdefer ") orelse break;
+        const abs = search_pos + p;
+        const rest = trimAscii(code[abs + 9 ..]);
+        if (rest.len >= ident.len and
+            mem.eql(u8, rest[0..ident.len], ident) and
+            rest.len > ident.len and rest[ident.len] == '.')
+        {
+            return true;
+        }
+        search_pos = abs + 9;
+    }
+    return false;
+}
+
+// Helper: detect `defer ` preceding a specific byte-offset callsite
+// (e.g. for `defer unlockPair(a, b)` — ordered-pair helpers live at
+// top-level, not as a `.method()` call, so the existing isDeferFor*
+// helpers don't match them).
+fn isOrderedDefer(code: []const u8, callsite_idx: usize) bool {
+    var sp: usize = 0;
+    while (sp < callsite_idx) {
+        const p = mem.indexOf(u8, code[sp..callsite_idx], "defer ") orelse break;
+        const abs = sp + p;
+        // There's a `defer ` before us; verify only whitespace between
+        // `defer ` and callsite_idx (ignoring `try ` / `errdefer` noise
+        // is beyond v1's appetite — if needed, callers can nest).
+        const between = trimAscii(code[abs + 6 .. callsite_idx]);
+        if (between.len == 0) return true;
+        sp = abs + 6;
+    }
+    return false;
+}
+
+// Helper: detect `defer <ident>(\.\?)?\.`. Rejects `errdefer ` — that
+// keyword shares the trailing `defer ` text but only fires on error
+// paths and is reported as a separate event kind.
 fn isDeferForFat(code: []const u8, ident: []const u8) bool {
     var sp: usize = 0;
     while (sp < code.len) {
         const p = mem.indexOf(u8, code[sp..], "defer ") orelse break;
         const abs = sp + p;
+        if (abs >= 3 and mem.eql(u8, code[abs - 3 .. abs], "err")) {
+            sp = abs + 6;
+            continue;
+        }
         const rest = trimAscii(code[abs + 6 ..]);
         if (rest.len >= ident.len and mem.eql(u8, rest[0..ident.len], ident)) {
             var k = ident.len;
@@ -2733,6 +3549,23 @@ fn isDeferForFat(code: []const u8, ident: []const u8) bool {
             if (k < rest.len and rest[k] == '.') return true;
         }
         sp = abs + 6;
+    }
+    return false;
+}
+
+// Helper: detect `errdefer <ident>(\.\?)?\.`.
+fn isErrdeferForFat(code: []const u8, ident: []const u8) bool {
+    var sp: usize = 0;
+    while (sp < code.len) {
+        const p = mem.indexOf(u8, code[sp..], "errdefer ") orelse break;
+        const abs = sp + p;
+        const rest = trimAscii(code[abs + 9 ..]);
+        if (rest.len >= ident.len and mem.eql(u8, rest[0..ident.len], ident)) {
+            var k = ident.len;
+            if (k + 2 <= rest.len and rest[k] == '.' and rest[k + 1] == '?') k += 2;
+            if (k < rest.len and rest[k] == '.') return true;
+        }
+        sp = abs + 9;
     }
     return false;
 }
@@ -2808,6 +3641,7 @@ fn analyzeEntry(
     entry: *const EntryPoint,
     out_env: *SlabEnv,
     out_events: *EventMap,
+    out_exits: *ExitEventList,
 ) !void {
     const sf = fileByPath(ctx_files, entry.file_path) orelse return;
     const toks = blk: {
@@ -2830,22 +3664,43 @@ fn analyzeEntry(
     }
     if (hdr == null) return;
 
-    const is_syscall_entry = mem.startsWith(u8, entry.name, "sys");
+    // Syscall entries live under kernel/syscall/. Spec-v3 syscall
+    // handlers all take `caller: *anyopaque` as their first parameter;
+    // the kernel-side syscall dispatcher hands the handler a pointer
+    // to the running ExecutionContext, which cannot be reaped while
+    // the syscall body executes. Recover the param name so the body
+    // walker can recognize the canonical `@ptrCast(@alignCast(caller))`
+    // recovery pattern as a self-alive seed.
+    const is_syscall_entry = mem.startsWith(u8, entry.file_rel, "kernel/syscall/");
 
     // Seed env from the fn header params.
     const params = try parseParamList(gpa, sf, toks, hdr.?.l_paren_idx, hdr.?.r_paren_idx);
     defer gpa.free(params);
+    if (is_syscall_entry and params.len > 0) {
+        const p0_ty = trimAscii(params[0].type_str);
+        if (mem.eql(u8, p0_ty, "*anyopaque")) {
+            out_env.caller_param = try pool.intern(params[0].name);
+        }
+    }
     for (params) |pp| {
+        const nm = try pool.intern(pp.name);
         if (parseTypeRef(pp.type_str)) |ty| {
             if (slab_types.contains(ty)) {
-                const nm = try pool.intern(pp.name);
                 const ty_i = try pool.intern(ty);
                 try out_env.map.put(nm, ty_i);
+                try out_env.all_types.put(nm, ty_i);
                 if (mem.indexOf(u8, pp.type_str, "SlabRef") != null) try out_env.fat.add(nm);
-                if (is_syscall_entry and (mem.eql(u8, ty, "Process") or mem.eql(u8, ty, "Thread"))) {
-                    try out_env.self_alive.add(nm);
-                }
+                continue;
             }
+        }
+        // Non-slab param: still record its bare type name (if any) so
+        // `self.lock.lock()` style calls on non-slab receivers can be
+        // classified via LockFieldMap. parseTypeRef is slab-specific;
+        // fall through to the bare-name extractor for plain types.
+        const bare = typeNameFromFieldType(pp.type_str);
+        if (bare.len > 0) {
+            const bare_i = try pool.intern(bare);
+            try out_env.all_types.put(nm, bare_i);
         }
     }
 
@@ -2867,6 +3722,7 @@ fn analyzeEntry(
         .seq = &seq,
         .param_set = &empty_set,
         .emit_param_only = false,
+        .exits = out_exits,
     };
 
     try walkBody(&ctx, sf, entry.body_start_line, entry.body_end_line, out_env, &ec);
@@ -2876,12 +3732,14 @@ const CheckResult = struct {
     entry: *const EntryPoint,
     env: SlabEnv,
     events: EventMap,
+    exit_events: ExitEventList,
     findings: ArrayList(Finding),
 
     fn deinit(self: *CheckResult, gpa: Allocator) void {
         var it = self.events.valueIterator();
         while (it.next()) |al| al.deinit(gpa);
         self.events.deinit();
+        self.exit_events.deinit(gpa);
         for (self.findings.items) |f| gpa.free(f.message);
         self.findings.deinit(gpa);
         self.env.deinit();
@@ -2974,7 +3832,7 @@ fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
         if (first_idx >= 1) {
             const prev = events[first_idx - 1];
             if (prev.kind == .lock or prev.kind == .lock_with_gen) acq_ok = true;
-            if (!acq_ok and prev.kind == .defer_unlock and first_idx >= 2) {
+            if (!acq_ok and (prev.kind == .defer_unlock or prev.kind == .errdefer_unlock) and first_idx >= 2) {
                 const pp = events[first_idx - 2];
                 if (pp.kind == .lock or pp.kind == .lock_with_gen) acq_ok = true;
             }
@@ -3013,7 +3871,7 @@ fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
             // Any defer_unlock anywhere before last_line covers.
             var has_defer = false;
             for (events) |ev| {
-                if (ev.kind == .defer_unlock and ev.src_line <= last_line) {
+                if ((ev.kind == .defer_unlock or ev.kind == .errdefer_unlock) and ev.src_line <= last_line) {
                     has_defer = true;
                     break;
                 }
@@ -3053,6 +3911,277 @@ fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
     }
 }
 
+
+// -----------------------------------------------------------------
+// Per-path release check
+//
+// The bracket check above verifies the linear (textual) order of
+// events: was the first access tight-preceded by a lock, was the last
+// access tight-followed by an unlock or covered by SOME defer-unlock
+// in the timeline. That misses two real leak shapes:
+//
+//   1. `const ptr = try ref.lockNoDefer();
+//       if (cond) return error.X;       // <- LEAK
+//       ref.unlock(ptr);`
+//
+//   2. `const ptr = try ref.lock();
+//       if (cond) return;                // covered by NOTHING
+//       ref.unlock(ptr);`
+//
+// Both have AN `.unlock` somewhere in the timeline so the existing
+// check is happy. Per-path coverage walks every reachable function
+// exit (return, return error, try-implicit-return, break, continue,
+// end-of-body) FROM each `lock` event and demands that on every such
+// path the lock is released — by an explicit `.unlock` reached on the
+// path, by a `.defer_unlock` registered before the exit at a depth
+// that still covers the exit, or by an `.errdefer_unlock` for the
+// subset of exits that propagate an error.
+//
+// Note: `panic_or_unreachable` exits don't unwind, so they're
+// effectively `noreturn` — the lock release obligation is dropped
+// (the runtime aborts). Similarly, breaks/continues that leave a loop
+// to a CONTAINING scope where the lock was registered fall back to
+// the same defer coverage rules — defers at any depth ≤ exit-depth
+// cover.
+// -----------------------------------------------------------------
+
+const ActiveDefer = struct {
+    kind: EventKind, // .defer_unlock or .errdefer_unlock
+    depth: i32,
+    register_seq: u32,
+    register_line: u32,
+};
+
+const BranchUnlock = struct {
+    depth: i32,
+    src_line: u32,
+};
+
+fn defersCover(
+    actives: []const ActiveDefer,
+    exit_kind: ExitKind,
+    exit_depth: i32,
+) bool {
+    for (actives) |ad| {
+        // Defer fires when scope at register-depth exits. An exit at
+        // depth >= ad.depth is inside the defer's protection.
+        if (exit_depth < ad.depth) continue;
+        if (ad.kind == .defer_unlock) return true;
+        if (ad.kind == .errdefer_unlock) {
+            switch (exit_kind) {
+                .return_error, .throw => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
+// A branch-local unlock at depth D covers subsequent exits ONLY while
+// execution stays at depth >= D. The path walker prunes branch unlocks
+// whose depth has been left behind: any later event at depth < bu.depth
+// means we exited bu's scope and bu no longer protects future paths.
+fn pruneBranchUnlocks(
+    actives: *ArrayList(BranchUnlock),
+    cur_depth: i32,
+) void {
+    var i: usize = 0;
+    while (i < actives.items.len) {
+        if (actives.items[i].depth > cur_depth) {
+            _ = actives.swapRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn anyBranchUnlockCovers(
+    actives: []const BranchUnlock,
+    exit_depth: i32,
+) bool {
+    for (actives) |bu| {
+        if (bu.depth <= exit_depth) return true;
+    }
+    return false;
+}
+
+fn exitKindLabel(k: ExitKind) []const u8 {
+    return switch (k) {
+        .return_normal => "return",
+        .return_error => "return error",
+        .throw => "try (error propagation)",
+        .break_stmt => "break",
+        .continue_stmt => "continue",
+        .panic_or_unreachable => "panic/unreachable",
+        .scope_close => "scope close",
+    };
+}
+
+fn pathReleaseCheck(gpa: Allocator, res: *CheckResult) !void {
+    // We need a global event stream ordered by seq. Per-ident events
+    // are stored in res.events; exit events live in res.exit_events.
+    // Walk the per-ident timeline of EACH ident, interleaving exit
+    // events by seq.
+    var it = res.events.iterator();
+    while (it.next()) |kv| {
+        const ident = kv.key_ptr.*;
+        const events = kv.value_ptr.items;
+        if (events.len == 0) continue;
+        if (res.env.self_alive.contains(ident)) continue;
+
+        // Skip idents with no lock events at all — the existing check
+        // already produces a finding for "access without lock".
+        var has_lock = false;
+        for (events) |ev| {
+            if (ev.kind == .lock or ev.kind == .lock_with_gen) {
+                has_lock = true;
+                break;
+            }
+        }
+        if (!has_lock) continue;
+
+        const slab_ty: []const u8 = blk: {
+            for (events) |ev| {
+                if (ev.slab_type.len > 0) break :blk ev.slab_type;
+            }
+            break :blk res.env.map.get(ident) orelse "?";
+        };
+
+        // For each lock event, scan forward.
+        var li: usize = 0;
+        while (li < events.len) : (li += 1) {
+            const lock_ev = events[li];
+            if (lock_ev.kind != .lock and lock_ev.kind != .lock_with_gen) continue;
+
+            var actives = ArrayList(ActiveDefer).empty;
+            defer actives.deinit(gpa);
+            // Branch-local unlocks: an unlock at depth D > lock.depth
+            // covers exits inside the same branch (depth >= D). When
+            // execution leaves D's scope (we observe an event at depth
+            // < D), the unlock is pruned — sibling branches DO need
+            // their own release.
+            var branch_unlocks = ArrayList(BranchUnlock).empty;
+            defer branch_unlocks.deinit(gpa);
+
+            // Walk forward, interleaving exit events by seq order.
+            var ev_i: usize = li + 1;
+            var ex_i: usize = 0;
+            // Skip exit events that occurred before this lock.
+            while (ex_i < res.exit_events.items.len and
+                res.exit_events.items[ex_i].seq < lock_ev.seq) : (ex_i += 1)
+            {}
+
+            // For `x.lock() catch ...` form: until execution returns to
+            // lock_ev.depth, exits inside the failure-path operand are
+            // suppressed (the lock was never acquired on that path).
+            var in_catch_skip: bool = lock_ev.in_catch;
+
+            outer: while (ev_i < events.len or ex_i < res.exit_events.items.len) {
+                const next_ev_seq: u32 = if (ev_i < events.len) events[ev_i].seq else std.math.maxInt(u32);
+                const next_ex_seq: u32 = if (ex_i < res.exit_events.items.len)
+                    res.exit_events.items[ex_i].seq
+                else
+                    std.math.maxInt(u32);
+                if (next_ev_seq <= next_ex_seq) {
+                    const ev = events[ev_i];
+                    ev_i += 1;
+                    if (in_catch_skip and ev.depth <= lock_ev.depth) {
+                        in_catch_skip = false;
+                    }
+                    pruneBranchUnlocks(&branch_unlocks, ev.depth);
+                    switch (ev.kind) {
+                        .lock, .lock_with_gen => {
+                            // Re-acquired without intervening release.
+                            // Treat as continuation; outer defers still
+                            // apply. (A re-lock at depth equal to the
+                            // original lock's depth is dubious in
+                            // practice but caught by the existing
+                            // tight-bracket check.)
+                        },
+                        .unlock => {
+                            if (ev.depth <= lock_ev.depth) {
+                                // Explicit release at the lock's own
+                                // depth (or shallower): the lock has
+                                // been discharged on the only sequential
+                                // path. Branch unlocks below this point
+                                // belong to a different lock instance.
+                                break :outer;
+                            } else {
+                                try branch_unlocks.append(gpa, .{
+                                    .depth = ev.depth,
+                                    .src_line = ev.src_line,
+                                });
+                            }
+                        },
+                        .defer_unlock, .errdefer_unlock => {
+                            try actives.append(gpa, .{
+                                .kind = ev.kind,
+                                .depth = ev.depth,
+                                .register_seq = ev.seq,
+                                .register_line = ev.src_line,
+                            });
+                        },
+                        .access => {},
+                    }
+                } else {
+                    const ex = res.exit_events.items[ex_i];
+                    ex_i += 1;
+                    // scope_close is purely a pruning trigger — not a
+                    // real exit. Apply prune (also prune in_catch_skip
+                    // when we drop back to the lock's depth) and
+                    // continue.
+                    if (ex.kind == .scope_close) {
+                        pruneBranchUnlocks(&branch_unlocks, ex.depth);
+                        if (in_catch_skip and ex.depth <= lock_ev.depth) {
+                            in_catch_skip = false;
+                        }
+                        continue;
+                    }
+                    if (ex.kind == .panic_or_unreachable) continue;
+                    // `break` / `continue` exit the enclosing loop or
+                    // labeled block, not the enclosing function. When
+                    // the break/continue is at a depth strictly deeper
+                    // than the lock acquisition, it cannot escape the
+                    // lock's scope — the sequential walk continues past
+                    // the break target into code still inside the lock.
+                    // (At-or-shallower-than-lock break/continue is rare
+                    // in kernel code but would escape, so still report.)
+                    if ((ex.kind == .break_stmt or ex.kind == .continue_stmt) and
+                        ex.depth > lock_ev.depth) continue;
+                    if (in_catch_skip and ex.depth > lock_ev.depth) continue;
+                    if (in_catch_skip and ex.depth <= lock_ev.depth) {
+                        in_catch_skip = false;
+                    }
+                    pruneBranchUnlocks(&branch_unlocks, ex.depth);
+                    if (defersCover(actives.items, ex.kind, ex.depth)) continue;
+                    if (anyBranchUnlockCovers(branch_unlocks.items, ex.depth)) continue;
+                    const msg = try std.fmt.allocPrint(gpa,
+                        "{s} ({s}): lock at L{d} not released on path to {s} at L{d} (no unlock, no covering defer/errdefer)",
+                        .{ ident, slab_ty, lock_ev.src_line, exitKindLabel(ex.kind), ex.src_line });
+                    try res.findings.append(gpa, .{
+                        .severity = .err,
+                        .entry_name = res.entry.name,
+                        .message = msg,
+                        .line_no = ex.src_line,
+                    });
+                    // Continue scanning so multiple leaking paths in
+                    // the same body each surface as their own finding,
+                    // rather than only the first.
+                }
+            }
+            // No explicit fall-through-to-body-end check here: if the
+            // body's last reachable statement is an exit, the exit-
+            // events check already evaluated coverage. If the lock was
+            // released at its own depth via an explicit unlock, the
+            // walk broke out at that point. The remaining "implicit
+            // return at end of void function" case is rare for
+            // syscalls (which always return i64 explicitly); the
+            // existing tight-bracket check still complains if no
+            // unlock event exists at all on the timeline.
+        }
+    }
+}
+
 // -----------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------
@@ -3064,6 +4193,12 @@ const Args = struct {
     list_slab_types: bool = false,
     list_methods: bool = false,
     print_help: bool = false,
+    // Override the source root to scan. Used by the test harness so
+    // fixtures can stand in for real `kernel/` source without polluting
+    // the live tree. When set, the analyzer scans <override> instead of
+    // `<repo_root>/kernel/`. The relative-path stripping still uses the
+    // override directory as the "kernel root" for findRepoRoot purposes.
+    root_override: ?[]const u8 = null,
 };
 
 fn parseArgs(gpa: Allocator) !Args {
@@ -3084,6 +4219,8 @@ fn parseArgs(gpa: Allocator) !Args {
             args.print_help = true;
         } else if (mem.eql(u8, a, "--entry")) {
             if (it.next()) |val| args.entry_filter = val;
+        } else if (mem.eql(u8, a, "--root")) {
+            if (it.next()) |val| args.root_override = val;
         }
     }
     return args;
@@ -3103,11 +4240,21 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  - Per-entry-point gen-lock bracketing: every access to a slab-typed
         \\    local in a syscall / exception handler must be tight-preceded by
         \\    a lock and tight-followed by an unlock on the same ident.
+        \\  - Per-path release coverage: every lock event must be released on
+        \\    every reachable control-flow exit (return, return error, try
+        \\    error propagation, break, continue) — by an explicit unlock
+        \\    reached on that path, by a `defer ref.unlock(...)` registered
+        \\    before the exit, or (for error paths only) by an
+        \\    `errdefer ref.unlock(...)`. `@panic`/`unreachable` exits are
+        \\    treated as `noreturn` and impose no release obligation.
         \\
         \\Options:
         \\  --summary             one line per entry with finding counts
         \\  --verbose, -v         per-ident access and lock-op summary
         \\  --entry NAME          drill into a single handler
+        \\  --root DIR            scan DIR instead of <repo>/kernel/ (test
+        \\                        harness uses this to point at a fixture
+        \\                        tree shaped like a real kernel/ subtree)
         \\  --list-slab-types     print discovered slab-backed types and exit
         \\  --list-methods        print discovered (receiver, method) pairs
         \\  --help, -h            show this help
@@ -3161,10 +4308,25 @@ pub fn main() !u8 {
         return 0;
     }
 
-    const repo_root = try findRepoRoot(gpa);
-    defer gpa.free(repo_root);
-    const kernel_dir = try fs.path.join(gpa, &.{ repo_root, "kernel" });
-    defer gpa.free(kernel_dir);
+    const repo_root_owned: ?[]const u8 = if (args.root_override == null)
+        try findRepoRoot(gpa)
+    else blk: {
+        // Treat the override's parent directory as the synthetic repo
+        // root so rel paths are reported as `kernel/<file>` (matching
+        // the entry-discovery prefix `kernel/syscall/...`).
+        const parent_opt = fs.path.dirname(args.root_override.?);
+        if (parent_opt) |p| break :blk try gpa.dupe(u8, p);
+        break :blk try gpa.dupe(u8, ".");
+    };
+    defer if (repo_root_owned) |r| gpa.free(r);
+
+    const kernel_dir: []const u8 = if (args.root_override) |ov|
+        ov
+    else
+        try fs.path.join(gpa, &.{ repo_root_owned.?, "kernel" });
+    defer if (args.root_override == null) gpa.free(kernel_dir);
+
+    const repo_root: []const u8 = repo_root_owned.?;
 
     // Collect file list.
     var paths = ArrayList([]const u8).empty;
@@ -3334,14 +4496,17 @@ pub fn main() !u8 {
     for (entries.items) |*entry| {
         var env = SlabEnv.init(gpa);
         var events = EventMap.init(gpa);
-        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, entry, &env, &events);
+        var exit_events = ExitEventList.empty;
+        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, entry, &env, &events, &exit_events);
         var res = CheckResult{
             .entry = entry,
             .env = env,
             .events = events,
+            .exit_events = exit_events,
             .findings = ArrayList(Finding).empty,
         };
         try bracketCheck(gpa, &res);
+        try pathReleaseCheck(gpa, &res);
         try results.append(gpa, res);
     }
 
@@ -3406,6 +4571,16 @@ pub fn main() !u8 {
     try w.print("         {d} slab-backed types discovered\n", .{slab_types.inner.count()});
     try w.print("         {d} bare-pointer fat-pointer violations\n", .{bare_ptr.items.len});
     try w.print("         {d} `.ptr` bypass sites\n", .{ptr_bypasses.items.len});
+
+    // IRQ-acquired lock-class discipline. Independent of the genlock
+    // bracketing checks — runs over a separately-built call graph that
+    // includes ALL kernel functions, not just slab-method receivers.
+    // Findings here are gating: any IRQ discipline violation OR pairing
+    // violation increments total_errs and fails the analyzer's exit.
+    const n_irq_errs = try runIrqDisciplineCheck(
+        gpa, &pool, w, files.items, tokens.items, struct_fields.items, &slab_types,
+    );
+    total_errs += n_irq_errs;
 
     try w.flush();
     if (total_errs > 0) return 1;
@@ -3501,5 +4676,1325 @@ fn eventKindName(k: EventKind) []const u8 {
         .unlock => "unlock",
         .lock_with_gen => "lockWithGen",
         .defer_unlock => "defer-unlock",
+        .errdefer_unlock => "errdefer-unlock",
     };
+}
+
+// =================================================================
+// IRQ-acquired lock-class discipline analyzer.
+//
+// Rule (from spec): a lock class L is "IRQ-acquired" iff some IRQ /
+// NMI / async-trap entry can transitively reach an acquire of L. Any
+// process-context acquire of an IRQ-acquired class MUST disable IRQs
+// across the held window; otherwise an interrupt mid-hold can produce
+// AB-BA via lockdep ordering vs a destroy-side path that takes the
+// pair the other way around.
+//
+// Discipline OK iff:
+//   a. The acquire is itself reachable only from an IRQ entry (CPU
+//      already masked).
+//   b. The variant is `lockIrqSave` / `lockIrqSaveOrdered` /
+//      `lockOrderedIrqSave` / `lockWithGenIrqSave` /
+//      `lockWithGenIrqSaveOrdered` / `lockWithGenOrderedIrqSave`.
+//   c. The acquire is bracketed by a same-line / preceding
+//      `arch.cpu.saveAndDisableInterrupts()` and matching restore.
+//
+// Pairing: every plain `lock(...)` must pair with `unlock(...)`; every
+// `lockIrqSave*` must pair with `unlockIrqRestore(...)`. Mixed pairing
+// is a separate finding.
+// =================================================================
+
+// Lock-acquire method names. The analyzer treats these uniformly as
+// "acquire" events; the IRQ-saving subset is flagged for the discipline
+// check. Names mirror SpinLock + GenLock + SlabRef variants in
+// kernel/utils/sync/{spin_lock,gen_lock}.zig and
+// kernel/memory/allocators/secure_slab.zig.
+const PLAIN_ACQUIRE_METHODS = [_][]const u8{
+    "lock",
+    "lockOrdered",
+    "lockWithGen",
+    "lockWithGenOrdered",
+};
+
+const IRQ_SAVE_ACQUIRE_METHODS = [_][]const u8{
+    "lockIrqSave",
+    "lockIrqSaveOrdered",
+    "lockOrderedIrqSave",
+    "lockWithGenIrqSave",
+    "lockWithGenIrqSaveOrdered",
+    "lockWithGenOrderedIrqSave",
+};
+
+const PLAIN_RELEASE_METHODS = [_][]const u8{
+    "unlock",
+};
+
+const IRQ_RESTORE_RELEASE_METHODS = [_][]const u8{
+    "unlockIrqRestore",
+};
+
+// IRQ / NMI / async-trap entry kinds. Names match
+// EXCEPTION_ENTRY_NAMES + EXTRA_ROOTS but tagged async-vs-sync.
+//
+// Synchronous traps (page fault, GP, etc.) take the CPU out of the
+// running thread but do NOT preempt arbitrary kernel-mode lock-holders
+// the way an asynchronous IRQ does — a sync trap fires only at the
+// faulting instruction, so a kernel function that doesn't take page
+// faults won't see one mid-hold. They're therefore conservative
+// matches for "IRQ-acquired" classification: count them so that any
+// fault handler reachable from kernel code that can in fact fault
+// inside a held lock window is still policed. (The precise
+// async-vs-sync split would need control-flow that we don't have;
+// over-conservatism here is the design choice per the brief.)
+const IrqEntryKind = enum {
+    irq_async, // schedTimerHandler, dispatchIrq, handleIrq*
+    nmi, // (currently no separate name; reserved)
+    trap_sync, // exceptionHandler, pageFaultHandler, handleSync*
+    irq_unexpected, // handleUnexpected — async catch-all
+};
+
+const IrqEntryDecl = struct {
+    name: []const u8,
+    kind: IrqEntryKind,
+};
+
+const IRQ_ENTRY_DECLS = [_]IrqEntryDecl{
+    .{ .name = "schedTimerHandler", .kind = .irq_async },
+    .{ .name = "dispatchIrq", .kind = .irq_async },
+    .{ .name = "handleIrqLowerEl", .kind = .irq_async },
+    .{ .name = "handleIrqCurrentEl", .kind = .irq_async },
+    .{ .name = "handleUnexpected", .kind = .irq_unexpected },
+    .{ .name = "exceptionHandler", .kind = .trap_sync },
+    .{ .name = "pageFaultHandler", .kind = .trap_sync },
+    .{ .name = "handleSyncLowerEl", .kind = .trap_sync },
+    .{ .name = "handleSyncCurrentEl", .kind = .trap_sync },
+};
+
+fn irqEntryKindLabel(k: IrqEntryKind) []const u8 {
+    return switch (k) {
+        .irq_async => "irq_async",
+        .nmi => "nmi",
+        .trap_sync => "trap_sync",
+        .irq_unexpected => "irq_unexpected",
+    };
+}
+
+fn lookupIrqEntry(name: []const u8) ?IrqEntryKind {
+    for (IRQ_ENTRY_DECLS) |d| {
+        if (mem.eql(u8, d.name, name)) return d.kind;
+    }
+    return null;
+}
+
+fn isPlainAcquire(name: []const u8) bool {
+    return inList(name, &PLAIN_ACQUIRE_METHODS);
+}
+
+fn isIrqSaveAcquire(name: []const u8) bool {
+    return inList(name, &IRQ_SAVE_ACQUIRE_METHODS);
+}
+
+fn isAnyAcquire(name: []const u8) bool {
+    return isPlainAcquire(name) or isIrqSaveAcquire(name);
+}
+
+fn isPlainRelease(name: []const u8) bool {
+    return inList(name, &PLAIN_RELEASE_METHODS);
+}
+
+fn isIrqRestoreRelease(name: []const u8) bool {
+    return inList(name, &IRQ_RESTORE_RELEASE_METHODS);
+}
+
+fn isAnyRelease(name: []const u8) bool {
+    return isPlainRelease(name) or isIrqRestoreRelease(name);
+}
+
+// (StructName, FieldName) → known SpinLock / GenLock field. Built from
+// the existing scanStructFields output. The class id we hand back is
+// the dotted form `<StructName>.<FieldName>`.
+const LockFieldSet = struct {
+    inner: StringHashMap(void), // keys are owned "<S>.<F>" interns
+
+    fn init(gpa: Allocator) LockFieldSet {
+        return .{ .inner = StringHashMap(void).init(gpa) };
+    }
+    fn deinit(self: *LockFieldSet) void {
+        self.inner.deinit();
+    }
+    fn contains(self: *const LockFieldSet, key: []const u8) bool {
+        return self.inner.contains(key);
+    }
+};
+
+// One lock-acquire site we discovered. `class_id` is owned by the pool.
+const AcquireSite = struct {
+    file_rel: []const u8, // borrowed — sf.rel_path
+    line: u32,
+    class_id: []const u8, // pool-interned: "<T>._gen_lock", "<S>.<F>", or fallback chain
+    method: []const u8, // pool-interned method name (e.g. "lock", "lockIrqSave")
+    is_irq_save: bool,
+    enclosing_fn: u32, // index into FuncTable
+    // True iff the fn body has a syntactic `arch.cpu.saveAndDisableInterrupts()`
+    // call earlier in the body and a matching restore later. Per-acquire
+    // approximation: if the fn body contains both calls anywhere, every
+    // plain acquire in the same body is treated as bracketed. Strict
+    // analysis would require pairing the bracketing per-line, but this
+    // pragmatic approximation matches existing code that nests an entire
+    // critical section inside a manual save/restore block.
+    syntactic_save_bracket: bool,
+};
+
+// One lock-release site (used only by the pairing checker).
+const ReleaseSite = struct {
+    file_rel: []const u8,
+    line: u32,
+    class_id: []const u8, // pool-interned
+    method: []const u8, // pool-interned
+    is_irq_restore: bool,
+    enclosing_fn: u32,
+    receiver: []const u8, // pool-interned literal receiver text
+};
+
+// Entry in the global function table. A FuncTable supports name lookup
+// (one slot per function-name basename — multiple functions sharing a
+// name are stored as a flat list keyed off name).
+const FuncRecord = struct {
+    name: []const u8, // pool-interned
+    file_rel: []const u8,
+    line: u32,
+    body_start_line: u32,
+    body_end_line: u32,
+    receiver_type: []const u8 = "", // pool-interned, empty if free fn
+    // Indices into the global AcquireSite list — only acquires inside this
+    // function's body. Used for fast site lookup once IRQ-acquired classes
+    // are known.
+    acquire_site_idxs: []u32,
+    release_site_idxs: []u32,
+    // Names of called functions inside the body. By basename only. Used
+    // for transitive reachability.
+    callee_names: []const []const u8,
+    // Computed during reachability fixed-point: the set of lock-class ids
+    // this function transitively acquires (own + via callees). Stored as
+    // a sorted-unique slice of pool-interned class ids.
+    transitive_classes: []const []const u8 = &.{},
+    // Set of irq entry kinds whose reach set includes this function.
+    // Bitmask over IrqEntryKind values.
+    reached_from_irq: u8 = 0,
+};
+
+// Maps function name → list of FuncRecord indices. A name can resolve
+// to multiple functions across different files / receiver types; the
+// reachability propagator visits all of them when expanding a call edge.
+const FuncTable = struct {
+    records: ArrayList(FuncRecord),
+    by_name: StringHashMap(ArrayList(u32)),
+};
+
+fn funcTableInit(gpa: Allocator) FuncTable {
+    return .{
+        .records = ArrayList(FuncRecord).empty,
+        .by_name = StringHashMap(ArrayList(u32)).init(gpa),
+    };
+}
+
+fn funcTableDeinit(self: *FuncTable, gpa: Allocator) void {
+    var it = self.by_name.valueIterator();
+    while (it.next()) |al| al.deinit(gpa);
+    self.by_name.deinit();
+    for (self.records.items) |r| {
+        gpa.free(r.acquire_site_idxs);
+        gpa.free(r.release_site_idxs);
+        gpa.free(r.callee_names);
+        if (r.transitive_classes.len > 0) gpa.free(r.transitive_classes);
+    }
+    self.records.deinit(gpa);
+}
+
+// IRQ-discipline finding. Distinct from the genlock Finding type — the
+// IRQ analyzer has its own grouping (per-class + cross-cutting pairing
+// list), so it tracks its own lifecycle.
+const IrqFinding = struct {
+    kind: enum { discipline, pairing },
+    class_id: []const u8, // pool-interned (discipline), or "" (pairing)
+    file_rel: []const u8,
+    line: u32,
+    enclosing_fn: []const u8, // pool-interned
+    method: []const u8, // pool-interned
+    fix_hint: []const u8, // owned (allocPrint)
+};
+
+// Build LockFieldSet from struct_fields. Keys are pool-interned
+// "<StructName>.<FieldName>".
+fn buildLockFieldSet(
+    gpa: Allocator,
+    pool: *Pool,
+    struct_fields: []const StructField,
+    out: *LockFieldSet,
+) !void {
+    for (struct_fields) |f| {
+        const ft = trimAscii(f.field_type);
+        // Strip leading qualifiers: `pub `, `const `, `?`, `*`. The
+        // recognized lock types appear bare on a struct field.
+        var t = ft;
+        while (t.len > 0) {
+            if (t[0] == '?' or t[0] == '*') {
+                t = trimAscii(t[1..]);
+                continue;
+            }
+            if (mem.startsWith(u8, t, "const ")) {
+                t = trimAscii(t["const ".len..]);
+                continue;
+            }
+            break;
+        }
+        // A field-of-lock-type is normally bare-named; skip generic
+        // wrappers like `?SpinLock` or `*const GenLock` (still match
+        // the inner name).
+        var is_lock = false;
+        for (LOCK_TYPE_NAMES) |ln| {
+            if (mem.eql(u8, t, ln)) {
+                is_lock = true;
+                break;
+            }
+            // Allow exact-prefix `SpinLock` followed by `,` / end:
+            // declarations like `SpinLock = .{}` keep the bare name.
+            if (mem.startsWith(u8, t, ln) and (t.len == ln.len or !isIdentChar(t[ln.len]))) {
+                is_lock = true;
+                break;
+            }
+        }
+        if (!is_lock) continue;
+        const key = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ f.struct_name, f.field_name });
+        defer gpa.free(key);
+        const interned = try pool.intern(key);
+        try out.inner.put(interned, {});
+    }
+}
+
+// Walk every kernel/* file and register every fn into the FuncTable.
+// We capture (name, receiver_type, body_start, body_end). The receiver
+// type comes from the first param's parseTypeRef, just like buildFnIndex,
+// but here we accept ALL functions (not just those with a slab-typed
+// first param) and we don't restrict to non-arch/dispatch files —
+// downstream reachability still benefits from the broader corpus.
+fn buildFuncTable(
+    gpa: Allocator,
+    pool: *Pool,
+    files: []const *SourceFile,
+    tokens_per_file: []const []const Tok,
+    out: *FuncTable,
+) !void {
+    for (files, tokens_per_file) |sf, toks| {
+        // Skip non-kernel files (the analyzer's walker may have been
+        // pointed at a fixture root; we only care about kernel sources).
+        if (!mem.startsWith(u8, sf.rel_path, "kernel/")) continue;
+        var i: usize = 0;
+        while (i < toks.len) : (i += 1) {
+            if (toks[i].tag != .keyword_fn) continue;
+            var start_i = i;
+            if (i > 0 and toks[i - 1].tag == .keyword_pub) start_i = i - 1;
+            // Match `<ws>(pub )?fn ` at start of line — same anchor the
+            // genlock walker uses.
+            const hdr_line_raw = sf.raw_lines[toks[start_i].line - 1];
+            const hdr_line = trimAscii(hdr_line_raw);
+            if (!(mem.startsWith(u8, hdr_line, "fn ") or
+                mem.startsWith(u8, hdr_line, "pub fn ")))
+            {
+                continue;
+            }
+            const header = parseFnHeaderAt(toks, start_i) orelse continue;
+            const name = tokSlice(sf, toks[header.name_tok_idx]);
+            const name_i = try pool.intern(name);
+            const params = parseParamList(gpa, sf, toks, header.l_paren_idx, header.r_paren_idx) catch {
+                i = header.r_brace_idx;
+                continue;
+            };
+            defer gpa.free(params);
+            var recv_i: []const u8 = "";
+            if (params.len > 0) {
+                const bare = typeNameFromFieldType(params[0].type_str);
+                if (bare.len > 0) recv_i = try pool.intern(bare);
+                // Also accept SlabRef wrapper.
+                if (parseTypeRef(params[0].type_str)) |inner| {
+                    recv_i = try pool.intern(inner);
+                }
+            }
+            const body_start = computeFirstBodyLine(sf, toks, header);
+            const body_end = toks[header.r_brace_idx].line;
+            const idx: u32 = @intCast(out.records.items.len);
+            try out.records.append(gpa, .{
+                .name = name_i,
+                .file_rel = sf.rel_path,
+                .line = toks[start_i].line,
+                .body_start_line = body_start,
+                .body_end_line = body_end,
+                .receiver_type = recv_i,
+                .acquire_site_idxs = &.{},
+                .release_site_idxs = &.{},
+                .callee_names = &.{},
+            });
+            const gop = try out.by_name.getOrPut(name_i);
+            if (!gop.found_existing) gop.value_ptr.* = ArrayList(u32).empty;
+            try gop.value_ptr.append(gpa, idx);
+            i = header.r_brace_idx;
+        }
+    }
+}
+
+// Per-function env used by IRQ analysis. A pruned variant of SlabEnv
+// that tracks all idents → bare-type-name (no slab/fat distinction).
+// Lock-class resolution chases through this to pin down the type of
+// the receiver chain.
+const IrqEnv = struct {
+    types: StringStringMap, // ident -> bare type name (e.g. "ExecutionContext", "SlabRef:ExecutionContext", "Process")
+    // SlabRef wrapper marker: separate from `types` so the chain walker
+    // can distinguish `<x>.lock()` (gen-lock through a fat ref) from
+    // `<x>.<f>.lock()` (lock-field on a non-slab struct).
+    is_slabref: SliceSet,
+
+    fn init(gpa: Allocator) IrqEnv {
+        return .{
+            .types = StringStringMap.init(gpa),
+            .is_slabref = SliceSet.init(gpa),
+        };
+    }
+    fn deinit(self: *IrqEnv) void {
+        self.types.deinit();
+        self.is_slabref.deinit();
+    }
+};
+
+// Resolve the lock class for an acquire/release site. `recv_chain` is
+// the full receiver text BEFORE the trailing `.<lockop>(`. Examples:
+//   "sender_ref"         (an EC SlabRef local)
+//   "cd_ref"             (a CD SlabRef local)
+//   "ec._gen_lock"       (direct gen-lock access)
+//   "self.perm_lock"     (a SpinLock field)
+//   "irq_table_lock"     (a module-scoped lock — fallback)
+//   "bucket.lock"        (a SpinLock field on a non-slab struct)
+//
+// Returns (class_id, owned-by-pool) or null if we couldn't classify.
+fn resolveLockClass(
+    pool: *Pool,
+    env: *const IrqEnv,
+    lock_field_set: *const LockFieldSet,
+    recv_chain: []const u8,
+) !?[]const u8 {
+    const chain = trimAscii(recv_chain);
+    if (chain.len == 0) return null;
+    // Bare-dot / leading-dot fragments come from method-chain
+    // continuations like:
+    //     foo
+    //         .bar()
+    //         .lock();
+    // The walker strips back through ident+dot chars and lands on a
+    // bare `.lock` chunk with no resolvable receiver. Reject so we
+    // don't pollute the class set with junk ".lock" / "" entries.
+    if (chain[0] == '.') return null;
+    var has_ident = false;
+    for (chain) |c| if (isIdentStart(c)) { has_ident = true; break; };
+    if (!has_ident) return null;
+
+    // Pure ident.
+    if (mem.indexOfScalar(u8, chain, '.') == null) {
+        // Look up type. If it's a SlabRef, class is `<T>._gen_lock`.
+        // If it's a bare slab type T, also `<T>._gen_lock`.
+        if (env.is_slabref.contains(chain)) {
+            if (env.types.get(chain)) |inner| {
+                const buf = try std.fmt.allocPrint(pool.gpa, "{s}._gen_lock", .{inner});
+                defer pool.gpa.free(buf);
+                return try pool.intern(buf);
+            }
+        }
+        // Plain top-level ident — not enough info to bind a struct lock
+        // class; treat the chain literal itself as the class id (so two
+        // sites on the same global match, but we won't hit struct-field
+        // table lookups).
+        return try pool.intern(chain);
+    }
+
+    // <head>.<tail> with possibly more dots. For our purposes we
+    // recognize:
+    //   <head>._gen_lock           → "<head_type>._gen_lock"
+    //   <head>.<field>             → "<head_type>.<field>" if known
+    //   any other dotted form      → fall back to literal chain text
+    // Multi-dot chains: peel from the right looking for a known field.
+    if (mem.endsWith(u8, chain, "._gen_lock")) {
+        const head = chain[0 .. chain.len - "._gen_lock".len];
+        if (mem.indexOfScalar(u8, head, '.') == null) {
+            if (env.types.get(head)) |ty| {
+                const buf = try std.fmt.allocPrint(pool.gpa, "{s}._gen_lock", .{ty});
+                defer pool.gpa.free(buf);
+                return try pool.intern(buf);
+            }
+        }
+        // Multi-segment head — fall through.
+    }
+
+    // Try last-segment field. <prefix>.<field>
+    const last_dot = mem.lastIndexOfScalar(u8, chain, '.').?;
+    const prefix = chain[0..last_dot];
+    const field = chain[last_dot + 1 ..];
+    // Resolve prefix to a type name when possible.
+    var prefix_ty: ?[]const u8 = null;
+    if (mem.indexOfScalar(u8, prefix, '.') == null) {
+        if (env.types.get(prefix)) |ty| prefix_ty = ty;
+    }
+    if (prefix_ty) |pt| {
+        const buf = try std.fmt.allocPrint(pool.gpa, "{s}.{s}", .{ pt, field });
+        defer pool.gpa.free(buf);
+        const interned = try pool.intern(buf);
+        if (lock_field_set.contains(interned)) return interned;
+        // Even if not in the lock_field_set, return the pretty form
+        // so that two sites on the same struct.field collapse. Not in
+        // the set means we don't *know* it's a lock, but the acquire
+        // method already told us it is (.lock(...) call).
+        return interned;
+    }
+
+    // Fallback: literal chain text.
+    return try pool.intern(chain);
+}
+
+// Scan one function body for acquire/release sites and called fns.
+// Populates `acquires`, `releases`, `callees`. Updates `func.acquire_site_idxs`
+// / `func.release_site_idxs` / `func.callee_names`.
+fn scanFuncForIrq(
+    gpa: Allocator,
+    pool: *Pool,
+    sf: *const SourceFile,
+    toks: []const Tok,
+    func_idx: u32,
+    func: *FuncRecord,
+    lock_field_set: *const LockFieldSet,
+    slab_types: *const SlabTypeMap,
+    acquires: *ArrayList(AcquireSite),
+    releases: *ArrayList(ReleaseSite),
+) !void {
+    // Build a fresh env from the function header params.
+    var env = IrqEnv.init(gpa);
+    defer env.deinit();
+
+    // Re-find the header to walk params.
+    var hdr: ?FnHeader = null;
+    for (toks, 0..) |t, ti| {
+        if (t.tag != .keyword_fn) continue;
+        var si = ti;
+        if (ti > 0 and toks[ti - 1].tag == .keyword_pub) si = ti - 1;
+        if (toks[si].line != func.line) continue;
+        if (ti + 1 >= toks.len) continue;
+        if (!mem.eql(u8, tokSlice(sf, toks[ti + 1]), func.name)) continue;
+        hdr = parseFnHeaderAt(toks, si) orelse continue;
+        break;
+    }
+    if (hdr == null) return;
+    const params = try parseParamList(gpa, sf, toks, hdr.?.l_paren_idx, hdr.?.r_paren_idx);
+    defer gpa.free(params);
+    for (params) |pp| {
+        const nm = try pool.intern(pp.name);
+        // SlabRef(T) → record is_slabref + types[name] = T.
+        if (parseTypeRef(pp.type_str)) |inner| {
+            const inner_i = try pool.intern(inner);
+            try env.types.put(nm, inner_i);
+            if (mem.indexOf(u8, pp.type_str, "SlabRef") != null) try env.is_slabref.add(nm);
+            continue;
+        }
+        const bare = typeNameFromFieldType(pp.type_str);
+        if (bare.len > 0) {
+            const bare_i = try pool.intern(bare);
+            try env.types.put(nm, bare_i);
+        }
+    }
+
+    // Walk body lines.
+    if (func.body_start_line > func.body_end_line) return;
+    if (func.body_end_line > sf.stripped_lines.len) return;
+    const body_lines = sf.stripped_lines[func.body_start_line - 1 .. func.body_end_line];
+    const body_raw_lines = sf.raw_lines[func.body_start_line - 1 .. func.body_end_line];
+    _ = body_raw_lines;
+
+    // First, syntactic check: does the function body reference
+    // arch.cpu.saveAndDisableInterrupts() AND restoreInterrupts()?
+    // If both appear, we treat plain acquires inside this fn as
+    // sufficiently bracketed for rule (c).
+    var has_save = false;
+    var has_restore = false;
+    for (body_lines) |ln| {
+        if (mem.indexOf(u8, ln, "saveAndDisableInterrupts(") != null) has_save = true;
+        if (mem.indexOf(u8, ln, "restoreInterrupts(") != null) has_restore = true;
+    }
+    const syntactic_save_bracket = has_save and has_restore;
+
+    var local_acquires = ArrayList(u32).empty;
+    defer local_acquires.deinit(gpa);
+    var local_releases = ArrayList(u32).empty;
+    defer local_releases.deinit(gpa);
+    var local_callees = ArrayList([]const u8).empty;
+    defer local_callees.deinit(gpa);
+    var seen_callees = StringHashMap(void).init(gpa);
+    defer seen_callees.deinit();
+
+    for (body_lines, 0..) |line, rel| {
+        const src_line: u32 = func.body_start_line + @as(u32, @intCast(rel));
+        const code = line;
+
+        // Decl: const x = <RHS>;
+        const trimmed = trimAscii(code);
+        if (mem.startsWith(u8, trimmed, "const ") or mem.startsWith(u8, trimmed, "var ")) {
+            // Use the same parseDeclLine + multi-line join.
+            const joined = try joinMultilineDecl(gpa, body_lines, rel);
+            defer gpa.free(joined);
+            if (parseDeclLine(joined)) |dp| {
+                const nm = try pool.intern(dp.name);
+                // Type from annotation, when present.
+                if (dp.ann.len > 0) {
+                    if (parseTypeRef(dp.ann)) |inner| {
+                        const inner_i = try pool.intern(inner);
+                        try env.types.put(nm, inner_i);
+                        if (mem.indexOf(u8, dp.ann, "SlabRef") != null) try env.is_slabref.add(nm);
+                    } else {
+                        const bare = typeNameFromFieldType(dp.ann);
+                        if (bare.len > 0) {
+                            const bare_i = try pool.intern(bare);
+                            try env.types.put(nm, bare_i);
+                        }
+                    }
+                }
+                // RHS-derived type heuristics:
+                //   `const x = <ident>.lock(@src()) catch ...` → x : *<innerOf(ident)>
+                //   `const x = <ident>.<field>` → if env knows ident's
+                //      type T and T has FAT_YIELDING_FIELDS entry for field,
+                //      x is SlabRef of resolved type
+                //   `const x = <ident>` (bare) → inherit
+                const rhs_plain = stripPostfix(dp.rhs);
+                // Bare ident inheritance.
+                if (rhs_plain.len > 0) {
+                    var all_ident = true;
+                    for (rhs_plain) |c| if (!isIdentChar(c)) { all_ident = false; break; };
+                    if (all_ident) {
+                        if (env.types.get(rhs_plain)) |t| {
+                            try env.types.put(nm, t);
+                            if (env.is_slabref.contains(rhs_plain)) try env.is_slabref.add(nm);
+                        }
+                    }
+                }
+                // Chained `.lock()` returns *T (or AccessError!*T).
+                if (mem.endsWith(u8, rhs_plain, ")")) {
+                    const lock_open = ".lock(";
+                    if (mem.lastIndexOf(u8, rhs_plain, lock_open)) |lp| {
+                        const head = rhs_plain[0..lp];
+                        if (head.len > 0) {
+                            // head must be a pure ident-dot chain.
+                            var ok_chain = true;
+                            for (head) |c| if (!isIdentChar(c) and c != '.') { ok_chain = false; break; };
+                            if (ok_chain) {
+                                // First ident in chain.
+                                const first_dot = mem.indexOfScalar(u8, head, '.') orelse head.len;
+                                const head_ident = head[0..first_dot];
+                                if (env.types.get(head_ident)) |t| {
+                                    if (env.is_slabref.contains(head_ident)) {
+                                        try env.types.put(nm, t);
+                                    }
+                                }
+                                // <head>.<variant> (KernelObject) — last seg.
+                                if (mem.lastIndexOfScalar(u8, head, '.')) |last_dot| {
+                                    const last_seg = head[last_dot + 1 ..];
+                                    if (lookupUnionVariant(last_seg)) |ty| {
+                                        if (slab_types.contains(ty)) {
+                                            const ty_i = try pool.intern(ty);
+                                            try env.types.put(nm, ty_i);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // typedRef(<TypeName>, ...) call returns ?SlabRef(<TypeName>).
+                // The kernel's generic helper at kernel/capdom/capability.zig.
+                // Also handle `<module>.typedRef(<TypeName>, ...)`.
+                if (mem.indexOf(u8, rhs_plain, "typedRef(")) |tr_pos| {
+                    const after = rhs_plain[tr_pos + "typedRef(".len ..];
+                    var ae: usize = 0;
+                    while (ae < after.len and isIdentChar(after[ae])) ae += 1;
+                    if (ae > 0) {
+                        const ty_name = after[0..ae];
+                        if (slab_types.contains(ty_name)) {
+                            const ty_i = try pool.intern(ty_name);
+                            try env.types.put(nm, ty_i);
+                            try env.is_slabref.add(nm);
+                        }
+                    }
+                }
+
+                // <ident>.<fat_field> RHS — make nm a SlabRef of the resolved type.
+                if (rhs_plain.len > 0 and mem.indexOfScalar(u8, rhs_plain, '.') != null) {
+                    var ok_chain2 = true;
+                    for (rhs_plain) |c| if (!isIdentChar(c) and c != '.') { ok_chain2 = false; break; };
+                    if (ok_chain2) {
+                        const first_dot = mem.indexOfScalar(u8, rhs_plain, '.').?;
+                        const head_ident = rhs_plain[0..first_dot];
+                        const tail = rhs_plain[first_dot + 1 ..];
+                        if (env.types.get(head_ident)) |head_ty| {
+                            // Walk tail dots through DEFAULT_FIELD_CHAINS.
+                            var cur_ty: []const u8 = head_ty;
+                            var seg_start: usize = 0;
+                            var pos: usize = 0;
+                            var ok_walk = true;
+                            while (pos <= tail.len) : (pos += 1) {
+                                if (pos == tail.len or tail[pos] == '.') {
+                                    const seg = tail[seg_start..pos];
+                                    if (lookupDefaultFieldChain(cur_ty, seg)) |nxt| {
+                                        cur_ty = nxt;
+                                    } else if (mem.eql(u8, seg, "object") and pos < tail.len) {
+                                        // KernelObject hop — keep cur_ty
+                                        // and let the next segment's
+                                        // variant lookup below pick it up.
+                                    } else if (lookupUnionVariant(seg)) |variant_ty| {
+                                        cur_ty = variant_ty;
+                                    } else {
+                                        ok_walk = false;
+                                        break;
+                                    }
+                                    seg_start = pos + 1;
+                                }
+                            }
+                            if (ok_walk and slab_types.contains(cur_ty)) {
+                                const ty_i = try pool.intern(cur_ty);
+                                try env.types.put(nm, ty_i);
+                                try env.is_slabref.add(nm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Acquire / release sites: `<recv>.<method>(`.
+        try scanLockOpsOnLine(
+            gpa, pool, sf, src_line, code,
+            &env, lock_field_set, slab_types,
+            func_idx, func, syntactic_save_bracket,
+            acquires, releases, &local_acquires, &local_releases,
+        );
+
+        // Direct callee names: `<name>(` at top-level of each line. We
+        // accept dotted forms (last segment is the basename). The naive
+        // pattern over-counts but that's fine — over-conservative
+        // reachability is the design choice. We deduplicate per-fn so
+        // the worklist doesn't reprocess the same edge.
+        try scanCalleesOnLine(gpa, pool, code, &local_callees, &seen_callees);
+    }
+
+    func.acquire_site_idxs = try local_acquires.toOwnedSlice(gpa);
+    func.release_site_idxs = try local_releases.toOwnedSlice(gpa);
+    func.callee_names = try local_callees.toOwnedSlice(gpa);
+}
+
+// Pull out lock-op recognition into its own fn for clarity. Walks `code`
+// (one stripped line) looking for any `<recv_chain>.<method>(` where
+// `<method>` is in the acquire/release tables. Resolves the lock class
+// via env+lock_field_set. Emits AcquireSite/ReleaseSite as appropriate.
+fn scanLockOpsOnLine(
+    gpa: Allocator,
+    pool: *Pool,
+    sf: *const SourceFile,
+    src_line: u32,
+    code: []const u8,
+    env: *const IrqEnv,
+    lock_field_set: *const LockFieldSet,
+    slab_types: *const SlabTypeMap,
+    func_idx: u32,
+    func: *const FuncRecord,
+    syntactic_save_bracket: bool,
+    acquires_out: *ArrayList(AcquireSite),
+    releases_out: *ArrayList(ReleaseSite),
+    local_acquires: *ArrayList(u32),
+    local_releases: *ArrayList(u32),
+) !void {
+    _ = sf;
+    _ = slab_types;
+    var p: usize = 0;
+    while (p < code.len) : (p += 1) {
+        if (code[p] != '.') continue;
+        // Find method name `[a-zA-Z_][a-zA-Z0-9_]*` after the `.`.
+        const ms = p + 1;
+        if (ms >= code.len or !isIdentStart(code[ms])) continue;
+        var me = ms;
+        while (me < code.len and isIdentChar(code[me])) me += 1;
+        const method = code[ms..me];
+        // Followed by `(`.
+        var q = me;
+        while (q < code.len and ascii.isWhitespace(code[q])) q += 1;
+        if (q >= code.len or code[q] != '(') continue;
+        // Classify.
+        const is_acq = isAnyAcquire(method);
+        const is_rel = isAnyRelease(method);
+        if (!is_acq and !is_rel) continue;
+
+        // Walk back through ident/dot chars to capture full receiver chain.
+        var s: usize = p;
+        while (s > 0) {
+            const c = code[s - 1];
+            if (isIdentChar(c) or c == '.') {
+                s -= 1;
+            } else break;
+        }
+        if (s == p) continue;
+        var recv_chain = code[s..p];
+        // Strip leading `defer ` / `errdefer ` / `try ` keywords —
+        // the chain walker mustn't include them.
+        // (They'd already be stopped by the non-ident-char break, but
+        // the chain may begin at the start of line where the prior char
+        // is whitespace.) Done by `s` walk above — chain starts at first
+        // ident char.
+        // Trim trailing `.?` (optional unwrap).
+        if (recv_chain.len >= 2 and
+            recv_chain[recv_chain.len - 2] == '.' and
+            recv_chain[recv_chain.len - 1] == '?')
+        {
+            recv_chain = recv_chain[0 .. recv_chain.len - 2];
+        }
+
+        const class_opt = try resolveLockClass(pool, env, lock_field_set, recv_chain);
+        const class_id = class_opt orelse {
+            // Couldn't classify — skip this site (don't pollute the
+            // class set with empty ids).
+            continue;
+        };
+        const method_i = try pool.intern(method);
+        if (is_acq) {
+            const idx: u32 = @intCast(acquires_out.items.len);
+            try acquires_out.append(gpa, .{
+                .file_rel = func.file_rel,
+                .line = src_line,
+                .class_id = class_id,
+                .method = method_i,
+                .is_irq_save = isIrqSaveAcquire(method),
+                .enclosing_fn = func_idx,
+                .syntactic_save_bracket = syntactic_save_bracket,
+            });
+            try local_acquires.append(gpa, idx);
+        } else {
+            const recv_i = try pool.intern(recv_chain);
+            const idx: u32 = @intCast(releases_out.items.len);
+            try releases_out.append(gpa, .{
+                .file_rel = func.file_rel,
+                .line = src_line,
+                .class_id = class_id,
+                .method = method_i,
+                .is_irq_restore = isIrqRestoreRelease(method),
+                .enclosing_fn = func_idx,
+                .receiver = recv_i,
+            });
+            try local_releases.append(gpa, idx);
+        }
+        // Don't double-count: advance past the `(`.
+        p = q;
+    }
+}
+
+// Direct-callee scan: any <name>(...) where <name> is at the start of
+// an ident chain (possibly dotted; we take the last segment as the
+// basename). Filters out keywords + builtins.
+fn scanCalleesOnLine(
+    gpa: Allocator,
+    pool: *Pool,
+    code: []const u8,
+    out: *ArrayList([]const u8),
+    seen: *StringHashMap(void),
+) !void {
+    var p: usize = 0;
+    while (p < code.len) {
+        if (!isIdentStart(code[p])) {
+            p += 1;
+            continue;
+        }
+        // Don't restart inside an ident.
+        if (p > 0 and (isIdentChar(code[p - 1]) or code[p - 1] == '.' or code[p - 1] == '@')) {
+            p += 1;
+            continue;
+        }
+        var e = p;
+        while (e < code.len and (isIdentChar(code[e]) or code[e] == '.')) e += 1;
+        const fq = code[p..e];
+        var q = e;
+        while (q < code.len and ascii.isWhitespace(code[q])) q += 1;
+        if (q >= code.len or code[q] != '(') {
+            p = e;
+            continue;
+        }
+        // Last segment of fq is the basename.
+        var name: []const u8 = fq;
+        if (mem.lastIndexOfScalar(u8, fq, '.')) |ld| name = fq[ld + 1 ..];
+        if (name.len == 0 or !isIdentStart(name[0])) {
+            p = e;
+            continue;
+        }
+        if (isKeywordOrNotCall(name)) {
+            p = e;
+            continue;
+        }
+        // Exclude common Zig builtins / std-lib noise.
+        if (mem.startsWith(u8, fq, "std.") or mem.startsWith(u8, fq, "builtin.") or
+            mem.startsWith(u8, fq, "@"))
+        {
+            p = e;
+            continue;
+        }
+        const name_i = try pool.intern(name);
+        const gop = try seen.getOrPut(name_i);
+        if (!gop.found_existing) {
+            try out.append(gpa, name_i);
+        }
+        p = e;
+    }
+}
+
+// Worklist propagation: for each function, transitive_classes is the
+// union of own direct-acquire classes plus all callees' transitive
+// classes. We iterate to fixed point. Class id slices are pool-interned
+// so set operations can use reference equality.
+fn computeTransitiveClasses(
+    gpa: Allocator,
+    func_table: *FuncTable,
+    acquires: []const AcquireSite,
+) !void {
+    // Build per-fn initial set: direct acquires only.
+    const n = func_table.records.items.len;
+    var sets = try gpa.alloc(StringHashMap(void), n);
+    defer {
+        for (sets) |*s| s.deinit();
+        gpa.free(sets);
+    }
+    for (0..n) |i| {
+        sets[i] = StringHashMap(void).init(gpa);
+    }
+    for (func_table.records.items, 0..) |rec, idx| {
+        for (rec.acquire_site_idxs) |aidx| {
+            const a = acquires[aidx];
+            if (a.class_id.len == 0) continue;
+            try sets[idx].put(a.class_id, {});
+        }
+    }
+    // Worklist: any node that just gained a new element re-propagates
+    // backward via the reverse edge (callers of this fn need updating).
+    // Simpler: forward iteration to fixed point — for each fn, union
+    // every callee's set into our set. Repeat until no change.
+    var changed = true;
+    var iters: u32 = 0;
+    const max_iters: u32 = 64; // safety belt
+    while (changed and iters < max_iters) : (iters += 1) {
+        changed = false;
+        for (func_table.records.items, 0..) |rec, idx| {
+            for (rec.callee_names) |callee_name| {
+                if (callee_name.len == 0) continue;
+                const list_opt = func_table.by_name.get(callee_name);
+                if (list_opt == null) continue;
+                for (list_opt.?.items) |callee_idx| {
+                    if (callee_idx >= n) continue;
+                    // Snapshot the source set's keys before mutating the
+                    // dest. getOrPut(dest=...) on the same allocator may
+                    // realloc dest's underlying buffer; if dest == src
+                    // (self-recursive call edge), the iterator we're
+                    // walking points at potentially-moved memory.
+                    var snapshot = ArrayList([]const u8).empty;
+                    defer snapshot.deinit(gpa);
+                    var it = sets[callee_idx].keyIterator();
+                    while (it.next()) |k| {
+                        try snapshot.append(gpa, k.*);
+                    }
+                    for (snapshot.items) |key| {
+                        if (key.len == 0) continue;
+                        const gop = try sets[idx].getOrPut(key);
+                        if (!gop.found_existing) changed = true;
+                    }
+                }
+            }
+        }
+    }
+    // Materialize.
+    for (func_table.records.items, 0..) |*rec, idx| {
+        var classes = ArrayList([]const u8).empty;
+        defer classes.deinit(gpa);
+        var it = sets[idx].keyIterator();
+        while (it.next()) |k| try classes.append(gpa, k.*);
+        std.sort.heap([]const u8, classes.items, {}, lessStr);
+        rec.transitive_classes = try classes.toOwnedSlice(gpa);
+    }
+}
+
+// Mark `reached_from_irq` bitmask on each function reachable from any
+// IRQ entry. We do reverse-topological propagation: for each entry, BFS
+// over callees, OR'ing the entry kind's bit into reached_from_irq.
+fn markIrqReachable(
+    gpa: Allocator,
+    func_table: *FuncTable,
+) !void {
+    for (func_table.records.items) |*rec| rec.reached_from_irq = 0;
+
+    var queue = ArrayList(u32).empty;
+    defer queue.deinit(gpa);
+
+    for (IRQ_ENTRY_DECLS) |decl| {
+        const kind_bit: u8 = @as(u8, 1) << @intFromEnum(decl.kind);
+        const list_opt = func_table.by_name.get(decl.name);
+        if (list_opt == null) continue;
+        // Visited set per BFS (we BFS once per entry-kind to keep the
+        // bitmask attribution correct).
+        var visited = StringHashMap(void).init(gpa);
+        defer visited.deinit();
+        queue.clearRetainingCapacity();
+        for (list_opt.?.items) |idx| {
+            try queue.append(gpa, idx);
+            try visited.put(func_table.records.items[idx].name, {});
+            // ^ over-conservative key (name) so multiple records sharing
+            //   a name only enqueue once. That's fine — propagation
+            //   walks every callee anyway.
+        }
+        var qi: usize = 0;
+        while (qi < queue.items.len) : (qi += 1) {
+            const idx = queue.items[qi];
+            const rec = &func_table.records.items[idx];
+            rec.reached_from_irq |= kind_bit;
+            for (rec.callee_names) |cn| {
+                const cl = func_table.by_name.get(cn) orelse continue;
+                const v_gop = try visited.getOrPut(cn);
+                if (v_gop.found_existing) continue;
+                for (cl.items) |cidx| try queue.append(gpa, cidx);
+            }
+        }
+    }
+}
+
+// For each lock class, compute the union of IRQ entry kinds (bitmask)
+// whose reach set includes any acquire of that class.
+const ClassReachEntry = struct {
+    class_id: []const u8,
+    kinds: u8, // bitmask of IrqEntryKind
+};
+
+fn computeIrqAcquiredClasses(
+    gpa: Allocator,
+    func_table: *const FuncTable,
+    acquires: []const AcquireSite,
+    out: *StringHashMap(u8),
+) !void {
+    _ = gpa;
+    for (acquires) |a| {
+        const fn_rec = func_table.records.items[a.enclosing_fn];
+        const bits = fn_rec.reached_from_irq;
+        if (bits == 0) continue;
+        const gop = try out.getOrPut(a.class_id);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* |= bits;
+    }
+}
+
+fn renderReachableKindList(gpa: Allocator, kinds: u8) ![]u8 {
+    var buf = ArrayList(u8).empty;
+    errdefer buf.deinit(gpa);
+    try buf.append(gpa, '[');
+    var first = true;
+    inline for (.{ IrqEntryKind.irq_async, IrqEntryKind.nmi, IrqEntryKind.trap_sync, IrqEntryKind.irq_unexpected }) |k| {
+        const bit: u8 = @as(u8, 1) << @intFromEnum(k);
+        if (kinds & bit != 0) {
+            if (!first) try buf.appendSlice(gpa, ", ");
+            try buf.appendSlice(gpa, irqEntryKindLabel(k));
+            first = false;
+        }
+    }
+    try buf.append(gpa, ']');
+    return buf.toOwnedSlice(gpa);
+}
+
+// For each acquire site of an IRQ-acquired class, decide if it's OK
+// per rule 4 (a/b/c). Emit a finding when not.
+fn checkIrqDiscipline(
+    gpa: Allocator,
+    pool: *Pool,
+    func_table: *const FuncTable,
+    acquires: []const AcquireSite,
+    irq_classes: *const StringHashMap(u8),
+    out: *ArrayList(IrqFinding),
+) !void {
+    _ = pool;
+    for (acquires) |a| {
+        if (!irq_classes.contains(a.class_id)) continue;
+        const fn_rec = func_table.records.items[a.enclosing_fn];
+        // Rule (a): the acquire is itself reachable only from an IRQ
+        // entry — the CPU has already masked. We approximate with
+        // "reached from an IRQ-async or NMI entry"; a sync trap doesn't
+        // mask other IRQs, so reaching purely from a sync-trap entry
+        // doesn't satisfy (a).
+        const masked_kind_bits: u8 =
+            (@as(u8, 1) << @intFromEnum(IrqEntryKind.irq_async)) |
+            (@as(u8, 1) << @intFromEnum(IrqEntryKind.nmi)) |
+            (@as(u8, 1) << @intFromEnum(IrqEntryKind.irq_unexpected));
+        if (fn_rec.reached_from_irq & masked_kind_bits != 0) {
+            // Acquire is reachable from a hardware-IRQ context. The
+            // CPU already masked — but if the SAME function is also
+            // reachable from process context (i.e., the fn appears
+            // outside any IRQ context too) the acquire is still wrong
+            // when called from process context. Strictly checking
+            // "only-reachable-from-IRQ" requires per-call-site context,
+            // not just per-function reachability. We approximate: if
+            // ANY non-IRQ caller exists for this fn, the site is
+            // suspicious. For now we accept the (a) exemption when the
+            // fn is reached from an IRQ entry — false negatives here
+            // are rare in practice (kernel handlers don't double as
+            // process-context helpers).
+            // Mark this site OK by skipping the discipline complaint,
+            // BUT still apply rule (b) inverse: if the fn is reached
+            // from process context too AND uses a plain acquire,
+            // there's a problem. We don't have per-callsite reach
+            // info, so accept the false negative.
+            continue;
+        }
+
+        // Rule (b): IRQ-saving variant.
+        if (a.is_irq_save) continue;
+
+        // Rule (c): syntactic save/restore bracketing.
+        if (a.syntactic_save_bracket) continue;
+
+        // Otherwise — flag.
+        const fix = try std.fmt.allocPrint(gpa,
+            "switch to an IRQ-saving acquire variant (e.g. lockIrqSave + matching unlockIrqRestore)",
+            .{});
+        try out.append(gpa, .{
+            .kind = .discipline,
+            .class_id = a.class_id,
+            .file_rel = a.file_rel,
+            .line = a.line,
+            .enclosing_fn = fn_rec.name,
+            .method = a.method,
+            .fix_hint = fix,
+        });
+    }
+}
+
+// Pairing checker: per-function, walk acquire/release events in source
+// order. If receiver-text matches, the variant flavors must match too
+// (plain↔plain, IrqSave↔IrqRestore). When we can't pair statically (e.g.
+// the release lives in a callee or another function via `defer`), we
+// skip silently — false negatives are acceptable here per the brief.
+fn checkPairingDiscipline(
+    gpa: Allocator,
+    pool: *Pool,
+    func_table: *const FuncTable,
+    acquires: []const AcquireSite,
+    releases: []const ReleaseSite,
+    out: *ArrayList(IrqFinding),
+) !void {
+    _ = pool;
+    // For each function, gather events sorted by line.
+    for (func_table.records.items) |rec| {
+        if (rec.acquire_site_idxs.len == 0 and rec.release_site_idxs.len == 0) continue;
+        const Ev = struct { line: u32, is_acq: bool, idx: u32 };
+        var evs = ArrayList(Ev).empty;
+        defer evs.deinit(gpa);
+        for (rec.acquire_site_idxs) |aidx| {
+            try evs.append(gpa, .{ .line = acquires[aidx].line, .is_acq = true, .idx = aidx });
+        }
+        for (rec.release_site_idxs) |ridx| {
+            try evs.append(gpa, .{ .line = releases[ridx].line, .is_acq = false, .idx = ridx });
+        }
+        std.sort.heap(Ev, evs.items, {}, struct {
+            fn lt(_: void, a: Ev, b: Ev) bool {
+                if (a.line != b.line) return a.line < b.line;
+                // Acquire before release on the same line.
+                return a.is_acq and !b.is_acq;
+            }
+        }.lt);
+
+        // Walk events per receiver-string to pair acquires with releases.
+        // We need the receiver text for both acquires AND releases. The
+        // AcquireSite struct doesn't store the receiver explicitly (we
+        // dropped it after class resolution); use the class_id as a
+        // pairing key proxy. Class id may differ for two acquires on
+        // distinct receivers of the same class (both `cd_ref.lock` and
+        // `other_cd_ref.lock` map to "CapabilityDomain._gen_lock") — but
+        // that's the worst-case ambiguity, and the pairing checker's
+        // false-positive risk is symmetric. We additionally require the
+        // release receiver text to match a tracked acquire receiver
+        // text. ReleaseSite stores `.receiver` for that reason.
+        //
+        // Implementation: keep a stack of pending acquires per
+        // class_id. Each release pops the most recent acquire on the
+        // same class_id; flag if flavors mismatch.
+        var pending = StringHashMap(ArrayList(u32)).init(gpa);
+        defer {
+            var it = pending.valueIterator();
+            while (it.next()) |al| al.deinit(gpa);
+            pending.deinit();
+        }
+        for (evs.items) |ev| {
+            if (ev.is_acq) {
+                const a = acquires[ev.idx];
+                const gop = try pending.getOrPut(a.class_id);
+                if (!gop.found_existing) gop.value_ptr.* = ArrayList(u32).empty;
+                try gop.value_ptr.append(gpa, ev.idx);
+            } else {
+                const r = releases[ev.idx];
+                const lst_opt = pending.getPtr(r.class_id);
+                if (lst_opt == null) continue;
+                if (lst_opt.?.items.len == 0) continue;
+                const last_aidx = lst_opt.?.pop().?;
+                const a = acquires[last_aidx];
+                if (a.is_irq_save and !r.is_irq_restore) {
+                    const fix = try std.fmt.allocPrint(gpa,
+                        "acquire used IRQ-saving variant ({s} L{d}); release at L{d} must be unlockIrqRestore (currently {s})",
+                        .{ a.method, a.line, r.line, r.method });
+                    try out.append(gpa, .{
+                        .kind = .pairing,
+                        .class_id = a.class_id,
+                        .file_rel = r.file_rel,
+                        .line = r.line,
+                        .enclosing_fn = rec.name,
+                        .method = r.method,
+                        .fix_hint = fix,
+                    });
+                } else if (!a.is_irq_save and r.is_irq_restore) {
+                    const fix = try std.fmt.allocPrint(gpa,
+                        "acquire used plain variant ({s} L{d}); release at L{d} must be unlock (currently unlockIrqRestore)",
+                        .{ a.method, a.line, r.line });
+                    try out.append(gpa, .{
+                        .kind = .pairing,
+                        .class_id = a.class_id,
+                        .file_rel = r.file_rel,
+                        .line = r.line,
+                        .enclosing_fn = rec.name,
+                        .method = r.method,
+                        .fix_hint = fix,
+                    });
+                }
+            }
+        }
+    }
+}
+
+// Top-level driver: build everything and emit findings to `w`. Returns
+// the number of err-severity IRQ findings (caller adds to total_errs).
+fn runIrqDisciplineCheck(
+    gpa: Allocator,
+    pool: *Pool,
+    w: *std.Io.Writer,
+    files: []const *SourceFile,
+    tokens_per_file: []const []const Tok,
+    struct_fields: []const StructField,
+    slab_types: *const SlabTypeMap,
+) !u32 {
+    // Lock-field set from struct_fields.
+    var lock_field_set = LockFieldSet.init(gpa);
+    defer lock_field_set.deinit();
+    try buildLockFieldSet(gpa, pool, struct_fields, &lock_field_set);
+
+    // Func table.
+    var func_table = funcTableInit(gpa);
+    defer funcTableDeinit(&func_table, gpa);
+    try buildFuncTable(gpa, pool, files, tokens_per_file, &func_table);
+
+    // Acquire / release site lists.
+    var acquires = ArrayList(AcquireSite).empty;
+    defer acquires.deinit(gpa);
+    var releases = ArrayList(ReleaseSite).empty;
+    defer releases.deinit(gpa);
+
+    // Walk every function.
+    for (func_table.records.items, 0..) |*rec, idx| {
+        const sf = blk: {
+            for (files) |f| if (mem.eql(u8, f.rel_path, rec.file_rel)) break :blk f;
+            break :blk null;
+        };
+        if (sf == null) continue;
+        const toks = blk2: {
+            for (files, tokens_per_file) |f, t| if (f == sf.?) break :blk2 t;
+            break :blk2 @as([]const Tok, &.{});
+        };
+        try scanFuncForIrq(
+            gpa, pool, sf.?, toks, @intCast(idx), rec,
+            &lock_field_set, slab_types,
+            &acquires, &releases,
+        );
+    }
+
+    // Reachability: transitive_classes (currently unused for the IRQ
+    // check itself; computed for diagnostic completeness — costs a
+    // worklist pass) and reached_from_irq (the load-bearing one).
+    // The acquire-class IRQ-acquired classifier reads reached_from_irq
+    // directly per acquire site, so transitive_classes is optional. We
+    // still compute it to support potential future per-fn diagnostics
+    // and because it sanity-checks the call-graph plumbing on every
+    // run.
+    try computeTransitiveClasses(gpa, &func_table, acquires.items);
+    try markIrqReachable(gpa, &func_table);
+
+    // IRQ-acquired classes.
+    var irq_classes = StringHashMap(u8).init(gpa);
+    defer irq_classes.deinit();
+    try computeIrqAcquiredClasses(gpa, &func_table, acquires.items, &irq_classes);
+
+    // Discipline + pairing findings.
+    var discipline_findings = ArrayList(IrqFinding).empty;
+    defer {
+        for (discipline_findings.items) |f| gpa.free(f.fix_hint);
+        discipline_findings.deinit(gpa);
+    }
+    try checkIrqDiscipline(gpa, pool, &func_table, acquires.items, &irq_classes, &discipline_findings);
+
+    var pairing_findings = ArrayList(IrqFinding).empty;
+    defer {
+        for (pairing_findings.items) |f| gpa.free(f.fix_hint);
+        pairing_findings.deinit(gpa);
+    }
+    try checkPairingDiscipline(gpa, pool, &func_table, acquires.items, releases.items, &pairing_findings);
+
+    // ---- Output.
+    try w.writeAll("\n=== IRQ-acquired lock classes ===\n");
+    if (irq_classes.count() == 0) {
+        try w.writeAll("  (none — no lock class is reachable from any IRQ / NMI / async-trap entry)\n");
+    } else {
+        // Sort class ids for deterministic output.
+        var class_keys = ArrayList([]const u8).empty;
+        defer class_keys.deinit(gpa);
+        var ck_it = irq_classes.keyIterator();
+        while (ck_it.next()) |k| try class_keys.append(gpa, k.*);
+        std.sort.heap([]const u8, class_keys.items, {}, lessStr);
+        for (class_keys.items) |class_id| {
+            const kinds = irq_classes.get(class_id).?;
+            const reach_str = try renderReachableKindList(gpa, kinds);
+            defer gpa.free(reach_str);
+            try w.print("class  {s}  reachable_from={s}\n", .{ class_id, reach_str });
+            // List any sites needing fix.
+            var listed: u32 = 0;
+            for (discipline_findings.items) |f| {
+                if (!mem.eql(u8, f.class_id, class_id)) continue;
+                if (listed == 0) try w.writeAll("  acquire sites needing IRQ-save discipline:\n");
+                try w.print("    {s}:{d}  ({s})\n", .{ f.file_rel, f.line, f.enclosing_fn });
+                try w.print("      currently uses: {s}\n", .{f.method});
+                try w.print("      fix: {s}\n", .{f.fix_hint});
+                listed += 1;
+            }
+        }
+    }
+
+    if (pairing_findings.items.len > 0) {
+        try w.writeAll("\n=== Pairing violations ===\n");
+        for (pairing_findings.items) |f| {
+            try w.print("  {s}:{d}  ({s})  release={s}\n", .{ f.file_rel, f.line, f.enclosing_fn, f.method });
+            try w.print("    {s}\n", .{f.fix_hint});
+        }
+    }
+
+    const n_irq_classes: u32 = @intCast(irq_classes.count());
+    const n_discipline: u32 = @intCast(discipline_findings.items.len);
+    const n_pairing: u32 = @intCast(pairing_findings.items.len);
+    try w.print(
+        "\nIRQ-discipline summary: {d} IRQ-acquired classes, {d} discipline violations, {d} pairing violations\n",
+        .{ n_irq_classes, n_discipline, n_pairing },
+    );
+
+    return n_discipline + n_pairing;
 }

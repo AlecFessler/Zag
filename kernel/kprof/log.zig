@@ -19,7 +19,6 @@
 
 const mode = @import("mode.zig");
 const record_mod = @import("record.zig");
-const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
@@ -32,7 +31,6 @@ pub const MAX_CPUS: usize = 4;
 
 /// Bytes per per-CPU log.
 pub const LOG_SIZE_BYTES: usize = 256 * 1024;
-pub const RECORDS_PER_LOG: usize = LOG_SIZE_BYTES / @sizeOf(Record);
 
 /// Inline BSS backing for every per-CPU log. Zero bytes when profiling
 /// is compiled out; `MAX_CPUS * LOG_SIZE_BYTES` bytes otherwise.
@@ -59,9 +57,6 @@ pub var n_cpus: usize = 0;
 /// True once logs are allocated and accepting records.
 /// Set by `start()`, cleared by `end()`.
 pub var active: bool = false;
-
-/// True once `end()` has begun. Prevents re-entering the dump path.
-pub var ending: bool = false;
 
 /// Global "some CPU filled its log" flag. Set by `emit()` on first overflow
 /// on any CPU; polled from the scheduler timer tick so the next core to tick
@@ -132,10 +127,3 @@ pub inline fn emit(rec: Record) void {
     slot.* = rec;
 }
 
-/// Returns true if any CPU's log is full.
-pub fn anyOverflowed() bool {
-    for (cpu_logs[0..n_cpus]) |*log| {
-        if (@atomicLoad(u64, &log.overflowed, .acquire) != 0) return true;
-    }
-    return false;
-}

@@ -1,81 +1,234 @@
-/// Guest physical memory management.
-/// Allocates host virtual pages via mem_reserve and maps them into the
-/// guest physical address space via vm_guest_map.
+//! Guest physical memory management — spec-v3 port.
+//!
+//! Layout:
+//!   1. Allocate a page_frame for the VmPolicy struct (small, 1 page),
+//!      map it locally so we can write the policy bytes before
+//!      createVirtualMachine consumes it.
+//!   2. Allocate a single contiguous page_frame covering all guest RAM.
+//!   3. map_guest the guest RAM page_frame into the VM at gpa 0.
+//!   4. createVar + map_pf locally so the VMM can read/write guest
+//!      memory by host VA (used for bzImage / initramfs / boot_params).
+
 const lib = @import("lib");
 
 const log = @import("log.zig");
+
+const caps = lib.caps;
 const syscall = lib.syscall;
+
+const HandleId = caps.HandleId;
+const PfCap = caps.PfCap;
+const VarCap = caps.VarCap;
 
 const PAGE_SIZE: u64 = 4096;
 
+// Guest RAM is allocated in fixed-size chunks to fit the kernel's
+// buddy MAX_ORDER (currently 14 = 64 MiB). For 128 MiB we need 2
+// chunks; we leave headroom for up to 16 (1 GiB) so larger guests
+// don't immediately overflow this scaffolding.
+// Buddy allocator caps each block at MAX_ORDER = 14 → 64 MiB at 4 KiB.
+// Use 4 MiB chunks (order 10) for headroom and bounded allocator
+// fragmentation. 128 MiB guest RAM = 32 chunks.
+const CHUNK_PAGES: u64 = 1 << 10; // 1024 pages = 4 MiB per chunk
+const CHUNK_BYTES: u64 = CHUNK_PAGES * PAGE_SIZE;
+const MAX_CHUNKS: usize = 64;
+
+var guest_ram_pfs: [MAX_CHUNKS]HandleId = .{0} ** MAX_CHUNKS;
+var guest_ram_chunk_count: usize = 0;
+var guest_ram_var: HandleId = 0;
 var host_base: u64 = 0;
 var mapped_size: u64 = 0;
 
-/// Allocate and map guest physical memory.
-/// Creates a contiguous host virtual region and maps it 1:1 into guest
-/// physical address space starting at guest phys 0.
-pub fn setupGuestMemory(size: u64) void {
-    // rights = 0x7 (read + write + execute) — we need execute for guest code pages
-    const result = syscall.mem_reserve(0, size, 0x7);
-    if (result.val < 0) {
-        log.print("mem: mem_reserve failed: ");
-        log.dec(@as(u64, @bitCast(-result.val)));
+/// Allocate the VmPolicy page_frame and map it locally so the caller
+/// can zero-init / seed the policy before `createVirtualMachine`
+/// consumes it. Returns the page_frame handle, or null on failure.
+///
+/// Spec test 05: createVirtualMachine returns E_INVAL if the policy
+/// page_frame is smaller than sizeof(VmPolicy). One 4 KiB page covers
+/// the x86-64 VmPolicy (≈ 1 KiB) comfortably.
+pub fn allocPolicyPageFrame() ?HandleId {
+    const pf_caps_word: u64 = @as(u64, (PfCap{
+        .r = true,
+        .w = true,
+        .max_sz = 0, // 4 KiB
+    }).toU16());
+    const pf_props_word: u64 = 0; // sz = 0 (4 KiB)
+    const pf_r = syscall.createPageFrame(pf_caps_word, pf_props_word, 1);
+    if (pf_r.v1 < 16) {
+        log.print("policy: createPageFrame failed: ");
+        log.dec(pf_r.v1);
         log.print("\n");
-        syscall.shutdown();
+        return null;
     }
-    host_base = result.val2;
-    mapped_size = size;
+    const pf_handle: HandleId = @truncate(pf_r.v1 & 0xFFF);
 
-    log.print("mem: reserved ");
-    log.dec(size / (1024 * 1024));
-    log.print(" MB at host 0x");
-    log.hex64(host_base);
-    log.print("\n");
-
-    // Map into guest physical address space.
-    // vm_guest_map supports multi-page sizes, so map the whole thing at once.
-    const mr = syscall.vm_guest_map(@import("main.zig").vm_handle, host_base, 0, size, 0x7);
-    if (mr != syscall.E_OK) {
-        log.print("mem: vm_guest_map failed: ");
-        log.dec(@as(u64, @bitCast(-mr)));
+    // Map locally to zero the frame. The VAR is a regular (non-mmio,
+    // non-dma) range; we install one page_frame at offset 0.
+    const var_caps_word: u64 = @as(u64, (VarCap{
+        .r = true,
+        .w = true,
+    }).toU16());
+    const var_props: u64 = 0b011; // cur_rwx = r|w
+    const var_r = syscall.createVar(var_caps_word, var_props, 1, 0, 0);
+    if (var_r.v1 < 16) {
+        log.print("policy: createVar failed: ");
+        log.dec(var_r.v1);
         log.print("\n");
-        syscall.shutdown();
+        return null;
+    }
+    const var_handle: HandleId = @truncate(var_r.v1 & 0xFFF);
+    const var_base: u64 = var_r.v2;
+
+    const map_pairs = [_]u64{ 0, @as(u64, pf_handle) };
+    const map_r = syscall.mapPf(var_handle, &map_pairs);
+    if (map_r.v1 != 0) {
+        log.print("policy: mapPf failed: ");
+        log.dec(map_r.v1);
+        log.print("\n");
+        return null;
     }
 
-    log.print("mem: mapped guest phys 0x0 - 0x");
-    log.hex64(size);
-    log.print("\n");
+    // Zero the policy page so num_cpuid_responses / num_cr_policies
+    // start at 0 (the kernel rejects values exceeding MAX_*).
+    const policy_ptr: [*]u8 = @ptrFromInt(var_base);
+    @memset(policy_ptr[0..PAGE_SIZE], 0);
+
+    return pf_handle;
 }
 
-/// Map MMIO stub pages at device addresses so the guest can probe them
-/// without causing NPT faults. Pages are filled with 0xFF (no device present).
+/// Allocate guest RAM as a sequence of buddy-sized page_frames (each
+/// up to MAX_ORDER pages = 64 MiB at 4 KiB), install them contiguously
+/// at gpa 0..size in the VM, and map a single local VAR over them so
+/// VMM-side @memcpy etc. see one flat host VA range.
+pub fn setupGuestMemory(size: u64) bool {
+    const num_pages = size / PAGE_SIZE;
+    const chunks_needed: usize = @intCast((num_pages + CHUNK_PAGES - 1) / CHUNK_PAGES);
+    if (chunks_needed > MAX_CHUNKS) {
+        log.print("guest_ram: size exceeds MAX_CHUNKS\n");
+        return false;
+    }
+
+    // 1) Allocate chunks_needed page_frames.
+    const pf_caps_word: u64 = @as(u64, (PfCap{
+        .r = true,
+        .w = true,
+        .x = true, // guest executes its own code
+        .max_sz = 0,
+    }).toU16());
+    const pf_props_word: u64 = 0; // sz = 0 (4 KiB)
+
+    log.print("guest_ram: allocating ");
+    log.dec(chunks_needed);
+    log.print(" chunks of ");
+    log.dec(CHUNK_PAGES);
+    log.print(" pages each\n");
+
+    var i: usize = 0;
+    while (i < chunks_needed) {
+        log.print("  chunk[");
+        log.dec(i);
+        log.print("] createPageFrame...");
+        const pf_r = syscall.createPageFrame(pf_caps_word, pf_props_word, CHUNK_PAGES);
+        log.print(" ret=");
+        log.hex64(pf_r.v1);
+        log.print("\n");
+        if (pf_r.v1 < 16) {
+            log.print("guest_ram: createPageFrame[");
+            log.dec(i);
+            log.print("] failed: ");
+            log.dec(pf_r.v1);
+            log.print("\n");
+            return false;
+        }
+        guest_ram_pfs[i] = @truncate(pf_r.v1 & 0xFFF);
+        i += 1;
+    }
+    guest_ram_chunk_count = chunks_needed;
+
+    // 2) map_guest each chunk at its corresponding gpa.
+    const main_mod = @import("main.zig");
+    i = 0;
+    while (i < chunks_needed) {
+        const map_pairs = [_]u64{ i * CHUNK_BYTES, @as(u64, guest_ram_pfs[i]) };
+        const mg_r = syscall.mapGuest(main_mod.vm_handle, &map_pairs);
+        if (mg_r.v1 != 0) {
+            log.print("guest_ram: mapGuest[");
+            log.dec(i);
+            log.print("] failed: ");
+            log.dec(mg_r.v1);
+            log.print("\n");
+            return false;
+        }
+        i += 1;
+    }
+
+    // 3) Allocate a local VAR sized to all chunks_needed * CHUNK_PAGES,
+    //    then map_pf each chunk at the corresponding offset so VMM-side
+    //    code sees one flat host VA range.
+    const total_local_pages = chunks_needed * CHUNK_PAGES;
+    const var_caps_word: u64 = @as(u64, (VarCap{
+        .r = true,
+        .w = true,
+    }).toU16());
+    const var_props: u64 = 0b011; // cur_rwx = r|w
+    const var_r = syscall.createVar(var_caps_word, var_props, total_local_pages, 0, 0);
+    if (var_r.v1 < 16) {
+        log.print("guest_ram: createVar failed: ");
+        log.dec(var_r.v1);
+        log.print("\n");
+        return false;
+    }
+    guest_ram_var = @truncate(var_r.v1 & 0xFFF);
+    host_base = var_r.v2;
+
+    i = 0;
+    while (i < chunks_needed) {
+        const local_pairs = [_]u64{ i * CHUNK_BYTES, @as(u64, guest_ram_pfs[i]) };
+        const mp_r = syscall.mapPf(guest_ram_var, &local_pairs);
+        if (mp_r.v1 != 0) {
+            log.print("guest_ram: mapPf[");
+            log.dec(i);
+            log.print("] (local) failed: ");
+            log.dec(mp_r.v1);
+            log.print("\n");
+            return false;
+        }
+        i += 1;
+    }
+
+    mapped_size = size;
+    log.print("mem: ");
+    log.dec(size / (1024 * 1024));
+    log.print(" MB guest RAM (");
+    log.dec(chunks_needed);
+    log.print(" chunks) at host 0x");
+    log.hex64(host_base);
+    log.print("\n");
+    return true;
+}
+
+/// MMIO stub pages. Old hyprvOS mapped a couple of all-0 pages at
+/// device addresses Linux probes briefly (HPET, TPM). On the new ABI
+/// each stub takes its own page_frame + map_guest call.
 pub noinline fn mapMmioStubs() void {
-    // Common device MMIO ranges that Linux probes during boot:
-    // 0xFEC00000 - I/O APIC
-    // 0xFED00000 - HPET
-    // 0xFED80000 - Intel TPM/PTT
-    // 0xFEE00000 - Local APIC
-    // Note: Do NOT map Local APIC (0xFEE00000) or I/O APIC (0xFEC00000) —
-    // Linux reads specific registers from these and 0xFF responses cause
-    // incorrect behavior. Only map device stubs that Linux probes briefly.
     const mmio_addrs = [_]u64{
         0xFED00000, // HPET
         0xFED80000, // Intel TPM / platform devices
     };
 
     for (mmio_addrs) |addr| {
-        // Allocate a host page and fill with 0xFF
-        const result = syscall.mem_reserve(0, PAGE_SIZE, 0x7);
-        if (result.val < 0) continue;
-        const host_addr = result.val2;
+        const pf_caps_word: u64 = @as(u64, (PfCap{
+            .r = true,
+            .w = true,
+        }).toU16());
+        const pf_r = syscall.createPageFrame(pf_caps_word, 0, 1);
+        if (pf_r.v1 < 16) continue;
+        const pf_handle: HandleId = @truncate(pf_r.v1 & 0xFFF);
 
-        // Fill with 0x00 (safe default — no device capabilities)
-        const ptr: [*]u8 = @ptrFromInt(host_addr);
-        @memset(ptr[0..PAGE_SIZE], 0x00);
-
-        // Map into guest physical address space
-        const mr = syscall.vm_guest_map(@import("main.zig").vm_handle, host_addr, addr, PAGE_SIZE, 0x7);
-        if (mr == syscall.E_OK) {
+        const main_mod = @import("main.zig");
+        const map_pairs = [_]u64{ addr, @as(u64, pf_handle) };
+        const mg_r = syscall.mapGuest(main_mod.vm_handle, &map_pairs);
+        if (mg_r.v1 == 0) {
             log.print("mem: MMIO stub at 0x");
             log.hex64(addr);
             log.print("\n");
@@ -83,28 +236,48 @@ pub noinline fn mapMmioStubs() void {
     }
 }
 
-/// Map a single page at a specific guest physical address and return the
-/// host virtual address. Used for MMIO device shadow pages (LAPIC, IOAPIC).
+/// Allocate a single 4 KiB page_frame, map it at `guest_phys` in the
+/// VM, AND map it locally; return the host VA (caller can read / write
+/// the page directly to keep guest-visible state in sync).
 pub noinline fn mapDevicePage(guest_phys: u64) ?[*]volatile u8 {
-    const result = syscall.mem_reserve(0, PAGE_SIZE, 0x7);
-    if (result.val < 0) return null;
-    const host_addr = result.val2;
+    const pf_caps_word: u64 = @as(u64, (PfCap{
+        .r = true,
+        .w = true,
+    }).toU16());
+    const pf_r = syscall.createPageFrame(pf_caps_word, 0, 1);
+    if (pf_r.v1 < 16) return null;
+    const pf_handle: HandleId = @truncate(pf_r.v1 & 0xFFF);
 
-    const ptr: [*]u8 = @ptrFromInt(host_addr);
+    const main_mod = @import("main.zig");
+    const map_pairs = [_]u64{ guest_phys, @as(u64, pf_handle) };
+    const mg_r = syscall.mapGuest(main_mod.vm_handle, &map_pairs);
+    if (mg_r.v1 != 0) return null;
+
+    const var_caps_word: u64 = @as(u64, (VarCap{
+        .r = true,
+        .w = true,
+    }).toU16());
+    const var_props: u64 = 0b011;
+    const var_r = syscall.createVar(var_caps_word, var_props, 1, 0, 0);
+    if (var_r.v1 < 16) return null;
+    const var_handle: HandleId = @truncate(var_r.v1 & 0xFFF);
+    const var_base: u64 = var_r.v2;
+
+    const local_pairs = [_]u64{ 0, @as(u64, pf_handle) };
+    const mp_r = syscall.mapPf(var_handle, &local_pairs);
+    if (mp_r.v1 != 0) return null;
+
+    const ptr: [*]u8 = @ptrFromInt(var_base);
     @memset(ptr[0..PAGE_SIZE], 0);
-
-    const mr = syscall.vm_guest_map(@import("main.zig").vm_handle, host_addr, guest_phys, PAGE_SIZE, 0x7);
-    if (mr != syscall.E_OK) return null;
 
     log.print("mem: device page at 0x");
     log.hex64(guest_phys);
     log.print(" -> host 0x");
-    log.hex64(host_addr);
+    log.hex64(var_base);
     log.print("\n");
-    return @ptrFromInt(host_addr);
+    return @ptrFromInt(var_base);
 }
 
-/// Write data to guest physical memory via the host mapping.
 pub fn writeGuest(guest_phys: u64, data: []const u8) void {
     if (guest_phys + data.len > mapped_size) {
         log.print("mem: writeGuest out of bounds at 0x");
@@ -116,20 +289,17 @@ pub fn writeGuest(guest_phys: u64, data: []const u8) void {
     @memcpy(dst[0..data.len], data);
 }
 
-/// Read a single byte from guest physical memory.
 pub fn readGuestByte(guest_phys: u64) u8 {
     if (guest_phys >= mapped_size) return 0;
     const ptr: *const u8 = @ptrFromInt(host_base + guest_phys);
     return ptr.*;
 }
 
-/// Get a slice of guest physical memory.
 pub fn readGuestSlice(guest_phys: u64, len: usize) []const u8 {
     const ptr: [*]const u8 = @ptrFromInt(host_base + guest_phys);
     return ptr[0..len];
 }
 
-/// Copy data within guest physical memory (non-overlapping regions only).
 pub fn copyGuest(dst_phys: u64, src_phys: u64, len: u64) void {
     if (dst_phys + len > mapped_size or src_phys + len > mapped_size) return;
     const dst: [*]u8 = @ptrFromInt(host_base + dst_phys);

@@ -8,33 +8,14 @@ const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const paging = zag.arch.x64.paging;
 const scheduler = zag.sched.scheduler;
+const sync_debug = zag.utils.sync.debug;
 
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const InterruptHandler = idt.interruptHandler;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 
 pub const ArchCpuContext = cpu.Context;
-
-/// Number of general-purpose registers saved in a fault snapshot.
-/// x86-64: 15 (rax-r15 minus rsp).
-pub const fault_gpr_count: usize = 15;
-
-/// Size of the register portion of a FaultMessage: ip + flags + sp + GPRs.
-pub const fault_regs_size: usize = (3 + fault_gpr_count) * @sizeOf(u64);
-
-/// Total size of a FaultMessage written to userspace (32-byte header + regs).
-pub const fault_msg_size: usize = 32 + fault_regs_size;
-
-/// Architecture-neutral snapshot of a faulted thread's registers.
-/// Used by fault delivery to serialize register state without the
-/// generic kernel referencing arch-specific register names.
-pub const FaultRegSnapshot = struct {
-    ip: u64,
-    flags: u64,
-    sp: u64,
-    gprs: [fault_gpr_count]u64,
-};
 
 pub const PageFaultContext = struct {
     faulting_address: u64,
@@ -62,7 +43,6 @@ pub const IntVecs = enum(u8) {
 pub const VectorKind = enum {
     exception,
     external,
-    software,
 };
 
 const VectorEntry = struct {
@@ -96,34 +76,234 @@ const pushes_err = blk: {
 
 var vector_table: [256]VectorEntry = .{VectorEntry{}} ** 256;
 
-/// Per-CPU scratch space for SYSCALL entry. SWAPGS gives us access to
-/// this via the GS segment base. Layout: [0]=kernel_rsp, [8]=user_rsp.
+/// Per-core scratch zone for SYSCALL entry, accessed via `gs:` after
+/// `swapgs`. Sized to a full 4 KiB page so other arch fast paths
+/// (fault delivery, vm-exit) can grow into the same scratch without
+/// changing offsets. Statically allocated in BSS — kernel-mapped at
+/// boot, no per-cpu page allocation needed at runtime.
+///
+/// Offsets are load-bearing — the L4 IPC fast-path asm in
+/// `syscallEntry` references them as immediate displacements, not
+/// through `@offsetOf`. Reordering fields requires updating that asm.
 pub const SyscallScratch = extern struct {
+    /// Top of the current EC's kernel stack. Updated by `switchTo`
+    /// alongside TSS.RSP0. Read first by entry stub to switch RSP.
     kernel_rsp: u64,
+    /// Caller's user RSP at SYSCALL trap. Stashed by entry stub.
     user_rsp: u64,
+    /// Caller's user RIP (from RCX, which SYSCALL clobbers). Stashed
+    /// so RCX can be reused as scratch.
+    user_rip: u64,
+    /// Caller's user RFLAGS (from R11, ditto).
+    user_rflags: u64,
+    /// Pointer to the EC currently dispatched on this core. Updated
+    /// by `switchTo`. Read in fast-path entry without further lookup.
+    current_ec: u64,
+    /// Pointer to that EC's bound CapabilityDomain. Updated alongside
+    /// `current_ec` so handle-table walks skip a dereference.
+    current_domain: u64,
+    /// General fast-path scratch slots used to spill values across
+    /// phases (sender RIP/RFLAGS held until the user-stack write,
+    /// `*Port` retained across the spinlock release, etc.).
+    /// 8 slots = 64 bytes.
+    fast_temp: [8]u64,
+    /// Pointer to this core's `scheduler.PerCore` slot. Populated at
+    /// init so the fast path can reach `last_fpu_owner` and
+    /// `fpu_trap_armed` without a CPUID/APIC read followed by an array
+    /// index — both would be MOV-CR0/MSR-class costs we can't afford
+    /// inside the L4 path. Single deref, RIP-relative-free.
+    per_core_ptr: u64,
+    /// Snapshot of `cpu.pcid_enabled` written at init. The fast path
+    /// can't reach the global `var` symbol RIP-relative from a naked
+    /// fn without operand interpolation, so we cache it here and
+    /// branch on the byte.
+    pcid_enabled: u8,
+    /// Pad out to a full page.
+    _pad: [4096 - (14 * 8 + 8 + 1)]u8,
 };
 
-pub var per_cpu_scratch: [64]SyscallScratch = [_]SyscallScratch{.{ .kernel_rsp = 0, .user_rsp = 0 }} ** 64;
+comptime {
+    if (@sizeOf(SyscallScratch) != 4096) {
+        @compileError("SyscallScratch must be exactly 4 KiB");
+    }
+}
+
+/// SyscallScratch displacements pinned for the syscall-entry inline
+/// asm. The slow-path prologue references these as immediate `gs:N`
+/// memory operands rather than going through operand interpolation in
+/// a naked stub, so layout drift on `SyscallScratch` must trip a
+/// compile error here rather than silently corrupting the path. The
+/// future L4 IPC fast path will share the same scratch layout, hence
+/// the slot bookkeeping for `current_ec`, `current_domain`,
+/// `per_core_ptr`, and the `fast_temp` band stays parked here for
+/// when those slots become live again.
+const Offsets = struct {
+    const sc_kernel_rsp: usize = 0;
+    const sc_user_rsp: usize = 8;
+    const sc_user_rip: usize = 16;
+    const sc_user_rflags: usize = 24;
+    const sc_current_ec: usize = 32;
+    const sc_current_domain: usize = 40;
+    const sc_fast_temp_0: usize = 48;
+    const sc_per_core_ptr: usize = 112;
+    const sc_pcid_enabled: usize = 120;
+
+    // cpu.Context iret-frame field offsets — referenced by the slow-path
+    // Context-build literals (136/152/160).
+    const ctx_rip: usize = @offsetOf(cpu.Context, "rip");
+    const ctx_rflags: usize = @offsetOf(cpu.Context, "rflags");
+    const ctx_rsp: usize = @offsetOf(cpu.Context, "rsp");
+};
+
+// Sanity-check the SyscallScratch displacements — extern struct, but
+// even an extern layout flips on a Zig version bump if alignment
+// rules ever change.
+comptime {
+    if (@offsetOf(SyscallScratch, "kernel_rsp") != Offsets.sc_kernel_rsp) @compileError("scratch.kernel_rsp drift");
+    if (@offsetOf(SyscallScratch, "user_rsp") != Offsets.sc_user_rsp) @compileError("scratch.user_rsp drift");
+    if (@offsetOf(SyscallScratch, "user_rip") != Offsets.sc_user_rip) @compileError("scratch.user_rip drift");
+    if (@offsetOf(SyscallScratch, "user_rflags") != Offsets.sc_user_rflags) @compileError("scratch.user_rflags drift");
+    if (@offsetOf(SyscallScratch, "current_ec") != Offsets.sc_current_ec) @compileError("scratch.current_ec drift");
+    if (@offsetOf(SyscallScratch, "current_domain") != Offsets.sc_current_domain) @compileError("scratch.current_domain drift");
+    if (@offsetOf(SyscallScratch, "fast_temp") != Offsets.sc_fast_temp_0) @compileError("scratch.fast_temp drift");
+    if (@offsetOf(SyscallScratch, "per_core_ptr") != Offsets.sc_per_core_ptr) @compileError("scratch.per_core_ptr drift");
+    if (@offsetOf(SyscallScratch, "pcid_enabled") != Offsets.sc_pcid_enabled) @compileError("scratch.pcid_enabled drift");
+    if (Offsets.ctx_rip != 136) @compileError("cpu.Context.rip not at 136");
+    if (Offsets.ctx_rflags != 152) @compileError("cpu.Context.rflags not at 152");
+    if (Offsets.ctx_rsp != 160) @compileError("cpu.Context.rsp not at 160");
+}
+
+pub var per_cpu_scratch: [64]SyscallScratch align(4096) =
+    [_]SyscallScratch{std.mem.zeroes(SyscallScratch)} ** 64;
 
 /// Set KernelGsBase MSR for this core so SWAPGS can access per-CPU scratch.
-/// Must be called on each core during init, after APIC is available.
+/// Must be called on each core during init, after APIC is available and
+/// after `cpu.enablePcid` has run (so the cached `pcid_enabled` flag is
+/// authoritative for this core's lifetime).
 pub fn initSyscallScratch(core_id: u64) void {
     const ia32_kernel_gs_base: u32 = 0xC0000102;
-    cpu.wrmsr(ia32_kernel_gs_base, @intFromPtr(&per_cpu_scratch[core_id]));
+    const scratch = &per_cpu_scratch[core_id];
+    scratch.per_core_ptr = @intFromPtr(&scheduler.core_states[core_id]);
+    scratch.pcid_enabled = if (cpu.pcid_enabled) 1 else 0;
+    cpu.wrmsr(ia32_kernel_gs_base, @intFromPtr(scratch));
 }
 
 /// Update per-CPU scratch kernel_rsp. Called from switchTo on every
 /// context switch, mirroring the TSS.RSP0 update.
+///
+/// Pointer-index `per_cpu_scratch[]` to avoid Debug-mode codegen
+/// copying the entire [64]SyscallScratch array (256 KiB) onto the
+/// kernel stack on every context switch. See the matching note in
+/// sched.scheduler on `core_states[]`.
 pub fn updateScratchKernelRsp(core_id: u64, kernel_rsp: u64) void {
-    per_cpu_scratch[core_id].kernel_rsp = kernel_rsp;
+    (&per_cpu_scratch[core_id]).kernel_rsp = kernel_rsp;
 }
 
 /// Syscall dispatch — exported so the SYSCALL asm entry can call it.
-/// Wraps the generic syscall.dispatch and writes results back to ctx.
+/// Wraps the generic syscall.dispatch and writes the i64 return into
+/// vreg 1 (rax). Spec §[syscall_abi] ABI:
+///   - syscall_word lives at user vreg 0 = `[ctx.rsp + 0]`. SMAP gates
+///     the read; STAC/CLAC bracket the user-stack load.
+///   - args[0..13] = vregs 1..13, in spec order: rax, rbx, rdx, rbp,
+///     rsi, rdi, r8, r9, r10, r12, r13, r14, r15. Stack-spilled vregs
+///     14..127 are not collected here — handlers that need them read
+///     them from `[ctx.rsp + (N-13)*8]` directly.
+///   - return: i64 → ctx.regs.rax (vreg 1).
+///
+/// L4 IPC fast path (Phase 2 + 3): when the syscall word names
+/// `suspend` we attempt `port.suspendFast` BEFORE building the args
+/// slice or routing through the dispatch switch. The fast path handles
+/// the dominant test-runner pattern (self-suspend with a receiver
+/// already queued on the destination port). Predicate misses return
+/// `null` and we fall straight through to the slow-path dispatch — the
+/// observable behavior is identical because the slow path mints the
+/// same state via `suspendEc` → `suspendOnPort`.
 export fn syscallDispatch(ctx: *cpu.Context) void {
-    const result = zag.syscall.dispatch.dispatch(ctx);
-    ctx.regs.rax = @bitCast(result.ret);
-    ctx.regs.rdx = result.ret2;
+    const r = &ctx.regs;
+    var syscall_word: u64 = undefined;
+    cpu.stac();
+    syscall_word = @as(*const u64, @ptrFromInt(ctx.rsp)).*;
+    cpu.clac();
+    const caller = scheduler.currentEc() orelse @panic("syscall with no current EC");
+
+    // Phase 2: cheap classifier on the syscall number. Only `suspend`
+    // unlocks the fast rendezvous below — every other syscall takes
+    // the args[0..13] slice path.
+    //
+    // The fast path skips the §[handle_attachments] entry-validation
+    // step, so when pair_count > 0 (syscall word bits 12-19) we MUST
+    // fall through to the slow path so the per-entry checks (E_BADCAP
+    // on invalid source ids, etc.) actually run.
+    const SyscallNum = zag.syscall.dispatch.SyscallNum;
+    const pair_count_bits: u8 = @truncate((syscall_word >> 12) & 0xFF);
+    if ((syscall_word & 0xFFF) == @intFromEnum(SyscallNum.@"suspend") and pair_count_bits == 0) {
+        // vreg 1 = rax = target EC handle; vreg 2 = rbx = port handle.
+        if (zag.sched.port.suspendFast(caller, r.rax, r.rbx)) |fast_ret| {
+            r.rax = @bitCast(fast_ret);
+            // The fast path may have suspended `caller` (rendezvous
+            // success): in that case `current_ec` was cleared and the
+            // syscall epilogue would otherwise iretq back to the now-
+            // parked user EC. Drive the scheduler to pick the next
+            // ready EC (typically the just-readied receiver).
+            // `&core_states[i]` (pointer) rather than the
+            // `core_states[i].field` form: see the matching note in
+            // `sched.scheduler.currentEc`. Debug-mode Zig codegens the
+            // direct-array index as a 6 KiB memcpy of the entire
+            // `core_states` array onto the syscall path's stack frame
+            // — three such snapshots in this function consume ~18 KiB
+            // and overflow the 48 KiB kernel stack on faulting paths.
+            if (scheduler.coreIsIdle(@truncate(apic.coreID()))) {
+                scheduler.run();
+            }
+            return;
+        }
+        // Predicate miss — fall through to the slow path below.
+    }
+
+    var args: [13]u64 = .{
+        r.rax, r.rbx, r.rdx, r.rbp, r.rsi, r.rdi,
+        r.r8,  r.r9,  r.r10, r.r12, r.r13, r.r14, r.r15,
+    };
+    const ret = zag.syscall.dispatch.dispatch(caller, syscall_word, args[0..]);
+    r.rax = @bitCast(ret);
+
+    // Spec §[syscall_abi]: vreg 0 (`[user_rsp + 0]`) is the syscall
+    // word — `recv` event delivery surfaces its return payload here
+    // (reply_handle_id / event_type / pair_count / tstart) while vreg
+    // 1 (rax) carries OK. The caller is still the running EC on this
+    // core when dispatch returned without suspending us, and we are
+    // still in the caller's CR3, so the user-page write is safe here.
+    if (caller.pending_event_word_valid and
+        scheduler.coreCurrentIs(@truncate(apic.coreID()), caller))
+    {
+        writeUserSyscallWord(ctx, caller.pending_event_word);
+        caller.pending_event_word = 0;
+        caller.pending_event_word_valid = false;
+
+        // Spec §[event_state] vreg 14 — RIP at `[user_rsp + 8]`.
+        // Staged alongside the syscall word in `port.deliverEvent`;
+        // flush here while we are guaranteed to be in the receiver's
+        // CR3 (the synchronous path through dispatch ran in the
+        // caller's address space throughout). Tied to
+        // `pending_event_word_valid` because both flags are set
+        // together in `deliverEvent`.
+        if (caller.pending_event_rip_valid) {
+            writeUserVreg14(ctx, caller.pending_event_rip);
+            caller.pending_event_rip = 0;
+            caller.pending_event_rip_valid = false;
+        }
+    }
+
+    // If the dispatch suspended the calling EC (recv/suspend/futex
+    // wait), `current_ec` was cleared on this core and `caller.state`
+    // was retargeted to `.suspended_on_port` / `.futex_wait`. The asm
+    // epilogue would otherwise iretq back to the parked user mode and
+    // run the suspended EC. Switch to whatever's next (or idle); the
+    // saved register restore in the asm trampoline never executes
+    // because switchTo's `loadEcContextAndReturn` is `noreturn`.
+    if (scheduler.coreIsIdle(@truncate(apic.coreID()))) {
+        scheduler.run();
+    }
 }
 
 /// SYSCALL entry point. Builds an iret-compatible cpu.Context frame so
@@ -139,86 +319,96 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
 /// On exit (Intel SDM Vol 2B, "SYSRET—Return From Fast System Call"):
 ///   RIP=RCX, RFLAGS=R11&3C7FD7H|2, CS=STAR[63:48]+16|3, SS=STAR[63:48]+8|3.
 ///   Non-canonical RCX → #GP at CPL3 on kernel stack; checked before SYSRET.
+///
+/// All syscalls currently route through the slow path: a 176-byte
+/// `cpu.Context` save, followed by the generic `syscallDispatch`
+/// trampoline into `zag.syscall.dispatch`, then iretq. The slow path
+/// preserves vregs 1-13 (= rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10,
+/// r12, r13, r14, r15) across the call by saving them into the
+/// Context frame on entry and restoring them on exit, so any handler
+/// (including suspend/recv/reply) that does not modify those slots
+/// returns to userspace with them unchanged — matching the contract
+/// the eventual L4-style IPC fast path is intended to preserve in
+/// registers.
+///
+/// L4 IPC fast path — Phases 2 + 3 wired in `syscallDispatch` (Zig).
+/// The asm prologue below still does the full Context save unchanged;
+/// the short-circuit is taken inside `syscallDispatch` after a cheap
+/// classifier on the syscall word: when the call is `suspend` and the
+/// predicate matches (self-suspend + receiver queued + caps OK),
+/// `port.suspendFast` performs the rendezvous inline without traversing
+/// the args[0..13] copy or the dispatch switch. The receiver is made
+/// ready and the caller is transitioned to `.suspended_on_port` with
+/// `current_ec` cleared on this core so the post-dispatch hook drives
+/// the scheduler at the bottom of `syscallDispatch`. Predicate misses
+/// fall straight through to the slow path so suspend/reply still
+/// executes via `kernel/sched/port.zig` (`suspendEc`, `recv`, `reply`,
+/// `replyTransfer`) — observable state matches what the fast path is
+/// specified to produce per spec §[port], §[reply], §[event_state].
+///
+/// Phase 4 (CR3 + GS swap + sysretq inline in this naked stub) is not
+/// yet wired: the Zig fast path still returns through the asm Context
+/// restore + iretq epilogue, just bypassing the slow dispatch above.
+/// Moving the receiver dispatch into the naked stub itself remains the
+/// future work this scratch layout was provisioned for.
 pub export fn syscallEntry() callconv(.naked) void {
-    // cpu.Context layout (low addr → high addr, each field 8 bytes):
-    //   [RSP+0]   r15          ─┐
-    //   [RSP+8]   r14           │
-    //   [RSP+16]  r13           │
-    //   [RSP+24]  r12           │
-    //   [RSP+32]  r11           │ Registers (15 GPRs = 120 bytes)
-    //   [RSP+40]  r10           │
-    //   [RSP+48]  r9            │
-    //   [RSP+56]  r8            │
-    //   [RSP+64]  rdi           │
-    //   [RSP+72]  rsi           │
-    //   [RSP+80]  rbp           │
-    //   [RSP+88]  rbx           │
-    //   [RSP+96]  rdx           │
-    //   [RSP+104] rcx           │
-    //   [RSP+112] rax          ─┘
-    //   [RSP+120] int_num       ─┐ stub fields (16 bytes)
-    //   [RSP+128] err_code      ─┘
-    //   [RSP+136] rip           ─┐
-    //   [RSP+144] cs             │ iret frame (40 bytes)
-    //   [RSP+152] rflags         │
-    //   [RSP+160] rsp            │
-    //   [RSP+168] ss            ─┘
+    // Slow-path Context layout:
+    //   [RSP+0..112]   r15..rax (15 GPRs, 120 bytes)
+    //   [RSP+120,128]  int_num, err_code
+    //   [RSP+136..168] iret frame (rip, cs, rflags, rsp, ss)
     asm volatile (
-    // ── Stack switch via SWAPGS (Intel SDM Vol 3A §5.8.8) ────────
-        \\swapgs                       // GS.base → per-CPU SyscallScratch
-        \\movq %%rsp, %%gs:8          // scratch.user_rsp = user RSP
-        \\movq %%gs:0, %%rsp          // RSP = kernel stack top
+    // ═══════════════════════════════════════════════════════════════
+    // PHASE 1 — common prologue: swapgs, stash user RSP/RIP/RFLAGS,
+    // switch to kernel stack. Kept distinct from the slow-path body
+    // because it is the shared entry the future fast path will branch
+    // out of without paying the full Context save.
+    // ═══════════════════════════════════════════════════════════════
+        \\swapgs                              // GS.base → SyscallScratch
+        \\movq %%rsp, %%gs:8                  // user_rsp
+        \\movq %%rcx, %%gs:16                 // user_rip (rcx clobbered by SYSCALL)
+        \\movq %%r11, %%gs:24                 // user_rflags (r11 ditto)
+        \\movq %%gs:0, %%rsp                  // switch to kernel stack
 
-        // Allocate the full Context frame (176 bytes).
+    // ═══════════════════════════════════════════════════════════════
+    // SLOW PATH — 176-byte Context save + dispatch + iretq.
+    // Restores rcx and r11 from gs scratch first so the iret frame
+    // sees the original SYSCALL-saved values, not whatever the
+    // prologue may have spilled into those regs. Vregs 1-13 (rax,
+    // rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15) are
+    // saved into the Context on entry and restored on exit, so any
+    // handler that leaves them alone returns them to userspace
+    // unchanged — matching the L4 fast-path register-preservation
+    // contract via the long route.
+    // ═══════════════════════════════════════════════════════════════
+        \\movq %%gs:16, %%rcx                 // restore user_rip
+        \\movq %%gs:24, %%r11                 // restore user_rflags
         \\subq $176, %%rsp
-
-        // Save user RBP to its slot FIRST, so we can use RBP as scratch.
-        \\movq %%rbp, 80(%%rsp)       // ctx.regs.rbp = user RBP
-
-        // Ferry user RSP from gs:scratch into the frame via RBP.
-        \\movq %%gs:8, %%rbp          // RBP = user RSP (from scratch)
-        \\movq %%rbp, 160(%%rsp)      // ctx.rsp = user RSP
-
-        // Done with per-CPU data. Restore user GS base so kernel code
-        // that context-switches (IRETQ path) leaves GS in the right state.
-        \\swapgs                       // GS.base restored to user value
-
-        // ── Write iret frame + stub fields ───────────────────────────
-        \\movq $0x1b, 168(%%rsp)      // ctx.ss  = USER_DATA(0x18) | RPL3
-        \\movq %%r11, 152(%%rsp)      // ctx.rflags = R11 (SYSCALL saved)
-        \\movq $0x23, 144(%%rsp)      // ctx.cs  = USER_CODE(0x20) | RPL3
-        \\movq %%rcx, 136(%%rsp)      // ctx.rip = RCX (SYSCALL saved)
-        \\movq $0, 128(%%rsp)         // ctx.err_code = 0
-        \\movq $0x80, 120(%%rsp)      // ctx.int_num  = 0x80
-
-        // ── Write remaining 14 GPRs (RBP already saved above) ───────
-        \\movq %%rax, 112(%%rsp)      // ctx.regs.rax
-        \\movq %%rcx, 104(%%rsp)      // ctx.regs.rcx
-        \\movq %%rdx, 96(%%rsp)       // ctx.regs.rdx
-        \\movq %%rbx, 88(%%rsp)       // ctx.regs.rbx
-        // rbp already at 80(%%rsp)
-        \\movq %%rsi, 72(%%rsp)       // ctx.regs.rsi
-        \\movq %%rdi, 64(%%rsp)       // ctx.regs.rdi
-        \\movq %%r8,  56(%%rsp)       // ctx.regs.r8
-        \\movq %%r9,  48(%%rsp)       // ctx.regs.r9
-        \\movq %%r10, 40(%%rsp)       // ctx.regs.r10
-        \\movq %%r11, 32(%%rsp)       // ctx.regs.r11
-        \\movq %%r12, 24(%%rsp)       // ctx.regs.r12
-        \\movq %%r13, 16(%%rsp)       // ctx.regs.r13
-        \\movq %%r14, 8(%%rsp)        // ctx.regs.r14
-        \\movq %%r15, 0(%%rsp)        // ctx.regs.r15
-
-        // ── Dispatch ─────────────────────────────────────────────────
-        // Lazy FPU: no FXSAVE here. The user's FP/SIMD register file is
-        // left in place across the syscall. The kernel is built without
-        // SSE (see -mno-sse2/-mno-avx in build.zig), so it cannot
-        // clobber XMM/YMM state. The thread is still the FPU owner on
-        // this core (last_fpu_owner[core] == thread), so on iretq the
-        // user can keep using FP without any trap.
-        \\movq %%rsp, %%rdi            // RDI = &Context
+        \\movq %%rbp, 80(%%rsp)
+        \\movq %%gs:8, %%rbp
+        \\movq %%rbp, 160(%%rsp)              // ctx.rsp = user RSP
+        \\swapgs                              // restore user GS
+        \\movq $0x1b, 168(%%rsp)              // ctx.ss
+        \\movq %%r11, 152(%%rsp)              // ctx.rflags
+        \\movq $0x23, 144(%%rsp)              // ctx.cs
+        \\movq %%rcx, 136(%%rsp)              // ctx.rip
+        \\movq $0,    128(%%rsp)              // ctx.err_code
+        \\movq $0x80, 120(%%rsp)              // ctx.int_num
+        \\movq %%rax, 112(%%rsp)
+        \\movq %%rcx, 104(%%rsp)
+        \\movq %%rdx, 96(%%rsp)
+        \\movq %%rbx, 88(%%rsp)
+        \\movq %%rsi, 72(%%rsp)
+        \\movq %%rdi, 64(%%rsp)
+        \\movq %%r8,  56(%%rsp)
+        \\movq %%r9,  48(%%rsp)
+        \\movq %%r10, 40(%%rsp)
+        \\movq %%r11, 32(%%rsp)
+        \\movq %%r12, 24(%%rsp)
+        \\movq %%r13, 16(%%rsp)
+        \\movq %%r14, 8(%%rsp)
+        \\movq %%r15, 0(%%rsp)
+        \\movq %%rsp, %%rdi
         \\call syscallDispatch
-
-        // ── Restore GPRs ─────────────────────────────────────────────
         \\movq 0(%%rsp), %%r15
         \\movq 8(%%rsp), %%r14
         \\movq 16(%%rsp), %%r13
@@ -234,14 +424,8 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq 96(%%rsp), %%rdx
         \\movq 104(%%rsp), %%rcx
         \\movq 112(%%rsp), %%rax
-
-        // ── Return to userspace via IRETQ ─────────────────────��──────
-        // IRETQ properly loads CS/SS from the stack frame, avoiding
-        // SYSRET's reliance on the hidden descriptor cache which is
-        // unreliable under KVM. SYSCALL entry is still used for the
-        // fast entry path; only the return uses IRETQ.
-        \\addq $120, %%rsp             // skip GPRs (RSP now at int_num)
-        \\addq $16, %%rsp              // skip int_num + err_code → iret frame
+        \\addq $120, %%rsp
+        \\addq $16, %%rsp
         \\iretq
     );
 }
@@ -275,7 +459,18 @@ pub fn prepareThreadContext(
     if (ustack_top != null) {
         ctx.cs = gdt.USER_CODE_OFFSET | ring_3;
         ctx.ss = gdt.USER_DATA_OFFSET | ring_3;
-        ctx.rsp = ustack_top.?.addr;
+        // SysV AMD64 ABI §3.4.1: at a function's first instruction
+        // `rsp % 16 == 8` (the implicit CALL pushed an 8-byte return
+        // address onto a 16-byte-aligned stack). `ustack_top` is page-
+        // aligned (and therefore 16-byte aligned), so subtract 8 to
+        // mimic the post-CALL skew the compiler relies on. Without
+        // this skew, any 16-byte-aligned access the compiler emits
+        // against `rsp+offset` (e.g. movaps/movdqa for XMM spills,
+        // 16-byte struct copies) traps with #GP at the first
+        // instruction. Mirrors the same fix applied to the initial
+        // EC of a freshly-spawned capability domain in
+        // `capdom.capability_domain.patchInitialIretFrame`.
+        ctx.rsp = ustack_top.?.addr - 8;
     } else {
         ctx.cs = gdt.KERNEL_CODE_OFFSET;
         ctx.ss = gdt.KERNEL_DATA_OFFSET;
@@ -288,51 +483,98 @@ pub fn prepareThreadContext(
     return @ptrCast(ctx);
 }
 
-pub fn switchTo(thread: *Thread) void {
+pub fn switchTo(ec: *ExecutionContext) void {
     const core_id = apic.coreID();
-    const kstack = thread.kernel_stack.top.addr;
+    const kstack = ec.kernel_stack.top.addr;
     gdt.coreTss(core_id).rsp0 = kstack;
     updateScratchKernelRsp(core_id, kstack);
 
-    // self-alive: `thread` was selected by the scheduler for this
-    // core; its owning Process is kept alive by the thread through
-    // the dispatch window, so reading `addr_space_root` / `_id`
-    // directly without a lock is sound.
-    const proc = thread.process.ptr;
-    const new_root = proc.addr_space_root;
+    // self-alive: `ec` was selected by the scheduler for this core; its
+    // domain is held live by the EC through the dispatch window (the
+    // EC carries a SlabRef into the domain), so reading
+    // `addr_space_root` / `addr_space_id` directly off the deref'd
+    // pointer without re-locking the SlabRef is sound here.
+    const dom = ec.domain.ptr;
+    const new_root = dom.addr_space_root;
     if (new_root.addr != paging.getAddrSpaceRoot().addr) {
-        paging.swapAddrSpace(new_root, proc.addr_space_id);
+        paging.swapAddrSpace(new_root, dom.addr_space_id);
         std.debug.assert(paging.getAddrSpaceRoot().addr == new_root.addr);
     }
 
-    // Lazy FPU: TS should be clear iff `thread` is the current owner
-    // on this core, set otherwise. Track the desired state and only
-    // touch CR0 when it changes — MOV-to-CR0 vmexits under KVM at
-    // ~1k+ cycles per write, so skipping no-op writes is critical.
+    const cid: u8 = @truncate(core_id);
+    scheduler.setCurrentEc(cid, ec);
+    // Pointer-index `per_cpu_scratch[]`: see `updateScratchKernelRsp`.
+    // Each direct `per_cpu_scratch[i].field` write would otherwise
+    // memcpy the full 256 KiB array onto the dispatch stack frame.
+    const scratch = &per_cpu_scratch[cid];
+    scratch.current_ec = @intFromPtr(ec);
+    scratch.current_domain = @intFromPtr(dom);
+
+    // Lazy FPU: TS should be clear iff `ec` is the current owner on
+    // this core, set otherwise. Track the desired state and only touch
+    // CR0 when it changes — MOV-to-CR0 vmexits under KVM at ~1k+
+    // cycles per write, so skipping no-op writes is critical.
     //
-    // Cross-core migration: if the thread's FP state lives in a
-    // different core's regs, flush it out via IPI first so the trap
-    // handler restores from the right buffer contents.
+    // Cross-core migration: if the EC's FP state lives in a different
+    // core's regs, flush it out via IPI first so the trap handler
+    // restores from the right buffer contents.
     //
     // Skipped under -Dlazy_fpu=false (eager baseline): the FPU regs
     // were already swapped in scheduler.switchToWithPmu and CR0.TS is
     // never armed, so no migration flush is needed either.
     if (comptime fpu.lazy_enabled) {
-        fpu.migrateFlush(thread);
-        const cid: u8 = @truncate(core_id);
-        const desired_armed = (scheduler.last_fpu_owner[cid] != thread);
-        if (desired_armed != scheduler.fpu_trap_armed[cid]) {
+        scheduler.migrateFlush(ec);
+        const last_fpu = (&scheduler.core_states[cid]).last_fpu_owner;
+        const desired_armed = if (last_fpu) |ref|
+            // self-alive: identity compare against just-dispatched `ec`.
+            ref.ptr != ec
+        else
+            true;
+        if (desired_armed != (&scheduler.core_states[cid]).fpu_trap_armed) {
             if (desired_armed) cpu.fpuArmTrap() else cpu.fpuClearTrap();
-            scheduler.fpu_trap_armed[cid] = desired_armed;
+            (&scheduler.core_states[cid]).fpu_trap_armed = desired_armed;
         }
     }
 
     apic.endOfInterrupt();
+
+    // Spec §[syscall_abi]: flush the recv-deferred syscall word into
+    // user `[ctx.rsp + 0]` while we are guaranteed to be in the EC's
+    // address space. `deliverEvent` stages the value when the receiver
+    // is parked (rendezvous wake) — at that moment the kernel is still
+    // running in the sender's CR3, so the write must be deferred to
+    // the resume path. Flush after the CR3 swap above and before the
+    // iretq trampoline; the EC's user stack page is mapped in the
+    // domain we just switched into.
+    if (ec.pending_event_word_valid) {
+        writeUserSyscallWord(ec.ctx, ec.pending_event_word);
+        ec.pending_event_word = 0;
+        ec.pending_event_word_valid = false;
+
+        // Spec §[event_state] vreg 14 — RIP at `[user_rsp + 8]`.
+        // Staged in `port.deliverEvent` and flushed here on the
+        // rendezvous wake path now that CR3 references the
+        // receiver's address space.
+        if (ec.pending_event_rip_valid) {
+            writeUserVreg14(ec.ctx, ec.pending_event_rip);
+            ec.pending_event_rip = 0;
+            ec.pending_event_rip_valid = false;
+        }
+    }
+
+    // lockdep: this asm `jmp interruptStubEpilogue` abandons the call stack
+    // the IRQ-handler dispatcher (`dispatchInterrupt`) was using; its
+    // `defer exitIrqContext` never executes. Re-balance the per-core IRQ
+    // depth here so the counter doesn't drift upward each time an
+    // IRQ-driven preemption produces a context switch. No-op when called
+    // from non-IRQ paths (the depth is already zero there).
+    sync_debug.resetIrqContextOnSwitch();
+
     asm volatile (
         \\movq %[new_stack], %%rsp
         \\jmp interruptStubEpilogue
         :
-        : [new_stack] "r" (@intFromPtr(thread.ctx)),
+        : [new_stack] "r" (@intFromPtr(ec.ctx)),
     );
 }
 
@@ -434,102 +676,175 @@ export fn interruptStubEpilogue() callconv(.naked) void {
     );
 }
 
-pub fn serializeFaultRegs(ctx: *const ArchCpuContext) FaultRegSnapshot {
-    const r = &ctx.regs;
-    return .{
-        .ip = ctx.rip,
-        .flags = ctx.rflags,
-        .sp = ctx.rsp,
-        .gprs = .{
-            r.r15, r.r14, r.r13, r.r12, r.r11, r.r10, r.r9,  r.r8,
-            r.rdi, r.rsi, r.rbp, r.rbx, r.rdx, r.rcx, r.rax,
-        },
-    };
-}
-
-pub const SyscallArgs = struct {
-    num: u64,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    arg4: u64,
-};
-
-pub fn getSyscallArgs(ctx: *const ArchCpuContext) SyscallArgs {
-    return .{
-        .num = ctx.regs.rax,
-        .arg0 = ctx.regs.rdi,
-        .arg1 = ctx.regs.rsi,
-        .arg2 = ctx.regs.rdx,
-        .arg3 = ctx.regs.r10,
-        .arg4 = ctx.regs.r8,
-    };
-}
-
-pub fn getSyscallReturn(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.rax;
-}
-
 pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rax = value;
 }
 
-pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.r13;
+/// Write the syscall return word into vreg 0 — `[user_rsp + 0]` per
+/// Spec §[syscall_abi]. MUST be called with the user's address space
+/// active in CR3 (the syscall epilogue runs in the caller's CR3; the
+/// resume path swaps via `switchTo` first). STAC opens user-page
+/// access under SMAP; CLAC re-arms the trap. Aliased on aarch64 to
+/// the matching `[sp + 0]` slot. Used by `recv` event delivery —
+/// vreg 1 (rax) carries OK in that path while the composed
+/// pair_count / tstart / reply_handle_id / event_type word lands at
+/// vreg 0.
+pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
+    cpu.stac();
+    @as(*u64, @ptrFromInt(ctx.rsp)).* = value;
+    cpu.clac();
 }
 
-pub fn getIpcMetadata(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.r14;
+/// Spec §[event_state] vreg 2 — rbx on x86-64.
+pub fn setEventSubcode(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.rbx = value;
 }
 
-pub fn setIpcMetadata(ctx: *ArchCpuContext, value: u64) void {
-    ctx.regs.r14 = value;
+/// Spec §[event_state] vreg 3 — rdx on x86-64.
+pub fn setEventAddr(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.rdx = value;
 }
 
-pub fn getIpcPayloadWords(ctx: *const ArchCpuContext) [5]u64 {
-    return .{ ctx.regs.rdi, ctx.regs.rsi, ctx.regs.rdx, ctx.regs.r8, ctx.regs.r9 };
+/// Spec §[event_state] vreg 4 — rbp on x86-64.
+pub fn setEventVreg4(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.rbp = value;
 }
 
-pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_count: u3) void {
-    if (word_count >= 1) dst.regs.rdi = src.regs.rdi;
-    if (word_count >= 2) dst.regs.rsi = src.regs.rsi;
-    if (word_count >= 3) dst.regs.rdx = src.regs.rdx;
-    if (word_count >= 4) dst.regs.r8 = src.regs.r8;
-    if (word_count >= 5) dst.regs.r9 = src.regs.r9;
+pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.rsi = value;
 }
 
-pub const IpcPayloadSnapshot = struct { words: [5]u64 };
-
-pub fn saveIpcPayload(ctx: *const ArchCpuContext) IpcPayloadSnapshot {
-    return .{ .words = getIpcPayloadWords(ctx) };
+/// Spec §[event_state] vreg 14 read — the suspending EC's saved RIP.
+/// For freshly created ECs `ctx.rip` carries the entry point set in
+/// `prepareEcContext`; for ones suspended mid-execution it carries
+/// the iret-frame RIP saved on syscall/exception entry.
+pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
+    return ctx.rip;
 }
 
-pub fn restoreIpcPayload(ctx: *ArchCpuContext, words: [5]u64) void {
-    ctx.regs.rdi = words[0];
-    ctx.regs.rsi = words[1];
-    ctx.regs.rdx = words[2];
-    ctx.regs.r8 = words[3];
-    ctx.regs.r9 = words[4];
+/// Spec §[event_state] vreg 14 write into the resumed sender's saved
+/// frame. Used by reply_transfer test 14 to commit a write-cap
+/// receiver's RIP modification onto the suspended EC's iret frame.
+pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
+    ctx.rip = value;
 }
 
-pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
-    ctx.rip = snapshot.ip;
-    ctx.rflags = snapshot.flags;
-    ctx.rsp = snapshot.sp;
-    const r = &ctx.regs;
-    inline for (.{
-        "r15", "r14", "r13", "r12", "r11", "r10", "r9",  "r8",
-        "rdi", "rsi", "rbp", "rbx", "rdx", "rcx", "rax",
-    }, 0..) |field, i| {
-        @field(r, field) = snapshot.gprs[i];
-    }
+/// Spec §[event_state] vreg 14 write — writes the suspended EC's RIP
+/// into the receiver's user stack at `[ctx.rsp + 8]`. STAC/CLAC
+/// bracket the write under SMAP; caller MUST ensure CR3 already
+/// references the receiver's address space (the stack page only
+/// exists there). `vreg 0` lives at `[ctx.rsp + 0]` and is written by
+/// `writeUserSyscallWord`; this is the next slot up.
+pub fn writeUserVreg14(ctx: *const ArchCpuContext, value: u64) void {
+    cpu.stac();
+    @as(*u64, @ptrFromInt(ctx.rsp + 8)).* = value;
+    cpu.clac();
+}
+
+/// Spec §[event_state] vreg 14 read — pulls the value the receiver
+/// wrote at `[ctx.rsp + 8]` between recv and reply / reply_transfer.
+/// Companion to `writeUserVreg14`. STAC/CLAC bracket the load under
+/// SMAP; caller MUST ensure CR3 already references the receiver's
+/// address space (the user stack page is only mapped there). Used
+/// by reply_transfer §[reply] test 14 to commit a receiver's RIP
+/// modification onto the resumed sender's saved frame.
+pub fn readUserVreg14(ctx: *const ArchCpuContext) u64 {
+    cpu.stac();
+    const v = @as(*u64, @ptrFromInt(ctx.rsp + 8)).*;
+    cpu.clac();
+    return v;
+}
+
+/// Copy the §[event_state] GPR-backed vregs (vregs 1..13 on x86-64:
+/// rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15) from
+/// `src` to `dst`. Used by `reply` (Spec §[reply] test 05) to apply the
+/// receiver's vreg modifications onto the suspended EC's saved iret
+/// frame when the originating EC handle held the `write` cap. rcx and
+/// r11 are intentionally excluded — they carry user RIP and RFLAGS on
+/// SYSCALL return per the SysV/AMD64 SYSCALL ABI and are not part of the
+/// vreg-1..13 set.
+pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void {
+    dst.regs.rax = src.regs.rax;
+    dst.regs.rbx = src.regs.rbx;
+    dst.regs.rdx = src.regs.rdx;
+    dst.regs.rbp = src.regs.rbp;
+    dst.regs.rsi = src.regs.rsi;
+    dst.regs.rdi = src.regs.rdi;
+    dst.regs.r8 = src.regs.r8;
+    dst.regs.r9 = src.regs.r9;
+    dst.regs.r10 = src.regs.r10;
+    dst.regs.r12 = src.regs.r12;
+    dst.regs.r13 = src.regs.r13;
+    dst.regs.r14 = src.regs.r14;
+    dst.regs.r15 = src.regs.r15;
+}
+
+/// Snapshot the suspending EC's GPR-backed vregs 1..13 in canonical
+/// vreg order. Spec §[event_state] x86-64:
+///   vreg 1 → rax, vreg 2 → rbx, vreg 3 → rdx, vreg 4 → rbp,
+///   vreg 5 → rsi, vreg 6 → rdi, vreg 7 → r8,  vreg 8 → r9,
+///   vreg 9 → r10, vreg 10 → r12, vreg 11 → r13, vreg 12 → r14,
+///   vreg 13 → r15.
+/// rcx / r11 are reserved by the SYSCALL ABI (user RIP/RFLAGS) and are
+/// intentionally excluded.
+pub fn getEventStateGprs(ctx: *const ArchCpuContext) [13]u64 {
+    return .{
+        ctx.regs.rax,
+        ctx.regs.rbx,
+        ctx.regs.rdx,
+        ctx.regs.rbp,
+        ctx.regs.rsi,
+        ctx.regs.rdi,
+        ctx.regs.r8,
+        ctx.regs.r9,
+        ctx.regs.r10,
+        ctx.regs.r12,
+        ctx.regs.r13,
+        ctx.regs.r14,
+        ctx.regs.r15,
+    };
+}
+
+/// Project a vreg 1..13 GPR snapshot onto a receiving EC's frame in
+/// canonical vreg order. Companion to `getEventStateGprs`.
+pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
+    ctx.regs.rax = gprs[0];
+    ctx.regs.rbx = gprs[1];
+    ctx.regs.rdx = gprs[2];
+    ctx.regs.rbp = gprs[3];
+    ctx.regs.rsi = gprs[4];
+    ctx.regs.rdi = gprs[5];
+    ctx.regs.r8 = gprs[6];
+    ctx.regs.r9 = gprs[7];
+    ctx.regs.r10 = gprs[8];
+    ctx.regs.r12 = gprs[9];
+    ctx.regs.r13 = gprs[10];
+    ctx.regs.r14 = gprs[11];
+    ctx.regs.r15 = gprs[12];
 }
 
 export fn dispatchInterrupt(ctx: *cpu.Context) void {
-    if (vector_table[ctx.int_num].handler) |h| {
+    // Pointer-index `vector_table[]` to avoid Debug-mode codegen
+    // copying the entire [256]VectorEntry array (~4 KiB) onto the IRQ
+    // kernel stack on every interrupt. See the matching note in
+    // sched.scheduler on `core_states[]`.
+    const entry = &vector_table[ctx.int_num];
+    if (entry.handler) |h| {
+        // lockdep: an `external` vector is an asynchronous device/IPI/timer
+        // interrupt — the CPU auto-masked IFLAG on entry (Intel SDM Vol 3A
+        // §6.8.1) and the running thread was *interrupted*, not making a
+        // synchronous call into the kernel. That is the only state in which
+        // the IRQ-mode-mix detector should treat this acquire as "from an
+        // IRQ handler." `exception` vectors (#PF, #GP, #UD, syscall stub at
+        // 0x80) are synchronous — they execute on top of whatever IRQ-mode
+        // discipline the interrupted code already chose, and must NOT count
+        // as IRQ-handler context.
+        const is_async_irq = entry.kind == .external;
+        if (is_async_irq) sync_debug.enterIrqContext();
+        defer if (is_async_irq) sync_debug.exitIrqContext();
+
         h(ctx);
-        if (vector_table[@intCast(ctx.int_num)].kind == .external) {
+        if (is_async_irq) {
             apic.endOfInterrupt();
         }
         return;

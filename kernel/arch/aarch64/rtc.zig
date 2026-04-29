@@ -50,3 +50,10 @@ pub fn readRtc() u64 {
     const seconds: u64 = dr_ptr.*;
     return seconds * 1_000_000_000;
 }
+
+/// Write the PL031 RTC to `unix_ns` since the Unix epoch. Returns 0 on
+/// success or a negative spec error code. Spec §[time].time_setwall.
+pub fn writeRtc(unix_ns: u64) i64 {
+    _ = unix_ns;
+    @panic("not implemented");
+}

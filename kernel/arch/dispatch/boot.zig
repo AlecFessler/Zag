@@ -1,5 +1,4 @@
 const builtin = @import("builtin");
-const std = @import("std");
 const zag = @import("zag");
 
 const aarch64 = zag.arch.aarch64;
@@ -30,6 +29,17 @@ pub fn print(
     switch (builtin.cpu.arch) {
         .x86_64 => x64.serial.print(format, args),
         .aarch64 => aarch64.serial.print(format, args),
+        else => unreachable,
+    }
+}
+
+/// Lockless raw-bytes write to the active UART. Bypasses the per-arch
+/// `print_lock` so that detector-instrumented panic paths don't recurse
+/// through the very lock they're trying to report on.
+pub fn printRaw(s: []const u8) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.serial.printRaw(s),
+        .aarch64 => aarch64.serial.printRaw(s),
         else => unreachable,
     }
 }

@@ -1,41 +1,21 @@
 const builtin = @import("builtin");
-const std = @import("std");
 const zag = @import("zag");
 
 const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
-const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
-const Process = zag.proc.process.Process;
-const Range = zag.utils.range.Range;
-const SyscallResult = zag.syscall.dispatch.SyscallResult;
-const Thread = zag.sched.thread.Thread;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const MemoryPerms = zag.memory.address.MemoryPerms;
+const PAddr = zag.memory.address.PAddr;
+const PageFrame = zag.memory.page_frame.PageFrame;
+const VarPageSize = zag.capdom.var_range.PageSize;
+const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
 
 // Generic-kernel-facing VM dispatch. Arch-internal primitives (guest-page
 // mapping, interrupt injection, world-switch, sysreg passthrough, etc.)
 // are reached directly by the per-arch VMM code — they don't belong in
 // dispatch because no generic-kernel callers need them. This module
 // exposes only what the scheduler, process layer, and syscall layer use.
-
-// --- Opaque types referenced by generic kernel --------------------------
-
-pub const Vm = switch (builtin.cpu.arch) {
-    .x86_64 => x64.kvm.vm.Vm,
-    .aarch64 => aarch64.kvm.vm.Vm,
-    else => @compileError("unsupported arch for VM"),
-};
-
-pub const VmAllocator = switch (builtin.cpu.arch) {
-    .x86_64 => x64.kvm.vm.VmAllocator,
-    .aarch64 => aarch64.kvm.vm.VmAllocator,
-    else => @compileError("unsupported arch for VM"),
-};
-
-pub const VCpuAllocator = switch (builtin.cpu.arch) {
-    .x86_64 => x64.kvm.vcpu.VCpuAllocator,
-    .aarch64 => aarch64.kvm.vcpu.VCpuAllocator,
-    else => @compileError("unsupported arch for VM"),
-};
 
 // --- Init ---------------------------------------------------------------
 
@@ -47,16 +27,15 @@ pub fn vmInit() void {
     }
 }
 
+/// Per-core hardware-virtualization init. On x86 this enables VMX/SVM
+/// (VMXON / EFER.SVME) and arms per-core save areas; on aarch64 it
+/// installs the EL2 vector and stage-2 init for cores that came up at
+/// EL2. Called by `sched.scheduler.perCoreInit` after the core's APIC
+/// (or GIC) is online.
 pub fn vmPerCoreInit() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.vmPerCoreInit(),
-        .aarch64 => {
-            aarch64.vm.vmPerCoreInit();
-            // EL2 vector-table install is a per-core concern but lives in
-            // the hyp.zig half of the aarch64 VM split; keep the call-out
-            // here so vm.zig does not need a back-reference into hyp.
-            aarch64.hyp.installHypVectors();
-        },
+        .aarch64 => aarch64.vm.vmPerCoreInit(),
         else => unreachable,
     }
 }
@@ -77,118 +56,228 @@ pub fn bspBootHandoff(arrived_at_el2: bool) void {
     }
 }
 
-pub fn initVmSlab(data_range: Range, ptrs_range: Range, links_range: Range) void {
+// ── Spec v3 VM dispatch primitives ───────────────────────────────────
+// Fine-grained per-VM and per-vCPU control surface tied to the spec-v3
+// VirtualMachine / ExecutionContext objects.
+
+/// Allocate per-VM arch state (VMCS/VMCB region for the VM-level
+/// fields, stage-2 control structures, kernel-emulated interrupt
+/// controller state). `policy_pf` carries the create-time VM policy
+/// page. Spec §[virtual_machine].create_virtual_machine.
+pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.allocVmArchState(vm, policy_pf),
+        .aarch64 => aarch64.kvm.vm.allocVmArchState(vm, policy_pf),
+        else => unreachable,
+    };
+}
+
+/// Validate a `VmPolicy` struct seeded into `policy_pf` against the
+/// per-arch VmPolicy layout invariants defined in §[vm_policy]:
+///   - page frame must be at least `sizeof(VmPolicy)` bytes
+///   - `num_cpuid_responses` (x86) / `num_id_reg_responses` (aarch64)
+///     must not exceed the static array bound
+///   - `num_cr_policies` (x86) / `num_sysreg_policies` (aarch64) must
+///     not exceed the static array bound
+/// Returns `error.InvalidPolicy` when any of the bounds checks fail.
+/// Spec §[create_virtual_machine] tests 05, 06, 07.
+pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.validateVmPolicy(policy_pf),
+        .aarch64 => aarch64.kvm.vm.validateVmPolicy(policy_pf),
+        else => unreachable,
+    };
+}
+
+/// Free per-VM arch state allocated by `allocVmArchState`. Caller has
+/// already torn down all vCPUs and stage-2 mappings.
+pub fn freeVmArchState(vm: *VirtualMachine) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.slab_instance = x64.kvm.vm.VmAllocator.init(data_range, ptrs_range, links_range),
-        .aarch64 => aarch64.kvm.vm.slab_instance = aarch64.kvm.vm.VmAllocator.init(data_range, ptrs_range, links_range),
-        else => {},
+        .x86_64 => x64.kvm.vm.freeVmArchState(vm),
+        .aarch64 => aarch64.kvm.vm.freeVmArchState(vm),
+        else => unreachable,
     }
 }
 
-pub fn initVcpuSlab(data_range: Range, ptrs_range: Range, links_range: Range) void {
+/// Allocate per-vCPU arch state (VMCS / VMCB save area, sysreg bank).
+/// Stored on the vCPU EC. Spec §[virtual_machine].create_vcpu.
+pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vcpu.allocVcpuArchState(vm, vcpu_ec),
+        .aarch64 => aarch64.kvm.vcpu.allocVcpuArchState(vm, vcpu_ec),
+        else => unreachable,
+    };
+}
+
+/// Free per-vCPU arch state pinned on `vcpu_ec.vcpu_arch_state`.
+/// Counterpart to `allocVcpuArchState`; called on EC destruction.
+pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.slab_instance = x64.kvm.vcpu.VCpuAllocator.init(data_range, ptrs_range, links_range),
-        .aarch64 => aarch64.kvm.vcpu.slab_instance = aarch64.kvm.vcpu.VCpuAllocator.init(data_range, ptrs_range, links_range),
-        else => {},
+        .x86_64 => x64.kvm.vcpu.freeVcpuArchState(vcpu_ec),
+        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        else => unreachable,
     }
 }
 
-// --- Syscall entry points ----------------------------------------------
+/// Result of `enterGuest`: which sub-code + 3-vreg payload the kernel
+/// should attach to the vm_exit event delivered on the vCPU's
+/// `exit_port`. Layout follows spec §[vm_exit_state] x86-64 / aarch64
+/// sub-codes; the surrounding code is responsible for routing through
+/// `sched.port.fireVmExit`.
+pub const VmExitDelivery = struct {
+    subcode: u8,
+    payload: [3]u64,
+};
 
-pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
+/// Enter the guest bound to `vcpu_ec` via VMLAUNCH/VMRESUME (Intel) or
+/// VMRUN (AMD), running the guest until the next VM exit. On exit the
+/// guest's GPR / sregs / MSRs are saved back into the vCPU's GuestState
+/// and the exit reason is decoded into a `VmExitDelivery` describing
+/// which §[vm_exit_state] sub-code to surface and which 3-vreg payload
+/// to attach.
+///
+/// Returns `null` on platforms without hardware virtualization support;
+/// the caller must surface the synthetic-exit fallback in that case.
+pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.vmCreate(proc, vcpu_count, policy_ptr),
-        .aarch64 => aarch64.kvm.vm.vmCreate(proc, vcpu_count, policy_ptr),
-        else => -14, // E_NOSYS
+        .x86_64 => x64.vm_runloop.enterGuest(vcpu_ec),
+        .aarch64 => null,
+        else => unreachable,
     };
 }
 
-pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
+/// Allocate the stage-2 / nested page-table root for `vm` (EPT root on
+/// Intel, NPT root on AMD, stage-2 TTBR on aarch64). Returned PAddr
+/// is stored in `VirtualMachine.guest_pt_root`.
+pub fn allocStage2Root(vm: *VirtualMachine) !PAddr {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.guestMap(proc, vm_handle, host_vaddr, guest_addr, size, rights),
-        .aarch64 => aarch64.kvm.vm.guestMap(proc, vm_handle, host_vaddr, guest_addr, size, rights),
-        else => -14,
+        .x86_64 => x64.kvm.vm.allocStage2Root(vm),
+        .aarch64 => aarch64.kvm.vm.allocStage2Root(vm),
+        else => unreachable,
     };
 }
 
-pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: u64, buf_ptr: u64, blocking: bool) SyscallResult {
+/// Free the stage-2 root and any intermediate tables.
+pub fn freeStage2Root(vm: *VirtualMachine) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.freeStage2Root(vm),
+        .aarch64 => aarch64.kvm.vm.freeStage2Root(vm),
+        else => unreachable,
+    }
+}
+
+/// Map a single guest page in the VM's stage-2 tables.
+/// Spec §[virtual_machine].map_guest.
+pub fn stage2MapPage(
+    vm: *VirtualMachine,
+    guest_phys: u64,
+    host_phys: PAddr,
+    sz: VarPageSize,
+    perms: MemoryPerms,
+) !void {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.exit_box.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking),
-        .aarch64 => .{ .ret = aarch64.kvm.exit_box.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking) },
-        else => .{ .ret = -14 },
+        .x86_64 => x64.kvm.vm.stage2MapPage(vm, guest_phys, host_phys, sz, perms),
+        .aarch64 => aarch64.kvm.vm.stage2MapPage(vm, guest_phys, host_phys, sz, perms),
+        else => unreachable,
     };
 }
 
-pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64) i64 {
+/// Unmap a single guest page from stage-2 at `guest_phys`.
+/// Spec §[virtual_machine].unmap_guest.
+pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.stage2UnmapPage(vm, guest_phys, sz),
+        .aarch64 => aarch64.kvm.vm.stage2UnmapPage(vm, guest_phys, sz),
+        else => unreachable,
+    }
+}
+
+/// Stage-2 TLB shootdown across cores currently running this VM's
+/// vCPUs. Required after stage-2 unmaps or permission downgrades.
+pub fn invalidateStage2Range(
+    vm: *VirtualMachine,
+    guest_phys: u64,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.invalidateStage2Range(vm, guest_phys, sz, page_count),
+        .aarch64 => aarch64.kvm.vm.invalidateStage2Range(vm, guest_phys, sz, page_count),
+        else => unreachable,
+    }
+}
+
+/// Apply a typed slice of VM policy entries to the VM (MSR bitmap,
+/// sysreg passthrough table, exception passthrough mask, etc. — see
+/// Spec §[vm_policy] for the per-kind encoding). `count` is the
+/// caller-supplied entry count from syscall word bits 13-20; `entries`
+/// carries the entry payload as raw u64 vregs. Returns 0 on success
+/// or a negative error code.
+pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.exit_box.vmReply(proc, vm_handle, exit_token, action_ptr),
-        .aarch64 => aarch64.kvm.exit_box.vmReply(proc, vm_handle, exit_token, action_ptr),
-        else => -14,
+        .x86_64 => x64.kvm.vm.applyVmPolicyTable(vm, kind, count, entries),
+        .aarch64 => aarch64.kvm.vm.applyVmPolicyTable(vm, kind, count, entries),
+        else => unreachable,
     };
 }
 
-pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
+/// Inject (or de-assert) a virtual interrupt into the VM's emulated
+/// interrupt controller. Returns 0 on success or E_INVAL if `irq_num`
+/// exceeds the maximum line supported by the per-arch emulated
+/// controller. Spec §[virtual_machine].vm_inject_irq tests 02/04/05.
+pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.vcpuSetState(proc, thread_handle, state_ptr),
-        .aarch64 => aarch64.kvm.vcpu.vcpuSetState(proc, thread_handle, state_ptr),
-        else => -14,
+        .x86_64 => x64.kvm.vm.vmInjectIrq(vm, irq_num, assert),
+        .aarch64 => aarch64.kvm.vm.vmInjectIrq(vm, irq_num, assert),
+        else => unreachable,
     };
 }
 
-pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.vcpuGetState(proc, thread_handle, state_ptr),
-        .aarch64 => aarch64.kvm.vcpu.vcpuGetState(proc, thread_handle, state_ptr),
-        else => -14,
-    };
+/// Project the receiver's modified §[vm_exit_state] vregs back onto a
+/// vCPU's per-arch GuestState, gated by the originating EC's
+/// `write` cap. Called by `sched.port.consumeReply` when a vm_exit
+/// reply lands on a vCPU sender. Non-vCPU senders short-circuit
+/// inside the per-arch impl.
+pub fn applyReplyStateToVcpu(receiver: *ExecutionContext, vcpu_ec: *ExecutionContext) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm_runloop.applyReplyStateToVcpu(receiver, vcpu_ec),
+        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        else => unreachable,
+    }
 }
 
-pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.vcpuRun(proc, thread_handle),
-        .aarch64 => aarch64.kvm.vcpu.vcpuRun(proc, thread_handle),
-        else => -14,
-    };
+/// Stash the [3]u64 exit payload onto the vCPU's per-arch state so the
+/// rendezvous-resume / `deliverEvent` path can pick it up at delivery
+/// time without re-threading the payload through `suspendOnPort`.
+/// No-op when `ec` has no per-arch vCPU state (non-vCPU ECs).
+pub fn stashLastExitPayload(ec: *ExecutionContext, payload: [3]u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            if (x64.kvm.vcpu.archStateOf(ec)) |arch_state| {
+                arch_state.last_exit_payload = payload;
+            }
+        },
+        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        else => unreachable,
+    }
 }
 
-pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr),
-        .aarch64 => aarch64.kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr),
-        else => -14,
-    };
+/// Project the vCPU's full guest state into the receiver's vreg slots
+/// per §[vm_exit_state] for that arch, but only once the VMM has
+/// supplied initial state (post-first-reply). The synthetic
+/// pre-started exit delivers only sub-code + zeroed GPRs so receivers
+/// that haven't reserved the full vreg window aren't stomped.
+/// Called by `sched.port.fireRouted` on `event_type = vm_exit` when
+/// the originating EC handle had the `read` cap.
+pub fn populateVmExitVregsIfStarted(
+    receiver: *ExecutionContext,
+    sender: *ExecutionContext,
+    subcode: u8,
+) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm_runloop.populateVmExitVregsIfStarted(receiver, sender, subcode),
+        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        else => unreachable,
+    }
 }
 
-pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_read: bool, allow_write: bool) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.sysregPassthrough(proc, vm_handle, sysreg_id, allow_read, allow_write),
-        .aarch64 => aarch64.kvm.vm.sysregPassthrough(proc, vm_handle, sysreg_id, allow_read, allow_write),
-        else => -14,
-    };
-}
-
-pub fn intcAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.intcAssertIrq(proc, vm_handle, irq_num),
-        .aarch64 => aarch64.kvm.vm.intcAssertIrq(proc, vm_handle, irq_num),
-        else => -14,
-    };
-}
-
-pub fn intcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.intcDeassertIrq(proc, vm_handle, irq_num),
-        .aarch64 => aarch64.kvm.vm.intcDeassertIrq(proc, vm_handle, irq_num),
-        else => -14,
-    };
-}
-
-/// Whether `thread` is a vCPU owned by `vm_obj`. Used by the process exit
-/// path to detect "only vCPU threads remain" and tear the VM down.
-pub fn threadIsVcpu(vm_obj: *Vm, thread: *Thread) bool {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.vcpuFromThread(vm_obj, thread) != null,
-        .aarch64 => aarch64.kvm.vcpu.vcpuFromThread(vm_obj, thread) != null,
-        else => false,
-    };
-}

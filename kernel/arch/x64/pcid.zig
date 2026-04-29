@@ -32,10 +32,10 @@ var bitmap: [word_count]u64 = init: {
     break :init b;
 };
 var hint: u16 = 0;
-var lock: SpinLock = .{};
+var lock: SpinLock = .{ .class = "pcid.lock" };
 
 pub fn allocate() ?u16 {
-    const irq_state = lock.lockIrqSave();
+    const irq_state = lock.lockIrqSave(@src());
     defer lock.unlockIrqRestore(irq_state);
 
     var scanned: u16 = 0;
@@ -60,7 +60,7 @@ pub fn free(id: u16) void {
 
     invalidateTlb(id);
 
-    const irq_state = lock.lockIrqSave();
+    const irq_state = lock.lockIrqSave(@src());
     defer lock.unlockIrqRestore(irq_state);
 
     const w: u16 = id / word_bits;

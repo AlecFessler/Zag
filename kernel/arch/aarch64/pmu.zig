@@ -31,7 +31,6 @@
 const zag = @import("zag");
 
 const pmu_sched = zag.syscall.pmu;
-const sched = zag.sched.scheduler;
 
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
@@ -44,6 +43,8 @@ const PmuSample = pmu_sched.PmuSample;
 /// `zag.syscall.pmu.MAX_COUNTERS` for the rationale.
 pub const MAX_COUNTERS: u8 = pmu_sched.MAX_COUNTERS;
 
+/// GIC INTID used by the PMU overflow interrupt on aarch64.
+/// ARM ARM DDI 0487 K.a §D13.3.1: PMU overflow connects as a
 const default_config: PmuCounterConfig = .{
     .event = .cycles,
     .has_threshold = false,
@@ -90,15 +91,8 @@ fn eventNumber(e: PmuEvent) ?u16 {
         .bus_cycles => EVENT_BUS_CYCLES,
         .stalled_cycles_frontend => EVENT_STALL_FRONTEND,
         .stalled_cycles_backend => EVENT_STALL_BACKEND,
-        else => null,
     };
 }
-
-// ── PMCR_EL0 bit layout (DDI 0487 §D13.3.3) ────────────────────────────
-const PMCR_E: u64 = 1 << 0; // Global enable
-const PMCR_P: u64 = 1 << 1; // Reset event counters (write-only)
-const PMCR_C: u64 = 1 << 2; // Reset cycle counter
-const PMCR_LC: u64 = 1 << 6; // Long cycle counter (64-bit PMCCNTR)
 
 // ── State ───────────────────────────────────────────────────────────────
 
@@ -123,13 +117,6 @@ inline fn readPMCR() u64 {
     return v;
 }
 
-inline fn writePMCR(v: u64) void {
-    asm volatile ("msr pmcr_el0, %[v]"
-        :
-        : [v] "r" (v),
-    );
-}
-
 inline fn readID_AA64DFR0() u64 {
     var v: u64 = undefined;
     asm volatile ("mrs %[v], id_aa64dfr0_el1"
@@ -152,13 +139,6 @@ inline fn readPMCEID1() u64 {
         : [v] "=r" (v),
     );
     return v;
-}
-
-inline fn writePMUSERENR(v: u64) void {
-    asm volatile ("msr pmuserenr_el0, %[v]"
-        :
-        : [v] "r" (v),
-    );
 }
 
 inline fn writePMINTENCLR(mask: u64) void {
@@ -306,37 +286,11 @@ pub fn pmuInit() void {
     };
 }
 
-pub fn pmuPerCoreInit() void {
-    if (cached_info.num_counters == 0) return;
-
-    // Reset all counters and enable the PMCR global bit (E). LC=1 makes
-    // PMCCNTR 64-bit even on pre-8.5 implementations (DDI 0487 §D13.3.3).
-    var pmcr = readPMCR();
-    pmcr |= PMCR_E | PMCR_C | PMCR_P | PMCR_LC;
-    writePMCR(pmcr);
-
-    // Disable every event counter slot until `start` programs it, and
-    // clear any stale overflow bits.
-    const all_mask: u64 = counterMask(cached_info.num_counters);
-    writePMCNTENCLR(all_mask);
-    writePMOVSCLR(all_mask);
-
-    // Deny EL0 direct access (PMUSERENR_EL0 = 0); overflow interrupt is
-    // left masked until we wire PMI → GIC.
-    writePMUSERENR(0);
-    writePMINTENCLR(all_mask);
-}
-
 pub fn pmuGetInfo() PmuInfo {
     return cached_info;
 }
 
 pub fn pmuStart(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    programCounters(state, configs);
-}
-
-pub fn pmuReset(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    clearAllOverflowStatus(state.num_counters);
     programCounters(state, configs);
 }
 
@@ -560,76 +514,12 @@ fn clearAllOverflowStatus(num_counters: u8) void {
 ///   * ARM ARM DDI 0487 K.a §D13.3.21 PMINTENCLR_EL1 — masking removes
 ///     the counter's contribution to PMUIRQ without losing PMOVSSET state.
 pub fn pmiHandler(ctx: *ArchCpuContext) void {
-    const thread = sched.currentThread() orelse {
-        // No thread context (can happen during early boot transitions).
-        // Just scrub any pending overflow bits so the PPI deasserts.
-        writePMINTENCLR(~@as(u64, 0));
-        writePMOVSCLR(~@as(u64, 0));
-        return;
-    };
-    // self-alive: PMI fires on the core running `thread`; its pmu_state
-    // slot can't be freed under us during this handler.
-    const state_ref = thread.pmu_state orelse {
-        // No PMU state on this thread — another thread's overflow that
-        // was latched before the context switch. Mask and clear so the
-        // level-sensitive PPI line drops, then return.
-        writePMINTENCLR(~@as(u64, 0));
-        writePMOVSCLR(~@as(u64, 0));
-        return;
-    };
-    const state_ptr = state_ref.ptr;
-
-    // Stale-PMI filter: require at least one overflow bit that maps to
-    // a counter owned by the current thread. Matches the Intel PMI
-    // filter in `arch/x64/intel/pmu.zig`.
-    if (state_ptr.num_counters == 0) {
-        writePMINTENCLR(~@as(u64, 0));
-        writePMOVSCLR(~@as(u64, 0));
-        return;
-    }
-    const nbits: u6 = @intCast(state_ptr.num_counters);
-    const owned_mask: u64 = (@as(u64, 1) << nbits) - 1;
-    const status = readPMOVSCLR();
-    if ((status & owned_mask) == 0) {
-        // Overflow bit belongs to a different thread or a slot we no
-        // longer own; just clear every bit to drop the PPI and return.
-        writePMOVSCLR(status);
-        return;
-    }
-
-    // Snapshot every counter's live value so the faulted thread's
-    // userspace fault handler can observe the sample.
-    var i: u8 = 0;
-    while (i < state_ptr.num_counters) {
-        writePMSELR(i);
-        state_ptr.values[i] = readPMXEVCNTR();
-        i += 1;
-    }
-
-    // Mask PMU overflow contributions for every owned counter, and
-    // clear PMOVSCLR so the level-sensitive PPI 23 line deasserts
-    // before we ERET. PMINTENSET is re-armed on the next pmuRestore
-    // (or pmuStart) for counters that still have has_threshold = true.
-    writePMINTENCLR(owned_mask);
-    writePMOVSCLR(status);
-
-    const rip_at_pmi = ctx.elr_el1;
-    // self-alive: PMU overflow fires on the core where `thread` is
-    // running; its owning Process is alive across this handler.
-    const proc = thread.process.ptr;
-    const delivered = proc.faultBlock(
-        thread,
-        .pmu_overflow,
-        rip_at_pmi,
-        rip_at_pmi,
-        ctx,
-    );
-
-    if (!delivered) {
-        proc.kill(.pmu_overflow);
-    }
-
-    // Hand off to the scheduler so the fault handler (or a new thread,
-    // if this process was killed) can run. schedYield is noreturn.
-    sched.yield();
+    _ = ctx;
+    // TODO(spec-v3): pmu_state has been removed from ExecutionContext;
+    // PMI ownership / state lookup needs to be re-wired against the new
+    // PMU storage location (per-core or per-port?). Until then we panic
+    // — userspace cannot start counters, so this should be unreachable
+    // in practice. Mirrors the Intel PMI handler stub in
+    // `arch/x64/intel/pmu.zig`.
+    @panic("aarch64 pmu not yet implemented");
 }

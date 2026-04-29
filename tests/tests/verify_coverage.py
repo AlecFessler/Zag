@@ -1,112 +1,248 @@
 #!/usr/bin/env python3
-"""Verify 1:1 correspondence between spec assertions and test stubs.
+"""Verify 1:1 correspondence between spec-v3 assertions and per-file test stubs.
 
-Checks:
-  1. Every spec tag has a corresponding test function
-  2. Every test function tag exists in the spec
-  3. Doc comment text matches spec assertion text (case-insensitive first char)
+Spec source: docs/kernel/specv3.md
+Test files:  tests/tests/tests/<section>_<NN>.zig
+
+Spec format:
+  Sections are level-3 markdown headings (`### name`). Each section accumulates
+  every `[test NN] ...` line that appears between the heading and the next
+  `### ` or `## ` heading. Sections without `[test ]` lines are silently empty.
+
+Section name extraction:
+  - `### foo_bar`              -> `foo_bar`
+  - `### Self handle`          -> `self_handle`        (lowercase, spaces -> _)
+  - `### §[anchor] Pretty`     -> `anchor`             (anchor verbatim)
+
+Test number (NN):
+  - May contain an alphanumeric suffix, e.g. `[test 16a]` -> file
+    `<section>_16a.zig`. Numeric-only is the common case (`01`..`30`).
+
+Test file naming:
+  Each spec test `[test NN]` under `### <section>` is expected to have a
+  corresponding file at tests/tests/tests/<section>_<NN>.zig.
+
+Cross-checks (both directions):
+  - Every spec test entry has a matching test file (else: MISSING TEST FILE).
+  - Every test file has a matching spec entry (else: ORPHAN TEST FILE).
+
+Exits 0 if everything is in correspondence, 1 otherwise.
 """
 
+import os
 import re
 import sys
-import os
+from collections import defaultdict
 
-SPEC_PATH = os.path.join(os.path.dirname(__file__), "../../docs/kernel/spec.md")
+
+SPEC_PATH = os.path.join(os.path.dirname(__file__), "../../docs/kernel/specv3.md")
 TESTS_DIR = os.path.join(os.path.dirname(__file__), "tests")
 
-# Matches **§X.Y.Z** followed by assertion text, stopping before:
-#   - the next **§ tag
-#   - a sentence boundary followed by non-tag text (uppercase letter after ". ")
-# Captures the assertion sentence(s) belonging to this tag.
-TAG_RE = re.compile(r'\*\*§([\d.]+)\*\*\s+(.+?)(?=\s*\*\*§|$)')
+# Matches "[test NN]" at the start of a line (after optional whitespace).
+# NN is one or more alphanumerics — handles `01`, `30`, `16a`, etc.
+TEST_LINE_RE = re.compile(r"^\s*\[test\s+([A-Za-z0-9]+)\]\s*(.*)$")
 
-def normalize(text):
-    """Normalize for comparison: strip trailing period/whitespace, lowercase first char."""
-    text = text.rstrip().rstrip('.')
-    if text:
-        text = text[0].lower() + text[1:]
-    return text
+# `### §[anchor] Pretty Title` -> capture `anchor`.
+ANCHOR_HEADING_RE = re.compile(r"^###\s+§\[([A-Za-z0-9_]+)\]")
 
-def extract_first_sentence(text):
-    """Extract the first sentence from text (up to first '. ' or end)."""
-    # Strip inline HTML comments (spec:test tags)
-    text = re.sub(r'\s*<!--.*?-->\s*', ' ', text).strip()
-    # Split on ". " followed by an uppercase letter or backtick (sentence boundary)
-    m = re.match(r'^(.+?\.)\s+(?=[A-Z`])', text)
+# `### plain heading` -> capture the rest of the heading.
+PLAIN_HEADING_RE = re.compile(r"^###\s+(.+?)\s*$")
+
+# Test file name `<section>_<NN>.zig` where NN is alphanumeric.
+TEST_FILE_RE = re.compile(r"^(?P<section>[A-Za-z][A-Za-z0-9_]*?)_(?P<num>[0-9]+[a-z]?)\.zig$")
+
+
+def section_name_from_heading(heading_line: str) -> str | None:
+    """Return canonical section name for a `### ...` heading, or None.
+
+    Returns None for anything that isn't a level-3 heading.
+    """
+    if not heading_line.startswith("###"):
+        return None
+    if heading_line.startswith("####"):
+        return None
+
+    m = ANCHOR_HEADING_RE.match(heading_line)
     if m:
         return m.group(1)
-    return text
 
-def parse_spec(path):
-    """Extract tag -> text from spec.md"""
-    assertions = {}
-    with open(path) as f:
-        for line in f:
-            for m in TAG_RE.finditer(line):
-                tag = m.group(1)
-                raw = m.group(2).rstrip()
-                # Take only the first sentence as the assertion text
-                text = extract_first_sentence(raw)
-                assertions[tag] = text
-    return assertions
+    m = PLAIN_HEADING_RE.match(heading_line)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    # Lowercase + spaces -> underscores. Drop characters that can't appear in
+    # a file stem (parens, dashes inside parens, etc.). For sections that don't
+    # have tests this transformation doesn't matter.
+    name = name.lower().replace(" ", "_")
+    return name
 
-def parse_tests(tests_dir):
-    """Extract tag -> doc_comment_text from all test .zig files"""
-    tests = {}
+
+def parse_spec(path: str) -> dict[str, dict[str, str]]:
+    """Parse spec-v3.
+
+    Returns:
+      { section_name: { test_num: assertion_text } }
+
+    Sections that produce zero tests are omitted from the result.
+    """
+    sections: dict[str, dict[str, str]] = defaultdict(dict)
+    current: str | None = None
+
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+
+            # Section boundaries: any `## ` (level 2) ends the current section.
+            # `### ` either starts a new one or — if it's something like a
+            # `### vreg mapping` heading without tests — produces a section
+            # name we'll just never look up.
+            if line.startswith("## ") and not line.startswith("### "):
+                current = None
+                continue
+
+            if line.startswith("### "):
+                current = section_name_from_heading(line)
+                continue
+
+            if current is None:
+                continue
+
+            m = TEST_LINE_RE.match(line)
+            if not m:
+                continue
+            num, text = m.group(1), m.group(2).strip()
+            if num in sections[current]:
+                # Duplicate within the same section — flag but keep the first.
+                print(
+                    f"WARNING: duplicate spec test [{num}] under ### {current}",
+                    file=sys.stderr,
+                )
+                continue
+            sections[current][num] = text
+
+    # Drop any sections that ended up empty (e.g. anchor headings whose body
+    # contained no `[test]` lines).
+    return {sec: tests for sec, tests in sections.items() if tests}
+
+
+def parse_tests(tests_dir: str) -> dict[str, set[str]]:
+    """Discover test files.
+
+    Returns:
+      { section_name: set_of_test_nums }
+    """
+    files: dict[str, set[str]] = defaultdict(set)
+    if not os.path.isdir(tests_dir):
+        print(f"FATAL: tests directory not found: {tests_dir}", file=sys.stderr)
+        sys.exit(2)
+
     for fname in sorted(os.listdir(tests_dir)):
-        if not fname.endswith('.zig'):
+        if not fname.endswith(".zig"):
             continue
-        filepath = os.path.join(tests_dir, fname)
-        with open(filepath) as f:
-            for line in f:
-                m = re.match(r'^/// §([\d.]+) — (.+)$', line.strip())
-                if m:
-                    tag = m.group(1)
-                    text = m.group(2)
-                    if tag in tests:
-                        print(f"DUPLICATE: §{tag} in tests (first in another file)")
-                    tests[tag] = (text, fname)
-    return tests
+        m = TEST_FILE_RE.match(fname)
+        if not m:
+            print(
+                f"WARNING: ignoring test file with unrecognized name: {fname}",
+                file=sys.stderr,
+            )
+            continue
+        section = m.group("section")
+        num = m.group("num")
+        files[section].add(num)
+    return files
 
-def main():
+
+def longest_section_match(filename_section: str, spec_sections: set[str]) -> str | None:
+    """For a test file's parsed prefix, find the longest spec section that
+    is a prefix of it.
+
+    Necessary because the file naming `<section>_<NN>.zig` is greedy: a file
+    named `create_capability_domain_16.zig` parses (per the regex) as section
+    `create_capability_domain` + num `16`. But for a hypothetical file named
+    `foo_bar_baz_01.zig` where the spec section is `foo_bar`, we'd want to
+    re-attribute the trailing `_baz` as part of the test number stem... no:
+    the spec test ids never contain underscores, so `<section>_<NN>` is
+    actually unambiguous given the spec sections we know about.
+
+    This helper exists so we can detect orphans whose section name doesn't
+    appear in the spec at all.
+    """
+    if filename_section in spec_sections:
+        return filename_section
+    return None
+
+
+def main() -> int:
     spec = parse_spec(SPEC_PATH)
     tests = parse_tests(TESTS_DIR)
 
-    errors = 0
+    spec_total = sum(len(v) for v in spec.values())
+    tests_total = sum(len(v) for v in tests.values())
 
-    # Check every spec assertion has a test
-    for tag in sorted(spec.keys(), key=lambda t: [int(x) for x in t.split('.')]):
-        if tag not in tests:
-            print(f"MISSING TEST: §{tag} — {spec[tag]}")
-            errors += 1
+    missing: dict[str, list[str]] = defaultdict(list)   # spec entry, no file
+    orphan: dict[str, list[str]] = defaultdict(list)    # file, no spec entry
+    unknown_sections: list[str] = []                    # file section absent from spec
 
-    # Check every test has a spec assertion
-    for tag in sorted(tests.keys(), key=lambda t: [int(x) for x in t.split('.')]):
-        if tag not in spec:
-            fname = tests[tag][1]
-            print(f"ORPHAN TEST: §{tag} in {fname} — not in spec")
-            errors += 1
+    spec_section_names = set(spec.keys())
 
-    # Check text matches (case-insensitive first char, ignore trailing period)
-    for tag in sorted(spec.keys(), key=lambda t: [int(x) for x in t.split('.')]):
-        if tag in tests:
-            spec_norm = normalize(spec[tag])
-            test_norm = normalize(tests[tag][0])
-            if spec_norm != test_norm:
-                print(f"TEXT MISMATCH: §{tag}")
-                print(f"  spec: {spec[tag]}")
-                print(f"  test: {tests[tag][0]}")
-                errors += 1
+    # Direction 1: every spec test has a matching file.
+    for section, tests_in_sec in spec.items():
+        file_nums = tests.get(section, set())
+        for num in tests_in_sec:
+            if num not in file_nums:
+                missing[section].append(num)
 
-    # Summary
-    print(f"\n{'='*50}")
-    print(f"Spec assertions: {len(spec)}")
-    print(f"Test functions:  {len(tests)}")
-    if errors == 0:
-        print("All tags and texts match!")
-    else:
-        print(f"{errors} error(s) found")
-    return 1 if errors else 0
+    # Direction 2: every test file has a matching spec entry.
+    for section, file_nums in tests.items():
+        if section not in spec_section_names:
+            # The whole section is unknown to the spec.
+            for num in sorted(file_nums):
+                unknown_sections.append(f"{section}_{num}.zig")
+            continue
+        spec_nums = set(spec[section].keys())
+        for num in sorted(file_nums):
+            if num not in spec_nums:
+                orphan[section].append(num)
+
+    # Report.
+    mismatch_count = (
+        sum(len(v) for v in missing.values())
+        + sum(len(v) for v in orphan.values())
+        + len(unknown_sections)
+    )
+
+    if missing:
+        print("== Missing test files (spec entry exists, file does not) ==")
+        for section in sorted(missing):
+            for num in sorted(missing[section]):
+                text = spec[section][num]
+                print(f"  {section}_{num}.zig  --  [test {num}] {text}")
+
+    if orphan:
+        if missing:
+            print()
+        print("== Orphan test files (file exists, no matching spec entry) ==")
+        for section in sorted(orphan):
+            for num in sorted(orphan[section]):
+                print(f"  {section}_{num}.zig  --  no [test {num}] under ### {section}")
+
+    if unknown_sections:
+        if missing or orphan:
+            print()
+        print("== Unknown sections (file's section name not in spec) ==")
+        for fname in unknown_sections:
+            print(f"  {fname}")
+
+    if mismatch_count:
+        print()
+    print(
+        f"Spec has {spec_total} tests; "
+        f"{os.path.relpath(TESTS_DIR)}/ has {tests_total} files; "
+        f"{mismatch_count} mismatches."
+    )
+
+    return 0 if mismatch_count == 0 else 1
+
 
 if __name__ == "__main__":
     sys.exit(main())

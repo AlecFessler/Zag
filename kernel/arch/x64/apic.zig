@@ -3,7 +3,6 @@ const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
 const interrupts = zag.arch.x64.interrupts;
-const paging = zag.arch.x64.paging;
 
 const LocalApic = zag.arch.x64.acpi.LocalApic;
 const VAddr = zag.memory.address.VAddr;
@@ -181,6 +180,29 @@ var lapic_base: u64 = 0;
 pub var x2_apic: bool = false;
 pub var lapics: ?[]LocalApic = null;
 
+/// True once every core has written its core_index into IA32_TSC_AUX
+/// (`writeTscAuxCoreId`) AND the host CPU advertises RDPID. After this
+/// flips to true, `coreID()` issues a single RDPID instead of an
+/// RDMSR(IA32_X2APIC_ID) + lapic-table linear scan. RDMSR on the LAPIC
+/// ID register is supposed to be virtualized by APICv/AVIC, but in
+/// practice many KVM configurations still trap it (we measured ~1.5 µs
+/// per call on AMD AVIC), which blew the §2.2.34 wake-to-pinned budget
+/// because lockdep's `acquire`/`release` call coreID several times per
+/// SpinLock op. RDPID reads IA32_TSC_AUX, which is exposed
+/// unconditionally by KVM (needed for TSC virtualization), so the fast
+/// path executes natively in ~5 cycles.
+///
+/// The slow `RDMSR + lookup` path remains for two reasons:
+///   1. On hosts that lack RDPID (pre-Goldmont Intel, pre-Zen 2 AMD)
+///      `rdpid_ready` never flips and we always take the slow path.
+///   2. During boot, before each core has had `writeTscAuxCoreId` run
+///      on it, RDPID would return the firmware-default TSC_AUX (often
+///      garbage). The flag flips only once `enableRdpidFastPath` runs
+///      after `smpInit` has finished bringing every AP online.
+///
+/// Intel SDM Vol 2B, "RDPID — Read Processor ID" (CPUID.07H:ECX[22]).
+var rdpid_ready: bool = false;
+
 // ── Raw MMIO helpers (always 32-bit aligned access) ─────────────
 
 pub fn readReg(reg: Register) u32 {
@@ -200,6 +222,28 @@ pub fn writeReg(reg: Register, val: u32) void {
 /// Intel SDM Vol 3A, Section 13.5.4.1 "TSC-Deadline Mode".
 pub fn armTscDeadline(deadline_tsc: u64) void {
     cpu.wrmsr(tsc_deadline_msr, deadline_tsc);
+}
+
+/// Arm the LAPIC timer to fire at absolute monotonic-clock time
+/// `deadline_ns`. Used by the per-core timer wheel
+/// (`sched.timer.wheelInsert`) to schedule the next wheel wake on the
+/// local core. Spec §[timer].
+///
+/// Reuses the same scheduler vector (`IntVecs.sched`) the preemption
+/// timer is already on — `schedTimerHandler` calls
+/// `sched.timer.wheelExpireDue` so a wheel-driven IRQ and a
+/// preemption-driven IRQ run through the same handler. Computes a
+/// delta from the current monotonic time and delegates to the same
+/// LAPIC programming path used by the preemption tick
+/// (`getPreemptionTimer().armInterruptTimer`), so the LAPIC vs.
+/// TSC-deadline split stays in one place.
+pub fn armDeadline(deadline_ns: u64) void {
+    const timers = zag.arch.x64.timers;
+    const preemption = timers.getPreemptionTimer();
+    const monotonic = timers.getMonotonicClock();
+    const now_ns = monotonic.now();
+    const delta_ns: u64 = if (deadline_ns > now_ns) deadline_ns - now_ns else 0;
+    preemption.armInterruptTimer(delta_ns);
 }
 
 /// Signal end-of-interrupt by writing 0 to the EOI register. For level-triggered
@@ -309,12 +353,60 @@ pub fn rawApicId() u32 {
     }
 }
 
-pub fn coreID() u64 {
+/// Slow path: read this core's APIC ID and linear-scan the `lapics`
+/// table for the matching index. Used during boot before
+/// `enableRdpidFastPath` runs, and on hosts without RDPID. Public so
+/// `smpInit`/`coreInit` can prime each core's TSC_AUX before flipping
+/// the fast-path switch.
+pub fn coreIDSlow() u64 {
     const raw = rawApicId();
     for (lapics.?, 0..) |la, i| {
         if (la.apic_id == raw) return i;
     }
     unreachable;
+}
+
+pub fn coreID() u64 {
+    if (rdpid_ready) {
+        // RDPID reads IA32_TSC_AUX (MSR 0xC0000103) — populated by
+        // `writeTscAuxCoreId` to hold the per-core index, not the raw
+        // APIC ID, so no lapic-table lookup is needed.
+        var idx: u64 = undefined;
+        asm volatile (
+            \\rdpid %[idx]
+            : [idx] "=r" (idx),
+        );
+        return idx;
+    }
+    return coreIDSlow();
+}
+
+/// Returns true when the host advertises RDPID
+/// (CPUID.07H:ECX[22] = 1). Intel: Goldmont / Skylake-X and later.
+/// AMD: Zen 2 and later. Result is fixed across all cores in a system,
+/// so callers cache the result.
+pub fn hasRdpid() bool {
+    return (cpu.cpuidRaw(0x7, 0).ecx & (1 << 22)) != 0;
+}
+
+/// Write `core_id` into the calling core's IA32_TSC_AUX MSR so a
+/// subsequent `RDPID` returns it directly. Per-core; must be called
+/// once on every core (BSP and each AP) before that core's
+/// `coreID()` call can rely on the RDPID fast path. Safe to call
+/// even when RDPID is unsupported — the MSR is also returned by
+/// RDTSCP[%ecx], so writing it is harmless on older parts.
+/// Intel SDM Vol 4 §2.16.1 "Auxiliary TSC".
+pub fn writeTscAuxCoreId(core_id: u64) void {
+    cpu.wrmsr(0xC0000103, core_id);
+}
+
+/// Flip `coreID()` to the RDPID fast path. Call ONCE on the BSP
+/// after `smpInit` has finished bringing every AP online — at that
+/// point each core has run `writeTscAuxCoreId` on itself and the MSR
+/// holds the correct index. No-op if RDPID isn't supported.
+pub fn enableRdpidFastPath() void {
+    if (!hasRdpid()) return;
+    rdpid_ready = true;
 }
 
 /// Poll the ICR delivery status bit (bit 12) until it clears, indicating
@@ -373,15 +465,6 @@ pub fn sendIpiToCore(core_id: u64, vector: u8) void {
 /// vector the scheduler listens on.
 pub fn sendSchedulerIpi(core_id: u64) void {
     sendIpiToCore(core_id, @intFromEnum(interrupts.IntVecs.sched));
-}
-
-/// Fast-path self-scheduler-interrupt for the local core. Used by
-/// `yield()` to skip the APIC self-IPI path, which on x2APIC issues a
-/// WRMSR that typically causes a KVM vm-exit (~5K cycles round trip).
-/// Executes `int 0xFE` — a software interrupt directly dispatched
-/// through the IDT in guest mode without a vm-exit.
-pub inline fn sendSchedulerIpiSelf() void {
-    asm volatile ("int $0xFE" ::: .{ .memory = true });
 }
 
 /// Send a self-IPI. In x2APIC mode uses the dedicated Self IPI Register (MSR 83FH).

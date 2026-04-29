@@ -18,7 +18,9 @@ const SLAB_RESERVATION: u64 = 16 * 1024 * 1024;
 pub const AddrSpacePartition = arch.paging.addr_space;
 
 pub const UserVA = struct {
+    pub const null_guard: Range = arch.paging.user_null_guard;
     pub const aslr: Range = arch.paging.user_aslr;
+    pub const static: Range = arch.paging.user_static;
 };
 
 pub const KernelVA = struct {
@@ -135,9 +137,113 @@ pub const KernelVA = struct {
             .end = proc_slab_ptrs.end + SLAB_RESERVATION,
         };
 
+        // Spec-v3 §[device_region] slab (kernel/devices/device_region.zig).
+        // Distinct from the legacy `device_region_slab` above, which still
+        // backs the IOMMU PCI/DMA shape pending its spec-v3 rework.
+        pub const dev_region_slab: Range = .{
+            .start = proc_slab_links.end,
+            .end = proc_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const dev_region_slab_ptrs: Range = .{
+            .start = dev_region_slab.end,
+            .end = dev_region_slab.end + SLAB_RESERVATION,
+        };
+        pub const dev_region_slab_links: Range = .{
+            .start = dev_region_slab_ptrs.end,
+            .end = dev_region_slab_ptrs.end + SLAB_RESERVATION,
+        };
+
+        // Spec-v3 SecureSlab regions for the new typed kernel objects.
+        // Each typed slab needs a parallel data + ptrs + links region
+        // (see SecureSlab init).
+        pub const capability_domain_slab: Range = .{
+            .start = dev_region_slab_links.end,
+            .end = dev_region_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const capability_domain_slab_ptrs: Range = .{
+            .start = capability_domain_slab.end,
+            .end = capability_domain_slab.end + SLAB_RESERVATION,
+        };
+        pub const capability_domain_slab_links: Range = .{
+            .start = capability_domain_slab_ptrs.end,
+            .end = capability_domain_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const execution_context_slab: Range = .{
+            .start = capability_domain_slab_links.end,
+            .end = capability_domain_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const execution_context_slab_ptrs: Range = .{
+            .start = execution_context_slab.end,
+            .end = execution_context_slab.end + SLAB_RESERVATION,
+        };
+        pub const execution_context_slab_links: Range = .{
+            .start = execution_context_slab_ptrs.end,
+            .end = execution_context_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const var_range_slab: Range = .{
+            .start = execution_context_slab_links.end,
+            .end = execution_context_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const var_range_slab_ptrs: Range = .{
+            .start = var_range_slab.end,
+            .end = var_range_slab.end + SLAB_RESERVATION,
+        };
+        pub const var_range_slab_links: Range = .{
+            .start = var_range_slab_ptrs.end,
+            .end = var_range_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const port_slab: Range = .{
+            .start = var_range_slab_links.end,
+            .end = var_range_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const port_slab_ptrs: Range = .{
+            .start = port_slab.end,
+            .end = port_slab.end + SLAB_RESERVATION,
+        };
+        pub const port_slab_links: Range = .{
+            .start = port_slab_ptrs.end,
+            .end = port_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const page_frame_slab: Range = .{
+            .start = port_slab_links.end,
+            .end = port_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const page_frame_slab_ptrs: Range = .{
+            .start = page_frame_slab.end,
+            .end = page_frame_slab.end + SLAB_RESERVATION,
+        };
+        pub const page_frame_slab_links: Range = .{
+            .start = page_frame_slab_ptrs.end,
+            .end = page_frame_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const timer_slab: Range = .{
+            .start = page_frame_slab_links.end,
+            .end = page_frame_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const timer_slab_ptrs: Range = .{
+            .start = timer_slab.end,
+            .end = timer_slab.end + SLAB_RESERVATION,
+        };
+        pub const timer_slab_links: Range = .{
+            .start = timer_slab_ptrs.end,
+            .end = timer_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const virtual_machine_slab: Range = .{
+            .start = timer_slab_links.end,
+            .end = timer_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const virtual_machine_slab_ptrs: Range = .{
+            .start = virtual_machine_slab.end,
+            .end = virtual_machine_slab.end + SLAB_RESERVATION,
+        };
+        pub const virtual_machine_slab_links: Range = .{
+            .start = virtual_machine_slab_ptrs.end,
+            .end = virtual_machine_slab_ptrs.end + SLAB_RESERVATION,
+        };
+
         pub const range: Range = .{
             .start = vm_node_slab.start,
-            .end = proc_slab_links.end,
+            .end = virtual_machine_slab_links.end,
         };
     };
 };
@@ -198,6 +304,33 @@ comptime {
         @compileError("KernelVA.kernel_stacks overlaps KernelVA.KernelAllocators");
     }
 }
+
+pub const MemoryPerms = packed struct(u8) {
+    read: bool = false,
+    write: bool = false,
+    exec: bool = false,
+    _: u5 = 0,
+};
+
+/// Classifies a page mapping site. The arch backend derives cache,
+/// global, and privilege bits from the kind. Cache attributes follow
+/// the same defaults Linux applies to its analogous mappings.
+///
+/// `kernel_data`: kernel RAM (heap, stacks, kernel ELF, physmap of free
+///   memory). WB cache, global, supervisor-only.
+/// `kernel_mmio`: kernel-mapped device MMIO (IOMMU registers, ACPI
+///   tables, LAPIC). UC cache, non-global, supervisor-only.
+/// `user_data`: VAR-installed RAM exposed to userspace. Cache attribute
+///   comes from the VAR's `cch` field via `mapPageSized`. Non-global,
+///   user-accessible.
+/// `user_mmio`: VAR-installed MMIO exposed to userspace. UC cache,
+///   non-global, user-accessible.
+pub const MappingKind = enum {
+    kernel_data,
+    kernel_mmio,
+    user_data,
+    user_mmio,
+};
 
 pub const PAddr = extern struct {
     addr: u64,

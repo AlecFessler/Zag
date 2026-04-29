@@ -20,3 +20,4 @@ qemu.log
 exploits/
 CLAUDE.md
 .claude/
+.callgraph/

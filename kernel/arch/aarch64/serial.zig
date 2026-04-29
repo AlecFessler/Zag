@@ -40,23 +40,12 @@ const fr_bits = struct {
 /// Null until `setBase` is called during early boot.
 var base_addr: ?u64 = null;
 
-var print_lock = sync.SpinLock{};
+var print_lock = sync.SpinLock{ .class = "serial.print_lock" };
 
 /// Set the PL011 MMIO base address. Called by ACPI SPCR/DBG2 parsing
 /// during early boot before any serial output is needed.
 pub fn setBase(addr: u64) void {
     base_addr = addr;
-}
-
-/// Return the current PL011 MMIO base virtual address, or null if
-/// `init`/`setBase` have not run yet. Used by `arch.earlyDebugChar`
-/// to route low-level debug writes through the kernel-VA mapping
-/// (which is global across all process page tables) instead of the
-/// raw physical address (which is only mapped while UEFI's TTBR0
-/// identity map is still in place — i.e., before the first user
-/// process is scheduled).
-pub fn getBase() ?u64 {
-    return base_addr;
 }
 
 /// Initialize the PL011 UART for transmit.
@@ -74,6 +63,14 @@ pub fn getBase() ?u64 {
 /// the raw-PA writes are sufficient until then.
 pub fn init() void {}
 
+/// Lockless raw-bytes write. Used by panic / lockdep paths that must
+/// not recurse through `print_lock` (which is itself detector-instrumented).
+/// Silently returns if the base address has not yet been set.
+pub fn printRaw(s: []const u8) void {
+    const base = base_addr orelse return;
+    for (s) |b| writeByte(b, base);
+}
+
 /// Format and transmit a string over the PL011 UART.
 /// Silently returns if the base address has not yet been set (early boot
 /// before ACPI SPCR discovery).
@@ -87,8 +84,8 @@ pub fn print(comptime format: []const u8, args: anytype) void {
         args,
     ) catch @panic("Print would be truncated!");
 
-    print_lock.lock();
-    defer print_lock.unlock();
+    const irq = print_lock.lockIrqSave(@src());
+    defer print_lock.unlockIrqRestore(irq);
 
     for (s) |b| {
         writeByte(b, base);

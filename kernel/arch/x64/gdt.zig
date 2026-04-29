@@ -1,4 +1,3 @@
-const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
@@ -198,7 +197,10 @@ pub fn init() void {
 pub fn initForCore(core_id: u64) void {
     tss_entries[core_id] = .{};
     writeTssDescriptor(core_id);
-    per_core_gdt_ptrs[core_id].base = @intFromPtr(&per_core_gdts[core_id]);
+    // Pointer-index `per_core_gdt_ptrs[]` to avoid Debug-mode
+    // codegen copying the array onto the per-core init stack frame.
+    // See the matching note in sched.scheduler on `core_states[]`.
+    (&per_core_gdt_ptrs[core_id]).base = @intFromPtr(&per_core_gdts[core_id]);
 }
 
 pub fn loadGdt(core_id: u64) void {

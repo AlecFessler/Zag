@@ -390,11 +390,10 @@ pub fn perCoreInit() void {
     const LOCK_BIT: u64 = 1 << 0;
     const VMX_OUTSIDE_SMX: u64 = 1 << 2;
     if (feature_ctl & LOCK_BIT == 0) {
-        // Not locked yet — set VMX-outside-SMX and lock
         feature_ctl |= VMX_OUTSIDE_SMX | LOCK_BIT;
         cpu.wrmsr(IA32_FEATURE_CONTROL, feature_ctl);
     } else if (feature_ctl & VMX_OUTSIDE_SMX == 0) {
-        // Locked without VMX — cannot enable
+        // Locked without VMX — cannot enable.
         return;
     }
 
@@ -409,21 +408,18 @@ pub fn perCoreInit() void {
         : [val] "r" (cr4),
     );
 
-    // Allocate VMXON region (4KB aligned, zeroed)
+    // Allocate VMXON region (4KB aligned, zeroed).
     const page = allocPage() orelse return;
     @memset(&page.mem, 0);
 
-    // Write revision ID into first 4 bytes
+    // Write revision ID into first 4 bytes (SDM Vol 3C, Table 25-1).
     const rev_ptr: *u32 = @ptrCast(@alignCast(&page.mem));
     rev_ptr.* = vmx_revision_id;
 
     const phys = pageToPhys(page);
-
-    // Determine core ID and store
     const core_id = zag.arch.x64.apic.coreID();
     vmxon_regions[core_id] = phys;
 
-    // Execute VMXON
     asm volatile (
         \\vmxon (%[addr])
         :
@@ -475,41 +471,51 @@ pub fn perCoreInit() void {
 /// for VMCLEAR/VMPTRLD lifecycle). The VMCS revision ID is written into
 /// the first 4 bytes per Table 25-1.
 /// Returns the physical address of the VMCS, or null on failure.
-pub fn allocVmStructures() ?PAddr {
-    // Allocate VMCS page
+/// Allocate and zero a single 4K page to serve as the EPT PML4 root.
+/// Spec-v3 split: caller (`arch.x64.kvm.vm.allocStage2Root`) holds this
+/// PAddr in `VirtualMachine.guest_pt_root` and feeds it into
+/// `allocVmcsWithEpt` when the per-VM control state is allocated.
+pub fn allocEptRoot() ?PAddr {
+    const ept_page = allocPage() orelse return null;
+    @memset(&ept_page.mem, 0);
+    return pageToPhys(ept_page);
+}
+
+/// Free an EPT PML4 page allocated by `allocEptRoot`. Caller has
+/// already torn down any intermediate tables (TODO: stage-2 mapping
+/// teardown lives elsewhere).
+pub fn freeEptRoot(paddr: PAddr) void {
+    const virt = VAddr.fromPAddr(paddr, null);
+    const page: *paging.PageMem(.page4k) = @ptrFromInt(virt.addr);
+    freePage(page);
+}
+
+/// Allocate a VMCS page initialized against a pre-allocated EPT root.
+/// Mirrors the VMCLEAR + VMPTRLD + `initVmcs` sequence from the legacy
+/// `allocVmStructures` so callers (spec-v3 `allocVmArchState`) can keep
+/// the EPT root and per-VM control state in distinct dispatch slots.
+pub fn allocVmcsWithEpt(ept_root_phys: PAddr) ?PAddr {
     const vmcs_page = allocPage() orelse return null;
     @memset(&vmcs_page.mem, 0);
 
-    // Write revision ID
     const rev_ptr: *u32 = @ptrCast(@alignCast(&vmcs_page.mem));
     rev_ptr.* = vmx_revision_id;
 
     const vmcs_phys = pageToPhys(vmcs_page);
 
-    // Allocate EPT PML4 page
-    const ept_page = allocPage() orelse {
-        freePage(vmcs_page);
-        return null;
-    };
-    @memset(&ept_page.mem, 0);
-    const ept_phys = pageToPhys(ept_page);
-
-    // VMCLEAR the VMCS to initialize it
     asm volatile (
         \\vmclear (%[addr])
         :
         : [addr] "r" (&vmcs_phys.addr),
         : .{ .memory = true, .cc = true });
 
-    // VMPTRLD to make it current
     asm volatile (
         \\vmptrld (%[addr])
         :
         : [addr] "r" (&vmcs_phys.addr),
         : .{ .memory = true, .cc = true });
 
-    // Initialize all VMCS fields
-    initVmcs(ept_phys);
+    initVmcs(ept_root_phys);
 
     return vmcs_phys;
 }
@@ -847,21 +853,6 @@ pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr) VmExitInfo {
     // Write guest architectural state into VMCS fields
     writeGuestState(guest_state);
 
-    // The actual VM entry and GP register save/restore is done in inline
-    // assembly. We save host callee-saved regs, load guest GP regs from
-    // GuestState, execute VMLAUNCH/VMRESUME, then on exit save guest GP
-    // regs back and restore host callee-saved regs.
-    //
-    // We use VMRESUME by default, falling back to VMLAUNCH if VMRESUME
-    // fails (indicated by CF=1 meaning VMCS not launched).
-    //
-    // The guest_state pointer is passed in %rdi (first arg in SysV ABI).
-    // After the asm block, guest GP regs are saved back into guest_state.
-
-    // Set HOST_RSP to our current stack (after we push callee-saved regs)
-    // and HOST_RIP to the vm_exit_point label.
-    // We use a naked approach inside the asm to precisely control the stack.
-
     const gs_ptr = @intFromPtr(guest_state);
 
     asm volatile (
@@ -890,8 +881,6 @@ pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr) VmExitInfo {
         // offset 0x20: rsi, 0x28: rdi, 0x30: rbp, 0x38: rsp (not used here)
         // offset 0x40: r8,  0x48: r9,  0x50: r10, 0x58: r11
         // offset 0x60: r12, 0x68: r13, 0x70: r14, 0x78: r15
-        //
-        // gs_ptr is in %[gs]. Move it to a register we load last.
         \\movq %[gs], %%rax
         \\movq 0x08(%%rax), %%rbx
         \\movq 0x10(%%rax), %%rcx
@@ -928,16 +917,6 @@ pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr) VmExitInfo {
         //   - Guest GP registers still hold guest values
         //
         // Save guest GP registers back into GuestState.
-        // We need to recover the gs_ptr. We saved it on the stack implicitly
-        // as a local var before the asm block. But the cleanest approach:
-        // push RAX (guest), use a scratch to load gs_ptr, then store everything.
-        //
-        // Since HOST_RSP was set before our pushes... actually HOST_RSP was set
-        // to RSP after the callee-saved pushes. So on VM exit, RSP = HOST_RSP
-        // = the value right after the 6 pushes. The gs_ptr was passed in a register
-        // input — the compiler already allocated it somewhere safe.
-        //
-        // We need gs_ptr accessible. Use the stack: push rax, load gs_ptr into rax.
         \\pushq %%rax
         \\movq %[gs], %%rax
         \\popq 0x00(%%rax)
@@ -966,26 +945,23 @@ pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr) VmExitInfo {
         :
         : [gs] "r" (gs_ptr),
         : .{
-          // rbx, rbp, r12-r15 are NOT clobber-listed: the asm manually
-          // pushes/pops them on entry/exit. Listing a manually-saved
-          // callee-saved register as a clobber forces LLVM to allocate
-          // a scratch register for it — and with `omit_frame_pointer =
-          // false` plus the guest-GPR constraints below, there simply
-          // aren't enough free GPRs in ReleaseSafe/Fast, so LLVM aborts
-          // with "inline assembly requires more registers than
-          // available". See the matching comment on the SVM VMRUN asm
-          // in `amd/svm.zig`.
-          .rax = true,
-          .rcx = true,
-          .rdx = true,
-          .rsi = true,
-          .rdi = true,
-          .r8 = true,
-          .r9 = true,
-          .r10 = true,
-          .r11 = true,
-          .memory = true,
-          .cc = true,
+            // rbx, rbp, r12-r15 are NOT clobber-listed: the asm manually
+            // pushes/pops them on entry/exit. Listing a manually-saved
+            // callee-saved register as a clobber forces LLVM to allocate a
+            // scratch register for it — and with `omit_frame_pointer = false`
+            // plus the guest-GPR constraints, register pressure aborts the
+            // compile. See the matching comment on the SVM VMRUN asm.
+            .rax = true,
+            .rcx = true,
+            .rdx = true,
+            .rsi = true,
+            .rdi = true,
+            .r8 = true,
+            .r9 = true,
+            .r10 = true,
+            .r11 = true,
+            .memory = true,
+            .cc = true,
         });
 
     // Read guest architectural state back from VMCS into GuestState
@@ -1014,9 +990,9 @@ fn decodeExitReason(guest_state: *const GuestState) VmExitInfo {
             } };
         },
         EXIT_REASON_IO => {
-            // Exit qualification for I/O:
+            // Exit qualification for I/O (SDM Vol 3C, Table 28-5):
             // Bit 3: direction (0=out, 1=in)
-            // Bits 2:0: size (0=1 byte, 1=2 bytes, 3=4 bytes)
+            // Bits 2:0: size (0=1, 1=2, 3=4 bytes)
             // Bits 31:16: port number
             const size_bits: u8 = @truncate(qualification & 0x7);
             const size: u8 = switch (size_bits) {
@@ -1037,8 +1013,8 @@ fn decodeExitReason(guest_state: *const GuestState) VmExitInfo {
             } };
         },
         EXIT_REASON_CR_ACCESS => {
-            // Qualification: bits 3:0 = CR number, bits 5:4 = access type
-            // (0=mov to CR, 1=mov from CR), bits 11:8 = GP register
+            // Qualification (SDM Vol 3C, Table 28-3): bits 3:0 = CR number,
+            // bits 5:4 = access type (0=mov to CR, 1=mov from CR), bits 11:8 = GPR.
             const cr_num: u4 = @truncate(qualification & 0xF);
             const access_type: u2 = @truncate((qualification >> 4) & 0x3);
             const gpr: u4 = @truncate((qualification >> 8) & 0xF);
@@ -1107,6 +1083,65 @@ fn readGprFromGuest(gs: *const GuestState, gpr: u4) u64 {
         14 => gs.r14,
         15 => gs.r15,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Interrupt / exception injection
+// ---------------------------------------------------------------------------
+
+/// Inject a virtual interrupt into the guest via VMCS VM-entry
+/// interruption-information field (SDM Vol 3C, Section 25.8.3 "VM-Entry
+/// Controls for Event Injection", Table 25-17 for field format).
+pub fn injectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
+    _ = guest_state;
+
+    // VM-entry interruption-information field (0x4016):
+    // Bits 7:0   = vector
+    // Bits 10:8  = type (0=external interrupt, 2=NMI, 3=hardware exception,
+    //              4=software interrupt, 5=privileged sw exception, 6=software exception)
+    // Bit 11     = error code valid
+    // Bit 31     = valid
+    var info: u32 = @as(u32, interrupt.vector);
+    info |= @as(u32, interrupt.interrupt_type) << 8;
+    if (interrupt.error_code_valid) {
+        info |= (1 << 11);
+        vmcsWrite(VM_ENTRY_EXCEPTION_ERROR_CODE, interrupt.error_code);
+    }
+    info |= (1 << 31); // valid bit
+    vmcsWrite(VM_ENTRY_INTR_INFO, info);
+
+    // For software interrupts, also set instruction length
+    if (interrupt.interrupt_type == 4 or interrupt.interrupt_type == 6) {
+        vmcsWrite(VM_ENTRY_INSTRUCTION_LEN, 0);
+    }
+}
+
+/// Inject an exception into the guest via VMCS interrupt-info field (SDM
+/// Vol 3C, Section 25.8.3 "VM-Entry Controls for Event Injection"). Uses
+/// type 3 (hardware exception) and delivers error codes for #DF, #TS, #NP,
+/// #SS, #GP, #PF, and #AC per SDM Vol 3A, Table 6-1.
+pub fn injectException(guest_state: *GuestState, exception: GuestException) void {
+    // For #PF (vector 14), also set CR2 in guest state
+    if (exception.vector == 14) {
+        guest_state.cr2 = exception.fault_addr;
+    }
+
+    // Type 3 = hardware exception
+    var info: u32 = @as(u32, exception.vector);
+    info |= (3 << 8); // hardware exception type
+
+    // Exceptions that deliver an error code: #DF(8), #TS(10), #NP(11),
+    // #SS(12), #GP(13), #PF(14), #AC(17)
+    const has_error_code = switch (exception.vector) {
+        8, 10, 11, 12, 13, 14, 17 => true,
+        else => false,
+    };
+    if (has_error_code) {
+        info |= (1 << 11);
+        vmcsWrite(VM_ENTRY_EXCEPTION_ERROR_CODE, exception.error_code);
+    }
+    info |= (1 << 31); // valid bit
+    vmcsWrite(VM_ENTRY_INTR_INFO, info);
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,61 +1293,3 @@ pub fn unmapEptPage(ept_root: PAddr, guest_phys: u64) void {
         : .{ .memory = true, .cc = true });
 }
 
-// ---------------------------------------------------------------------------
-// Interrupt / exception injection
-// ---------------------------------------------------------------------------
-
-/// Inject a virtual interrupt into the guest via VMCS VM-entry
-/// interruption-information field (SDM Vol 3C, Section 25.8.3 "VM-Entry
-/// Controls for Event Injection", Table 25-17 for field format).
-pub fn injectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
-    _ = guest_state;
-
-    // VM-entry interruption-information field (0x4016):
-    // Bits 7:0   = vector
-    // Bits 10:8  = type (0=external interrupt, 2=NMI, 3=hardware exception,
-    //              4=software interrupt, 5=privileged sw exception, 6=software exception)
-    // Bit 11     = error code valid
-    // Bit 31     = valid
-    var info: u32 = @as(u32, interrupt.vector);
-    info |= @as(u32, interrupt.interrupt_type) << 8;
-    if (interrupt.error_code_valid) {
-        info |= (1 << 11);
-        vmcsWrite(VM_ENTRY_EXCEPTION_ERROR_CODE, interrupt.error_code);
-    }
-    info |= (1 << 31); // valid bit
-    vmcsWrite(VM_ENTRY_INTR_INFO, info);
-
-    // For software interrupts, also set instruction length
-    if (interrupt.interrupt_type == 4 or interrupt.interrupt_type == 6) {
-        vmcsWrite(VM_ENTRY_INSTRUCTION_LEN, 0);
-    }
-}
-
-/// Inject an exception into the guest via VMCS interrupt-info field (SDM
-/// Vol 3C, Section 25.8.3 "VM-Entry Controls for Event Injection"). Uses
-/// type 3 (hardware exception) and delivers error codes for #DF, #TS, #NP,
-/// #SS, #GP, #PF, and #AC per SDM Vol 3A, Table 6-1.
-pub fn injectException(guest_state: *GuestState, exception: GuestException) void {
-    // For #PF (vector 14), also set CR2 in guest state
-    if (exception.vector == 14) {
-        guest_state.cr2 = exception.fault_addr;
-    }
-
-    // Type 3 = hardware exception
-    var info: u32 = @as(u32, exception.vector);
-    info |= (3 << 8); // hardware exception type
-
-    // Exceptions that deliver an error code: #DF(8), #TS(10), #NP(11),
-    // #SS(12), #GP(13), #PF(14), #AC(17)
-    const has_error_code = switch (exception.vector) {
-        8, 10, 11, 12, 13, 14, 17 => true,
-        else => false,
-    };
-    if (has_error_code) {
-        info |= (1 << 11);
-        vmcsWrite(VM_ENTRY_EXCEPTION_ERROR_CODE, exception.error_code);
-    }
-    info |= (1 << 31); // valid bit
-    vmcsWrite(VM_ENTRY_INTR_INFO, info);
-}

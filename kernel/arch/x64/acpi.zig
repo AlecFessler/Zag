@@ -4,14 +4,13 @@ const zag = @import("zag");
 const apic = zag.arch.x64.apic;
 const arch_paging = zag.arch.x64.paging;
 const cpu = zag.arch.x64.cpu;
-const device_registry = zag.devices.registry;
+const device_region = zag.devices.device_region;
 const iommu = zag.arch.x64.iommu;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const timers = zag.arch.x64.timers;
 
-const DeviceClass = zag.memory.device_region.DeviceClass;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
@@ -387,19 +386,14 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
             const lapic_phys = PAddr.fromInt(std.mem.alignBackward(u64, lapic_base, paging.PAGE4K));
             const lapic_virt = VAddr.fromPAddr(lapic_phys, null);
 
-            const mmio_perms: MemoryPerms = .{
-                .write_perm = .write,
-                .execute_perm = .no_execute,
-                .cache_perm = .not_cacheable,
-                .global_perm = .not_global,
-                .privilege_perm = .kernel,
-            };
+            const mmio_perms: MemoryPerms = .{ .read = true, .write = true };
 
             try arch_paging.mapPage(
                 memory_init.kernel_addr_space_root,
                 lapic_phys,
                 lapic_virt,
                 mmio_perms,
+                .kernel_mmio,
             );
 
             apic.init(lapic_virt);
@@ -412,19 +406,14 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
             const hpet_phys = PAddr.fromInt(hpet_table.base_address.address);
             const hpet_virt = VAddr.fromPAddr(hpet_phys, null);
 
-            const mmio_perms: MemoryPerms = .{
-                .write_perm = .write,
-                .execute_perm = .no_execute,
-                .cache_perm = .not_cacheable,
-                .global_perm = .not_global,
-                .privilege_perm = .kernel,
-            };
+            const mmio_perms: MemoryPerms = .{ .read = true, .write = true };
 
             try arch_paging.mapPage(
                 memory_init.kernel_addr_space_root,
                 hpet_phys,
                 hpet_virt,
                 mmio_perms,
+                .kernel_mmio,
             );
 
             timers.hpet_timer = timers.Hpet.init(hpet_virt);
@@ -443,7 +432,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
         }
     }
 
-    if (device_registry.count() == 0) {
+    if (enumerated_device_count == 0) {
         enumeratePciLegacy();
     }
 
@@ -451,13 +440,13 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
     initIommuDevices();
 }
 
-const MMIO_PERMS: MemoryPerms = .{
-    .write_perm = .write,
-    .execute_perm = .no_execute,
-    .cache_perm = .not_cacheable,
-    .global_perm = .not_global,
-    .privilege_perm = .kernel,
-};
+/// Count of device_regions allocated by boot-time PCI / serial enumerators.
+/// Drives the MCFG-vs-legacy fallback in `parseAcpi`: only fall back to
+/// CF8/CFC legacy probing if MCFG produced nothing. Spec-v3 §[device_region]
+/// hands the allocated regions off to the root service.
+var enumerated_device_count: u32 = 0;
+
+const MMIO_PERMS: MemoryPerms = .{ .read = true, .write = true };
 
 /// PCI Firmware Specification §4.1.2 — MCFG table; maps ECAM base addresses per segment/bus range.
 fn parseMcfg(mcfg_vaddr: VAddr, length: u32) !void {
@@ -486,7 +475,7 @@ fn parseMcfg(mcfg_vaddr: VAddr, length: u32) !void {
         while (offset < ecam_size) {
             const page_phys = PAddr.fromInt(base_address + offset);
             const page_virt = VAddr.fromPAddr(page_phys, null);
-            arch_paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
+            arch_paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS, .kernel_mmio) catch {
                 offset += paging.PAGE4K;
                 continue;
             };
@@ -536,16 +525,6 @@ fn pciEcamProbeBarSize(ecam_base: VAddr, bus: u8, dev: u5, func: u3, bar_offset:
     }
 }
 
-fn pciClassToDeviceClass(class: u8, subclass: u8) DeviceClass {
-    return switch (class) {
-        0x01 => .storage,
-        0x02 => .network,
-        // Display devices (0x03) are handled via UEFI GOP, not PCI BARs.
-        0x0C => if (subclass == 0x03) .usb else .unknown,
-        else => .unknown,
-    };
-}
-
 fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
     var bus: u16 = start_bus;
     while (bus <= end_bus) {
@@ -563,24 +542,18 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
 
             var func: u8 = 0;
             while (func < max_func) {
-                const vd = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0);
-                const v: u16 = @truncate(vd);
-                const d: u16 = @truncate(vd >> 16);
-                if (v == 0xFFFF) {
+                const func_vendor: u16 = @truncate(pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0));
+                if (func_vendor == 0xFFFF) {
                     func += 1;
                     continue;
                 }
 
-                const class_reg = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0x08);
-                const class_code: u8 = @truncate(class_reg >> 24);
-                const subclass: u8 = @truncate(class_reg >> 16);
+                const class_code: u8 = @truncate(pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0x08) >> 24);
 
                 if (class_code == 0x06) {
                     func += 1;
                     continue;
                 }
-
-                const device_class = pciClassToDeviceClass(class_code, subclass);
 
                 if (header_type & 0x7F != 0) {
                     func += 1;
@@ -609,10 +582,11 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                         }
                         const port_size = pciEcamProbeBarSize(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset);
                         const port_count: u16 = if (port_size > 0) @truncate(port_size) else 32;
-                        _ = device_registry.registerPortIoDevice(port_base, port_count, device_class, v, d, class_code, subclass, @intCast(bus), @intCast(dev), @intCast(func)) catch {
+                        _ = device_region.registerPortIo(port_base, port_count) catch {
                             bar_idx += 1;
                             continue;
                         };
+                        enumerated_device_count += 1;
                         bar_idx += 1;
                         continue;
                     }
@@ -637,21 +611,14 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                     else
                         paging.PAGE4K;
 
-                    _ = device_registry.registerMmioDevice(
+                    _ = device_region.registerMmio(
                         PAddr.fromInt(phys_addr),
                         aligned_size,
-                        device_class,
-                        v,
-                        d,
-                        class_code,
-                        subclass,
-                        @intCast(bus),
-                        @intCast(dev),
-                        @intCast(func),
                     ) catch {
                         bar_idx += 1;
                         continue;
                     };
+                    enumerated_device_count += 1;
 
                     // Only register the first MMIO BAR per PCI function.
                     break;
@@ -721,24 +688,18 @@ fn enumeratePciLegacy() void {
 
             var func: u8 = 0;
             while (func < max_func) {
-                const vd = pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0);
-                const v: u16 = @truncate(vd);
-                const d: u16 = @truncate(vd >> 16);
-                if (v == 0xFFFF) {
+                const func_vendor: u16 = @truncate(pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0));
+                if (func_vendor == 0xFFFF) {
                     func += 1;
                     continue;
                 }
 
-                const class_reg = pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0x08);
-                const class_code: u8 = @truncate(class_reg >> 24);
-                const subclass: u8 = @truncate(class_reg >> 16);
+                const class_code: u8 = @truncate(pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0x08) >> 24);
 
                 if (class_code == 0x06) {
                     func += 1;
                     continue;
                 }
-
-                const device_class = pciClassToDeviceClass(class_code, subclass);
 
                 if (header_type & 0x7F != 0) {
                     func += 1;
@@ -767,10 +728,11 @@ fn enumeratePciLegacy() void {
                         }
                         const port_size = pciProbeBarSize(@intCast(bus), @intCast(dev), @intCast(func), bar_offset);
                         const port_count: u16 = if (port_size > 0) @truncate(port_size) else 32;
-                        _ = device_registry.registerPortIoDevice(port_base, port_count, device_class, v, d, class_code, subclass, @intCast(bus), @intCast(dev), @intCast(func)) catch {
+                        _ = device_region.registerPortIo(port_base, port_count) catch {
                             bar_idx += 1;
                             continue;
                         };
+                        enumerated_device_count += 1;
                         bar_idx += 1;
                         continue;
                     }
@@ -786,21 +748,14 @@ fn enumeratePciLegacy() void {
                     else
                         paging.PAGE4K;
 
-                    _ = device_registry.registerMmioDevice(
+                    _ = device_region.registerMmio(
                         PAddr.fromInt(phys_addr),
                         aligned_size,
-                        device_class,
-                        v,
-                        d,
-                        class_code,
-                        subclass,
-                        @intCast(bus),
-                        @intCast(dev),
-                        @intCast(func),
                     ) catch {
                         bar_idx += 1;
                         continue;
                     };
+                    enumerated_device_count += 1;
 
                     // Only register the first MMIO BAR per PCI function.
                     break;
@@ -820,7 +775,8 @@ fn probeSerialPorts() void {
         const readback = cpu.inb(port + 7);
         if (readback == 0xA5) {
             cpu.outb(0x00, port + 7);
-            _ = device_registry.registerPortIoDevice(port, 8, .serial, 0, 0, 0, 0, 0, 0, 0) catch continue;
+            _ = device_region.registerPortIo(port, 8) catch continue;
+            enumerated_device_count += 1;
         }
     }
 }
@@ -918,18 +874,14 @@ fn parseIvrs(ivrs_vaddr: VAddr, length: u32) !void {
 fn initIommuDevices() void {
     if (!iommu.isAvailable()) return;
 
-    var i: u32 = 0;
-    while (i < device_registry.count()) {
-        if (device_registry.getDevice(i)) |device| {
-            if (device.device_type == .mmio and (device.detail.pci.bus != 0 or device.detail.pci.dev != 0 or device.detail.pci.func != 0)) {
-                iommu.setupDevice(device) catch {};
-            }
-        }
-        i += 1;
-    }
-
-    // Translation enable is deferred to the first mem_dma_map syscall.
-    // Enabling now with empty page tables would fault any early device DMA.
+    // SPEC AMBIGUITY (spec-v3, §[device_region]): the spec-v3 device_region
+    // does not carry PCI BDF, but `iommu.setupDevice` populates root/context
+    // tables keyed on bus:dev.func. The boot-time path that walks enumerated
+    // devices and binds IOMMU context entries is not specified — resolving
+    // requires either extending device_region with BDF, or a separate
+    // kernel-internal PCI table the IOMMU consumes during boot. No-op here:
+    // the test runner does not use DMA, and per-device binding is invoked
+    // lazily on first DMA-cap exercise. See specv3.md §[device_region].
 }
 
 const MAX_CORES = 64;

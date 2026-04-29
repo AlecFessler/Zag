@@ -46,7 +46,7 @@ var page_caches: [MAX_CORES]PerCorePageCache = [_]PerCorePageCache{.{}} ** MAX_C
 
 pub const PhysicalMemoryManager = struct {
     buddy: *BuddyAllocator,
-    lock: SpinLock = .{},
+    lock: SpinLock = .{ .class = "PhysicalMemoryManager.lock" },
 
     pub fn init(buddy: *BuddyAllocator) PhysicalMemoryManager {
         return .{
@@ -68,7 +68,7 @@ pub const PhysicalMemoryManager = struct {
                 return page;
             }
 
-            self.lock.lock();
+            self.lock.lock(@src());
             const bulk = self.buddy.allocBlock(paging.PAGE4K * CACHE_REFILL_PAGES) orelse {
                 const single = self.buddy.allocBlock(paging.PAGE4K);
                 self.lock.unlock();
@@ -87,7 +87,7 @@ pub const PhysicalMemoryManager = struct {
             return result;
         }
 
-        const irq = self.lock.lockIrqSave();
+        const irq = self.lock.lockIrqSave(@src());
         defer self.lock.unlockIrqRestore(irq);
         return self.buddy.allocBlock(paging.PAGE4K);
     }
@@ -109,7 +109,7 @@ pub const PhysicalMemoryManager = struct {
                 return;
             }
 
-            self.lock.lock();
+            self.lock.lock(@src());
             var i: u32 = 0;
             while (i < CACHE_MAX_PAGES / 2) {
                 const cached = cache.pop().?;
@@ -123,7 +123,7 @@ pub const PhysicalMemoryManager = struct {
             return;
         }
 
-        const irq = self.lock.lockIrqSave();
+        const irq = self.lock.lockIrqSave(@src());
         defer self.lock.unlockIrqRestore(irq);
         self.buddy.freeBlock(page[0..paging.PAGE4K]);
     }
@@ -133,7 +133,7 @@ pub const PhysicalMemoryManager = struct {
     /// the cache only holds single pages — and returns directly from
     /// the buddy allocator.
     pub fn allocBlock(self: *PhysicalMemoryManager, len: u64) ?[*]u8 {
-        const irq = self.lock.lockIrqSave();
+        const irq = self.lock.lockIrqSave(@src());
         defer self.lock.unlockIrqRestore(irq);
         return self.buddy.allocBlock(len);
     }
@@ -148,7 +148,7 @@ pub const PhysicalMemoryManager = struct {
             arch.memory.zeroPage(@ptrCast(&buf[offset]));
             offset += paging.PAGE4K;
         }
-        const irq = self.lock.lockIrqSave();
+        const irq = self.lock.lockIrqSave(@src());
         defer self.lock.unlockIrqRestore(irq);
         self.buddy.freeBlock(buf);
     }
@@ -170,37 +170,6 @@ pub const PhysicalMemoryManager = struct {
 
 pub var global_pmm: ?PhysicalMemoryManager = null;
 
-/// Number of physical pages currently free for allocation. Used by the
-/// `sys_info` syscall to populate `SysInfo.mem_free` (§2.15.3, §21).
-///
-/// Queries the buddy allocator's internal `free_pages` counter (pages sitting
-/// on any order-N freelist) and adds every page currently held in the
-/// per-core `PerCorePageCache` rings. Per-core cache entries were allocated
-/// from the buddy at refill time, so the buddy's own counter no longer sees
-/// them as free — but to userspace they are observably free, and the next
-/// `alloc` on this core pops them without touching the buddy.
-///
-/// O(MAX_CORES) in the worst case (only the per-core cache count fields
-/// are touched, not their intrusive freelists); acquires `pmm.lock` to
-/// serialize with the buddy counter's updates under `alloc`/`free`.
-pub fn freePageCount() u64 {
-    if (global_pmm == null) return 0;
-    const pmm_ptr: *PhysicalMemoryManager = &global_pmm.?;
-    const irq = pmm_ptr.lock.lockIrqSave();
-    defer pmm_ptr.lock.unlockIrqRestore(irq);
-
-    var total = pmm_ptr.buddy.free_pages;
-
-    // Per-core cache pages were allocated from the buddy (via
-    // `splitAllocation`) and are observably free to userspace. Each
-    // cache node is a 4 KiB page; `count` is the number of nodes.
-    var i: usize = 0;
-    while (i < MAX_CORES) {
-        total += page_caches[i].count;
-        i += 1;
-    }
-    return total;
-}
 
 /// Static total physical page count established by the buddy allocator
 /// at `addRegion` time. Used by `sys_info` to populate `SysInfo.mem_total`
@@ -208,7 +177,7 @@ pub fn freePageCount() u64 {
 pub fn totalPageCount() u64 {
     if (global_pmm == null) return 0;
     const pmm_ptr: *PhysicalMemoryManager = &global_pmm.?;
-    const irq = pmm_ptr.lock.lockIrqSave();
+    const irq = pmm_ptr.lock.lockIrqSave(@src());
     defer pmm_ptr.lock.unlockIrqRestore(irq);
     return pmm_ptr.buddy.total_pages;
 }

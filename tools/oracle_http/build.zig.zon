@@ -1,0 +1,13 @@
+.{
+    .name = .oracle_http,
+    .version = "0.1.0",
+    .fingerprint = 0x573b86c4501f0bfa,
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "test",
+    },
+}

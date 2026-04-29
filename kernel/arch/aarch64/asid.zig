@@ -36,10 +36,10 @@ var bitmap: [words]u64 = blk: {
     break :blk init_bitmap;
 };
 var hint: usize = 0;
-var lock: SpinLock = .{};
+var lock: SpinLock = .{ .class = "asid.lock" };
 
 pub fn allocate() ?u16 {
-    const irq_state = lock.lockIrqSave();
+    const irq_state = lock.lockIrqSave(@src());
     defer lock.unlockIrqRestore(irq_state);
 
     var scanned: usize = 0;
@@ -64,7 +64,7 @@ pub fn free(id: u16) void {
 
     invalidateTlb(id);
 
-    const irq_state = lock.lockIrqSave();
+    const irq_state = lock.lockIrqSave(@src());
     defer lock.unlockIrqRestore(irq_state);
 
     const w: usize = id / 64;

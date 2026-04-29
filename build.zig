@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.display else "none";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
+    const emit_ir = b.option(bool, "emit_ir", "Emit kernel LLVM IR to zig-out/kernel.ll (for tools/callgraph)") orelse false;
     const kernel_profile = b.option([]const u8, "kernel_profile", "Kernel profiling mode: none, trace, or sample (default: none)") orelse "none";
     if (!std.mem.eql(u8, kernel_profile, "none") and
         !std.mem.eql(u8, kernel_profile, "trace") and
@@ -282,7 +283,7 @@ pub fn build(b: *std.Build) void {
         }),
         .linkage = .static,
     });
-    if (use_llvm) {
+    if (use_llvm or emit_ir) {
         kernel.use_llvm = true;
         kernel.use_lld = true;
     }
@@ -310,6 +311,13 @@ pub fn build(b: *std.Build) void {
     );
     install_kernel.step.dependOn(&kernel.step);
     b.getInstallStep().dependOn(&install_kernel.step);
+
+    if (emit_ir) {
+        const ir_name = b.fmt("kernel.{s}.ll", .{@tagName(arch)});
+        const install_ir = b.addInstallFile(kernel.getEmittedLlvmIr(), ir_name);
+        install_ir.step.dependOn(&kernel.step);
+        b.getInstallStep().dependOn(&install_ir.step);
+    }
 
     // ── Root service (copied into FAT image, loaded by bootloader) ─────
     const install_root_service = b.addInstallFile(
@@ -387,7 +395,7 @@ pub fn build(b: *std.Build) void {
         ;
         break :blk b.fmt(
             \\exec qemu-system-x86_64 \
-            \\ -m 1G \
+            \\ -m 4G \
             \\ -bios /usr/share/ovmf/x64/OVMF.4m.fd \
             \\ -drive file=fat:rw:{s}/{s},format=raw \
             \\ -serial mon:stdio \

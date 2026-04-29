@@ -1,5 +1,4 @@
 const builtin = @import("builtin");
-const std = @import("std");
 const zag = @import("zag");
 
 const aarch64 = zag.arch.aarch64;
@@ -42,4 +41,47 @@ pub inline fn getMonotonicClock() Timer {
         .aarch64 => return aarch64.timers.getMonotonicClock(),
         else => unreachable,
     }
+}
+
+/// One-shot BSP-side init for the monotonic clock backend. On x86-64 this
+/// promotes `getMonotonicClock()` from HPET (MMIO, vm-exits) to invariant
+/// TSC (per-core register read) when the CPU advertises it. On aarch64
+/// CNTVCT_EL0 is the only backend, so this is a no-op.
+pub inline fn initMonotonicClock() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.timers.initMonotonicClock(),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+// ── Spec v3 time primitives ──────────────────────────────────────────
+
+/// Write the platform RTC to `unix_ns` since the Unix epoch. Returns 0
+/// on success or a negative spec error code. Spec §[time].time_setwall.
+pub fn writeRtc(unix_ns: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.rtc.writeRtc(unix_ns),
+        .aarch64 => aarch64.rtc.writeRtc(unix_ns),
+        else => unreachable,
+    };
+}
+
+/// Arm the platform's per-core deadline timer to fire at absolute
+/// monotonic-clock time `deadline_ns`. Used by the timer wheel to
+/// schedule the next wake. Spec §[timer].
+pub fn armWheelDeadline(deadline_ns: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.apic.armDeadline(deadline_ns),
+        .aarch64 => aarch64.timers.armDeadline(deadline_ns),
+        else => unreachable,
+    }
+}
+
+/// Read the monotonic clock in nanoseconds. Convenience wrapper over
+/// `getMonotonicClock` for callers that only want the scalar value.
+/// Spec §[time].time_monotonic.
+pub fn currentMonotonicNs() u64 {
+    const clock = getMonotonicClock();
+    return clock.now();
 }

@@ -12,7 +12,6 @@
 ///   - Section 2.4:   Commands (generic format in Figure 40)
 ///   - Section 3.3.1: MMIO Control and Status Registers
 ///   - Section 3.3.13: Command and Event Log Pointer Registers
-const std = @import("std");
 const zag = @import("zag");
 
 const arch_paging = zag.arch.x64.paging;
@@ -20,19 +19,11 @@ const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
-const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
-/// MMIO pages are mapped uncacheable, non-executable, kernel-only.
-const MMIO_PERMS: MemoryPerms = .{
-    .write_perm = .write,
-    .execute_perm = .no_execute,
-    .cache_perm = .not_cacheable,
-    .global_perm = .not_global,
-    .privilege_perm = .kernel,
-};
+const MMIO_PERMS: MemoryPerms = .{ .read = true, .write = true };
 
 // ---------------------------------------------------------------------------
 // MMIO register offsets (spec Section 3.3.1, Section 3.3.13)
@@ -54,17 +45,9 @@ const MMIO_EVT_LOG_BASE = 0x0010;
 /// Controls IOMMU enable, command buffer enable, event log enable, etc.
 const MMIO_CONTROL = 0x0018;
 
-/// Command Buffer Tail Pointer — spec MMIO Offset 2008h.
-/// Bits [18:4] = CmdTailPtr (16-byte aligned offset from buffer base).
-/// Written by software after enqueueing commands.
-const MMIO_CMD_BUF_TAIL = 0x2008;
-
 // ---------------------------------------------------------------------------
 // IOMMU Control Register bit definitions (spec MMIO Offset 0018h)
 // ---------------------------------------------------------------------------
-
-/// IommuEn (bit 0): Master enable — all upstream transactions processed by IOMMU.
-const CTRL_IOMMU_EN: u64 = 1 << 0;
 
 /// EventLogEn (bit 2): Enable event logging to the Event Log buffer.
 const CTRL_EVT_LOG_EN: u64 = 1 << 2;
@@ -139,83 +122,6 @@ const IommuUnit = struct {
         const ptr: *volatile u64 = @ptrFromInt(self.base + offset);
         ptr.* = value;
     }
-
-    /// Enqueue a 128-bit command into the circular command buffer and advance
-    /// the tail pointer to notify the IOMMU.
-    ///
-    /// Spec Section 2.4 / Figure 39: Commands are 128 bits (16 bytes). Software
-    /// writes the command at the current tail offset, then advances the tail
-    /// pointer register. The IOMMU fetches commands between head and tail.
-    ///
-    /// Spec Section 3.3.13, MMIO Offset 2008h: CmdTailPtr is at bits [18:4],
-    /// representing a 16-byte-aligned byte offset from the buffer base.
-    fn issueCommand(self: *const IommuUnit, lo: u64, hi: u64) void {
-        const tail = self.readReg64(MMIO_CMD_BUF_TAIL);
-        const cmd_ptr: [*]volatile u64 = @ptrFromInt(self.cmd_buf_virt.addr + tail);
-        cmd_ptr[0] = lo;
-        cmd_ptr[1] = hi;
-        // Advance tail by 16 bytes (one command entry), wrapping at buffer length.
-        // For the minimum 4KB buffer this wraps at 0x1000.
-        self.writeReg64(MMIO_CMD_BUF_TAIL, (tail + 16) % self.cmd_buf_len);
-    }
-
-    /// Issue INVALIDATE_DEVTAB_ENTRY for the given DeviceID.
-    ///
-    /// Spec Section 2.4.2, Figure 42:
-    ///   lo[15:0]  = DeviceID
-    ///   lo[31:16] = Reserved
-    ///   lo[63:60] = Opcode 02h
-    ///   hi        = Reserved (zero)
-    ///
-    /// Forces the IOMMU to discard its cached copy of this device's DTE so that
-    /// subsequent DMA from the device triggers a fresh DTE fetch from memory.
-    fn invalidateDeviceEntry(self: *const IommuUnit, device_id: u16) void {
-        self.issueCommand(
-            CMD_INVALIDATE_DEVTAB_ENTRY | @as(u64, device_id),
-            0,
-        );
-    }
-
-    /// Issue INVALIDATE_IOMMU_PAGES for all pages in the given domain.
-    ///
-    /// Spec Section 2.4.3, Figure 43:
-    ///   lo[19:0]  = PASID (zero — no guest translation)
-    ///   lo[31:20] = Reserved
-    ///   lo[47:32] = DomainID
-    ///   lo[59:48] = Reserved
-    ///   lo[63:60] = Opcode 03h
-    ///   hi[0]     = S (size: 1 = use address-encoded size)
-    ///   hi[1]     = PDE (1 = also flush page directory entries)
-    ///   hi[2]     = GN (0 = guest physical / nested)
-    ///   hi[63:12] = Address[63:12]
-    ///
-    /// To invalidate ALL cached translations for the domain, set S=1, PDE=1,
-    /// and Address[63:12] = 0x7_FFFF_FFFF_FFFF (spec software note in 2.4.3).
-    fn invalidatePages(self: *const IommuUnit, domain_id: u16) void {
-        const lo = CMD_INVALIDATE_IOMMU_PAGES | (@as(u64, domain_id) << 32);
-        // S=1 (bit 0), PDE=1 (bit 1), Address[63:12] all 1s except bit 63
-        // Address[31:12] = 0xFFFFF in hi[31:12], Address[63:32] = 0x7FFFFFFF in hi[63:32]
-        const hi: u64 = 0x7FFF_FFFF_FFFF_F003;
-        self.issueCommand(lo, hi);
-    }
-
-    /// Issue COMPLETION_WAIT to synchronize with the IOMMU command stream.
-    ///
-    /// Spec Section 2.4.1, Figure 41:
-    ///   lo[0]     = s (store): 0 = no store
-    ///   lo[1]     = i (interrupt): 0 = no interrupt
-    ///   lo[2]     = f (flush queue): 1 = strict ordering, subsequent commands
-    ///               wait until this completes
-    ///   lo[63:60] = Opcode 01h
-    ///   hi        = Store data (unused when s=0)
-    ///
-    /// This command does not finish until all older commands have completed.
-    /// Software must issue this after invalidation sequences before allowing
-    /// device DMA to ensure no stale translations persist (spec Section 2.4.9).
-    fn completionWait(self: *const IommuUnit) void {
-        // f=1 (flush queue), s=0, i=0
-        self.issueCommand(CMD_COMPLETION_WAIT | 0x4, 0);
-    }
 };
 
 const AliasEntry = struct {
@@ -245,15 +151,6 @@ pub fn addAlias(source: u16, alias: u16) void {
     }
 }
 
-/// Look up whether a device BDF has an alias (e.g., from IVRS ACPI table).
-/// Returns the alias DeviceID if found, otherwise the original BDF.
-fn lookupAlias(bdf: u16) u16 {
-    for (aliases[0..alias_count]) |entry| {
-        if (entry.source == bdf) return entry.alias;
-    }
-    return bdf;
-}
-
 /// Initialize one IOMMU unit given its MMIO register base physical address.
 ///
 /// This follows the startup sequence from spec Section 2.3.1:
@@ -275,7 +172,7 @@ pub fn init(reg_base_phys: PAddr) !void {
     while (i < num_mmio_pages) {
         const page_phys = PAddr.fromInt(reg_base_phys.addr + @as(u64, i) * paging.PAGE4K);
         const page_virt = VAddr.fromPAddr(page_phys, null);
-        arch_paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
+        arch_paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS, .kernel_mmio) catch {
             i += 1;
             continue;
         };
@@ -375,238 +272,5 @@ pub fn init(reg_base_phys: PAddr) !void {
     unit_count += 1;
 }
 
-/// Configure a device's DTE to enable IOMMU-translated DMA through a
-/// per-device I/O page table.
-///
-/// This allocates a fresh level-4 root page table for the device and programs
-/// the DTE to use 4-level host translation (Mode=100b → 48-bit DMA address space,
-/// per spec Table 7 Mode field / Table 15 level parameters).
-///
-/// Spec Section 2.2.2.2 (Making Device Table Entry Changes):
-///   When V=1 before the change, the DTE must be updated carefully. We clear V
-///   first to mark the entry invalid, write all fields, then set V=1 as the
-///   final step, followed by INVALIDATE_DEVTAB_ENTRY.
-pub fn setupDevice(device: *DeviceRegion) !void {
-    if (unit_count == 0) return;
 
-    const pci = &device.detail.pci;
-    const bdf = @as(u16, pci.bus) << 8 | @as(u16, pci.dev) << 3 | @as(u16, pci.func);
-    const device_id = lookupAlias(bdf);
-    const entry_offset = @as(u64, device_id) * 32;
 
-    // Allocate a zeroed 4KB page as the level-4 root of the I/O page table.
-    const pt = try allocZeroedPage();
-    pci.dma_page_table_root = pt.phys;
-
-    // -----------------------------------------------------------------------
-    // Build the DTE quadwords (spec Figure 7, Table 7).
-    //
-    // QW0 (bits [63:0]):
-    //   Bit  0:     V  = 1 (entry valid)
-    //   Bit  1:     TV = 1 (translation info valid)
-    //   Bits [8:7]: HAD = 00 (no HW access/dirty tracking)
-    //   Bits [11:9]: Mode = 100b (4-level page table → 48-bit GPA space)
-    //   Bits [51:12]: Host Page Table Root Pointer (SPA of level-4 table)
-    //   Bit  61:    IR = 1 (DMA reads allowed)
-    //   Bit  62:    IW = 1 (DMA writes allowed)
-    //
-    // QW1 (bits [127:64]):
-    //   Bits [79:64]: DomainID — unique tag for this device's translation domain.
-    //                 The IOMMU uses DomainID to tag IOTLB entries; devices with
-    //                 different page tables must have different DomainIDs (spec Table 7).
-    //                 We use the aliased DeviceID as a naturally unique domain tag.
-    //   Remaining bits are zero (no guest translation, no IOTLB, no ATS, etc.)
-    //
-    // QW2, QW3 = 0 (no interrupt remapping, no guest APIC virtualization).
-    // -----------------------------------------------------------------------
-    const mode: u64 = 4;
-    const qw0 = 0x3 | (mode << 9) | (pt.phys.addr & AMDVI_ADDR_MASK) | AMDVI_RW;
-    const qw1 = @as(u64, device_id);
-
-    for (units[0..unit_count]) |*unit| {
-        if (!unit.active) continue;
-
-        // Write DTE at the alias DeviceID index.
-        if (entry_offset + 32 > unit.dev_table_size) continue;
-        const entry_base: [*]volatile u64 = @ptrFromInt(unit.dev_table_virt.addr + entry_offset);
-
-        // Spec Section 2.2.2.2: When V=1 before the change, clear V first
-        // to prevent the IOMMU from seeing a partially-updated DTE.
-        entry_base[0] = 0;
-        entry_base[3] = 0;
-        entry_base[2] = 0;
-        entry_base[1] = qw1;
-        // Write qw0 last — this sets V=1, making the entry live.
-        entry_base[0] = qw0;
-
-        unit.invalidateDeviceEntry(device_id);
-        unit.invalidatePages(device_id);
-        unit.completionWait();
-
-        // If this device has an alias, also program the DTE at the original BDF
-        // so the IOMMU handles both the aliased and original requester IDs.
-        if (device_id == bdf) continue;
-        const bdf_offset = @as(u64, bdf) * 32;
-        if (bdf_offset + 32 <= unit.dev_table_size) {
-            const bdf_entry: [*]volatile u64 = @ptrFromInt(unit.dev_table_virt.addr + bdf_offset);
-            bdf_entry[0] = 0;
-            bdf_entry[3] = 0;
-            bdf_entry[2] = 0;
-            bdf_entry[1] = qw1;
-            bdf_entry[0] = qw0;
-
-            unit.invalidateDeviceEntry(bdf);
-            unit.invalidatePages(bdf);
-            unit.completionWait();
-        }
-    }
-}
-
-/// Construct a non-leaf (Page Directory Entry) I/O page table entry.
-///
-/// Spec Section 2.2.3, Figure 10, Table 18 (PDE fields, PR=1):
-///   Bit  0:      PR = 1 (present)
-///   Bits [11:9]: NextLevel (level of the page table this entry points to;
-///                must not be 000b or 111b for a PDE)
-///   Bits [51:12]: Next Table Address (SPA of the child page table)
-///   Bit  61:     IR = 1 (read permission — ANDed into cumulative perms)
-///   Bit  62:     IW = 1 (write permission — ANDed into cumulative perms)
-fn amdviNonLeaf(phys_addr: u64, next_level: u64) u64 {
-    return (phys_addr & AMDVI_ADDR_MASK) | (next_level << 9) | AMDVI_RW | 0x1;
-}
-
-/// Construct a leaf (Page Translation Entry) I/O page table entry for a 4KB page.
-///
-/// Spec Section 2.2.3, Figure 9, Table 17 (PTE fields, PR=1):
-///   Bit  0:      PR = 1 (present)
-///   Bits [11:9]: NextLevel = 000b (page translation entry, not a directory)
-///   Bits [51:12]: Page Address (SPA of the 4KB physical page)
-///   Bit  61:     IR = 1 (read allowed)
-///   Bit  62:     IW = 1 (write allowed)
-fn amdviLeaf(phys_addr: u64) u64 {
-    return (phys_addr & AMDVI_ADDR_MASK) | AMDVI_RW | 0x1;
-}
-
-/// Check the Present bit (bit 0) of a page table entry.
-/// Spec Table 16: PR=0 means the entry is not present; remaining bits are ignored.
-fn amdviPresent(entry: u64) bool {
-    return (entry & 0x1) != 0;
-}
-
-/// Map a single 4KB DMA address to a physical page in a device's I/O page table.
-///
-/// Walks (and lazily allocates) the 4-level page table tree rooted at
-/// device.dma_page_table_root, creating intermediate page directory entries
-/// as needed, and installs a leaf PTE mapping dma_addr → phys.
-///
-/// Spec Section 2.2.3, Table 15 (level parameters for 4-level mode):
-///   Level 4: indexes bits [47:39] of the DMA virtual address (DVA)
-///   Level 3: indexes bits [38:30]
-///   Level 2: indexes bits [29:21]
-///   Level 1: indexes bits [20:12]
-///
-/// Each level uses 9 address bits to index into a 512-entry (4KB) page table.
-pub fn mapDmaPage(device: *DeviceRegion, dma_addr: u64, phys: PAddr) !void {
-    if (unit_count == 0 or device.detail.pci.dma_page_table_root.addr == 0) return error.NotSetup;
-
-    const pml4_virt = VAddr.fromPAddr(device.detail.pci.dma_page_table_root, null);
-    const pml4: *[512]u64 = @ptrFromInt(pml4_virt.addr);
-
-    const pml4_idx: u9 = @truncate((dma_addr >> 39) & 0x1FF);
-    const pdpt_idx: u9 = @truncate((dma_addr >> 30) & 0x1FF);
-    const pd_idx: u9 = @truncate((dma_addr >> 21) & 0x1FF);
-    const pt_idx: u9 = @truncate((dma_addr >> 12) & 0x1FF);
-
-    // Level 4 → Level 3: PDE with NextLevel=3
-    if (!amdviPresent(pml4[pml4_idx])) {
-        const page = try allocZeroedPage();
-        pml4[pml4_idx] = amdviNonLeaf(page.phys.addr, 3);
-    }
-    const pdpt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pml4[pml4_idx] & AMDVI_ADDR_MASK), null).addr);
-
-    // Level 3 → Level 2: PDE with NextLevel=2
-    if (!amdviPresent(pdpt[pdpt_idx])) {
-        const page = try allocZeroedPage();
-        pdpt[pdpt_idx] = amdviNonLeaf(page.phys.addr, 2);
-    }
-    const pd: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pdpt[pdpt_idx] & AMDVI_ADDR_MASK), null).addr);
-
-    // Level 2 → Level 1: PDE with NextLevel=1
-    if (!amdviPresent(pd[pd_idx])) {
-        const page = try allocZeroedPage();
-        pd[pd_idx] = amdviNonLeaf(page.phys.addr, 1);
-    }
-    const pt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pd[pd_idx] & AMDVI_ADDR_MASK), null).addr);
-
-    // Level 1: leaf PTE mapping to the target physical page.
-    pt[pt_idx] = amdviLeaf(phys.addr);
-}
-
-/// Remove the mapping for a single 4KB DMA address from a device's I/O page table.
-///
-/// Sets the leaf PTE to zero (PR=0 → not present). Does NOT free intermediate
-/// page table pages; the tree structure is retained for reuse.
-/// Caller must issue flushDevice() after unmapping to invalidate IOTLB entries.
-pub fn unmapDmaPage(device: *DeviceRegion, dma_addr: u64) void {
-    if (unit_count == 0 or device.detail.pci.dma_page_table_root.addr == 0) return;
-
-    const pml4_virt = VAddr.fromPAddr(device.detail.pci.dma_page_table_root, null);
-    const pml4: *[512]u64 = @ptrFromInt(pml4_virt.addr);
-    const pml4_idx: u9 = @truncate((dma_addr >> 39) & 0x1FF);
-    if (!amdviPresent(pml4[pml4_idx])) return;
-
-    const pdpt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pml4[pml4_idx] & AMDVI_ADDR_MASK), null).addr);
-    const pdpt_idx: u9 = @truncate((dma_addr >> 30) & 0x1FF);
-    if (!amdviPresent(pdpt[pdpt_idx])) return;
-
-    const pd: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pdpt[pdpt_idx] & AMDVI_ADDR_MASK), null).addr);
-    const pd_idx: u9 = @truncate((dma_addr >> 21) & 0x1FF);
-    if (!amdviPresent(pd[pd_idx])) return;
-
-    const pt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pd[pd_idx] & AMDVI_ADDR_MASK), null).addr);
-    const pt_idx: u9 = @truncate((dma_addr >> 12) & 0x1FF);
-    pt[pt_idx] = 0;
-}
-
-/// Flush all cached IOTLB translations for a device's domain across all IOMMU units.
-///
-/// Issues INVALIDATE_IOMMU_PAGES for the device's DomainID (which equals its
-/// aliased DeviceID), followed by COMPLETION_WAIT to ensure the flush completes
-/// before returning (spec Section 2.4.9 ordering rules).
-///
-/// Must be called after modifying a device's I/O page table entries (mapDmaPage /
-/// unmapDmaPage) to ensure the IOMMU re-walks the updated tables.
-pub fn flushDevice(device: *const DeviceRegion) void {
-    if (unit_count == 0) return;
-    const bdf = @as(u16, device.detail.pci.bus) << 8 | @as(u16, device.detail.pci.dev) << 3 | @as(u16, device.detail.pci.func);
-    const domain_id = lookupAlias(bdf);
-    for (units[0..unit_count]) |*unit| {
-        if (!unit.active) continue;
-        unit.invalidatePages(domain_id);
-        unit.completionWait();
-    }
-}
-
-var translation_enabled: bool = false;
-
-/// Enable DMA translation by setting IommuEn on all active units.
-///
-/// Called after the first mem_dma_map syscall so that device page tables
-/// contain actual mappings before the IOMMU starts translating.
-/// Without this deferral, early device DMA would fault against
-/// empty page tables (same pattern as Intel VT-d's deferred TE).
-pub fn enableTranslation() void {
-    if (translation_enabled) return;
-    for (units[0..unit_count]) |*unit| {
-        if (unit.active) {
-            var ctrl = unit.readReg64(MMIO_CONTROL);
-            ctrl |= CTRL_IOMMU_EN;
-            unit.writeReg64(MMIO_CONTROL, ctrl);
-        }
-    }
-    translation_enabled = true;
-}
-
-pub fn isAvailable() bool {
-    return unit_count > 0;
-}

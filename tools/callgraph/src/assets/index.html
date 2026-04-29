@@ -1,0 +1,1812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Zag Callgraph Explorer</title>
+  <style>
+    :root {
+      --bg: #15171c;
+      --bg-elev: #1d2027;
+      --bg-elev-2: #262a33;
+      --border: #2e333d;
+      --fg: #d8dde6;
+      --fg-dim: #8a93a3;
+      --fg-bright: #ffffff;
+      --accent: #4a9eff;
+      --direct: #888888;
+      --dispatch-x64: #4a9eff;
+      --dispatch-aarch64: #3ec9c9;
+      --vtable: #b06ef0;
+      --indirect: #f06060;
+      --leaf-userspace: #f0a050;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      width: 100%;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
+        Arial, sans-serif;
+      font-size: 13px;
+      overflow: hidden;
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      width: 100vw;
+    }
+
+    /* ---- Top bar ----------------------------------------------------- */
+    #topbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      align-items: center;
+      padding: 10px 16px;
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border);
+      flex: 0 0 auto;
+    }
+
+    #topbar h1 {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      color: var(--fg-bright);
+      text-transform: uppercase;
+      margin-right: 8px;
+    }
+
+    .field {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .field label {
+      color: var(--fg-dim);
+      font-size: 12px;
+    }
+
+    select, button, input[type="range"] {
+      background: var(--bg-elev-2);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font: inherit;
+      padding: 4px 8px;
+      outline: none;
+    }
+
+    select:focus, button:focus {
+      border-color: var(--accent);
+    }
+
+    select {
+      min-width: 280px;
+    }
+
+    select#arch_picker {
+      min-width: 110px;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #2f3540;
+    }
+
+    #depth_value {
+      display: inline-block;
+      width: 1.5em;
+      text-align: center;
+      color: var(--fg-bright);
+      font-variant-numeric: tabular-nums;
+    }
+
+    select#compare_commit {
+      min-width: 240px;
+      max-width: 360px;
+    }
+    select#compare_commit option.opt_incompatible {
+      color: var(--fg-dim);
+      font-style: italic;
+    }
+    /* Review-coverage tints. Browsers vary in how aggressively they
+       restrict <option> styling, but background-color is reliable
+       enough across Chrome/Firefox to be useful — and the [AH] glyph
+       prefix in the option text means the indicator survives even
+       when the browser ignores the color. */
+    select#compare_commit option.opt_reviewed_mcp { color: #6fd17a; }
+    select#compare_commit option.opt_reviewed_http { color: #4a9eff; }
+    select#compare_commit option.opt_reviewed_mcp.opt_reviewed_http {
+      color: #b06ef0;
+    }
+
+    .compare_status {
+      color: var(--fg-dim);
+      font-size: 11px;
+      min-width: 90px;
+    }
+    .compare_status.building { color: #f0c060; }
+    .compare_status.ready    { color: #6fd17a; }
+    .compare_status.errored  { color: var(--indirect); }
+
+    /* ---- Body split -------------------------------------------------- */
+    #body {
+      display: flex;
+      flex: 1 1 auto;
+      min-height: 0;
+    }
+
+    #graph {
+      flex: 1 1 auto;
+      min-width: 0;
+      background: var(--bg);
+      position: relative;
+    }
+
+    /* Floating legend ---------------------------------------------- */
+    #legend {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      background: rgba(29, 32, 39, 0.92);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 10px;
+      font-size: 11px;
+      color: var(--fg-dim);
+      pointer-events: none;
+      line-height: 1.6;
+    }
+    #legend .swatch {
+      display: inline-block;
+      width: 22px;
+      height: 2px;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    #legend .dashed {
+      border-top: 2px dashed currentColor;
+      height: 0;
+    }
+
+    /* ---- Side panel -------------------------------------------------- */
+    /* Default width tuned for source code review (~50% of a 1080p screen).
+       The drag handle on the left edge lets the user resize horizontally;
+       the chosen width persists in localStorage. min-width keeps the
+       metadata header readable; max-width is large but bounded so the
+       panel can't completely swallow the graph. */
+    #info {
+      flex: 0 0 720px;
+      max-width: 90%;
+      min-width: 320px;
+      background: var(--bg-elev);
+      border-left: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 16px;
+      display: none;
+      position: relative;
+    }
+
+    #info.visible { display: block; }
+
+    /* Drag handle: thin strip on the left edge of #info. Hover/active
+       states give the user a visual hook; cursor flips to col-resize so
+       it's clear the strip is interactive. The handle itself is 6px wide
+       with a 4px hit area extension into the panel (negative margin) so
+       it's easy to grab without obscuring panel content. */
+    #info .resize_handle {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 6px;
+      cursor: col-resize;
+      background: transparent;
+      transition: background 0.15s ease;
+      z-index: 5;
+    }
+    #info .resize_handle:hover,
+    #info .resize_handle.dragging {
+      background: var(--accent);
+    }
+    /* Disable text selection across the page while dragging so the cursor
+       doesn't keep selecting random source lines mid-drag. */
+    body.cg_resizing { user-select: none; cursor: col-resize; }
+
+    #info header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+
+    #info h2 {
+      margin: 0;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--fg-bright);
+    }
+
+    #info .close {
+      background: transparent;
+      border: none;
+      color: var(--fg-dim);
+      font-size: 18px;
+      cursor: pointer;
+      padding: 0 6px;
+    }
+
+    #info dl {
+      margin: 0 0 14px 0;
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 4px 12px;
+    }
+
+    #info dt {
+      color: var(--fg-dim);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      align-self: start;
+      padding-top: 2px;
+    }
+
+    #info dd {
+      margin: 0;
+      color: var(--fg);
+      word-break: break-all;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+    }
+
+    #info .badge {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 10px;
+      font-size: 10px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      background: var(--bg-elev-2);
+      color: var(--fg-bright);
+      border: 1px solid var(--border);
+    }
+
+    #info pre.source {
+      background: #1e1e1e;
+      border: 1px solid var(--border);
+      border-radius: 0 0 4px 4px;
+      padding: 0;
+      margin: 0;
+      /* Intentionally NOT a scroll container — the surrounding
+         `.source_block` already scrolls in both axes. Making `pre`
+         scroll too would create a nested H-bar at the bottom of the
+         pre's content (far below the visible area) while the outer
+         block's H-bar would have nothing to scroll. */
+      overflow: visible;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.4;
+      color: #e6e6e6;
+    }
+
+    .source_block {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      max-height: 60vh;
+      /* `scroll` (not `auto`) keeps both bars visible whenever the content
+         exceeds either dimension. With `auto` the horizontal bar only
+         materialises after the user has scrolled to the bottom, which the
+         user found jarring during code review. */
+      overflow: scroll;
+      background: #1e1e1e;
+      /* Firefox: forces the gutter for both axes so the layout doesn't
+         jump when a bar becomes needed. */
+      scrollbar-gutter: stable both-edges;
+    }
+
+    /* Side-by-side source for compare mode. The split is a flex row so
+       both halves grow equally; each .source_block is already a scroll
+       container so it brings its own scrollbars. The default state
+       (compare off) shows just the primary block at full width — the
+       secondary's `display:none` collapses it out of the flex row. */
+    .source_split {
+      display: flex;
+      flex-direction: row;
+      gap: 6px;
+      min-width: 0;
+    }
+    .source_split > .source_pane,
+    .source_split > .source_block {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+    .source_split.compare_active > .source_pane {
+      max-width: 50%;
+    }
+    .source_pane {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      flex: 1 1 0;
+    }
+    .source_pane_label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 8px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-bottom: none;
+      border-radius: 4px 4px 0 0;
+      font-size: 11px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--fg-dim);
+    }
+    .source_pane_label .pane_tag {
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .source_pane_label.live  .pane_tag { background: rgba(80, 180, 80, 0.20); color: #6fd17a; }
+    .source_pane_label.older .pane_tag { background: rgba(220, 80, 80, 0.20); color: #f06060; }
+    .source_pane_label .pane_sha {
+      color: var(--fg);
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .source_pane > .source_block {
+      border-radius: 0 0 4px 4px;
+    }
+    /* When the label is hidden, restore the rounded top corners. */
+    .source_pane > .source_block:first-child {
+      border-radius: 4px;
+    }
+
+    .source_header {
+      background: var(--bg-elev-2);
+      border-bottom: 1px solid var(--border);
+      padding: 6px 8px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 11px;
+      color: var(--fg-dim);
+      user-select: text;
+      word-break: break-all;
+    }
+
+    .source_header .open_file {
+      color: var(--accent);
+      text-decoration: none;
+      cursor: text;
+      user-select: text;
+    }
+
+    .source_table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .source_table td {
+      padding: 0;
+      vertical-align: top;
+      white-space: pre;
+    }
+
+    .source_gutter {
+      color: #6a6a6a;
+      text-align: right;
+      padding: 0 10px 0 8px;
+      user-select: none;
+      border-right: 1px solid #2e333d;
+      min-width: 3em;
+      background: #1a1a1a;
+    }
+
+    .source_code {
+      padding: 0 10px;
+      color: #e6e6e6;
+    }
+
+    /* Syntax highlight palette. Tag groupings come from the server-side
+       Zig tokenizer (see classifyTokenTag). Colors picked to harmonize
+       with the existing edge-kind palette so nothing screams. */
+    .source_code .tok_keyword     { color: #c586c0; }
+    .source_code .tok_builtin     { color: #4a9eff; }
+    .source_code .tok_string      { color: #ce9178; }
+    .source_code .tok_number      { color: #b5cea8; }
+    .source_code .tok_comment     { color: #6a9955; font-style: italic; }
+    .source_code .tok_doc_comment { color: #8a9a8a; font-style: italic; }
+
+    /* Identifier that resolves to a Definition whose source range
+       overlaps a hunk in the current diff. Underline + cursor pointer;
+       click drills the source pane to the def. Inert when compare is
+       off (no spans get emitted in that case). */
+    .source_code .tok_changed_dep {
+      text-decoration: underline dotted #f0c060;
+      text-underline-offset: 2px;
+      cursor: pointer;
+    }
+    .source_code .tok_changed_dep:hover {
+      background: rgba(240, 192, 96, 0.18);
+    }
+
+    /* Per-review-unit checkbox in the source pane gutter. Drawn at the
+       first line of each contiguous +/- run when compare is active.
+       Click toggles the unit's reviewed state, persisted in parent mode
+       to <git_root>/.callgraph/review/<sha_a>..<sha_b>.json. */
+    .source_gutter .unit_checkbox {
+      margin-right: 4px;
+      vertical-align: middle;
+      cursor: pointer;
+      width: 11px;
+      height: 11px;
+      accent-color: #6fd17a;
+    }
+    .source_line.unit_reviewed.added .source_code,
+    .source_line.unit_reviewed.added .source_gutter {
+      background-color: rgba(80, 180, 80, 0.06);
+    }
+    .source_line.unit_reviewed.removed .source_code,
+    .source_line.unit_reviewed.removed .source_gutter {
+      background-color: rgba(220, 80, 80, 0.06);
+    }
+    .source_line.unit_reviewed .source_gutter {
+      opacity: 0.65;
+    }
+
+    .source_line.highlight .source_code,
+    .source_line.highlight .source_gutter {
+      background-color: rgba(255, 200, 0, 0.15);
+    }
+
+    .source_line.highlight .source_gutter {
+      color: #d8a050;
+    }
+
+    /* Diff line tints. `added` (new side) is green, `removed` (old side)
+       is red. Both backgrounds are restrained so the syntax tokens stay
+       readable; the gutter takes a stronger tint and a +/- glyph so the
+       diff state is obvious without re-tinting code. */
+    .source_line.added .source_code,
+    .source_line.added .source_gutter {
+      background-color: rgba(80, 180, 80, 0.18);
+    }
+    .source_line.added .source_gutter {
+      color: #6fd17a;
+    }
+    .source_line.added .source_gutter::before {
+      content: "+ ";
+      color: #6fd17a;
+      opacity: 0.85;
+    }
+    .source_line.removed .source_code,
+    .source_line.removed .source_gutter {
+      background-color: rgba(220, 80, 80, 0.18);
+    }
+    .source_line.removed .source_gutter {
+      color: #f06060;
+    }
+    .source_line.removed .source_gutter::before {
+      content: "− ";
+      color: #f06060;
+      opacity: 0.85;
+    }
+    /* Highlight + diff: highlight wins on the gutter glyph slot. */
+    .source_line.highlight.added .source_gutter::before,
+    .source_line.highlight.removed .source_gutter::before {
+      content: "";
+    }
+
+    .source_error {
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg-elev-2);
+      color: var(--indirect, #f06060);
+      font-size: 12px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+    }
+
+    #info .placeholder {
+      color: var(--fg-dim);
+      font-style: italic;
+      font-size: 12px;
+    }
+
+    /* ---- Intra (call-tree) block ---------------------------------- */
+    .intra_block {
+      margin-top: 14px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: #1e1e1e;
+      max-height: 50vh;
+      overflow-y: auto;
+    }
+
+    .intra_header {
+      background: var(--bg-elev-2);
+      border-bottom: 1px solid var(--border);
+      padding: 6px 10px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 11px;
+      color: var(--fg-dim);
+      letter-spacing: 0.05em;
+    }
+
+    .intra_body {
+      padding: 8px 10px 10px 10px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+      color: var(--fg);
+    }
+
+    .intra_body ul.atom_list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+
+    .intra_body li.atom_call {
+      padding: 2px 0 2px 0;
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      border-left: 2px solid transparent;
+      padding-left: 6px;
+    }
+
+    .intra_body li.atom_call:hover {
+      background: rgba(74, 158, 255, 0.06);
+    }
+
+    .intra_body .callee_name {
+      color: var(--fg);
+      cursor: pointer;
+      flex: 1 1 auto;
+      word-break: break-all;
+    }
+
+    .intra_body .callee_name.kind_direct          { color: #d8dde6; }
+    .intra_body .callee_name.kind_dispatch_x64    { color: #4a9eff; }
+    .intra_body .callee_name.kind_dispatch_aarch64{ color: #3ec9c9; }
+    .intra_body .callee_name.kind_vtable          { color: #b06ef0; }
+    .intra_body .callee_name.kind_indirect        { color: #f06060; font-style: italic; }
+    .intra_body .callee_name.kind_leaf_userspace  { color: #f0a050; }
+
+    .intra_body .callee_name.unresolved {
+      color: #f06060;
+      font-style: italic;
+    }
+
+    .intra_body .callee_loc {
+      color: var(--fg-dim);
+      font-size: 11px;
+      flex: 0 0 auto;
+    }
+
+    .intra_body details.atom_branch {
+      margin: 4px 0;
+      border-left: 2px solid #3a4150;
+      padding-left: 8px;
+    }
+
+    .intra_body details.atom_branch > summary {
+      cursor: pointer;
+      color: var(--fg-dim);
+      list-style: none;
+      padding: 2px 0;
+    }
+
+    .intra_body details.atom_branch > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .intra_body details.atom_branch > summary::before {
+      content: "▸ ";
+      color: var(--fg-dim);
+      font-size: 10px;
+    }
+
+    .intra_body details.atom_branch[open] > summary::before {
+      content: "▾ ";
+    }
+
+    .intra_body details.atom_branch summary .branch_kw {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .intra_body details.atom_branch summary .branch_loc {
+      color: var(--fg-dim);
+      font-size: 11px;
+      margin-left: 6px;
+    }
+
+    .intra_body .arm {
+      margin: 4px 0 4px 8px;
+      border-left: 1px dashed #3a4150;
+      padding-left: 8px;
+    }
+
+    .intra_body .arm_label {
+      color: #d8a050;
+      font-size: 11px;
+      margin: 4px 0 2px 0;
+      letter-spacing: 0.02em;
+    }
+
+    .intra_body .intra_empty {
+      color: var(--fg-dim);
+      font-style: italic;
+      padding: 4px 0;
+    }
+
+    @keyframes intra_flash {
+      0%   { box-shadow: 0 0 0 0 rgba(255, 200, 0, 0.0); }
+      30%  { box-shadow: 0 0 0 6px rgba(255, 200, 0, 0.5); }
+      100% { box-shadow: 0 0 0 12px rgba(255, 200, 0, 0.0); }
+    }
+
+    .cy_flash {
+      animation: intra_flash 0.6s ease-out;
+    }
+
+    /* ---- Unreachable badge ---------------------------------------- */
+    .badge.unreachable {
+      background: #3a1f23;
+      border-color: #7a2a30;
+      color: #ff9b8c;
+    }
+
+    /* ---- List panel (indirect calls / dead code) ------------------ */
+    #list_panel {
+      flex: 0 0 32%;
+      max-width: 520px;
+      min-width: 320px;
+      background: var(--bg-elev);
+      border-left: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 16px;
+      display: none;
+    }
+
+    #list_panel.visible { display: block; }
+
+    #list_panel header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    #list_panel h2 {
+      margin: 0;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--fg-bright);
+    }
+
+    #list_panel .close {
+      background: transparent;
+      border: none;
+      color: var(--fg-dim);
+      font-size: 18px;
+      cursor: pointer;
+      padding: 0 6px;
+    }
+
+    #list_panel .filter_row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    #list_panel input[type="text"] {
+      flex: 1 1 auto;
+      background: var(--bg-elev-2);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font: inherit;
+      padding: 4px 8px;
+      outline: none;
+    }
+    #list_panel input[type="text"]:focus { border-color: var(--accent); }
+
+    #list_panel .summary {
+      color: var(--fg-dim);
+      font-size: 11px;
+      margin-bottom: 8px;
+    }
+
+    .list_rows {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .list_row {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      padding: 4px 6px;
+      border-left: 2px solid transparent;
+      cursor: pointer;
+      border-radius: 3px;
+    }
+    .list_row:hover {
+      background: rgba(74, 158, 255, 0.08);
+      border-left-color: var(--accent);
+    }
+
+    .list_row .marker {
+      flex: 0 0 auto;
+      color: var(--indirect);
+      font-weight: bold;
+      width: 1em;
+      text-align: center;
+    }
+    .list_row .marker.dead {
+      color: var(--fg-dim);
+    }
+
+    .list_row .row_name {
+      flex: 1 1 auto;
+      color: var(--fg);
+      word-break: break-all;
+    }
+
+    .list_row .row_loc {
+      flex: 0 0 auto;
+      color: var(--fg-dim);
+      font-size: 11px;
+    }
+
+    .list_row .kind_tag {
+      flex: 0 0 auto;
+      color: var(--fg-dim);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .list_empty {
+      color: var(--fg-dim);
+      font-style: italic;
+      padding: 8px 4px;
+    }
+
+    /* ---- Mode toggle (Graph | Trace) -------------------------------- */
+    .mode_toggle {
+      display: inline-flex;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .mode_button {
+      background: var(--bg-elev-2);
+      color: var(--fg-dim);
+      border: 0;
+      padding: 4px 12px;
+      cursor: pointer;
+      font: inherit;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 11px;
+    }
+    .mode_button + .mode_button {
+      border-left: 1px solid var(--border);
+    }
+    .mode_button.active {
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+    }
+    .mode_button:hover:not(.active) {
+      background: #2f3540;
+      color: var(--fg);
+    }
+
+    /* ---- Trace breadcrumb ------------------------------------------- */
+    #trace_breadcrumb {
+      flex: 0 0 auto;
+      padding: 6px 16px;
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border);
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+      color: var(--fg-dim);
+      min-height: 26px;
+      transition: background 0.18s ease;
+    }
+    #trace_breadcrumb.flash {
+      background: rgba(240, 96, 96, 0.18);
+    }
+    #trace_breadcrumb .crumb {
+      color: var(--accent);
+      cursor: pointer;
+    }
+    #trace_breadcrumb .crumb:hover { text-decoration: underline; }
+    #trace_breadcrumb .crumb.current {
+      color: var(--fg-bright);
+      font-weight: 600;
+      cursor: default;
+    }
+    #trace_breadcrumb .crumb_sep {
+      color: var(--fg-dim);
+    }
+
+    /* ---- Trace view ------------------------------------------------- */
+    #trace_view_wrap {
+      flex: 1 1 auto;
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: row;
+      gap: 0;
+    }
+    .trace_pane_col {
+      flex: 1 1 0;
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .trace_pane_col + .trace_pane_col {
+      border-left: 1px solid var(--border);
+    }
+    .trace_view_pane {
+      flex: 1 1 auto;
+      min-width: 0;
+      min-height: 0;
+      background: var(--bg);
+      overflow: auto;
+      padding: 14px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+      color: var(--fg);
+    }
+    .trace_pane_label {
+      flex: 0 0 auto;
+      background: var(--bg-elev);
+      color: var(--fg-dim);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* Per-pane minimize/maximize button. Lives in a header row at the
+       top of each pane (always present, even outside compare mode where
+       the label content is empty). Click toggles a `.collapsed` class
+       on the pane wrapper; state persists in localStorage. */
+    .pane_header_row {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: stretch;
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border);
+      min-height: 28px;
+    }
+    .pane_header_row > .trace_pane_label,
+    .pane_header_row > .source_pane_label {
+      flex: 1 1 auto;
+      min-width: 0;
+      background: transparent;
+      border-bottom: none;
+      border-radius: 0;
+      /* Truncate long subjects so they don't push the button off-screen. */
+      overflow: hidden;
+    }
+    .pane_header_row > .trace_pane_label .pane_subj,
+    .pane_header_row > .source_pane_label .pane_subj {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .pane_collapse_btn {
+      flex: 0 0 auto;
+      width: 28px;
+      padding: 0;
+      background: transparent;
+      border: none;
+      border-left: 1px solid var(--border);
+      color: var(--fg-dim);
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1;
+      font-family: inherit;
+    }
+    .pane_collapse_btn:hover {
+      color: var(--fg-bright);
+      background: var(--bg-elev-2);
+    }
+    /* Vertical-strip name shown only when the pane is collapsed. */
+    .pane_collapsed_label {
+      display: none;
+      writing-mode: vertical-rl;
+      transform: rotate(180deg);
+      color: var(--fg-dim);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 12px 0 6px 0;
+      text-align: center;
+      flex: 1 1 auto;
+      user-select: none;
+    }
+    /* Collapsed-pane styling: shrink to a thin strip, hide everything
+       except the header row (which holds the button) and the rotated
+       name. Other panes in the flex row redistribute automatically. */
+    .trace_pane_col.collapsed,
+    .review_tracker_col.collapsed,
+    .source_pane.collapsed {
+      flex: 0 0 28px;
+      min-width: 28px;
+      max-width: 28px;
+      overflow: hidden;
+    }
+    .trace_pane_col.collapsed > *:not(.pane_header_row):not(.pane_collapsed_label),
+    .review_tracker_col.collapsed > *:not(.pane_header_row):not(.pane_collapsed_label),
+    .source_pane.collapsed > *:not(.pane_header_row):not(.pane_collapsed_label) {
+      display: none !important;
+    }
+    /* Inside the collapsed strip, the header row holds just the button —
+       the label content (LIVE tag, sha, subject) is hidden. */
+    .collapsed > .pane_header_row > .trace_pane_label,
+    .collapsed > .pane_header_row > .source_pane_label {
+      display: none !important;
+    }
+    .collapsed > .pane_header_row > .pane_collapse_btn {
+      border-left: none;
+      width: 100%;
+    }
+    .trace_pane_col.collapsed > .pane_collapsed_label,
+    .review_tracker_col.collapsed > .pane_collapsed_label,
+    .source_pane.collapsed > .pane_collapsed_label {
+      display: block;
+    }
+
+    /* Diff change list — sticky panel at the top of the primary trace
+       pane that lists every changed fn reachable from the current entry.
+       Click a row to drill the trace there and pop the source pane open
+       on the actual diff. Without this, the user has to scan the entire
+       tree for ◆ glyphs, which gets tedious on big entries. */
+    .diff_changes_panel {
+      /* As of the 3-column layout: the tracker is its own column.
+         Fill the full vertical space of the column so the user can
+         scroll through all units without competing with the trace view
+         for height. */
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-elev);
+    }
+    .review_tracker_col {
+      /* Same flex weight as the trace columns so all three share the
+         available width evenly — the user explicitly wants the panes
+         the same size, not a slim tracker stacked on a wide trace. */
+      flex: 1 1 0;
+      min-width: 240px;
+      border-right: 1px solid var(--border);
+    }
+    .review_tracker_label {
+      color: #f0c060;
+    }
+    .diff_changes_header {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .diff_changes_title {
+      color: var(--fg-bright);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .diff_changes_count {
+      color: #f0c060;
+      font-size: 11px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+    }
+    .diff_changes_list {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+      padding: 4px 0;
+    }
+    .diff_changes_row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 3px 10px;
+      cursor: pointer;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 11px;
+      color: var(--fg);
+    }
+    .diff_changes_row:hover {
+      background: rgba(74, 158, 255, 0.10);
+    }
+    .diff_changes_row .glyph {
+      color: #f0c060;
+      flex: 0 0 auto;
+    }
+    .diff_changes_row .fn_name {
+      flex: 0 1 auto;
+      color: var(--fg-bright);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .diff_changes_row .fn_loc {
+      flex: 1 1 auto;
+      color: var(--fg-dim);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: right;
+    }
+    .diff_changes_empty {
+      color: var(--fg-dim);
+      font-style: italic;
+      padding: 6px 10px;
+      font-size: 11px;
+    }
+    .diff_changes_row .fn_badge {
+      flex: 0 0 auto;
+      color: var(--fg-dim);
+      font-size: 10px;
+      letter-spacing: 0.04em;
+    }
+    /* Review tracker rows. The panel renders three nested levels:
+       1. file group — "kernel/proc/process.zig 3 of 7" + "Mark all"
+       2. fn group   — "performRestart 1 of 4" + "Mark fn"
+       3. unit row   — checkbox + ± glyph + label + jump click
+       The hierarchy lets the user mark a whole fn or whole file done
+       in one click, scan progress at a glance, and still drill into
+       individual hunks. */
+    .review_progress_bar {
+      flex: 1 1 auto;
+      max-width: 180px;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 2px;
+      overflow: hidden;
+      position: relative;
+    }
+    .review_progress_fill {
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      background: #6fd17a;
+      transition: width 120ms ease-out;
+    }
+    .review_file_group {
+      border-top: 1px solid var(--border);
+    }
+    .review_file_group:first-child { border-top: none; }
+    .review_file_header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 10px;
+      background: rgba(255, 255, 255, 0.02);
+      cursor: pointer;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 11px;
+      color: var(--fg-bright);
+    }
+    .review_file_header:hover { background: rgba(74, 158, 255, 0.06); }
+    .review_file_header .file_name {
+      flex: 0 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .review_file_header .file_progress {
+      flex: 1 1 auto;
+      text-align: right;
+      color: var(--fg-dim);
+      font-size: 10px;
+    }
+    .review_file_header.fully_reviewed .file_name { color: #6fd17a; }
+    .review_file_header.fully_reviewed .file_progress { color: #6fd17a; }
+    .review_group_action {
+      flex: 0 0 auto;
+      font-family: inherit;
+      font-size: 10px;
+      padding: 1px 6px;
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--fg-dim);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    .review_group_action:hover {
+      background: rgba(74, 158, 255, 0.10);
+      color: var(--fg-bright);
+    }
+    .review_fn_group { padding-left: 0; }
+    .review_fn_header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 3px 10px 3px 20px;
+      cursor: pointer;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 10.5px;
+      color: var(--fg);
+    }
+    .review_fn_header:hover { background: rgba(74, 158, 255, 0.06); }
+    .review_fn_header .fn_name {
+      flex: 0 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .review_fn_header.fully_reviewed .fn_name {
+      color: #6fd17a;
+      text-decoration: line-through;
+      text-decoration-color: rgba(111, 209, 122, 0.4);
+    }
+    .review_fn_header .fn_progress {
+      flex: 1 1 auto;
+      text-align: right;
+      color: var(--fg-dim);
+      font-size: 10px;
+    }
+    .review_fn_header.fully_reviewed .fn_progress { color: #6fd17a; }
+    .review_unit_row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 10px 2px 38px;
+      cursor: pointer;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 10.5px;
+      color: var(--fg-dim);
+    }
+    .review_unit_row:hover {
+      background: rgba(74, 158, 255, 0.10);
+      color: var(--fg);
+    }
+    .review_unit_row.unit_reviewed { opacity: 0.55; }
+    .review_unit_row .unit_checkbox {
+      flex: 0 0 auto;
+      width: 11px; height: 11px;
+      accent-color: #6fd17a;
+      margin: 0;
+      cursor: pointer;
+    }
+    .review_unit_row .unit_checkbox_placeholder {
+      flex: 0 0 11px;
+      width: 11px; height: 11px;
+    }
+    .review_unit_row .unit_glyph {
+      flex: 0 0 12px;
+      text-align: center;
+      font-weight: 600;
+    }
+    .review_unit_row .unit_glyph.added   { color: #6fd17a; }
+    .review_unit_row .unit_glyph.removed { color: #f06060; }
+    .review_unit_row .unit_glyph.dep     { color: #b06ef0; }
+    .review_unit_row .unit_label {
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .review_unit_row .unit_dep_via {
+      flex: 0 0 auto;
+      color: var(--fg-dim);
+      font-size: 10px;
+      font-style: italic;
+    }
+    /* Side chip — tiny tag distinguishing LIVE-side line numbers from
+       OLDER-side. Mirrors the trace-pane tag colors so the user can
+       associate the chip with the pane it points to without thinking. */
+    .review_unit_row .unit_side_chip {
+      flex: 0 0 auto;
+      font-size: 9px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 0 4px;
+      border-radius: 2px;
+      font-weight: 600;
+    }
+    .review_unit_row .unit_side_chip.side_live  { background: rgba(80, 180, 80, 0.18); color: #6fd17a; }
+    .review_unit_row .unit_side_chip.side_older { background: rgba(220, 80, 80, 0.18); color: #f06060; }
+    /* Per-symbol review footer (summary textarea + Mark Reviewed
+       button), shown at the bottom of the review tracker once
+       /api/review/open has populated the item list. */
+    .review_footer {
+      padding: 8px 10px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .review_footer .review_summary_input {
+      width: 100%;
+      box-sizing: border-box;
+      background: var(--bg-input, #1a1d22);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 4px 6px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 10.5px;
+      resize: vertical;
+    }
+    .review_footer .review_summary_input:focus {
+      outline: none;
+      border-color: #4a9eff;
+    }
+    .review_footer .review_summary_readonly {
+      white-space: pre-wrap;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 10.5px;
+      color: var(--fg-dim);
+      padding: 4px 6px;
+      background: rgba(80, 180, 80, 0.05);
+      border-left: 2px solid #6fd17a;
+      border-radius: 2px;
+    }
+    .review_footer .review_complete_btn {
+      align-self: flex-end;
+      padding: 4px 12px;
+      background: #6fd17a;
+      color: #0a0a0a;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 11px;
+    }
+    .review_footer .review_complete_btn:hover:not(:disabled) {
+      background: #8ae29a;
+    }
+    .review_footer .review_complete_btn:disabled {
+      background: rgba(111, 209, 122, 0.25);
+      color: var(--fg-dim);
+      cursor: not-allowed;
+    }
+    .review_footer .review_complete_msg {
+      color: #6fd17a;
+      font-weight: 600;
+      font-size: 11px;
+    }
+    /* Legacy classes kept for any in-flight transitional rendering. */
+    .diff_changes_subrow {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 10px 2px 30px;
+      cursor: pointer;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 10.5px;
+      color: var(--fg-dim);
+    }
+    .diff_changes_subrow:hover {
+      background: rgba(74, 158, 255, 0.10);
+      color: var(--fg);
+    }
+    .diff_changes_subrow .subglyph {
+      flex: 0 0 12px;
+      text-align: center;
+      color: var(--fg-dim);
+    }
+    .diff_changes_subrow_own.diff_changes_subrow .subglyph { color: #6fd17a; }
+    .diff_changes_subrow_dep.diff_changes_subrow .subglyph { color: #b06ef0; }
+    .diff_changes_subrow .sublabel {
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .trace_pane_label .pane_tag {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .trace_pane_label.live  .pane_tag { background: rgba(80, 180, 80, 0.20); color: #6fd17a; }
+    .trace_pane_label.older .pane_tag { background: rgba(220, 80, 80, 0.20); color: #f06060; }
+    .trace_pane_label .pane_sha {
+      color: var(--fg);
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .trace_pane_label .pane_subj {
+      color: var(--fg-dim);
+      text-transform: none;
+      letter-spacing: 0;
+      font-style: italic;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .trace_box {
+      border: 1px solid #888;
+      border-radius: 4px;
+      padding: 6px 8px;
+      margin: 4px 0;
+      background: rgba(255, 255, 255, 0.012);
+      min-width: 0;
+      overflow: hidden;
+      /* Off-screen subtrees (kEntry can produce thousands of nested boxes)
+         are taken out of layout/paint until they scroll into view. The
+         intrinsic-size hint reserves 0×56px per box so scrollbars stay
+         honest before the first measurement. */
+      content-visibility: auto;
+      contain-intrinsic-size: 0 56px;
+    }
+
+    .trace_header {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      min-width: 0;
+    }
+
+    /* min-width: 0 on the flex container is the magic that lets the name
+       shrink and ellipsize. Without it flex children refuse to shrink below
+       their content's intrinsic size and overflow the parent column. */
+    .trace_title {
+      color: var(--fg-bright);
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .trace_title.clickable { cursor: pointer; color: var(--accent); }
+    .trace_title.clickable:hover { text-decoration: underline; }
+
+    .trace_loc {
+      color: var(--fg-dim);
+      font-size: 11px;
+      font-weight: 400;
+      margin-left: auto;
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+
+    /* AST-only badge — small pill next to the title indicating the function
+       was reconstructed from source because LLVM inlined every call site. */
+    .trace_badge {
+      color: var(--fg-dim);
+      font-size: 10px;
+      font-weight: 400;
+      padding: 1px 6px;
+      border: 1px dashed var(--fg-dim);
+      border-radius: 8px;
+      flex: 0 0 auto;
+      white-space: nowrap;
+      margin-left: 6px;
+    }
+
+    .trace_box.ast_only {
+      border-style: dashed;
+    }
+
+    .trace_body { margin-top: 6px; }
+
+    .trace_empty {
+      color: var(--fg-dim);
+      font-style: italic;
+      padding: 2px 0;
+    }
+
+    /* Per-edge-kind border colors mirror the Cytoscape palette. */
+    .trace_box.kind_direct          { border-color: #888; }
+    .trace_box.kind_dispatch_x64    { border-color: #4a9eff; }
+    .trace_box.kind_dispatch_aarch64{ border-color: #3ec9c9; }
+    .trace_box.kind_vtable          { border-color: #b06ef0; }
+    .trace_box.kind_indirect        { border-color: #f06060; border-style: dashed; }
+    .trace_box.kind_leaf_userspace  { border-color: #f0a050; border-style: dashed; }
+
+    .trace_box.entry {
+      border-color: #4a9eff;
+      border-width: 2px;
+      background: rgba(74, 158, 255, 0.06);
+    }
+
+    .trace_box.trace_indirect {
+      border-color: #f06060;
+      border-style: dashed;
+      color: #f06060;
+    }
+    .trace_box.trace_indirect .trace_title { color: #f06060; font-style: italic; }
+
+    .trace_box.trace_recursive {
+      border-color: #d8a050;
+    }
+    .trace_box.trace_recursive .trace_title { color: #d8a050; }
+
+    .trace_box.trace_library {
+      border-color: #555;
+      background: rgba(255, 255, 255, 0.02);
+    }
+    .trace_box.trace_library .trace_title { color: #888; font-style: italic; }
+
+    .trace_box.trace_debug {
+      border-color: #d8a050;
+      border-style: dashed;
+      background: rgba(216, 160, 80, 0.05);
+    }
+    .trace_box.trace_debug .trace_title { color: #d8a050; font-style: italic; }
+
+    .trace_box.trace_loop {
+      border-color: #4caf75;
+    }
+    .trace_box.trace_loop > .trace_header > .trace_title { color: #4caf75; }
+
+    .trace_box.trace_unknown { border-color: #555; color: var(--fg-dim); }
+
+    /* Direct call whose IR target was dropped (e.g. inlined helpers). The
+       AST resolver still gave us a qualified name; we render it as a leaf
+       with a dimmer border than `kind_direct` and no red — it's not
+       genuinely indirect. */
+    .trace_box.trace_inlined {
+      border-color: #555;
+      border-style: dotted;
+    }
+    .trace_box.trace_inlined .trace_title { color: #a0a8b3; }
+
+    /* Depth-capped callee — the body wasn't expanded because we hit the
+       depth limit. Double-click drills in to re-root the trace at this
+       function. The ▸ marker in the title is a visual cue. */
+    .trace_box.trace_capped {
+      cursor: pointer;
+      border-style: dashed;
+    }
+    .trace_box.trace_capped:hover {
+      background: rgba(74, 158, 255, 0.06);
+    }
+    .trace_box.trace_capped .trace_title { color: var(--accent); }
+
+    /* Secondary-pane dblclick fallback: when the user drills into a fn
+       that doesn't exist on the primary (added/deleted across the
+       diff), the primary can't follow. Briefly flash the box so the
+       gesture isn't silently swallowed. */
+    .trace_box.flash {
+      animation: trace_box_flash 250ms ease-out;
+    }
+    @keyframes trace_box_flash {
+      0%   { background: rgba(240, 96, 96, 0.20); }
+      100% { background: rgba(255, 255, 255, 0.012); }
+    }
+
+    /* Diff hints — two flavors.
+       trace_diffhint_direct: the fn ITSELF was changed in the diff. Bright
+         gold stripe + ◆ glyph in the title. Highest signal: drill in or
+         click through to source to read the actual change.
+       trace_diffhint_subtree: the fn or some descendant has changes
+         deeper in the call tree (often past the depth cap). Faint
+         dotted stripe so the user sees the trail to drill down without
+         confusing it with a direct change.
+       Inert when compare is off — predicates default to false. */
+    .trace_box.trace_diffhint_direct {
+      box-shadow: inset 4px 0 0 0 #f0c060;
+    }
+    .trace_box.trace_diffhint_direct > .trace_header > .trace_title::before {
+      content: "◆ ";
+      color: #f0c060;
+      font-size: 10px;
+    }
+    .trace_box.trace_diffhint_subtree {
+      box-shadow: inset 3px 0 0 0 rgba(240, 192, 96, 0.45);
+    }
+
+    /* Branch — title row + columns under it.
+       Columns use horizontal-scrolling flex (not grid) so that deeply-nested
+       3-arm switches and the 65-arm syscall dispatch keep each arm readable
+       at a fixed minimum width and scroll horizontally inside the parent
+       box. A grid with `1fr 1fr 1fr` would squeeze every arm to ~30% and
+       overflow names like `power.doShutdown` past their column. */
+    .trace_branch {
+      border: 1px dashed #3a4150;
+      border-radius: 4px;
+      padding: 6px;
+      margin: 4px 0;
+      min-width: 0;
+    }
+    .trace_branch_head {
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      margin-bottom: 4px;
+    }
+    .trace_branch_kw {
+      color: var(--accent);
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 11px;
+    }
+    .trace_branch_cols {
+      display: flex;
+      flex-wrap: nowrap;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      align-items: stretch;
+    }
+    .trace_arm {
+      flex: 0 0 280px;
+      min-width: 280px;
+      display: flex;
+      flex-direction: column;
+      border-left: 2px solid #3a4150;
+      padding: 0 6px 6px 6px;
+    }
+    .trace_arm_label {
+      color: #d8a050;
+      font-size: 11px;
+      padding: 2px 4px 4px 4px;
+      letter-spacing: 0.02em;
+      border-bottom: 1px dashed #3a4150;
+      margin-bottom: 4px;
+      font-style: italic;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .trace_arm_body {
+      font-size: 12px;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+
+    /* ---- Status / overlays ------------------------------------------ */
+    #status {
+      position: absolute;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(29, 32, 39, 0.95);
+      color: var(--fg);
+      padding: 6px 14px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      font-size: 12px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.15s ease;
+    }
+    #status.visible { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="topbar">
+      <h1>Zag Callgraph</h1>
+
+      <div class="field">
+        <label class="arch_label" for="arch_picker">arch:
+          <select id="arch_picker"></select>
+        </label>
+      </div>
+
+      <div class="field">
+        <label for="entry_select">Entry point:</label>
+        <select id="entry_select">
+          <option value="">(loading)</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="depth_slider">Depth:</label>
+        <input type="range" id="depth_slider" min="1" max="10" value="4" />
+        <span id="depth_value">4</span>
+      </div>
+
+      <div class="field">
+        <label><input type="checkbox" id="include_indirect" checked /> include indirect</label>
+      </div>
+
+      <div class="field">
+        <label title="Hides functions in /usr/lib/zig/ and __zig_* / __ubsan_* / compiler_rt.* infrastructure. Your kernel code is never hidden."><input type="checkbox" id="hide_library" checked /> hide stdlib/compiler <span style="color: var(--fg-dim); cursor: help;">(?)</span></label>
+      </div>
+
+      <div class="field">
+        <label title="Hide std.debug, kprof tracing, *.assert, kernel/panic.zig downstream, and kernel/utils/debug.zig calls. Your panic entry stays visible."><input type="checkbox" id="hide_debug" checked /> hide debug code <span style="color: var(--fg-dim); cursor: help;">(?)</span></label>
+      </div>
+
+      <button id="fit_btn" type="button">fit to view</button>
+      <button id="indirect_panel_btn" type="button">indirect calls</button>
+      <button id="dead_panel_btn" type="button">dead code</button>
+
+      <div class="mode_toggle" id="mode_toggle">
+        <button class="mode_button active" data-mode="graph" type="button">Graph</button>
+        <button class="mode_button" data-mode="trace" type="button">Trace</button>
+      </div>
+
+      <div class="field" id="compare_field">
+        <label for="compare_mode">Compare:</label>
+        <select id="compare_mode">
+          <option value="off">off</option>
+          <option value="parent">X^ vs X</option>
+          <option value="head">X vs HEAD</option>
+        </select>
+        <select id="compare_commit" style="display: none;">
+          <option value="">(loading commits…)</option>
+        </select>
+        <span id="compare_status" class="compare_status"></span>
+      </div>
+    </div>
+
+    <div id="trace_breadcrumb" style="display: none;"></div>
+
+    <div id="body">
+      <div id="graph">
+        <div id="status"></div>
+        <div id="legend">
+          <div><span class="swatch" style="background: #888888"></span>direct</div>
+          <div><span class="swatch" style="background: #4a9eff"></span>dispatch_x64</div>
+          <div><span class="swatch" style="background: #3ec9c9"></span>dispatch_aarch64</div>
+          <div><span class="swatch" style="background: #b06ef0"></span>vtable</div>
+          <div><span class="swatch dashed" style="color: #f06060"></span>indirect</div>
+          <div><span class="swatch dashed" style="color: #f0a050"></span>leaf_userspace</div>
+        </div>
+      </div>
+
+      <div id="trace_view_wrap" class="trace_view_wrap" style="display: none;">
+        <div class="trace_pane_col review_tracker_col" id="review_tracker_col" style="display: none;">
+          <div class="pane_header_row">
+            <div class="trace_pane_label review_tracker_label" id="review_tracker_label">REVIEW TRACKER</div>
+            <button class="pane_collapse_btn" data-pane="review_tracker_col" type="button" title="Collapse pane">&minus;</button>
+          </div>
+          <div class="pane_collapsed_label" data-pane-label-for="review_tracker_col">REVIEW</div>
+          <div class="diff_changes_panel" id="diff_changes_panel">
+            <div class="diff_changes_header">
+              <span class="diff_changes_count" id="diff_changes_count"></span>
+              <span class="review_progress_bar" id="review_progress_bar" style="display: none;">
+                <span class="review_progress_fill" id="review_progress_fill"></span>
+              </span>
+            </div>
+            <div class="diff_changes_list" id="diff_changes_list"></div>
+          </div>
+        </div>
+        <div class="trace_pane_col" id="trace_pane_col_a">
+          <div class="pane_header_row">
+            <div class="trace_pane_label" id="trace_label_a" style="display: none;"></div>
+            <button class="pane_collapse_btn" data-pane="trace_pane_col_a" type="button" title="Collapse pane">&minus;</button>
+          </div>
+          <div class="pane_collapsed_label" data-pane-label-for="trace_pane_col_a">LIVE</div>
+          <div id="trace_view" class="trace_view_pane"></div>
+        </div>
+        <div class="trace_pane_col" id="trace_pane_col_b" style="display: none;">
+          <div class="pane_header_row">
+            <div class="trace_pane_label" id="trace_label_b" style="display: none;"></div>
+            <button class="pane_collapse_btn" data-pane="trace_pane_col_b" type="button" title="Collapse pane">&minus;</button>
+          </div>
+          <div class="pane_collapsed_label" data-pane-label-for="trace_pane_col_b">OLDER</div>
+          <div id="trace_view_b" class="trace_view_pane trace_view_pane_b"></div>
+        </div>
+      </div>
+
+      <aside id="info">
+        <div class="resize_handle" id="info_resize_handle" aria-label="Resize source pane" role="separator"></div>
+        <header>
+          <h2 id="info_title">Selection</h2>
+          <button class="close" id="info_close" type="button" aria-label="Close panel">&times;</button>
+        </header>
+        <dl id="info_meta"></dl>
+        <div id="info_source_wrap" style="display: none;">
+          <dt style="color: var(--fg-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px;">Source</dt>
+          <div class="source_split" id="info_source_split">
+            <div class="source_pane" id="info_source_pane_a">
+              <div class="pane_header_row">
+                <div class="source_pane_label" id="info_source_label_a" style="display: none;"></div>
+                <button class="pane_collapse_btn" data-pane="info_source_pane_a" type="button" title="Collapse pane">&minus;</button>
+              </div>
+              <div class="pane_collapsed_label" data-pane-label-for="info_source_pane_a">LIVE</div>
+              <div class="source_block" id="info_source"></div>
+            </div>
+            <div class="source_pane" id="info_source_pane_b" style="display: none;">
+              <div class="pane_header_row">
+                <div class="source_pane_label" id="info_source_label_b" style="display: none;"></div>
+                <button class="pane_collapse_btn" data-pane="info_source_pane_b" type="button" title="Collapse pane">&minus;</button>
+              </div>
+              <div class="pane_collapsed_label" data-pane-label-for="info_source_pane_b">OLDER</div>
+              <div class="source_block source_block_b" id="info_source_b"></div>
+            </div>
+          </div>
+        </div>
+        <div class="source_error" id="info_source_error" style="display: none;"></div>
+        <div class="intra_block" id="info_intra_wrap" style="display: none;">
+          <div class="intra_header">CALL TREE</div>
+          <div class="intra_body" id="info_intra"></div>
+        </div>
+      </aside>
+
+      <aside id="list_panel">
+        <header>
+          <h2 id="list_title">List</h2>
+          <button class="close" id="list_close" type="button" aria-label="Close panel">&times;</button>
+        </header>
+        <div class="filter_row">
+          <input type="text" id="list_filter" placeholder="filter..." />
+        </div>
+        <div class="summary" id="list_summary"></div>
+        <ul class="list_rows" id="list_rows"></ul>
+      </aside>
+    </div>
+  </div>
+
+  <!-- The Zig backend serves the JS at /static/...; for local preview with
+       `python3 -m http.server` in the assets dir the same files live at the
+       root. We probe HEAD /static/cytoscape.min.js once and pick whichever
+       prefix returns 200, then inject the scripts in order:
+         1) cytoscape.min.js (Graph mode dependency)
+         2) trace.js         (defines window.traceMode before app.js binds it)
+         3) app.js           (Graph + mode-toggle wiring) -->
+  <script>
+    (function () {
+      function inject(prefix) {
+        var s1 = document.createElement("script");
+        s1.src = prefix + "cytoscape.min.js";
+        s1.onload = function () {
+          var s2 = document.createElement("script");
+          s2.src = prefix + "trace.js";
+          s2.onload = function () {
+            var s3 = document.createElement("script");
+            s3.src = prefix + "app.js";
+            document.body.appendChild(s3);
+          };
+          document.body.appendChild(s2);
+        };
+        document.body.appendChild(s1);
+      }
+      var probe = new XMLHttpRequest();
+      probe.open("HEAD", "/static/cytoscape.min.js", true);
+      probe.onload = function () {
+        inject(probe.status === 200 ? "/static/" : "");
+      };
+      probe.onerror = function () { inject(""); };
+      probe.send();
+    })();
+  </script>
+</body>
+</html>

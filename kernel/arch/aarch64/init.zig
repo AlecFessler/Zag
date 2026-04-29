@@ -19,7 +19,6 @@ const zag = @import("zag");
 
 const exceptions = zag.arch.aarch64.exceptions;
 const fpu = zag.sched.fpu;
-const gic = zag.arch.aarch64.gic;
 const paging = zag.arch.aarch64.paging;
 const serial = zag.arch.aarch64.serial;
 
@@ -71,14 +70,6 @@ pub fn init() void {
     // NOTE: GIC init is deferred to acpi.parseAcpi() — the distributor
     // and redistributor base addresses come from MADT, which has not
     // been parsed yet at this point.
-}
-
-/// Secondary core initialization. Called on each AP after SMP boot brings
-/// the core online. Sets up the per-core GIC redistributor and CPU interface.
-pub fn perCoreInit(core_idx: usize) void {
-    if (comptime fpu.lazy_enabled) armFpTrapEl0();
-    enableSpAlignmentChecks();
-    gic.initSecondaryCoreGic(core_idx);
 }
 
 /// Set CPACR_EL1.FPEN bits [21:20] = 0b01 — trap any FP/SIMD access

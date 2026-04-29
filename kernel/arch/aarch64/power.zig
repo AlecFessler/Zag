@@ -28,7 +28,6 @@
 //! - ARM DEN 0022D: PSCI 1.1 Specification
 //! - ACPI 6.5, Section 5.2.9: FADT ARM Boot Architecture Flags
 
-const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.aarch64.cpu;
@@ -98,13 +97,6 @@ pub fn setConduit(c: Conduit) void {
     conduit = c;
 }
 
-/// Query the PSCI version from firmware.
-/// DEN0022D, Section 5.1.1: Returns major in bits [31:16], minor in bits [15:0].
-/// Returns the raw version word on success, or a negative PSCI error code.
-pub fn psciVersion() i64 {
-    return psciCall(PSCI_VERSION, 0, 0, 0);
-}
-
 /// Perform a system-wide power action.
 /// Spec SS4.61; systems.md SS25.
 pub fn powerAction(action: PowerAction) i64 {
@@ -150,12 +142,6 @@ pub fn cpuPowerAction(action: CpuPowerAction, value: u64) i64 {
 ///  -9  = INTERNAL_FAILURE
 pub fn cpuOn(target_mpidr: u64, entry_point: u64, context_id: u64) i64 {
     return psciCall(CPU_ON_64, target_mpidr, entry_point, context_id);
-}
-
-/// Power down the calling CPU. Does not return on success.
-/// DEN0022D, Section 5.1.3.
-pub fn cpuOff() i64 {
-    return psciCall(CPU_OFF, 0, 0, 0);
 }
 
 // --- Internal helpers ---

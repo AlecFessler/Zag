@@ -1,9 +1,11 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
-const apic = zag.arch.x64.apic;
+const gdt = zag.arch.x64.gdt;
 const interrupts = zag.arch.x64.interrupts;
 
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const VAddr = zag.memory.address.VAddr;
 
 pub const CpuidFeatureEcx = enum(u32) {
@@ -112,13 +114,6 @@ pub const Context = packed struct {
     ss: u64,
 };
 
-/// Size of the per-thread FXSAVE save buffer used by the lazy-FPU
-/// machinery (`sched.fpu`). 512 bytes is the FXSAVE format; we
-/// allocate 576 in `Thread.fpu_state` to leave headroom matching the
-/// aarch64 layout, but the FXSAVE/FXRSTOR instructions only touch the
-/// first 512 bytes.
-pub const fxsave_size: u64 = 512;
-
 /// FXSAVE the local core's FP/SIMD state into the thread's lazy-FPU
 /// buffer. `area` must be 16-byte aligned (Thread.fpu_state is 64-byte
 /// aligned, so this is satisfied by construction).
@@ -193,33 +188,12 @@ pub const FpuFlushMailbox = struct {
     requested_thread: ?*anyopaque align(64) = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
-    pub fn requestThread(self: *FpuFlushMailbox, thread: anytype) void {
-        @atomicStore(?*anyopaque, &self.requested_thread, @ptrCast(thread), .release);
-        self.done.store(false, .release);
-    }
-
-    pub fn waitDone(self: *FpuFlushMailbox) void {
-        while (!self.done.load(.acquire)) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
     pub fn ackDone(self: *FpuFlushMailbox) void {
         self.done.store(true, .release);
     }
 };
 
 pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
-
-/// Send the FPU-flush IPI to `target_core`, encoding `thread` as the
-/// target via the per-core mailbox. Spins on the mailbox's done flag
-/// until the receiver finishes saving `thread`'s state. Receiver is
-/// `fpuFlushIpiHandler` registered in `irq.zig`.
-pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
-    fpu_flush_mailbox[target_core].requestThread(thread);
-    apic.sendIpiToCore(target_core, @intFromEnum(interrupts.IntVecs.fpu_flush));
-    fpu_flush_mailbox[target_core].waitDone();
-}
 
 pub const Registers = packed struct {
     r15: u64,
@@ -413,6 +387,18 @@ pub fn restoreInterrupts(saved_rflags: u64) void {
     }
 }
 
+/// Intel SDM Vol 2A, "PUSHFQ" — captures RFLAGS without modifying any state.
+/// Returns true if the IF bit (bit 9) is set, i.e., maskable interrupts are
+/// currently enabled on this core. Used by lockdep to detect IRQ-vs-process
+/// context at lock acquire sites.
+pub fn interruptsEnabled() bool {
+    var rflags: u64 = 0;
+    asm volatile ("pushfq; pop %[out]"
+        : [out] "={rax}" (rflags),
+    );
+    return (rflags & (1 << 9)) != 0;
+}
+
 /// Intel SDM Vol 2A, "PUSHFQ" / "CLI" — atomically captures RFLAGS (including
 /// IF bit 9) then clears the interrupt flag. Caller must pass the returned value
 /// to `restoreInterrupts` to re-arm interrupts only if they were previously enabled.
@@ -451,39 +437,6 @@ pub fn alignStack(stack_top: VAddr) VAddr {
     return VAddr.fromInt(std.mem.alignBackward(u64, stack_top.addr, 16) - 8);
 }
 
-pub fn qemuShutdown() noreturn {
-    // Drain COM1 before cutting power. `writeByte` in `serial.zig`
-    // only waits for the Transmit Holding Register to empty (LSR
-    // bit 5) between bytes — that guarantees the kernel never
-    // overwrites bytes the UART hasn't picked up yet, but the FINAL
-    // byte of the last `serial.print` is still shifting out when we
-    // return. Poking `0x604` here immediately powers off the VM, so
-    // without this wait QEMU cuts the chardev mid-shift and the
-    // tail of the line is lost. Test `s2_4_9` flaked on this for a
-    // long time — `[PASS] §2.4.9` would show up as a truncated
-    // `[PAS` in ~40% of runs.
-    //
-    // Wait for LSR bit 6 ("Transmitter Empty", TEMT) which is the
-    // strictly stronger signal: BOTH the THR AND the Transmitter
-    // Shift Register are empty, i.e. the wire is actually idle.
-    // COM1's LSR is at 0x3F8 + 5 = 0x3FD; drain is bounded so a
-    // wedged UART can't hang the shutdown path forever.
-    const com1_lsr: u16 = 0x3FD;
-    const transmitter_empty: u8 = 0b0100_0000;
-    var spins: u32 = 0;
-    while ((inb(com1_lsr) & transmitter_empty) == 0) {
-        spins += 1;
-        if (spins >= 10_000_000) break;
-    }
-
-    asm volatile ("outw %[val], %[port]"
-        :
-        : [val] "{ax}" (@as(u16, 0x2000)),
-          [port] "{dx}" (@as(u16, 0x604)),
-    );
-    unreachable;
-}
-
 /// Intel SDM Vol 3A, Section 2.5 "Control Registers" — CR3 holds the physical
 /// base address of the top-level paging structure (PML4 with 4-level paging).
 /// Intel SDM Vol 3A, Table 4-12 "Use of CR3 with 4-Level Paging and CR4.PCIDE=0".
@@ -509,6 +462,7 @@ pub fn writeCr3(value: u64) void {
 /// byte (8-bit), word (16-bit), and doubleword (32-bit) variants of the x86
 /// port I/O instructions. Port address is supplied in DX; data in AL/AX/EAX.
 pub fn inb(port: u16) u8 {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     return asm volatile (
         \\inb %[port], %[ret]
         : [ret] "={al}" (-> u8),
@@ -517,6 +471,7 @@ pub fn inb(port: u16) u8 {
 }
 
 pub fn outb(value: u8, port: u16) void {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     asm volatile (
         \\outb %[value], %[port]
         :
@@ -526,6 +481,7 @@ pub fn outb(value: u8, port: u16) void {
 }
 
 pub fn inw(port: u16) u16 {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     return asm volatile (
         \\inw %[port], %[ret]
         : [ret] "={ax}" (-> u16),
@@ -534,6 +490,7 @@ pub fn inw(port: u16) u16 {
 }
 
 pub fn outw(value: u16, port: u16) void {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     asm volatile (
         \\outw %[value], %[port]
         :
@@ -543,6 +500,7 @@ pub fn outw(value: u16, port: u16) void {
 }
 
 pub fn ind(port: u16) u32 {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     return asm volatile (
         \\inl %[port], %[ret]
         : [ret] "={eax}" (-> u32),
@@ -551,6 +509,7 @@ pub fn ind(port: u16) u32 {
 }
 
 pub fn outd(value: u32, port: u16) void {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     asm volatile (
         \\outl %[value], %[port]
         :
@@ -857,4 +816,72 @@ pub fn zeroPage4K(ptr: *anyopaque) void {
     }
     const bytes: [*]u8 = @ptrCast(ptr);
     @memset(bytes[0..4096], 0);
+}
+
+// ── Spec v3 EC dispatch primitives ────────────────────────────────────
+
+/// Restore `ec.ctx` into the live register file and IRETQ to userspace.
+/// Spec §[execution_context] dispatch.
+pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
+    interrupts.switchTo(ec);
+    // `switchTo` jmps to interruptStubEpilogue with rsp pointing at
+    // `ec.ctx`, which iretq's into userspace and never returns to this
+    // frame. Mark unreachable for the type system.
+    unreachable;
+}
+
+/// Build a first-dispatch iret frame at the top of `kstack_top` so that
+/// `interrupts.switchTo`'s jmp interruptStubEpilogue → iretq lands at
+/// `entry` in user mode (or kernel mode when `ustack_top` is null).
+/// Spec §[execution_context] first-dispatch.
+pub fn prepareEcContext(
+    kstack_top: VAddr,
+    ustack_top: ?VAddr,
+    entry: VAddr,
+    arg: u64,
+) *interrupts.ArchCpuContext {
+    @setRuntimeSafety(false);
+    const aligned = alignStack(kstack_top);
+    const entry_fn: *const fn () void = @ptrFromInt(entry.addr);
+    return interrupts.prepareThreadContext(
+        aligned,
+        ustack_top,
+        entry_fn,
+        arg,
+    );
+}
+
+/// Re-patch an already-built kernel-mode iret frame into user-mode
+/// shape. Mirrors the user-mode arm of `interrupts.prepareThreadContext`
+/// (sets USER_CODE/USER_DATA selectors, applies the SysV ABI
+/// `rsp%16==8` skew, writes RIP and the first-arg register). Used by
+/// callers that allocate an EC without an attached user stack and wire
+/// the stack in afterward.
+pub fn patchUserModeIretFrame(
+    ctx: *interrupts.ArchCpuContext,
+    entry: VAddr,
+    user_stack_top: VAddr,
+    arg: u64,
+) void {
+    const ring_3: u64 = 3;
+    ctx.cs = gdt.USER_CODE_OFFSET | ring_3;
+    ctx.ss = gdt.USER_DATA_OFFSET | ring_3;
+    ctx.rip = entry.addr;
+    // SysV AMD64 ABI §3.4.1: at the first instruction of `_start` /
+    // any function entry, `rsp % 16 == 8` (the implicit CALL pushed an
+    // 8-byte return address onto a 16-byte-aligned stack). `user_stack_top`
+    // is page-aligned, so subtract 8 to mimic that post-CALL skew —
+    // without it, 16-byte aligned moves (movaps/movdqa for XMM spills)
+    // emitted against `rsp+offset` trap with #GP at the first instruction.
+    ctx.rsp = user_stack_top.addr - 8;
+    ctx.regs.rdi = arg;
+}
+
+/// Halt the local core with interrupts enabled until the next IRQ.
+/// Spec §[execution_context] idle EC.
+pub fn idle() void {
+    asm volatile (
+        \\sti
+        \\hlt
+    );
 }

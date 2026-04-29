@@ -13,7 +13,6 @@ const VAddr = zag.memory.address.VAddr;
 const STACK_RANGE_START: u64 = address.KernelVA.kernel_stacks.start;
 const STACK_RANGE_END: u64 = address.KernelVA.kernel_stacks.end;
 const SLOT_SIZE: u64 = address.KERNEL_STACK_SLOT_SIZE;
-const STACK_PAGES: u64 = address.KERNEL_STACK_PAGES;
 const MAX_SLOTS: u64 = (STACK_RANGE_END - STACK_RANGE_START) / SLOT_SIZE;
 
 const FREELIST_CAP: usize = 512;
@@ -21,7 +20,7 @@ const FREELIST_CAP: usize = 512;
 var next_slot = std.atomic.Value(u64).init(0);
 var freelist_buf: [FREELIST_CAP]u64 = undefined;
 var freelist_top: usize = 0;
-var freelist_lock: SpinLock = .{};
+var freelist_lock: SpinLock = .{ .class = "stack.freelist_lock" };
 
 pub const Stack = struct {
     top: VAddr,
@@ -40,7 +39,7 @@ pub fn isKernelStackPage(vaddr: VAddr) KernelStackPage {
 }
 
 fn allocSlot() !u64 {
-    freelist_lock.lock();
+    freelist_lock.lock(@src());
     if (freelist_top > 0) {
         freelist_top -= 1;
         const slot = freelist_buf[freelist_top];
@@ -55,7 +54,7 @@ fn allocSlot() !u64 {
 }
 
 fn recycleSlot(slot: u64) void {
-    freelist_lock.lock();
+    freelist_lock.lock(@src());
     defer freelist_lock.unlock();
     if (freelist_top < FREELIST_CAP) {
         freelist_buf[freelist_top] = slot;
@@ -87,16 +86,3 @@ pub fn destroyKernel(stack: Stack, addr_space_root: PAddr) void {
     recycleSlot(stack.slot);
 }
 
-pub fn createUser(proc_vmm: *zag.memory.vmm.VirtualMemoryManager, num_pages: u32) !Stack {
-    const result = try proc_vmm.reserveStack(num_pages);
-    return .{
-        .top = result.top,
-        .base = result.base,
-        .guard = result.guard,
-        .slot = std.math.maxInt(u64),
-    };
-}
-
-pub fn destroyUser(stack: Stack, proc_vmm: *zag.memory.vmm.VirtualMemoryManager) void {
-    proc_vmm.reclaimStack(stack);
-}

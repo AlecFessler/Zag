@@ -6,14 +6,7 @@
 /// Section 3.0: Register Description.
 const zag = @import("zag");
 
-/// Host interface supplied by the owning `Vm`. Lets the IOAPIC deliver
-/// a decoded interrupt into the LAPIC without importing `kvm/lapic.zig`
-/// directly — breaks the peer import cycle. See `kvm/vm.zig` for the
-/// trampoline that casts `ctx` back to `*Vm`.
-pub const IoapicHost = struct {
-    ctx: *anyopaque,
-    injectExternal: *const fn (ctx: *anyopaque, vector: u8) void,
-};
+const Lapic = zag.arch.x64.kvm.lapic.Lapic;
 
 // Memory-mapped register offsets (Table 1)
 const IOREGSEL_OFF: u32 = 0x00;
@@ -26,7 +19,7 @@ const REG_ARB: u8 = 0x02; // IOAPICARB -- RO, arbitration ID
 const REG_REDTBL_BASE: u8 = 0x10; // IOREDTBL[0] lo, 0x11 = IOREDTBL[0] hi, etc.
 
 /// Number of redirection table entries (24 IRQ pins).
-const NUM_REDIR_ENTRIES: u5 = 24;
+pub const NUM_REDIR_ENTRIES: u5 = 24;
 
 pub const Ioapic = struct {
     /// IOREGSEL: currently selected register index.
@@ -38,14 +31,13 @@ pub const Ioapic = struct {
     redir_table: [NUM_REDIR_ENTRIES]u64 = .{@as(u64, 1) << 16} ** NUM_REDIR_ENTRIES,
     /// IRQ line state for level-triggered interrupt tracking.
     irq_level: u32 = 0,
-    /// Host callback for delivering a decoded interrupt into the LAPIC.
-    /// Wired by `Vm.create`; see `IoapicHost` at the top of this file.
-    host: IoapicHost = undefined,
+    /// Pointer to the associated LAPIC for interrupt delivery.
+    lapic: *Lapic = undefined,
 
     /// Initialize the IOAPIC to reset state.
-    pub fn init(self: *Ioapic, host: IoapicHost) void {
+    pub fn init(self: *Ioapic, lapic_ptr: *Lapic) void {
         self.* = .{};
-        self.host = host;
+        self.lapic = lapic_ptr;
     }
 
     /// Handle MMIO read at offset from IOAPIC base 0xFEC00000.
@@ -179,11 +171,11 @@ pub const Ioapic = struct {
             0b000, 0b001 => {
                 // Fixed / Lowest Priority -- deliver vector to LAPIC.
                 if (vector < 16) return; // Illegal vector, ignore
-                self.host.injectExternal(self.host.ctx, vector);
+                self.lapic.injectExternal(vector);
             },
             0b111 => {
                 // ExtINT -- deliver as external interrupt
-                self.host.injectExternal(self.host.ctx, vector);
+                self.lapic.injectExternal(vector);
             },
             else => {}, // SMI, NMI, INIT -- stubbed
         }

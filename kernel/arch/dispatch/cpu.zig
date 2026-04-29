@@ -6,43 +6,10 @@ const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
 const BootInfo = zag.boot.protocol.BootInfo;
-const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const Process = zag.proc.process.Process;
-const Thread = zag.sched.thread.Thread;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const VAddr = zag.memory.address.VAddr;
 
 // --- Fault / context types ---------------------------------------------
-
-/// Number of general-purpose registers saved in a fault snapshot.
-/// x86-64: 15 (rax-r15 minus rsp). aarch64: 31 (x0-x30).
-pub const fault_gpr_count: usize = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.fault_gpr_count,
-    .aarch64 => aarch64.interrupts.fault_gpr_count,
-    else => unreachable,
-};
-
-/// Size of the register portion of a FaultMessage: ip + flags + sp + GPRs.
-pub const fault_regs_size: usize = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.fault_regs_size,
-    .aarch64 => aarch64.interrupts.fault_regs_size,
-    else => unreachable,
-};
-
-/// Total size of a FaultMessage written to userspace (32-byte header + regs).
-pub const fault_msg_size: usize = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.fault_msg_size,
-    .aarch64 => aarch64.interrupts.fault_msg_size,
-    else => unreachable,
-};
-
-/// Architecture-neutral snapshot of a faulted thread's registers.
-/// Used by fault delivery to serialize register state without the
-/// generic kernel referencing arch-specific register names.
-pub const FaultRegSnapshot = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.FaultRegSnapshot,
-    .aarch64 => aarch64.interrupts.FaultRegSnapshot,
-    else => unreachable,
-};
 
 pub const ArchCpuContext = switch (builtin.cpu.arch) {
     .x86_64 => x64.interrupts.ArchCpuContext,
@@ -55,46 +22,6 @@ pub const PageFaultContext = switch (builtin.cpu.arch) {
     .aarch64 => aarch64.interrupts.PageFaultContext,
     else => unreachable,
 };
-
-/// Apply a modified register snapshot from userspace to a faulted thread's
-/// saved context. Reverse of serializeFaultRegs. The caller is responsible
-/// for SMAP (userAccessBegin/End) around the buffer read.
-pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.applyFaultRegs(ctx, snapshot),
-        .aarch64 => aarch64.interrupts.applyFaultRegs(ctx, snapshot),
-        else => unreachable,
-    }
-}
-
-pub fn serializeFaultRegs(ctx: *const ArchCpuContext) FaultRegSnapshot {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.serializeFaultRegs(ctx),
-        .aarch64 => aarch64.interrupts.serializeFaultRegs(ctx),
-        else => unreachable,
-    };
-}
-
-pub fn prepareThreadContext(
-    kstack_top: VAddr,
-    ustack_top: ?VAddr,
-    entry: *const fn () void,
-    arg: u64,
-) *ArchCpuContext {
-    switch (builtin.cpu.arch) {
-        .x86_64 => return x64.interrupts.prepareThreadContext(kstack_top, ustack_top, entry, arg),
-        .aarch64 => return aarch64.interrupts.prepareThreadContext(kstack_top, ustack_top, entry, arg),
-        else => unreachable,
-    }
-}
-
-pub fn switchTo(thread: *Thread) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.switchTo(thread),
-        .aarch64 => aarch64.interrupts.switchTo(thread),
-        else => unreachable,
-    }
-}
 
 // --- Calling convention / entry ----------------------------------------
 
@@ -204,6 +131,14 @@ pub fn enableInterrupts() void {
     }
 }
 
+pub fn interruptsEnabled() bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.interruptsEnabled(),
+        .aarch64 => aarch64.cpu.interruptsEnabled(),
+        else => unreachable,
+    };
+}
+
 pub fn saveAndDisableInterrupts() u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.saveAndDisableInterrupts(),
@@ -244,48 +179,6 @@ pub inline fn userAccessEnd() void {
     }
 }
 
-// --- Interrupt controller (APIC / GIC) ---------------------------------
-
-pub fn maskIrq(irq: u8) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.irq.maskIrq(irq),
-        .aarch64 => aarch64.irq.maskIrq(irq),
-        else => unreachable,
-    }
-}
-
-pub fn unmaskIrq(irq: u8) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.irq.unmaskIrq(irq),
-        .aarch64 => aarch64.irq.unmaskIrq(irq),
-        else => unreachable,
-    }
-}
-
-pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.irq.findIrqForDevice(device),
-        .aarch64 => aarch64.irq.findIrqForDevice(device),
-        else => unreachable,
-    };
-}
-
-pub fn clearIrqPendingBit(irq_line: u8) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.irq.clearIrqPendingBit(irq_line),
-        .aarch64 => {}, // stub
-        else => unreachable,
-    }
-}
-
-pub fn registerIrqOwner(irq_line: u8, proc: *Process, slot_index: u16) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.irq.registerIrqOwner(irq_line, proc, slot_index),
-        .aarch64 => {}, // stub
-        else => unreachable,
-    }
-}
-
 // --- Cache maintenance -------------------------------------------------
 
 /// Synchronize the instruction cache with the data cache after writing
@@ -315,30 +208,6 @@ pub fn syncInstructionCache() void {
 /// repeating instruction-abort exceptions on every ERET.
 ///
 /// ARM ARM B2.4.6 / D5.10.2: data-to-instruction cache coherency.
-pub fn cleanDcacheToPou(start: u64, len: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => {
-            if (len == 0) return;
-            // Conservative 64-byte cache line for Cortex-A72/A76. The
-            // exact line size is in CTR_EL0.DminLine; using 64 bytes
-            // simply over-cleans on cores with smaller lines, which is
-            // safe.
-            const line: u64 = 64;
-            const end = start + len;
-            var addr = start & ~(line - 1);
-            while (addr < end) : (addr += line) {
-                asm volatile ("dc cvau, %[a]"
-                    :
-                    : [a] "r" (addr),
-                    : .{ .memory = true });
-            }
-            asm volatile ("dsb ish" ::: .{ .memory = true });
-        },
-        else => unreachable,
-    }
-}
-
 /// Clean + invalidate the data cache over the given byte range to the
 /// point of coherency. On x86-64 this is a no-op (coherent D-cache). On
 /// aarch64 this is required when memory is reconfigured from Normal
@@ -420,30 +289,6 @@ pub fn fpuClearTrap() void {
     }
 }
 
-/// Arm the FP-disable trap on the local core so the next user-mode FP
-/// access raises #NM (x64) / EC=0x07 (aarch64). Called from switchTo
-/// at every context switch out.
-pub fn fpuArmTrap() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.fpuArmTrap(),
-        .aarch64 => aarch64.cpu.fpuArmTrap(),
-        else => unreachable,
-    }
-}
-
-/// Synchronously flush `thread`'s FP state from the source core's
-/// registers into `thread.fpu_state`. Called by the destination core
-/// when work-stealing has migrated `thread` and a subsequent
-/// `fpuRestore` would otherwise read stale buffer contents. Sends an
-/// IPI and spins until the source core acknowledges.
-pub fn fpuFlushIpi(target_core: u8, thread: *Thread) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.fpuFlushIpi(target_core, thread),
-        .aarch64 => aarch64.cpu.fpuFlushIpi(target_core, thread),
-        else => unreachable,
-    }
-}
-
 // --- Power / shutdown / entropy ----------------------------------------
 
 pub const PowerAction = switch (builtin.cpu.arch) {
@@ -507,52 +352,82 @@ pub fn sysInfoInit() void {
     }
 }
 
-/// Per-core bring-up. Runs on every core from `sched.perCoreInit`
-/// alongside `pmuPerCoreInit`.
-pub fn sysInfoPerCoreInit() void {
+// ── Spec v3 EC dispatch primitives ───────────────────────────────────
+// FPU-trap arming, register-bank load, and TLS-base accessors used by
+// the ExecutionContext dispatch path. Spec §[execution_context].
+
+/// Restore `ec.ctx` into the live register file and return to userspace
+/// via iretq / eret. Never returns to the caller. Used by the scheduler
+/// `switchTo` path after lazy-FPU bookkeeping.
+pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.sysinfo.sysInfoPerCoreInit(),
-        .aarch64 => aarch64.sysinfo.sysInfoPerCoreInit(),
+        .x86_64 => x64.cpu.loadEcContextAndReturn(ec),
+        .aarch64 => aarch64.cpu.loadEcContextAndReturn(ec),
         else => unreachable,
     }
 }
 
-/// Sample this core's frequency / temperature / C-state into its cache
-/// slot. Called from schedTimerHandler on every scheduler tick. Must run
-/// on the target core because the underlying MSR reads are core-local.
-pub fn sampleCoreHwState() void {
+/// Build the first-dispatch iret frame at the top of an EC's kernel
+/// stack. Returns the *ArchCpuContext pointer that scheduler.switchTo
+/// will pass to loadEcContextAndReturn. `entry` is the user-mode RIP;
+/// `ustack_top` is the user RSP (or null for kernel-mode init ECs);
+/// `arg` is loaded into the first argument register (vreg 1 / rdi on
+/// x86-64) so create_capability_domain can pass `cap_table_base`.
+pub fn prepareEcContext(
+    kstack_top: VAddr,
+    ustack_top: ?VAddr,
+    entry: VAddr,
+    arg: u64,
+) *ArchCpuContext {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.prepareEcContext(kstack_top, ustack_top, entry, arg),
+        .aarch64 => aarch64.cpu.prepareEcContext(kstack_top, ustack_top, entry, arg),
+        else => unreachable,
+    };
+}
+
+
+/// Re-patch a previously-built iret frame from kernel-mode shape to
+/// user-mode shape. Used when an EC was allocated without a user stack
+/// (so `prepareEcContext` left the frame in kernel mode) and the
+/// caller is wiring in the user stack and entry afterward — the root
+/// service's primordial EC and freshly-spawned domain ECs both follow
+/// this pattern. Writes user code/data selectors, the user stack
+/// pointer (with the SysV `rsp%16==8` skew baked in), the entry RIP,
+/// and the first-arg register.
+pub fn patchUserModeIretFrame(
+    ctx: *ArchCpuContext,
+    entry: VAddr,
+    user_stack_top: VAddr,
+    arg: u64,
+) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.sysinfo.sampleCoreHwState(),
-        .aarch64 => aarch64.sysinfo.sampleCoreHwState(),
+        .x86_64 => x64.cpu.patchUserModeIretFrame(ctx, entry, user_stack_top, arg),
+        .aarch64 => aarch64.cpu.patchUserModeIretFrame(ctx, entry, user_stack_top, arg),
         else => unreachable,
     }
 }
 
-/// Read the cached current frequency of `core_id` in hertz. Up to one
-/// scheduler tick stale for remote cores.
-pub fn getCoreFreq(core_id: u64) u64 {
+/// Read the user-mode stack pointer captured on syscall entry from a
+/// saved EC context. x86_64 stashes it in `ctx.rsp`; aarch64 stashes
+/// it in `ctx.sp_el0` (the user SP banked register). Used by syscall
+/// paths that need to re-read vreg overflow entries off the user stack
+/// per spec §[syscall_abi].
+pub fn userStackPointer(ctx: *const ArchCpuContext) u64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.sysinfo.getCoreFreq(core_id),
-        .aarch64 => aarch64.sysinfo.getCoreFreq(core_id),
+        .x86_64 => ctx.rsp,
+        .aarch64 => ctx.sp_el0,
         else => unreachable,
     };
 }
 
-/// Read the cached current temperature of `core_id` in milli-celsius.
-pub fn getCoreTemp(core_id: u64) u32 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.sysinfo.getCoreTemp(core_id),
-        .aarch64 => aarch64.sysinfo.getCoreTemp(core_id),
+/// Halt the local core in an interrupts-enabled state until the next
+/// interrupt (HLT with IF=1 on x86-64, WFI with DAIF cleared on
+/// aarch64). Used by the per-core idle EC.
+pub fn idle() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.idle(),
+        .aarch64 => aarch64.cpu.idle(),
         else => unreachable,
-    };
-}
-
-/// Read the cached current C-state level of `core_id`. 0 means active;
-/// higher values indicate progressively deeper idle states.
-pub fn getCoreState(core_id: u64) u8 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.sysinfo.getCoreState(core_id),
-        .aarch64 => aarch64.sysinfo.getCoreState(core_id),
-        else => unreachable,
-    };
+    }
 }

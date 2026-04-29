@@ -22,3 +22,4 @@ pub const smp = @import("smp.zig");
 pub const sysinfo = @import("sysinfo.zig");
 pub const timers = @import("timers.zig");
 pub const vm = @import("vm.zig");
+pub const vm_runloop = @import("vm_runloop.zig");

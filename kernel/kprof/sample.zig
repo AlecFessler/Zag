@@ -30,7 +30,6 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 
 const Kind = record.Kind;
-const Record = record.Record;
 
 /// Target number of cycles between samples. Kept modest so a short
 /// workload (e.g. tests/prof yield) produces enough samples to fill a
@@ -43,15 +42,6 @@ pub const SAMPLE_PERIOD_CYCLES: u64 = 10_000;
 /// path is ~dozens at worst); 32 is comfortably above worst case and
 /// keeps one sample's emit cost a small constant.
 pub const MAX_FRAMES: usize = 32;
-
-/// Program PMC 0 on this core for cycle-overflow sampling and set the
-/// LAPIC LVT PerfMon entry to NMI delivery. Called from
-/// `sched.perCoreInit` after `arch.pmu.pmuPerCoreInit` so the per-thread
-/// user PMU plumbing has finished laying claim to the LVT entry.
-pub fn perCoreInit() void {
-    if (comptime !mode.sample_enabled) return;
-    arch.pmu.kprofSamplePerCoreInit(SAMPLE_PERIOD_CYCLES);
-}
 
 /// Called from the NMI exception handler. Returns true if this NMI
 /// came from the kprof sampling counter — in that case the counter is

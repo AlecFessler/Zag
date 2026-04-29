@@ -22,21 +22,6 @@
 //! - ARM IHI 0069H: GICv3 Architecture Specification, Section 3 (SPI routing)
 //! - ACPI 6.5, Section 6.2.13: _CRS interrupt resource descriptors
 
-const zag = @import("zag");
-
-const gic = zag.arch.aarch64.gic;
-
-const DeviceRegion = zag.memory.device_region.DeviceRegion;
-
-pub fn maskIrq(irq: u8) void {
-    gic.maskIrq(@as(u32, irq) + 32);
-}
-
-pub fn unmaskIrq(irq: u8) void {
-    gic.unmaskIrq(@as(u32, irq) + 32);
-}
-
-pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {
-    _ = device;
-    return null;
-}
+// AArch64 IRQ routing — to be implemented when device IRQ delivery
+// reaches aarch64. SPI mask/unmask helpers and DeviceRegion → INTID
+// lookup will land here, mirroring `arch/x64/irq.zig`.
