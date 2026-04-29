@@ -186,16 +186,11 @@ run_dead_code_check() {
     fi
     ensure_oracle_db || return 1
     local detector="$SCRIPT_DIR/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    local any_failed=0
-    for tgt in kernel routerOS hyprvOS bootloader; do
-        if (cd "$SCRIPT_DIR" && "$detector" --db "$ORACLE_DB" --target "$tgt"); then
-            echo "[PASS] dead-code analyzer clean: $tgt"
-        else
-            echo "[FAIL] dead-code analyzer findings: $tgt"
-            any_failed=1
-        fi
-    done
-    [[ $any_failed -eq 0 ]] || return 1
+    if ! (cd "$SCRIPT_DIR" && "$detector" --db "$ORACLE_DB" --target kernel); then
+        echo "[FAIL] dead-code analyzer findings"
+        return 1
+    fi
+    echo "[PASS] dead-code analyzer clean"
 }
 
 run_oracle_smokes() {

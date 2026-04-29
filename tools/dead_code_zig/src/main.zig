@@ -818,17 +818,18 @@ pub fn main() !void {
         std.process.exit(2);
     }
 
-    // Validate the target name early. `collectFindings` re-checks before
-    // building the path-filter SQL, but failing here gives a tidier error
-    // than a parse error from inside `db.exec`.
-    if (!(std.mem.eql(u8, target_name, "kernel") or
-        std.mem.eql(u8, target_name, "routerOS") or
-        std.mem.eql(u8, target_name, "hyprvOS") or
-        std.mem.eql(u8, target_name, "bootloader")))
-    {
+    // Only `kernel` is supported. The non-kernel trees (routerOS,
+    // hyprvOS, bootloader) compile separately, so the indexer doesn't
+    // emit IR / entry_reaches data for them. Without per-tree IR the
+    // alive-set falls back to bare-token heuristics that get tricked by
+    // cross-tree homonyms (e.g. hyprvOS/libz/syscall.zig:acquireEcs
+    // looks "alive" because the kernel's acquireEcs is referenced from
+    // syscall/dispatch.zig). The verdict on those trees would be too
+    // unreliable to gate on, so reject them outright.
+    if (!std.mem.eql(u8, target_name, "kernel")) {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf,
-            "unsupported --target: {s} (expected kernel | routerOS | hyprvOS | bootloader)\n",
+            "unsupported --target: {s} (only `kernel` is supported — non-kernel trees lack per-tree IR/entry_reaches)\n",
             .{target_name},
         ) catch "unsupported --target\n";
         _ = std.fs.File.stderr().write(msg) catch {};
