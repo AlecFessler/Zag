@@ -1,7 +1,5 @@
-const std = @import("std");
 const zag = @import("zag");
 
-const address = zag.memory.address;
 const cpu = zag.arch.x64.cpu;
 const fpu = zag.sched.fpu;
 const gdt = zag.arch.x64.gdt;
@@ -11,17 +9,38 @@ const kprof = zag.kprof.trace_id;
 const kprof_sample = zag.kprof.sample;
 const mmio_decode = zag.arch.x64.mmio_decode;
 const paging_mod = zag.arch.x64.paging;
+const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const serial = zag.arch.x64.serial;
+const var_range = zag.capdom.var_range;
 
-const FaultReason = zag.perms.permissions.FaultReason;
+const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const DeviceRegion = zag.devices.device_region.DeviceRegion;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.x64.interrupts.PageFaultContext;
-const PAddr = zag.memory.address.PAddr;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
+const VAR = zag.capdom.var_range.VAR;
 const VAddr = zag.memory.address.VAddr;
-const VmNode = zag.memory.vmm.VmNode;
+
+/// thread_fault sub-codes for exception-derived faults (spec §[event_type]
+/// row 2). Values are local to this file; the spec leaves sub-code
+/// numbering to implementations and only the routed handler observes them.
+const ThreadFaultSubcode = struct {
+    const arithmetic: u8 = 1;
+    const illegal_instruction: u8 = 2;
+    const alignment: u8 = 3;
+    const protection: u8 = 4;
+};
+
+/// memory_fault sub-codes for exception-derived faults (spec §[event_type]
+/// row 1). Values are local to this file; the spec leaves sub-code
+/// numbering to implementations and only the routed handler observes them.
+const MemoryFaultSubcode = struct {
+    const invalid_read: u8 = 1;
+    const invalid_write: u8 = 2;
+    const invalid_execute: u8 = 3;
+};
 
 /// Intel SDM Vol 3A, Table 7-1 — Protected-Mode Exceptions and Interrupts.
 /// Vector assignments for architecturally defined exceptions (0-31).
@@ -138,18 +157,26 @@ pub fn init() void {
     }
 }
 
-fn exceptionFaultReason(vector: u5) ?FaultReason {
+/// Event-route classification of an architectural exception. `null` for
+/// vectors handled out-of-band (lazy FPU trap, single-step, NMI, machine
+/// check, double fault).
+const ExceptionEvent = union(enum) {
+    thread_fault: u8,
+    breakpoint,
+};
+
+fn exceptionEvent(vector: u5) ?ExceptionEvent {
     return switch (@as(Exception, @enumFromInt(vector))) {
-        .divide_by_zero, .overflow, .bound_range_exceeded => .arithmetic_fault,
-        .x87_floating_point, .simd_floating_point => .arithmetic_fault,
-        .invalid_opcode => .illegal_instruction,
+        .divide_by_zero, .overflow, .bound_range_exceeded => .{ .thread_fault = ThreadFaultSubcode.arithmetic },
+        .x87_floating_point, .simd_floating_point => .{ .thread_fault = ThreadFaultSubcode.arithmetic },
+        .invalid_opcode => .{ .thread_fault = ThreadFaultSubcode.illegal_instruction },
         // device_not_available is handled out-of-band (lazy FPU trap)
-        // before we reach exceptionFaultReason — see exceptionHandler.
+        // before we reach exceptionEvent — see exceptionHandler.
         .device_not_available => null,
-        .alignment_check => .alignment_fault,
-        .general_protection_fault, .stack_segment_fault => .protection_fault,
-        .invalid_task_state_segment, .segment_not_present => .protection_fault,
-        .virtualization, .security => .protection_fault,
+        .alignment_check => .{ .thread_fault = ThreadFaultSubcode.alignment },
+        .general_protection_fault, .stack_segment_fault => .{ .thread_fault = ThreadFaultSubcode.protection },
+        .invalid_task_state_segment, .segment_not_present => .{ .thread_fault = ThreadFaultSubcode.protection },
+        .virtualization, .security => .{ .thread_fault = ThreadFaultSubcode.protection },
         .single_step_debug => null,
         .breakpoint_debug => .breakpoint,
         .double_fault, .machine_check => null,
@@ -164,14 +191,14 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
 
-    // Lazy-FPU trap. CR0.TS was set by switchTo when this thread last
-    // got dispatched (because it wasn't the last FPU owner on this
-    // core). Userspace's first FP/SSE instruction trapped #NM here —
-    // swap state and return so the instruction re-executes.
+    // Lazy-FPU trap. CR0.TS was set by switchTo when this EC last got
+    // dispatched (because it wasn't the last FPU owner on this core).
+    // Userspace's first FP/SSE instruction trapped #NM here — swap
+    // state and return so the instruction re-executes.
     if (exception == .device_not_available) {
-        const thread = scheduler.currentThread() orelse
-            @panic("#NM with no current thread");
-        fpu.handleTrap(thread);
+        const ec = scheduler.currentEc() orelse
+            @panic("#NM with no current EC");
+        fpu.handleTrap(ec);
         return;
     }
 
@@ -179,20 +206,34 @@ fn exceptionHandler(ctx: *cpu.Context) void {
         // Debug/single-step from userspace: just resume.
         if (exception == .single_step_debug) return;
 
-        if (exceptionFaultReason(vector)) |reason| {
-            const thread = scheduler.currentThread() orelse
-                @panic("user exception with no current thread");
-            // self-alive: currentThread() is running on this core; its
-            // owning Process is alive across this exception path.
-            const proc = thread.process.ptr;
-            if (proc.faultBlock(thread, reason, ctx.rip, ctx.rip, ctx)) {
-                cpu.enableInterrupts();
-                scheduler.yield();
-                return;
+        if (exceptionEvent(vector)) |event| {
+            const ec = scheduler.currentEc() orelse
+                @panic("user exception with no current EC");
+            switch (event) {
+                .thread_fault => |subcode| port.fireThreadFault(ec, subcode, ctx.rip),
+                .breakpoint => port.fireBreakpoint(ec, 0),
             }
-            proc.kill(reason);
             cpu.enableInterrupts();
-            while (true) cpu.halt();
+            scheduler.yieldTo(null);
+            // If `yieldTo` dispatched a fresh EC it would never return
+            // here (`loadEcContextAndReturn` is noreturn). Reaching this
+            // line means the run queue was empty — the no-route fallback
+            // (`parkSelfFaulted` for thread_fault, `markReady` of the
+            // resumed EC was the last work) drained `current_ec` to null.
+            // We CANNOT iretq back to the kernel-stack iret frame: that
+            // frame still holds the now-stale faulting user context, and
+            // returning there would re-fault on the same RIP and re-enter
+            // this handler with `currentEc() == null`, hitting the
+            // user-exception-with-no-current-EC panic.
+            //
+            // Instead jump into the scheduler's main loop (noreturn). It
+            // will idle (`sti+hlt`) until any IRQ delivers more work, at
+            // which point it dispatches via `loadEcContextAndReturn`
+            // (which resets `rsp` to the new EC's saved context) — the
+            // current kernel-stack frame is abandoned, which is the same
+            // discipline the preempt-driven path uses.
+            if (scheduler.currentEc() == null) scheduler.run();
+            return;
         }
     }
 
@@ -200,6 +241,22 @@ fn exceptionHandler(ctx: *cpu.Context) void {
         .double_fault => @panic("Double fault"),
         .machine_check => @panic("Machine check exception"),
         .non_maskable_interrupt => {
+            // lockdep blindspot: NMI is NOT wired into sync_debug.enterIrqContext.
+            // Safe today only because the sole NMI consumer (kprof_sample.onNmi)
+            // is intentionally lock-free (atomic-RMW BSS log emit, MSR-only
+            // counter rearm — see kprof/sample.zig).
+            //
+            // Before adding any lock-taking code to an NMI path:
+            //   1. Wrap the NMI handler body with sync_debug.enterIrqContext()
+            //      / exitIrqContext() (mirror the pattern in
+            //      arch/x64/interrupts.zig dispatchInterrupt).
+            //   2. Add sync_debug.resetIrqContextOnSwitch() on any NMI-driven
+            //      noreturn-jmp path (mirror arch/x64/interrupts.zig).
+            // Without that wiring, the IRQ-mode-mix detector misclassifies
+            // NMI-context acquires as state 2 (process + IRQs disabled =
+            // "lockIrqSave / safe") instead of state 1 (async-IRQ-handler
+            // context), and a class taken in both NMI and plain process
+            // context will deadlock without warning.
             if (kprof_sample.onNmi(ctx.rip, ctx.regs.rbp)) return;
             @panic("NMI");
         },
@@ -230,21 +287,26 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
 
-    // Intercept virtual_bar faults from userspace before the generic handler.
-    // These intentionally have no PTEs — the kernel decodes the faulting
-    // instruction and performs the port I/O on behalf of the process.
+    // Intercept port-IO virtual_bar faults from userspace before the
+    // generic handler. A VAR mapped via `map_mmio` to a port-IO
+    // device_region intentionally has no PTEs — every CPU access faults
+    // and the kernel decodes the MOV, performs the port I/O on behalf
+    // of the EC, and advances RIP. Spec §[port_io_virtualization].
     if (from_user and !pf_err.present) {
-        const thread = scheduler.currentThread() orelse
-            @panic("user page fault with no current thread");
-        // self-alive: currentThread() runs on this core; its owning
-        // Process is alive across this PF handler.
-        const proc = thread.process.ptr;
-        if (proc.vmm.findNode(VAddr.fromInt(faulting_addr))) |node_ref| {
-            const node = node_ref.lock() catch return;
-            const is_virtual_bar = node.kind == .virtual_bar;
-            node_ref.unlock();
-            if (is_virtual_bar) {
-                emulateVirtualBar(ctx, node_ref, faulting_addr, proc);
+        const ec = scheduler.currentEc() orelse
+            @panic("user page fault with no current EC");
+        // self-alive: currentEc() runs on this core; its bound
+        // capability domain is alive across this PF handler.
+        const domain = ec.domain.ptr;
+        if (var_range.findVarCovering(domain, VAddr.fromInt(faulting_addr))) |v| {
+            const v_irq = v._gen_lock.lockIrqSave(@src());
+            const is_port_io = v.map == .mmio and
+                v.device != null and
+                // self-alive: device ref under v's gen-lock.
+                v.device.?.ptr.device_type == .port_io;
+            v._gen_lock.unlockIrqRestore(v_irq);
+            if (is_port_io) {
+                emulateVirtualBar(ctx, ec, v, faulting_addr, domain);
                 return;
             }
         }
@@ -261,15 +323,37 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     zag.memory.fault.handlePageFault(&pf_ctx);
 }
 
-/// Emulate a port I/O access through a virtual BAR mapping.
+/// Emulate a port I/O access through a port-IO VAR.
 /// Decodes the faulting instruction, performs the port I/O, writes back
 /// the result (for reads), and advances RIP past the instruction.
-fn emulateVirtualBar(ctx: *cpu.Context, node_ref: SlabRef(VmNode), faulting_addr: u64, proc: anytype) void {
-    const node = node_ref.lock() catch return;
-    defer node_ref.unlock();
-    const device = node.deviceRegion().?;
+///
+/// Spec §[port_io_virtualization]: unsupported instruction forms (8-byte
+/// MOV, LOCK prefixes, IN/OUT/INS/OUTS, undecodable bytes) deliver
+/// `thread_fault` with the protection sub-code. Out-of-bounds offsets
+/// and other access failures deliver `memory_fault` with read/write
+/// sub-codes.
+fn emulateVirtualBar(
+    ctx: *cpu.Context,
+    ec: *ExecutionContext,
+    v: *VAR,
+    faulting_addr: u64,
+    domain: *CapabilityDomain,
+) void {
+    // Snapshot under the lock then release before any path that may
+    // suspend or terminate `ec`: the fault-routing handlers may unwind
+    // through the scheduler and never return here, so holding the VAR
+    // lock across them would strand the gen and deadlock any future
+    // walk of the domain's vars[]. The DeviceRegion pointer is stable
+    // for the kernel's lifetime once bound and `base_vaddr` is
+    // immutable on the VAR, so the snapshot is safe to use unlocked.
+    const v_irq = v._gen_lock.lockIrqSave(@src());
+    // self-alive: device ref under v's gen-lock; the DeviceRegion is
+    // stable for the kernel's lifetime once bound.
+    const device: *DeviceRegion = v.device.?.ptr;
+    const var_base_addr = v.base_vaddr.addr;
+    v._gen_lock.unlockIrqRestore(v_irq);
 
-    // Fetch instruction bytes from user RIP via the process page tables.
+    // Fetch instruction bytes from user RIP via the domain's page tables.
     const rip = ctx.rip;
     const page_off = rip & 0xFFF;
     // max_bytes is always >= 1 since page_off is in [0, 4095].
@@ -278,10 +362,19 @@ fn emulateVirtualBar(ctx: *cpu.Context, node_ref: SlabRef(VmNode), faulting_addr
     const max_bytes: u8 = @intCast(@min(15, 4096 - page_off));
 
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
-    const phys = paging_mod.resolveVaddr(proc.addr_space_root, rip_page) orelse {
-        proc.kill(.protection_fault);
+    const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse {
+        port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
         cpu.enableInterrupts();
-        while (true) cpu.halt();
+        scheduler.yieldTo(null);
+        // `fireThreadFault`'s no-route fallback (`parkSelfFaulted`)
+        // cleared `current_ec`; if `yieldTo` couldn't dispatch fresh
+        // work, returning would iretq back to the now-stale faulting
+        // user RIP. Hand off to `scheduler.run()` (noreturn) — it idles
+        // until an IRQ delivers more work, at which point dispatch via
+        // `loadEcContextAndReturn` resets `rsp` and abandons this
+        // kernel-stack frame.
+        if (scheduler.currentEc() == null) scheduler.run();
+        unreachable;
     };
 
     const physmap_base = VAddr.fromPAddr(phys, null).addr + page_off;
@@ -291,21 +384,32 @@ fn emulateVirtualBar(ctx: *cpu.Context, node_ref: SlabRef(VmNode), faulting_addr
 
     // Decode the instruction
     const op = mmio_decode.decodeBytes(buf[0..max_bytes]) catch {
-        proc.kill(.protection_fault);
+        port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
         cpu.enableInterrupts();
-        while (true) cpu.halt();
+        scheduler.yieldTo(null);
+        // See the rip_page-resolve fallback above: if the run queue is
+        // empty after firing the no-route park, return into
+        // `scheduler.run()` rather than letting iretq return to a stale
+        // user frame.
+        if (scheduler.currentEc() == null) scheduler.run();
+        unreachable;
     };
 
     // Compute the port offset and validate bounds
-    const port_offset = faulting_addr - node.start.addr;
+    const port_offset = faulting_addr - var_base_addr;
     if (port_offset + op.size > device.access.port_io.port_count) {
-        const reason: FaultReason = if (op.is_write) .invalid_write else .invalid_read;
-        proc.kill(reason);
+        const subcode: u8 = if (op.is_write)
+            MemoryFaultSubcode.invalid_write
+        else
+            MemoryFaultSubcode.invalid_read;
+        port.fireMemoryFault(ec, subcode, faulting_addr);
         cpu.enableInterrupts();
-        while (true) cpu.halt();
+        scheduler.yieldTo(null);
+        if (scheduler.currentEc() == null) scheduler.run();
+        return;
     }
 
-    const port: u16 = device.access.port_io.base_port + @as(u16, @truncate(port_offset));
+    const io_port: u16 = device.access.port_io.base_port + @as(u16, @truncate(port_offset));
 
     if (op.is_write) {
         const value: u32 = if (op.is_immediate)
@@ -314,24 +418,28 @@ fn emulateVirtualBar(ctx: *cpu.Context, node_ref: SlabRef(VmNode), faulting_addr
             @truncate(readContextGpr(ctx, op.reg));
 
         switch (op.size) {
-            1 => cpu.outb(@truncate(value), port),
-            2 => cpu.outw(@truncate(value), port),
-            4 => cpu.outd(value, port),
+            1 => cpu.outb(@truncate(value), io_port),
+            2 => cpu.outw(@truncate(value), io_port),
+            4 => cpu.outd(value, io_port),
             else => {
-                proc.kill(.protection_fault);
+                port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
                 cpu.enableInterrupts();
-                while (true) cpu.halt();
+                scheduler.yieldTo(null);
+                if (scheduler.currentEc() == null) scheduler.run();
+                return;
             },
         }
     } else {
         const result: u32 = switch (op.size) {
-            1 => @as(u32, cpu.inb(port)),
-            2 => @as(u32, cpu.inw(port)),
-            4 => cpu.ind(port),
+            1 => @as(u32, cpu.inb(io_port)),
+            2 => @as(u32, cpu.inw(io_port)),
+            4 => cpu.ind(io_port),
             else => {
-                proc.kill(.protection_fault);
+                port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
                 cpu.enableInterrupts();
-                while (true) cpu.halt();
+                scheduler.yieldTo(null);
+                if (scheduler.currentEc() == null) scheduler.run();
+                unreachable;
             },
         };
         writeContextGpr(ctx, op.reg, op.size, result);

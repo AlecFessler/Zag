@@ -83,14 +83,6 @@ pub fn pmuInit() void {
     }
 }
 
-pub fn pmuPerCoreInit() void {
-    switch (active_backend) {
-        .intel => intel_pmu.perCoreInit(),
-        .amd => amd_pmu.perCoreInit(),
-        .none => {},
-    }
-}
-
 pub fn pmuGetInfo() PmuInfo {
     return switch (active_backend) {
         .intel => intel_pmu.getInfo(),
@@ -107,14 +99,6 @@ pub fn pmuStart(state: *PmuState, configs: []const PmuCounterConfig) !void {
     switch (active_backend) {
         .intel => try intel_pmu.start(state, configs),
         .amd => try amd_pmu.start(state, configs),
-        .none => return error.NoPmu,
-    }
-}
-
-pub fn pmuReset(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    switch (active_backend) {
-        .intel => try intel_pmu.reset(state, configs),
-        .amd => try amd_pmu.reset(state, configs),
         .none => return error.NoPmu,
     }
 }
@@ -167,17 +151,6 @@ pub fn pmuClearState(state: *PmuState) void {
     }
 }
 
-/// kprof sample-mode per-core init. Programs one PMC for cycle
-/// overflow every `period_cycles` cycles and routes the LVT PerfMon
-/// entry to NMI delivery. No-op when no backend is active.
-pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
-    switch (active_backend) {
-        .intel => intel_pmu.kprofSamplePerCoreInit(period_cycles),
-        .amd => amd_pmu.kprofSamplePerCoreInit(period_cycles),
-        .none => {},
-    }
-}
-
 /// kprof sample-mode NMI check. Returns true if the dedicated
 /// sampling PMC overflowed and was rearmed with a fresh
 /// `period_cycles` preload.
@@ -187,16 +160,6 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
         .amd => amd_pmu.kprofSampleCheckAndRearm(period_cycles),
         .none => false,
     };
-}
-
-/// kprof trace-mode per-core init. Programs three PMCs for
-/// free-running cycles / L1 DC refill / branch-mispredict counting.
-pub fn kprofTraceCountersPerCoreInit() void {
-    switch (active_backend) {
-        .intel => intel_pmu.kprofTraceCountersPerCoreInit(),
-        .amd => amd_pmu.kprofTraceCountersPerCoreInit(),
-        .none => {},
-    }
 }
 
 /// kprof trace-mode counter snapshot. Reads the three trace PMCs

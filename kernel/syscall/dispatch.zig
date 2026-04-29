@@ -1,177 +1,402 @@
+//! Spec-v3 syscall dispatch table — switches on the syscall number
+//! encoded in the syscall word and trampolines into the per-object
+//! handler in this directory. The arch-specific entry path collects
+//! register-passed args and any vreg-passed extras into the `args`
+//! slice before calling here. See docs/kernel/specv3.md §[syscall].
+//!
+//! `caller` is the calling EC, type-erased to keep the syscall surface
+//! free of the per-arch context type. Each handler casts it back to
+//! `*ExecutionContext` internally.
+
+const std = @import("std");
 const zag = @import("zag");
 
-const clock = zag.syscall.clock;
-const device = zag.syscall.device;
+const capability = zag.syscall.capability;
+const capability_domain = zag.syscall.capability_domain;
 const errors = zag.syscall.errors;
-const fault = zag.syscall.fault;
+const event_route = zag.syscall.event_route;
+const execution_context = zag.syscall.execution_context;
 const futex = zag.syscall.futex;
-const ipc = zag.syscall.ipc;
-const kprof = zag.kprof.trace_id;
-const memory = zag.syscall.memory;
-const pmu = zag.syscall.pmu;
-const process = zag.syscall.process;
-const sysinfo = zag.syscall.sysinfo;
+const page_frame = zag.syscall.page_frame;
+const port = zag.syscall.port;
+const reply = zag.syscall.reply;
 const system = zag.syscall.system;
-const thread = zag.syscall.thread;
-const vm = zag.syscall.vm;
-
-const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
-
-const E_INVAL = errors.E_INVAL;
-
-pub const SyscallResult = struct {
-    ret: i64,
-    ret2: u64 = 0,
-    /// On aarch64 x0 is both the syscall return register and IPC reply
-    /// word 0. IPC recv handlers that have already written word 0 into x0
-    /// via copyIpcPayload set this flag so the arch-level exception
-    /// dispatcher does not clobber x0 with `ret` on the way out.
-    skip_ret_write: bool = false,
-};
+const timer = zag.syscall.timer;
+const var_ = zag.syscall.var_;
+const virtual_machine = zag.syscall.virtual_machine;
 
 pub const SyscallNum = enum(u64) {
-    write,
-    mem_reserve,
-    mem_perms,
-    mem_shm_create,
-    mem_shm_map,
-    mem_unmap,
-    mem_mmio_map,
-    _mem_mmio_unmap_removed,
-    proc_create,
-    thread_create,
-    thread_exit,
-    thread_yield,
-    set_affinity,
-    revoke_perm,
-    disable_restart,
-    futex_wait_val,
-    futex_wake,
-    clock_gettime,
-    _ioport_read_removed,
-    _ioport_write_removed,
-    mem_dma_map,
-    mem_dma_unmap,
-    set_priority,
-    ipc_send,
-    ipc_call,
-    ipc_recv,
-    ipc_reply,
-    shutdown,
-    thread_self,
-    thread_suspend,
-    thread_resume,
-    thread_kill,
-    fault_recv,
-    fault_reply,
-    fault_read_mem,
-    fault_write_mem,
-    fault_set_thread_mode,
-    vm_create,
-    vm_destroy,
-    vm_guest_map,
-    vm_recv,
-    vm_reply,
-    vm_vcpu_set_state,
-    vm_vcpu_get_state,
-    vm_vcpu_run,
-    vm_vcpu_interrupt,
-    vm_sysreg_passthrough,
-    vm_intc_assert_irq,
-    vm_intc_deassert_irq,
-    pmu_info,
-    pmu_start,
-    pmu_read,
-    pmu_reset,
-    pmu_stop,
-    sys_info,
-    clock_getwall,
-    clock_setwall,
-    getrandom,
-    _notify_wait_removed,
-    irq_ack,
-    sys_power,
-    sys_cpu_power,
-    _thread_unpin_removed,
-    futex_wait_change,
-    _,
+    ack = 26,
+    acquire_ecs = 5,
+    acquire_vars = 6,
+    affinity = 12,
+    bind_event_route = 36,
+    clear_event_route = 37,
+    create_capability_domain = 4,
+    create_execution_context = 7,
+    create_page_frame = 25,
+    create_port = 33,
+    create_var = 17,
+    create_vcpu = 28,
+    create_virtual_machine = 27,
+    delete = 1,
+    futex_wait_change = 44,
+    futex_wait_val = 43,
+    futex_wake = 45,
+    idc_read = 23,
+    idc_write = 24,
+    info_cores = 51,
+    info_system = 50,
+    map_guest = 29,
+    map_mmio = 19,
+    map_pf = 18,
+    perfmon_info = 13,
+    perfmon_read = 15,
+    perfmon_start = 14,
+    perfmon_stop = 16,
+    power_reboot = 53,
+    power_screen_off = 55,
+    power_set_freq = 56,
+    power_set_idle = 57,
+    power_shutdown = 52,
+    power_sleep = 54,
+    priority = 11,
+    random = 49,
+    recv = 35,
+    remap = 21,
+    reply = 38,
+    reply_transfer = 39,
+    restrict = 0,
+    revoke = 2,
+    self = 8,
+    snapshot = 22,
+    @"suspend" = 34,
+    sync = 3,
+    terminate = 9,
+    time_getwall = 47,
+    time_monotonic = 46,
+    time_setwall = 48,
+    timer_arm = 40,
+    timer_cancel = 42,
+    timer_rearm = 41,
+    unmap = 20,
+    unmap_guest = 30,
+    vm_inject_irq = 32,
+    vm_set_policy = 31,
+    yield = 10,
 };
 
-pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
-    kprof.enter(.syscall_dispatch);
-    defer kprof.exit(.syscall_dispatch);
-    const args = zag.arch.dispatch.syscall.getSyscallArgs(ctx);
-    const arg0 = args.arg0;
-    const arg1 = args.arg1;
-    const arg2 = args.arg2;
-    const arg3 = args.arg3;
-    const arg4 = args.arg4;
-    const syscall_num: SyscallNum = @enumFromInt(args.num);
-    return switch (syscall_num) {
-        .write => system.sysWrite(arg0, arg1),
-        .mem_reserve => memory.sysMemReserve(arg0, arg1, arg2),
-        .mem_perms => .{ .ret = memory.sysMemPerms(arg0, arg1, arg2, arg3) },
-        .mem_shm_create => .{ .ret = memory.sysMemShmCreate(arg0, arg1) },
-        .mem_shm_map => .{ .ret = memory.sysMemShmMap(arg0, arg1, arg2) },
-        .mem_unmap => .{ .ret = memory.sysMemUnmap(arg0, arg1, arg2) },
-        .mem_mmio_map => .{ .ret = device.sysMemMmioMap(arg0, arg1, arg2) },
-        ._mem_mmio_unmap_removed => .{ .ret = E_INVAL },
-        .proc_create => .{ .ret = process.sysProcCreate(arg0, arg1, arg2, arg3, arg4) },
-        .thread_create => .{ .ret = thread.sysThreadCreate(arg0, arg1, arg2) },
-        .thread_exit => thread.sysThreadExit(),
-        .thread_yield => .{ .ret = thread.sysThreadYield() },
-        .set_affinity => .{ .ret = thread.sysSetAffinity(arg0) },
-        .revoke_perm => .{ .ret = process.sysRevokePerm(arg0) },
-        .disable_restart => .{ .ret = process.sysDisableRestart() },
-        .futex_wait_val => .{ .ret = futex.sysFutexWaitVal(arg0, arg1, arg2, arg3) },
-        .futex_wake => .{ .ret = futex.sysFutexWake(arg0, arg1) },
-        .clock_gettime => .{ .ret = clock.sysClockGettime() },
-        ._ioport_read_removed => .{ .ret = E_INVAL },
-        ._ioport_write_removed => .{ .ret = E_INVAL },
-        .mem_dma_map => .{ .ret = device.sysMemDmaMap(arg0, arg1) },
-        .mem_dma_unmap => .{ .ret = device.sysMemDmaUnmap(arg0, arg1) },
-        .set_priority => .{ .ret = thread.sysSetPriority(arg0) },
-        .ipc_send => ipc.sysIpcSend(ctx),
-        .ipc_call => ipc.sysIpcCall(ctx),
-        .ipc_recv => ipc.sysIpcRecv(ctx),
-        .ipc_reply => ipc.sysIpcReply(ctx),
-        .shutdown => .{ .ret = system.sysSysPower(0) },
-        .thread_self => .{ .ret = thread.sysThreadSelf() },
-        .thread_suspend => .{ .ret = thread.sysThreadSuspend(arg0) },
-        .thread_resume => .{ .ret = thread.sysThreadResume(arg0) },
-        .thread_kill => .{ .ret = thread.sysThreadKill(arg0) },
-        .fault_recv => fault.sysFaultRecv(ctx, arg0, arg1),
-        .fault_reply => .{ .ret = fault.sysFaultReply(ctx, arg0, arg1, arg2) },
-        .fault_read_mem => .{ .ret = fault.sysFaultReadMem(arg0, arg1, arg2, arg3) },
-        .fault_write_mem => .{ .ret = fault.sysFaultWriteMem(arg0, arg1, arg2, arg3) },
-        .fault_set_thread_mode => .{ .ret = fault.sysFaultSetThreadMode(arg0, arg1) },
-        .vm_create => .{ .ret = vm.sysVmCreate(arg0, arg1) },
-        .vm_destroy => .{ .ret = E_INVAL },
-        .vm_guest_map => .{ .ret = vm.sysVmGuestMap(arg0, arg1, arg2, arg3, arg4) },
-        .vm_recv => vm.sysVmRecv(ctx, arg0, arg1, arg2),
-        .vm_reply => .{ .ret = vm.sysVmReplyCall(arg0, arg1, arg2) },
-        .vm_vcpu_set_state => .{ .ret = vm.sysVmVcpuSetState(arg0, arg1) },
-        .vm_vcpu_get_state => .{ .ret = vm.sysVmVcpuGetState(arg0, arg1) },
-        .vm_vcpu_run => .{ .ret = vm.sysVmVcpuRun(arg0) },
-        .vm_vcpu_interrupt => .{ .ret = vm.sysVmVcpuInterrupt(arg0, arg1) },
-        .vm_sysreg_passthrough => .{ .ret = vm.sysVmSysregPassthrough(arg0, arg1, arg2, arg3) },
-        .vm_intc_assert_irq => .{ .ret = vm.sysVmIntcAssertIrq(arg0, arg1) },
-        .vm_intc_deassert_irq => .{ .ret = vm.sysVmIntcDeassertIrq(arg0, arg1) },
-        .pmu_info => .{ .ret = pmu.sysPmuInfo(zag.sched.scheduler.currentProc(), arg0) },
-        .pmu_start => .{ .ret = pmu.sysPmuStart(zag.sched.scheduler.currentProc(), arg0, arg1, arg2) },
-        .pmu_read => .{ .ret = pmu.sysPmuRead(zag.sched.scheduler.currentProc(), arg0, arg1) },
-        .pmu_reset => .{ .ret = pmu.sysPmuReset(zag.sched.scheduler.currentProc(), arg0, arg1, arg2) },
-        .pmu_stop => .{ .ret = pmu.sysPmuStop(zag.sched.scheduler.currentProc(), arg0) },
-        .sys_info => .{ .ret = sysinfo.sysSysInfo(zag.sched.scheduler.currentProc(), arg0, arg1) },
-        .clock_getwall => .{ .ret = clock.sysClockGetwall() },
-        .clock_setwall => .{ .ret = clock.sysClockSetwall(arg0) },
-        .getrandom => .{ .ret = system.sysGetrandom(arg0, arg1) },
-        ._notify_wait_removed => .{ .ret = E_INVAL },
-        .irq_ack => .{ .ret = device.sysIrqAck(arg0) },
-        .sys_power => .{ .ret = system.sysSysPower(arg0) },
-        .sys_cpu_power => .{ .ret = system.sysSysCpuPower(arg0, arg1) },
-        ._thread_unpin_removed => .{ .ret = E_INVAL },
-        .futex_wait_change => .{ .ret = futex.sysFutexWaitChange(arg0, arg1, arg2) },
-        _ => .{ .ret = E_INVAL },
+/// Read `args[i]`, returning 0 when the index is past the end. Lets
+/// handlers that take fewer args than the max not have to special-case
+/// the slice length.
+inline fn arg(args: []const u64, i: usize) u64 {
+    return if (i < args.len) args[i] else 0;
+}
+
+pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
+    // Spec §[syscall]: syscall number lives in bits 0-11 of the syscall
+    // word. Anything beyond that range is per-syscall metadata
+    // (pair_count, kind, etc.) and is the handler's responsibility.
+    const num_raw: u64 = syscall_word & 0xFFF;
+    const num = std.meta.intToEnum(SyscallNum, num_raw) catch return errors.E_INVAL;
+
+    return switch (num) {
+        .restrict => capability.restrict(caller, arg(args, 0), arg(args, 1)),
+        .delete => capability.delete(caller, arg(args, 0)),
+        .revoke => capability.revoke(caller, arg(args, 0)),
+        .sync => capability.sync(caller, arg(args, 0)),
+
+        .create_capability_domain => capability_domain.createCapabilityDomain(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+            arg(args, 2),
+            arg(args, 3),
+            arg(args, 4),
+            if (args.len > 5) args[5..] else &.{},
+        ),
+        .acquire_ecs => capability_domain.acquireEcs(caller, arg(args, 0)),
+        .acquire_vars => capability_domain.acquireVars(caller, arg(args, 0)),
+
+        .create_execution_context => execution_context.createExecutionContext(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+            arg(args, 2),
+            arg(args, 3),
+            arg(args, 4),
+        ),
+        .self => execution_context.self(caller),
+        .terminate => execution_context.terminate(caller, arg(args, 0)),
+        .yield => execution_context.yield(caller, arg(args, 0)),
+        .priority => execution_context.priority(caller, arg(args, 0), arg(args, 1)),
+        .affinity => execution_context.affinity(caller, arg(args, 0), arg(args, 1)),
+        .perfmon_info => execution_context.perfmonInfo(caller),
+        .perfmon_start => execution_context.perfmonStart(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+            if (args.len > 2) args[2..] else &.{},
+        ),
+        .perfmon_read => execution_context.perfmonRead(caller, arg(args, 0)),
+        .perfmon_stop => execution_context.perfmonStop(caller, arg(args, 0)),
+
+        .create_var => var_.createVar(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+            arg(args, 2),
+            arg(args, 3),
+            arg(args, 4),
+        ),
+        .map_pf => blk: {
+            // Spec §[var].map_pf: syscall word bits 12-19 carry N, the
+            // number of (offset, page_frame) pairs. The pairs occupy
+            // vregs 2..2+2N-1 — args[1..1+2N]. Without this slice the
+            // handler sees uninitialized vregs as junk pairs.
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const pair_words: usize = @intCast(n * 2);
+            const end_idx: usize = @min(1 + pair_words, args.len);
+            break :blk var_.mapPf(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
+        .map_mmio => var_.mapMmio(caller, arg(args, 0), arg(args, 1)),
+        .unmap => blk: {
+            // Spec §[var].unmap: syscall word bits 12-19 carry N, the
+            // number of selectors (0 = unmap everything). The selectors
+            // occupy vregs 2..1+N — args[1..1+N]. Without this slice the
+            // handler sees uninitialized vregs above the user's payload
+            // as junk selectors (e.g. a `&.{}` call would gate into the
+            // map=1/3 selector arms and trip E_BADCAP / E_INVAL on
+            // garbage values, breaking the N=0 "unmap everything" path).
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const end_idx: usize = @min(1 + @as(usize, @intCast(n)), args.len);
+            break :blk var_.unmap(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
+        .remap => var_.remap(caller, arg(args, 0), arg(args, 1)),
+        .snapshot => var_.snapshot(caller, arg(args, 0), arg(args, 1)),
+        .idc_read => blk: {
+            // Spec §[var].idc_read: syscall word bits 12-19 carry count
+            // (number of qwords, max 125). Args carry only [1] var and
+            // [2] offset — vreg 3 onwards holds the *return* qwords, so
+            // sourcing count from `arg(args, 2)` would read whatever the
+            // caller left in rdx (typically 0) and trip the count-zero
+            // guard before the BADCAP / alignment / size checks ever
+            // run, breaking [test 01] / [test 02] / [test 07] / [test 08].
+            const n: u8 = @truncate((syscall_word >> 12) & 0xFF);
+            break :blk var_.idcRead(
+                caller,
+                arg(args, 0),
+                arg(args, 1),
+                n,
+            );
+        },
+        .idc_write => blk: {
+            // Spec §[var].idc_write: syscall word bits 12-19 carry count
+            // (number of qwords, max 125). Qwords occupy vregs 3..2+count
+            // — args[2..2+count]. The handler needs the *raw* count
+            // (before slice truncation) so it can return E_INVAL for
+            // count > 125 even though the args slice tops out at 13
+            // entries (test 04 boundary).
+            const n: u8 = @truncate((syscall_word >> 12) & 0xFF);
+            const end_idx: usize = @min(2 + @as(usize, n), args.len);
+            break :blk var_.idcWrite(
+                caller,
+                arg(args, 0),
+                arg(args, 1),
+                n,
+                if (end_idx > 2) args[2..end_idx] else &.{},
+            );
+        },
+
+        .create_page_frame => page_frame.createPageFrame(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+            arg(args, 2),
+        ),
+
+        .ack => reply.ack(caller, arg(args, 0)),
+
+        .create_port => port.createPort(caller, arg(args, 0)),
+        .@"suspend" => blk: {
+            // Spec §[handle_attachments]: syscall word bits 12-19 carry
+            // `pair_count` `N`. When N > 0 the [2] port handle must
+            // carry the `xfer` cap (test 01), entries must be valid,
+            // etc. The handler needs the count to gate that check.
+            const pair_count: u8 = @truncate((syscall_word >> 12) & 0xFF);
+            break :blk port.@"suspend"(caller, arg(args, 0), arg(args, 1), pair_count);
+        },
+        .recv => port.recv(caller, arg(args, 0), arg(args, 1)),
+
+        .bind_event_route => event_route.bindEventRoute(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+            arg(args, 2),
+        ),
+        .clear_event_route => event_route.clearEventRoute(caller, arg(args, 0), arg(args, 1)),
+
+        .reply => reply.reply(caller, syscall_word),
+        .reply_transfer => blk: {
+            // Spec §[reply].reply_transfer: syscall word bits 12-19 carry
+            // `pair_count` `N`, bits 20-31 carry `reply_handle_id`. Spec
+            // §[handle_attachments] places the N pair entries at vregs
+            // [128-N..127] — the *high* end of the vreg space, which
+            // lives on the user stack at `[user_rsp + (M-13)*8]` for vreg
+            // M. The handler reads pair entries itself (under STAC/CLAC)
+            // so the dispatcher only forwards `n` and the syscall word.
+            //
+            // The handle id rides in the syscall word rather than vreg 1
+            // so the GPR-backed event-state vregs (1..13) survive the
+            // reply syscall — receivers handling vm_exits can keep
+            // modified guest GPRs in registers throughout the handler
+            // and on into the syscall, preserving the L4-style IPC fast
+            // path. See spec §[reply].
+            const n: u8 = @truncate((syscall_word >> 12) & 0xFF);
+            break :blk reply.replyTransfer(caller, syscall_word, n);
+        },
+
+        .timer_arm => timer.timerArm(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+            arg(args, 2),
+        ),
+        .timer_rearm => timer.timerRearm(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+            arg(args, 2),
+        ),
+        .timer_cancel => timer.timerCancel(caller, arg(args, 0)),
+
+        .futex_wait_val => blk: {
+            // Spec §[futex_wait_val]: syscall word bits 12-19 carry N
+            // (number of (addr, expected) pairs, 1..63). The pairs
+            // occupy vregs 2..1+2N — args[1..1+2N]. Without this slice
+            // the handler sees uninitialized vregs as junk pairs.
+            //
+            // [test 02] N = 0 or N > 63 must surface E_INVAL. We
+            // validate the raw N here BEFORE slicing — otherwise an
+            // out-of-range N could silently truncate to a smaller
+            // valid count once clamped against args.len, masking the
+            // bounds violation.
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            if (n == 0 or n > 63) break :blk errors.E_INVAL;
+            const pair_words: usize = @intCast(n * 2);
+            const end_idx: usize = @min(1 + pair_words, args.len);
+            break :blk futex.futexWaitVal(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
+        .futex_wait_change => blk: {
+            // Spec §[futex_wait_change]: identical N-bounds rule as
+            // futex_wait_val — see comment above.
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            if (n == 0 or n > 63) break :blk errors.E_INVAL;
+            const pair_words: usize = @intCast(n * 2);
+            const end_idx: usize = @min(1 + pair_words, args.len);
+            break :blk futex.futexWaitChange(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
+        .futex_wake => futex.futexWake(caller, arg(args, 0), arg(args, 1)),
+
+        .create_virtual_machine => virtual_machine.createVirtualMachine(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+        ),
+        .create_vcpu => virtual_machine.createVcpu(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+            arg(args, 2),
+            arg(args, 3),
+        ),
+        .map_guest => blk: {
+            // Spec §[virtual_machine].map_guest: syscall word bits 12-19
+            // carry N, the number of (guest_addr, page_frame) pairs. The
+            // pairs occupy vregs 2..2+2N-1 — args[1..1+2N]. Without this
+            // slice the handler sees uninitialized vregs above the user's
+            // payload as junk pairs (pairs.len ends up odd or carries
+            // garbage handles, tripping E_INVAL/E_BADCAP before the
+            // user's actual error path can fire).
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const pair_words: usize = @intCast(n * 2);
+            const end_idx: usize = @min(1 + pair_words, args.len);
+            break :blk virtual_machine.mapGuest(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
+        .unmap_guest => blk: {
+            // Spec §[virtual_machine].unmap_guest: syscall word bits 12-19
+            // carry N, the number of page_frames to unmap. The handles
+            // occupy vregs 2..1+N — args[1..1+N]. Without this slice the
+            // handler sees uninitialized vregs above the user's payload
+            // as junk handles, tripping E_BADCAP before the user's
+            // intended error path runs.
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const end_idx: usize = @min(1 + @as(usize, @intCast(n)), args.len);
+            break :blk virtual_machine.unmapGuest(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
+        .vm_set_policy => blk: {
+            // Spec §[virtual_machine].vm_set_policy: syscall word bit 12
+            // = kind, bits 13-20 = count. Each entry occupies a per-arch,
+            // per-kind number of vregs (3 on x86-64 for kind 0/1; 2 or 3
+            // on aarch64 per §[vm_set_policy]). The handler resolves the
+            // exact vreg count against count + the (kind, arch) layout;
+            // dispatch hands it the full vreg space above [1] so the
+            // handler can validate `entries.len == count * vregs/entry`
+            // and reject malformed wires.
+            const end_idx: usize = args.len;
+            break :blk virtual_machine.vmSetPolicy(
+                caller,
+                syscall_word,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
+        .vm_inject_irq => virtual_machine.vmInjectIrq(
+            caller,
+            arg(args, 0),
+            arg(args, 1),
+            arg(args, 2),
+        ),
+
+        .time_monotonic => system.timeMonotonic(caller),
+        .time_getwall => system.timeGetwall(caller),
+        .time_setwall => system.timeSetwall(caller, arg(args, 0)),
+        .random => blk: {
+            // Spec §[rng] random: count packed in syscall word bits 12-19.
+            const count: u8 = @truncate((syscall_word >> 12) & 0xFF);
+            break :blk system.random(caller, count);
+        },
+        .info_system => system.infoSystem(caller),
+        .info_cores => system.infoCores(caller, arg(args, 0)),
+        .power_shutdown => system.powerShutdown(caller),
+        .power_reboot => system.powerReboot(caller),
+        .power_sleep => system.powerSleep(caller, arg(args, 0)),
+        .power_screen_off => system.powerScreenOff(caller),
+        .power_set_freq => system.powerSetFreq(caller, arg(args, 0), arg(args, 1)),
+        .power_set_idle => system.powerSetIdle(caller, arg(args, 0), arg(args, 1)),
     };
 }

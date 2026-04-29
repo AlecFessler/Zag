@@ -5,11 +5,14 @@ const zag = @import("zag");
 const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MappingKind = zag.memory.address.MappingKind;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const Range = zag.utils.range.Range;
 const VAddr = zag.memory.address.VAddr;
+const VarPageSize = zag.capdom.var_range.PageSize;
+const VarCacheType = zag.capdom.var_range.CacheType;
 
 // ── Address Space Layout ────────────────────────────────────────────────
 // Architecture-specific virtual address space boundaries. These define
@@ -57,7 +60,17 @@ pub const addr_space = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-/// ASLR range for userspace allocations (subset of addr_space.user).
+/// NULL guard at the bottom of every user address space. The first
+/// page must always fault — no mapping path may install a leaf into
+/// `[0, 0x1000)`. Spec §[address_space].
+pub const user_null_guard: Range = .{
+    .start = 0x0000_0000_0000_0000,
+    .end = 0x0000_0000_0000_1000,
+};
+
+/// ASLR zone — kernel-chosen base, randomized at placement time. Used
+/// for ELF segments, EC stacks, and `create_var(preferred_base = 0)`.
+/// Spec §[address_space].
 pub const user_aslr: Range = switch (builtin.cpu.arch) {
     .x86_64 => .{
         .start = 0x0000_0000_0000_1000,
@@ -70,15 +83,30 @@ pub const user_aslr: Range = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
+/// Static zone — userspace-chosen base via `create_var(preferred_base
+/// != 0)`. Placement is deterministic. Spec §[address_space].
+pub const user_static: Range = switch (builtin.cpu.arch) {
+    .x86_64 => .{
+        .start = 0x0000_1000_0000_0000,
+        .end = 0x0000_8000_0000_0000,
+    },
+    .aarch64 => .{
+        .start = 0x0000_1000_0000_0000,
+        .end = 0x0001_0000_0000_0000,
+    },
+    else => unreachable,
+};
+
 pub fn mapPage(
     addr_space_root: PAddr,
     phys: PAddr,
     virt: VAddr,
     perms: MemoryPerms,
+    kind: MappingKind,
 ) !void {
     switch (builtin.cpu.arch) {
-        .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, perms),
-        .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, perms),
+        .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, perms, kind),
+        .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, perms, kind),
         else => unreachable,
     }
 }
@@ -89,11 +117,12 @@ pub fn mapPageBoot(
     virt: VAddr,
     size: PageSize,
     perms: MemoryPerms,
+    kind: MappingKind,
     allocator: std.mem.Allocator,
 ) !void {
     switch (builtin.cpu.arch) {
-        .x86_64 => try x64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, allocator),
-        .aarch64 => try aarch64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, allocator),
+        .x86_64 => try x64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, kind, allocator),
+        .aarch64 => try aarch64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, kind, allocator),
         else => unreachable,
     }
 }
@@ -105,18 +134,6 @@ pub fn unmapPage(
     switch (builtin.cpu.arch) {
         .x86_64 => return x64.paging.unmapPage(addr_space_root, virt),
         .aarch64 => return aarch64.paging.unmapPage(addr_space_root, virt),
-        else => unreachable,
-    }
-}
-
-pub fn updatePagePerms(
-    addr_space_root: PAddr,
-    virt: VAddr,
-    new_perms: MemoryPerms,
-) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.updatePagePerms(addr_space_root, virt, new_perms),
-        .aarch64 => aarch64.paging.updatePagePerms(addr_space_root, virt, new_perms),
         else => unreachable,
     }
 }
@@ -188,22 +205,6 @@ pub fn setKernelAddrSpace(root: PAddr) void {
     }
 }
 
-pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.freeUserAddrSpace(addr_space_root),
-        .aarch64 => aarch64.paging.freeUserAddrSpace(addr_space_root),
-        else => unreachable,
-    }
-}
-
-pub fn copyKernelMappings(root: VAddr) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.copyKernelMappings(root),
-        .aarch64 => aarch64.paging.copyKernelMappings(root),
-        else => unreachable,
-    }
-}
-
 pub fn dropIdentityMapping() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.dropIdentityMapping(),
@@ -253,10 +254,78 @@ pub fn classifyRelocation(rtype: u32) RelocAction {
     };
 }
 
-pub fn isRelativeRelocation(rela_type: u32) bool {
+// ── Spec v3 paging primitives ────────────────────────────────────────
+// Fine-grained per-page mapping/invalidation surface used by VAR
+// install/unmap, page_frame mapcnt updates, and shootdown coordination.
+
+/// Map a single page of size `sz` at `virt → phys` with `cch` cache
+/// attributes and `perms`. Spec §[var].map_pf.
+pub fn mapPageSized(
+    addr_space_root: PAddr,
+    phys: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+    cch: VarCacheType,
+    perms: MemoryPerms,
+) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => try x64.paging.mapPageSized(addr_space_root, phys, virt, sz, cch, perms),
+        .aarch64 => try aarch64.paging.mapPageSized(addr_space_root, phys, virt, sz, cch, perms),
+        else => unreachable,
+    }
+}
+
+/// Unmap a single page of size `sz` at `virt`. Returns the previously
+/// mapped physical page if any. Spec §[var].unmap.
+pub fn unmapPageSized(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+) ?PAddr {
     return switch (builtin.cpu.arch) {
-        .x86_64 => rela_type == @intFromEnum(std.elf.R_X86_64.RELATIVE),
-        .aarch64 => rela_type == @intFromEnum(std.elf.R_AARCH64.RELATIVE),
+        .x86_64 => x64.paging.unmapPageSized(addr_space_root, virt, sz),
+        .aarch64 => aarch64.paging.unmapPageSized(addr_space_root, virt, sz),
         else => unreachable,
     };
+}
+
+/// Allocate a fresh empty top-level address space (PML4 root on x86-64,
+/// stage-1 TTBR0 root on aarch64). Bumps the per-arch ASID/PCID
+/// allocator implicitly is the caller's responsibility — this only
+/// hands back the page-table root. Spec §[capability_domain].
+/// Mirror the kernel half (upper) of the current address-space root into
+/// a freshly-allocated child root. On x86_64 this copies PML4 entries
+/// 256..511; on aarch64 the kernel half lives in TTBR1 and is shared by
+/// hardware so this is a no-op.
+pub fn copyKernelMappings(root: VAddr) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.copyKernelMappings(root),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+pub fn allocAddrSpaceRoot() !PAddr {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.allocAddrSpaceRoot(),
+        .aarch64 => aarch64.paging.allocAddrSpaceRoot(),
+        else => unreachable,
+    };
+}
+
+/// Cross-core TLB shootdown over the same page range, addressed by
+/// `addr_space_id` so remote cores can filter quickly. Issues a
+/// shootdown IPI and waits for ack from every core that may hold a
+/// stale entry.
+pub fn shootdownTlbRange(
+    addr_space_id: u16,
+    virt: VAddr,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.shootdownTlbRange(addr_space_id, virt, sz, page_count),
+        .aarch64 => aarch64.paging.shootdownTlbRange(addr_space_id, virt, sz, page_count),
+        else => unreachable,
+    }
 }

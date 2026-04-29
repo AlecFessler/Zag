@@ -1,200 +1,150 @@
 # Zag
 
-A capability-based microkernel written in Zig, targeting x86-64, with a bare-metal network router (routerOS) built on top.
+A capability-based microkernel written in Zig, currently mid-rebuild against [spec v3](docs/kernel/specv3.md). The new kernel surface is implemented and the test runner is on its second generation; many tests do not yet pass.
 
-## Prerequisites
+## Status
 
-- Zig compiler (0.15+)
-- NASM (for SMP trampoline assembly)
-- QEMU with KVM support
-- OVMF UEFI firmware (`/usr/share/ovmf/x64/OVMF.4m.fd`)
-- Python 3 with venv (for router integration tests)
-
-## Building
-
-The routerOS has its own build system. Always build routerOS first, then the kernel (the kernel embeds the routerOS ELF into the boot image).
-
-### RouterOS (QEMU with e1000 virtual NICs)
-
-```bash
-cd routerOS && zig build -Dnic=e1000
-cd .. && zig build -Dprofile=router
-```
-
-### RouterOS (bare metal with Intel x550 NIC)
-
-```bash
-cd routerOS && zig build -Dnic=x550
-cd .. && zig build -Dprofile=router -Diommu=amd
-```
-
-The `-Dnic` flag selects the NIC driver (e1000 for QEMU, x550 for real hardware). The `-Diommu` flag selects the IOMMU type for the QEMU guest device (intel default, amd for AMD-based systems). On bare metal the kernel auto-detects the IOMMU from ACPI tables.
-
-### Kernel tests
-
-```bash
-zig build -Dprofile=test
-```
-
-### Build options
-
-| Flag | Values | Default | Description |
-|------|--------|---------|-------------|
-| `-Dprofile` | `router`, `test`, `bench` | none | Sets defaults for other flags |
-| `-Dnic` | `e1000`, `x550` | `x550` | NIC driver (routerOS build) |
-| `-Dpassthrough` | `true`, `false` | `false` | Skip NIC reset for VFIO passthrough (routerOS build) |
-| `-Dkvm` | `true`, `false` | `true` | KVM acceleration |
-| `-Diommu` | `intel`, `amd` | `intel` | QEMU guest IOMMU device |
-| `-Ddisplay` | `none`, `gtk`, `sdl` | `none` | QEMU display |
-| `-Dnet` | `tap`, `user`, `passthrough`, `none` | profile-dependent | QEMU network type |
-| `-Duse-llvm` | `true`, `false` | profile-dependent | Force LLVM+LLD backend |
-
-### Running in QEMU
-
-```bash
-zig build run -Dprofile=router   # boots router with tap networking
-zig build run -Dprofile=test     # runs kernel test suite
-```
-
-The kernel boots via UEFI, brings up all CPU cores, enumerates PCI devices and serial ports, then launches the root service with full capabilities.
-
-## Testing
-
-### Quick start
-
-```bash
-./test.sh              # run kernel + router tests
-./test.sh kernel       # kernel tests only
-./test.sh router       # router integration tests only
-./test.sh kernel-fuzz  # all kernel fuzzers
-./test.sh router-fuzz  # router fuzzer
-./test.sh -h           # full usage
-```
-
-### Kernel test suite
-
-The test root service (`kernel/tests/`) exercises every syscall and validates kernel behavior against the specification. Tests reference specific spec sections (e.g., `S2.3`, `S4.mem_reserve`). 18 test modules with 9 embedded child processes.
-
-```bash
-./test.sh kernel
-# or directly:
-zig build run -Dprofile=test
-```
-
-The suite prints pass/fail for each test, reports total elapsed time, and calls `shutdown` to cleanly exit QEMU.
-
-### Router integration tests (e1000, QEMU)
-
-134 pytest-based integration tests covering ARP, DHCP (server + client), DNS relay/cache, firewall, NAT, port forwarding, IPv6, fragmentation, HTTP management API, NFS, NTP, UPnP, PCP, traceroute, and more.
-
-**One-time setup** (requires sudo):
-
-```bash
-sudo routerOS/tests/setup_network.sh   # creates tap0/tap1 interfaces
-sudo routerOS/tests/setup_sudo.sh      # sets up namespace + capabilities
-```
-
-The test runner (`test.sh router`) handles venv creation and builds automatically. Or manually:
-
-```bash
-cd routerOS/tests
-python3 -m venv .venv
-.venv/bin/pip install pytest pexpect
-.venv/bin/pytest -v                    # all 134 tests
-.venv/bin/pytest test_dns.py -v        # single test file
-.venv/bin/pytest -k test_nat -v        # filter by name
-```
-
-### Bare metal (SSD boot)
-
-For testing on real hardware with the x550 NIC:
-
-```bash
-# 1. Build routerOS and kernel
-cd routerOS && zig build -Dnic=x550
-cd .. && zig build -Dprofile=router -Diommu=amd
-
-# 2. Flash to SSD (requires the SSD mounted)
-sudo tools/flash_ssd.sh
-```
-
-The flash script copies `BOOTX64.EFI`, `kernel.elf`, and `routerOS.elf` to the EFI system partition. Boot the target machine from the SSD via UEFI.
-
-### Fuzzers
-
-```bash
-./test.sh kernel-fuzz                                # all kernel fuzzers
-./test.sh kernel-fuzz --iterations 50000 --seed 123  # custom params
-./test.sh router-fuzz                                # router packet fuzzer
-./test.sh router-fuzz --seed 42 --iterations 100000  # custom params
-```
-
-Individual fuzzers:
-
-```bash
-cd fuzzing/buddy_allocator && zig build fuzz -- -s 42 -i 100000
-cd fuzzing/heap_allocator && zig build fuzz -- -s 42 -i 100000
-cd fuzzing/vmm && zig build fuzz -- -s 42 -i 100000
-cd fuzzing/red_black_tree && zig build fuzz -- -s 42 -i 100000
-cd fuzzing/router && zig build run -- -s 42 -i 100000
-```
-
-### Kernel unit tests
-
-```bash
-zig test kernel/memory/buddy_allocator.zig
-zig test kernel/containers/red_black_tree.zig
-```
-
-## Documentation
-
-- **[Kernel Specification](docs/spec.md)** --- Observable behavior from userspace. Syscall API, capability model, error codes, device types, system limits.
-- **[Kernel Systems Design](docs/systems.md)** --- Internal architecture and implementation. Data structures, algorithms, memory management, scheduling, page tables.
-- **[Userspace Library](docs/userspace_lib.md)** --- Reference for libz (syscall wrappers, permissions, channels, sync primitives).
-- **[RouterOS Specification](docs/routerOS/spec.md)** --- RouterOS user-facing behavior. Network protocols, DHCP, DNS, NAT, firewall, console commands.
-- **[RouterOS Systems Design](docs/routerOS/system.md)** --- RouterOS internals. Zero-copy forwarding, DMA layout, lock-free data plane, NIC drivers.
-- **[RouterOS Console](docs/routerOS/console.md)** --- Console command reference with examples.
+Spec v3 is a ground-up redesign — the syscall ABI, capability model, IPC, scheduler primitives, address-space layout, and test runner all changed. Code, runner, and most syscalls are in place; gaps are being closed test-by-test against the spec checklist at [`tests/tests/CHECKLIST.md`](tests/tests/CHECKLIST.md).
 
 ## Architecture
 
+The kernel exposes a small set of typed capability objects. Userspace gets things done by holding handles to them and invoking syscalls.
+
+| Object | Role |
+|---|---|
+| **Capability Domain** | Process-equivalent. Owns a handle table and the static caps that gate every syscall. |
+| **Execution Context** | Thread-equivalent. Runnable, suspendable, attachable to vregs for IPC. |
+| **Var** (Virtual Address Range) | Mapped region in a domain's address space. Backed by page frames or device regions. |
+| **Page Frame** | Contiguous physical memory, allocated and revocable. |
+| **Device Region** | MMIO/port-IO range gated by a capability. |
+| **Virtual Machine** | KVM-style guest container; vCPUs are ECs in a VM domain. |
+| **Port** | IPC endpoint. ECs suspend on it; senders deliver vreg payloads. |
+| **Event Route** | Kernel-event → port routing (faults, timers, exits). |
+| **Reply** | One-shot capability minted on suspension; resolves a waiting EC. |
+| **Timer** | Programmable one-shot/periodic wake on a port. |
+| **Futex** | Address-keyed wait/wake on shared memory. |
+
+Syscall ABI uses **128 virtual registers** (low ones backed by GPRs, the rest spill to the user stack), with an L4-style IPC fast path for suspend/reply. See [`docs/kernel/specv3.md`](docs/kernel/specv3.md) for the full spec.
+
+## Repo layout
+
 ```
-kernel/           Microkernel
-  arch/             Architecture-specific (x64, aarch64 placeholder)
-  boot/             UEFI boot protocol
-  containers/       Data structures (red-black tree)
-  devices/          Device registry
-  memory/           PMM, VMM, SHM, stacks, slab/buddy/heap allocators
-  perms/            Capability permission types
-  sched/            Scheduler, process, thread, futex, sync
-  tests/            Kernel test suite (root service + child processes)
+kernel/                Kernel proper
+  arch/                  Arch dispatch + per-arch impls (x64, aarch64)
+  boot/                  UEFI handoff
+  capdom/                Capability domain, var range, virtual machine
+  caps/                  Capability/handle types and derivation
+  devices/               Device region registry
+  memory/                PMM, VMM, page frames, paging, fault, allocators/
+  sched/                 Scheduler, EC, futex, port, timer, perfmon, FPU
+  syscall/               Per-object syscall handlers + dispatch
+  kprof/                 In-kernel tracing/sampling profiler
+  utils/                 Containers, sync primitives, ELF, debug info
 
-routerOS/         Bare-metal network router
-  root_service/     Process broker (spawns and monitors all services)
-  router/           Packet processing, NAT, firewall, DHCP, DNS, IPv6
-    hal/              Hardware abstraction (e1000, x550, DMA)
-    protocols/        Network protocol implementations
-  console/          Serial console CLI
-  serial_driver/    UART driver
-  nfs_client/       NFSv3 client
-  ntp_client/       SNTP client
-  http_server/      HTTP management API + web UI
-  tests/            Integration tests (pytest)
+bootloader/            UEFI bootloader (KASLR, kernel + root-service load)
 
-libz/             Userspace library (shared by all processes)
-bootloader/       UEFI bootloader
-fuzzing/          Fuzzers (buddy, heap, vmm, red-black tree, router)
-tools/            Deployment scripts (flash_ssd.sh)
-docs/             Specification and design documents
+tests/
+  tests/                 Spec v3 test runner + 475 test ELFs
+    runner/                primary.zig (in-kernel orchestrator) + serial
+    tests/                 one ELF per spec assertion (e.g. recv_07.zig)
+    build.zig              authoritative test manifest
+    CHECKLIST.md           per-section progress tracker
+    verify_coverage.py     enforces spec ↔ test parity
+  prof/                  Kernel perf regression harness + baselines
+  fuzzing/               Fuzzers (buddy allocator, vmm, …)
+  redteam/               Red-team regression PoCs (being repopulated under v3)
+  precommit.sh           Full local CI gauntlet (see below)
+  test.sh                Day-to-day target dispatcher (kernel, perf, fuzz)
+  ci.sh                  Long-form CI script with timestamped run logs
+
+tools/                 Dev tooling (see Tools)
+
+docs/
+  kernel/                specv3.md (observable behavior), systems.md (internals)
+  x86/                   Intel SDM / VMX / VT-d / AMD SVM / AMD-Vi PDFs
+  aarch64/               ARM ARM, GICv3, SMMUv3, PSCI, IORT, PL011 PDFs
+  devices/               NVMe, xHCI, virtio, x550 datasheets
+  tools/                 Tool docs + screenshots
 ```
 
-## Kernel capabilities
+## Test runner architecture
 
-- Process isolation with capability-based access control
-- Shared memory IPC with reference counting
-- MMIO device mapping and port I/O syscalls for userspace drivers
-- PCI device enumeration with vendor/device/class metadata
-- IOMMU support (Intel VT-d and AMD-Vi) for DMA isolation
-- Process restart (crash recovery) with configurable persistence
-- Futex-based synchronization (cross-process via SHM)
-- ASLR and stack guard pages
-- SMP support (up to 64 cores) with per-core pinning
+The kernel test suite runs entirely in-kernel — no host shell harness loops over QEMU boots. One QEMU boot runs all 475 tests in parallel.
+
+- The **primary** (root service, `tests/tests/runner/primary.zig`) owns all rights and drives the suite.
+- It mints a single **result port** and spawns each test as its own child capability domain, passing the port handle with `bind | xfer` caps.
+- Each test ELF is embedded into the primary at build time (`tests/tests/build.zig` is the manifest). Each test asserts spec behavior, then calls `libz.testing.report`, which suspends the initial EC on the result port with vregs encoding `{result_code, assertion_id, tag}`.
+- The kernel scheduler/SMP gives parallelism for free. The primary `recv`s suspension events and writes them into a tag-indexed table; the tag is the manifest index, so result join is order-independent.
+- A final pass over the manifest joins names with results and prints pass/fail per test plus a summary line.
+
+Test discovery is build-time: add an ELF under `tests/tests/tests/<slug>_NN.zig`, append an entry to `test_entries` in `tests/tests/build.zig`, and the runner picks it up.
+
+## Building
+
+```bash
+zig build -Dprofile=test           # build kernel + test suite
+zig build run -Dprofile=test       # boot under QEMU/KVM, run the suite
+```
+
+Cross-arch:
+```bash
+zig build -Darch=arm -Dprofile=test
+```
+
+## Tools
+
+All under [`tools/`](tools/). Each builds with `zig build` from its own directory.
+
+### callgraph — interactive call graph explorer
+
+[`tools/callgraph/`](tools/callgraph/) — parses kernel LLVM IR + Zig AST and serves a browser UI for navigating the call graph. Same daemon also runs as an MCP server over stdio for use from agentic tools.
+
+![callgraph trace view](docs/tools/callgraph_trace_view.png)
+
+```bash
+cd tools/callgraph && zig build
+./zig-out/bin/callgraph                 # http://127.0.0.1:8080
+./zig-out/bin/callgraph --mcp           # stdio MCP server
+./zig-out/bin/callgraph --verify        # AST/IR diff, exit
+```
+
+### check_gen_lock — SecureSlab gen-lock analyzer
+
+[`tools/check_gen_lock/`](tools/check_gen_lock/) — token-based static analyzer that enforces the kernel's generational-lock invariant: every pointer to a slab-backed object (Process, Thread, Vm, VCpu, …) is stored as `SlabRef(T)` and every dereference goes through a `lock()`/`unlock()` bracket. Gating stage in precommit.
+
+### dead_code_zig — dead-code detector
+
+[`tools/dead_code_zig/`](tools/dead_code_zig/) — `std.zig.Tokenizer`-based dead-code finder. Comment- and string-aware, alias-chain aware (`pub const X = mod.X;` re-exports are caught when nothing consumes them). Hash-validated skip file at `kernel/.dead-code-skip.txt` whitelists hardware-spec layouts.
+
+### bin_analyzer — ELF source ↔ disassembly explorer
+
+[`tools/bin_analyzer/`](tools/bin_analyzer/) — split-pane analyzer that uses DWARF debug info to map between source lines and disassembly bidirectionally. CLI mode for scripting; see [`docs/tools/bin_analyzer.md`](docs/tools/bin_analyzer.md).
+
+## Local CI — `tests/precommit.sh`
+
+Runs the full cross-arch gauntlet before commits. Stages run independently and failures are summarized at the end:
+
+| Stage | Gate |
+|---|---|
+| arch layering lint | `zag.arch.dispatch` not used inside `kernel/arch/<arch>/`; generic code never reaches into `zag.arch.x64`/`aarch64` (must go through dispatch). |
+| dead-code detector | `tools/dead_code_zig` exits non-zero on any unwhitelisted finding. |
+| gen-lock analyzer | `tools/check_gen_lock` exits non-zero on any err-severity finding. |
+| x86-64 kernel tests | Full suite under local KVM. |
+| aarch64 kernel tests | Same suite, run on a Pi 5 over SSH (`PI_HOST` overridable). |
+| boots Linux guest (x86-64) | KVM, must reach the guest shell within 90s. |
+| boots Linux guest (aarch64) | Local TCG, must reach the guest shell within 300s. |
+| red-team regressions | `tests/redteam/run_all.sh` — every PoC must emit `POC-<id>: PATCHED`. |
+| kernel perf gate | `tests/prof/run_perf.sh --compare-baseline` — kprof per-scope medians vs baselines. |
+
+```bash
+PARALLEL=8 ./tests/precommit.sh
+```
+
+Knobs: `PARALLEL`, `PI_HOST`, `PI_LIMIT`, `PI_TIMEOUT`.
+
+## Documentation
+
+- [`docs/kernel/specv3.md`](docs/kernel/specv3.md) — observable behavior from userspace (syscalls, capabilities, error codes, limits). The **what**.
+- [`docs/kernel/systems.md`](docs/kernel/systems.md) — internal implementation (algorithms, data structures, boot sequence). The **how**.
+- [`docs/x86/`](docs/x86/), [`docs/aarch64/`](docs/aarch64/), [`docs/devices/`](docs/devices/) — vendor reference PDFs cited from kernel hardware code.
+- [`docs/tools/`](docs/tools/) — tool docs and UI screenshots.

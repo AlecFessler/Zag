@@ -1,13 +1,13 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const zag = @import("zag");
 
-const bump = zag.memory.allocators.bump;
-
 const arch = zag.arch.dispatch;
+const bump = zag.memory.allocators.bump;
+const debug = zag.utils.sync.debug;
 
 const Range = zag.utils.range.Range;
 const SpinLock = zag.utils.sync.SpinLock;
+const SrcLoc = debug.SrcLoc;
 
 const INVALID_INDEX: u32 = std.math.maxInt(u32);
 const DEFAULT_WALK_BOUND: u32 = 256;
@@ -37,11 +37,29 @@ pub const AccessError = error{
 /// `lock()` which acquires whatever gen is current.
 pub const GenLock = extern struct {
     word: std.atomic.Value(u64) align(8) = .{ .raw = 0 },
+    class: [*:0]const u8 = "@unclassified",
 
     /// Plain spin-acquire of the lock bit, regardless of generation.
     /// Used by internal kernel paths that already have a live *T from a
     /// pinned reference chain (no handle, no staleness concern).
-    pub fn lock(self: *GenLock) void {
+    pub fn lock(self: *GenLock, src: SrcLoc) void {
+        self.lockOrdered(0, src);
+    }
+
+    /// `lock` variant that tags the lockdep entry with a non-zero
+    /// `ordered_group`. The tag opts out of two checks: same-class
+    /// overlap (lockdep treats every instance in the same group as
+    /// disjoint for the duration of the held window) and pair-edge
+    /// insertion against any other held lock (lockdep skips the
+    /// (held, acquiring) pair-registry entry when either side is
+    /// ordered, so cross-class cycle detection treats the ordered
+    /// acquisition as exempt). Mirrors `SpinLock.lockIrqSaveOrdered`
+    /// in spin_lock.zig and the futex `FUTEX_BUCKET_GROUP` site in
+    /// kernel/proc/futex.zig. Caller must enforce a fixed acquisition
+    /// order across every instance sharing this group; otherwise the
+    /// escape hides real AB-BA deadlocks.
+    pub fn lockOrdered(self: *GenLock, ordered_group: u32, src: SrcLoc) void {
+        debug.acquire(self, self.class, ordered_group, src);
         while (true) {
             const cur = self.word.load(.monotonic);
             if (cur & 1 == 0) {
@@ -53,26 +71,115 @@ pub const GenLock = extern struct {
 
     /// Release a lock acquired via `lock` or `lockWithGen`. Clears the
     /// lock bit without touching the generation counter.
+    ///
+    /// Pairing rule: callers MUST match `lock`/`lockWithGen` to `unlock`,
+    /// and `lockIrqSave*`/`lockWithGenIrqSave*` to `unlockIrqRestore`.
+    /// Mixing produces broken IRQ state (an `unlock` paired with an
+    /// `lockIrqSave` leaves IRQs disabled forever; `unlockIrqRestore`
+    /// paired with a plain `lock` reads an undefined IRQ state) and is
+    /// flagged by the gen-lock analyzer.
     pub fn unlock(self: *GenLock) void {
+        debug.release(self);
         const prev = self.word.fetchAnd(~@as(u64, 1), .release);
         std.debug.assert(prev & 1 == 1);
+    }
+
+    /// IRQ-saving counterpart of `lock`. Disables IRQs on the current
+    /// core, then spin-acquires the lock bit. The returned `u64` carries
+    /// the prior IRQ state — callers MUST pass it back to
+    /// `unlockIrqRestore` to release.
+    ///
+    /// Required at every acquire site of an IRQ-acquired lock class
+    /// (one some IRQ/NMI handler can transitively reach an acquire of)
+    /// — see `tools/check_gen_lock` for the static enforcement.
+    /// Without IRQ masking across the held window, a timer/IPI/etc.
+    /// firing mid-hold runs the ISR on top of the held lock; if the
+    /// ISR acquires any other lock M, lockdep records L→M against the
+    /// destroy-side M→L = AB-BA cycle.
+    pub fn lockIrqSave(self: *GenLock, src: SrcLoc) u64 {
+        return self.lockIrqSaveOrdered(0, src);
+    }
+
+    /// `lockIrqSave` variant that tags the lockdep entry with a
+    /// non-zero `ordered_group`. See `lockOrdered` for the ordered-group
+    /// semantics; this just adds the IRQ-mask discipline on top.
+    pub fn lockIrqSaveOrdered(self: *GenLock, ordered_group: u32, src: SrcLoc) u64 {
+        const state = arch.cpu.saveAndDisableInterrupts();
+        self.lockOrdered(ordered_group, src);
+        return state;
+    }
+
+    /// IRQ-saving counterpart of `lockWithGen`. Disables IRQs first,
+    /// then spin-CAS-acquires + verifies gen. On `StaleHandle` the IRQ
+    /// state is restored before returning the error so callers don't
+    /// have to special-case; on success the caller MUST pass the
+    /// returned `u64` to `unlockIrqRestore`.
+    pub fn lockWithGenIrqSave(self: *GenLock, expected_gen: u63, src: SrcLoc) AccessError!u64 {
+        return self.lockWithGenIrqSaveOrdered(expected_gen, 0, src);
+    }
+
+    /// `lockWithGenIrqSave` variant that tags the lockdep entry with a
+    /// non-zero `ordered_group`.
+    pub fn lockWithGenIrqSaveOrdered(
+        self: *GenLock,
+        expected_gen: u63,
+        ordered_group: u32,
+        src: SrcLoc,
+    ) AccessError!u64 {
+        const state = arch.cpu.saveAndDisableInterrupts();
+        self.lockWithGenOrdered(expected_gen, ordered_group, src) catch |err| {
+            arch.cpu.restoreInterrupts(state);
+            return err;
+        };
+        return state;
+    }
+
+    /// Release a lock acquired via `lockIrqSave*` / `lockWithGenIrqSave*`.
+    /// Clears the lock bit and restores the IRQ state captured at
+    /// acquire time. MUST NOT be paired with a plain `lock`/`lockWithGen`
+    /// acquire — see the pairing note on `unlock`.
+    pub fn unlockIrqRestore(self: *GenLock, state: u64) void {
+        debug.release(self);
+        const prev = self.word.fetchAnd(~@as(u64, 1), .release);
+        std.debug.assert(prev & 1 == 1);
+        arch.cpu.restoreInterrupts(state);
     }
 
     /// Spin-CAS-acquire the lock bit while atomically verifying the
     /// caller's `expected_gen` snapshot matches the slot's current gen.
     /// Returns `StaleHandle` if the slot has been freed (and possibly
     /// reallocated) since the handle was issued.
-    pub fn lockWithGen(self: *GenLock, expected_gen: u63) AccessError!void {
+    pub fn lockWithGen(self: *GenLock, expected_gen: u63, src: SrcLoc) AccessError!void {
+        return self.lockWithGenOrdered(expected_gen, 0, src);
+    }
+
+    /// `lockWithGen` variant that tags the lockdep entry with a
+    /// non-zero `ordered_group`. Same semantics as `GenLock.lockOrdered`
+    /// — opts out of both same-class overlap and cross-class
+    /// pair-edge cycle detection for this acquisition. Mirrors
+    /// `SpinLock.lockIrqSaveOrdered`. Caller must enforce a fixed
+    /// acquisition order across every instance sharing this group;
+    /// otherwise the escape hides real AB-BA deadlocks.
+    pub fn lockWithGenOrdered(
+        self: *GenLock,
+        expected_gen: u63,
+        ordered_group: u32,
+        src: SrcLoc,
+    ) AccessError!void {
         // Parity invariant: a live-handle gen is always odd. An even
         // expected_gen means the caller is holding a reference to a
         // freed slot — a bug at the issuance site, not a stale handle.
         std.debug.assert(expected_gen % 2 == 1);
+        debug.acquire(self, self.class, ordered_group, src);
         const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
         const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
         while (true) {
             if (self.word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
             const cur = self.word.load(.monotonic);
-            if ((cur >> 1) != expected_gen) return error.StaleHandle;
+            if ((cur >> 1) != expected_gen) {
+                debug.release(self);
+                return error.StaleHandle;
+            }
             std.atomic.spinLoopHint();
         }
     }
@@ -143,8 +250,20 @@ pub fn SlabRef(comptime T: type) type {
         /// access to `self.ptr` until `unlock()`. On `StaleHandle` the
         /// slot was freed since this ref was minted — the caller must
         /// NOT touch `self.ptr`.
-        pub fn lock(self: Self) AccessError!*T {
-            try self.ptr._gen_lock.lockWithGen(@intCast(self.gen));
+        pub fn lock(self: Self, src: SrcLoc) AccessError!*T {
+            try self.ptr._gen_lock.lockWithGen(@intCast(self.gen), src);
+            return self.ptr;
+        }
+
+        /// `lock` variant that tags the lockdep entry with a non-zero
+        /// `ordered_group`. Same semantics as `GenLock.lockOrdered` —
+        /// opts out of both same-class overlap and cross-class
+        /// pair-edge cycle detection for this acquisition. Mirrors
+        /// `SpinLock.lockIrqSaveOrdered`. Caller must enforce a
+        /// fixed acquisition order across every instance sharing this
+        /// group; otherwise the escape hides real AB-BA deadlocks.
+        pub fn lockOrdered(self: Self, ordered_group: u32, src: SrcLoc) AccessError!*T {
+            try self.ptr._gen_lock.lockWithGenOrdered(@intCast(self.gen), ordered_group, src);
             return self.ptr;
         }
 
@@ -152,64 +271,32 @@ pub fn SlabRef(comptime T: type) type {
             self.ptr._gen_lock.unlock();
         }
 
+        /// IRQ-saving counterpart of `lock`. Required at acquire sites
+        /// of IRQ-acquired classes (any class an IRQ/NMI handler can
+        /// reach an acquire of) — see `GenLock.lockIrqSave` for the
+        /// rationale. Returns the prior IRQ state, which the caller
+        /// MUST pass to `unlockIrqRestore`. On `StaleHandle` the IRQ
+        /// state is restored internally before the error returns.
+        pub fn lockIrqSave(self: Self, src: SrcLoc) AccessError!struct { ptr: *T, irq_state: u64 } {
+            const state = try self.ptr._gen_lock.lockWithGenIrqSave(@intCast(self.gen), src);
+            return .{ .ptr = self.ptr, .irq_state = state };
+        }
+
+        /// `lockIrqSave` variant that tags the lockdep entry with a
+        /// non-zero `ordered_group`.
+        pub fn lockOrderedIrqSave(self: Self, ordered_group: u32, src: SrcLoc) AccessError!struct { ptr: *T, irq_state: u64 } {
+            const state = try self.ptr._gen_lock.lockWithGenIrqSaveOrdered(@intCast(self.gen), ordered_group, src);
+            return .{ .ptr = self.ptr, .irq_state = state };
+        }
+
+        /// Release a lock acquired via `lockIrqSave` / `lockOrderedIrqSave`.
+        /// MUST NOT be paired with a plain `lock` acquire.
+        pub fn unlockIrqRestore(self: Self, irq_state: u64) void {
+            self.ptr._gen_lock.unlockIrqRestore(irq_state);
+        }
+
         pub fn eql(self: Self, other: Self) bool {
             return self.ptr == other.ptr and self.gen == other.gen;
-        }
-    };
-}
-
-/// Lock-guarded cell for a `?SlabRef(T)`. Native 128-bit atomics would
-/// want `cmpxchg16b` on x86_64, which our kernel's CPU baseline does
-/// not mandate; a per-cell `SpinLock` gives the same observable
-/// semantics (consistent ptr+gen snapshot across cores) with no CPU
-/// feature dependency. Scheduler use is low-contention: writers are
-/// always the owning core; cross-core readers are identity-compare
-/// only and hit the lock briefly.
-///
-/// The cell stores `ptr: ?*T` + `gen: u32` separately under the lock,
-/// so there is no "empty bit pattern" constraint on the SlabRef
-/// layout — a null `ptr` plus any `gen` encodes empty.
-pub fn AtomicSlabRef(comptime T: type) type {
-    return struct {
-        const Self = @This();
-        const Ref = SlabRef(T);
-
-        lock: SpinLock = .{},
-        ptr: ?*T = null,
-        gen: u32 = 0,
-
-        pub fn load(self: *const Self, comptime _: std.builtin.AtomicOrder) ?Ref {
-            const mut: *Self = @constCast(self);
-            mut.lock.lock();
-            defer mut.lock.unlock();
-            const p = mut.ptr orelse return null;
-            return Ref.init(p, @intCast(mut.gen));
-        }
-
-        pub fn store(self: *Self, ref: ?Ref, comptime _: std.builtin.AtomicOrder) void {
-            self.lock.lock();
-            defer self.lock.unlock();
-            if (ref) |r| {
-                self.ptr = r.ptr;
-                self.gen = r.gen;
-            } else {
-                self.ptr = null;
-                self.gen = 0;
-            }
-        }
-
-        pub fn swap(self: *Self, ref: ?Ref, comptime _: std.builtin.AtomicOrder) ?Ref {
-            self.lock.lock();
-            defer self.lock.unlock();
-            const prev: ?Ref = if (self.ptr) |p| Ref.init(p, @intCast(self.gen)) else null;
-            if (ref) |r| {
-                self.ptr = r.ptr;
-                self.gen = r.gen;
-            } else {
-                self.ptr = null;
-                self.gen = 0;
-            }
-            return prev;
         }
     };
 }
@@ -270,7 +357,7 @@ pub fn SecureSlab(
 
         /// Allocator-internal lock guarding the freelist / cursors /
         /// bump pointers. Orthogonal to per-slot GenLocks.
-        lock: SpinLock = .{},
+        lock: SpinLock = .{ .class = "SecureSlab(" ++ @typeName(T) ++ ").lock" },
 
         pub const Ref = SlabRef(T);
 
@@ -328,7 +415,7 @@ pub fn SecureSlab(
         /// observer holds the ref, field access during init is
         /// self-alive and does not need lock/unlock bracketing.
         pub fn create(self: *Self) AllocError!Ref {
-            self.lock.lock();
+            self.lock.lock(@src());
             defer self.lock.unlock();
 
             if (self.count_free == 0) {
@@ -353,7 +440,8 @@ pub fn SecureSlab(
             const new_gen: u63 = prev_gen + 1;
             slot_ptr._gen_lock.setGenRelease(new_gen);
 
-            return Ref.init(slot_ptr, new_gen);
+            const ref = Ref.init(slot_ptr, new_gen);
+            return ref;
         }
 
         /// Atomically verify the caller's carried gen, acquire the
@@ -363,9 +451,10 @@ pub fn SecureSlab(
         /// reallocation and is a bug). A racing double-free is rejected
         /// cleanly rather than panicking.
         ///
-        /// Prefer `SlabRef(T).destroy(slab)` at call sites that already
-        /// hold a fat pointer; this underlying form exists for sites
-        /// that only know `(*T, gen)` and haven't migrated yet.
+        /// For call sites that already hold the slot's gen-lock (they
+        /// locked, did work, and are ready to free) prefer
+        /// `destroyLocked(ptr, expected_gen)` — it avoids the awkward
+        /// unlock/destroy-relock dance and cannot fail.
         pub fn destroy(
             self: *Self,
             ptr: *T,
@@ -375,9 +464,60 @@ pub fn SecureSlab(
             // lockWithGen asserts this too; stating it here makes the
             // destroy-side contract explicit for readers.
             std.debug.assert(expected_gen % 2 == 1);
-            try ptr._gen_lock.lockWithGen(expected_gen);
+            try ptr._gen_lock.lockWithGen(expected_gen, @src());
+            self.destroyLockedInner(ptr, expected_gen);
+        }
 
-            self.lock.lock();
+        /// Destroy a slot whose gen-lock the caller already holds at
+        /// `expected_gen`. Releases the lock as part of the gen bump
+        /// (same `setGenRelease(expected_gen + 1)` that `destroy` does).
+        /// Cannot fail: gen was verified when the caller took the lock,
+        /// and the lock bit prevents anyone else from mutating the slot.
+        pub fn destroyLocked(self: *Self, ptr: *T, expected_gen: u63) void {
+            std.debug.assert(expected_gen % 2 == 1);
+            // Debug-only: caller must actually hold the lock at expected_gen.
+            if (std.debug.runtime_safety) {
+                const word = ptr._gen_lock.word.load(.monotonic);
+                std.debug.assert(word == ((@as(u64, expected_gen) << 1) | 1));
+            }
+            self.destroyLockedInner(ptr, expected_gen);
+        }
+
+        /// Visit every currently-allocated slot. The visitor receives a
+        /// `*T` and a `u63` gen for the live slot, then returns whether
+        /// to continue iterating. Slots whose gen-lock parity is even
+        /// (freed) or zero (never allocated) are skipped.
+        ///
+        /// No lock is held across the visitor — callers must take the
+        /// per-slot gen-lock themselves if they need exclusive access
+        /// to T's fields. Liveness across the visitor is best-effort:
+        /// a slot can be destroyed concurrently. The `gen` returned
+        /// alongside the pointer is the snapshot the visitor would use
+        /// to construct a `SlabRef(T)` for verify-and-acquire.
+        ///
+        /// Used by cross-domain object-holder lookups (e.g. timer
+        /// fire propagation walks every CapabilityDomain to find handles
+        /// pointing at a given Timer) where no inverse index exists.
+        pub fn forEachAlive(self: *Self, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *T, u63) bool) void {
+            // Snapshot count_total once. New slots minted concurrently
+            // will sit at indices >= the snapshot; visiting them is
+            // optional and could be racy with their initialization.
+            const total = @atomicLoad(u32, &self.count_total, .acquire);
+            var i: u32 = 0;
+            while (i < total) {
+                const ptr = self.ptrAt(i);
+                const gen = ptr._gen_lock.currentGen();
+                if (gen != 0 and (gen % 2) == 1) {
+                    if (!visit(ctx, ptr, gen)) return;
+                }
+                i += 1;
+            }
+        }
+
+        /// Shared tail of `destroy` / `destroyLocked`. Caller has already
+        /// established the slot's gen-lock is held at `expected_gen`.
+        fn destroyLockedInner(self: *Self, ptr: *T, expected_gen: u63) void {
+            self.lock.lock(@src());
             defer self.lock.unlock();
 
             // Defense-in-depth: clear every byte of T *except* `_gen_lock`
@@ -391,7 +531,14 @@ pub fn SecureSlab(
 
             // Gen-lock currently held. Bump to (expected_gen+1)<<1 | 0 and
             // release in one store: the new gen is even (freed) and the
-            // lock bit is clear.
+            // lock bit is clear. The atomic store releases the in-memory
+            // lock bit, but lockdep tracks acquires/releases on its own
+            // per-core held stack — the matching `debug.release` keeps that
+            // stack in sync, otherwise the entry stays held until the slot
+            // gets re-acquired and same-class / cycle false positives fire
+            // on the next sibling-slot destroy under the same critical
+            // section (e.g. `vmm.deinit` walking and freeing every node).
+            debug.release(&ptr._gen_lock);
             ptr._gen_lock.setGenRelease(expected_gen + 1);
 
             const idx = self.indexOf(ptr);
@@ -415,6 +562,19 @@ pub fn SecureSlab(
             // zeroes new pages); be explicit under second-touch reuse.
             @memset(slot_base[0..slot_stride], 0);
             const slot_ptr: *T = @ptrCast(@alignCast(slot_base));
+            // The whole-slot @memset above clobbers `_gen_lock.class`. The
+            // GenLock struct-default `"@unclassified"` only fills in for
+            // instances built via `.{}` literals; the slab's raw-bytes init
+            // path bypasses it entirely. Without this restore the class
+            // pointer stays NULL for the slot's lifetime — `zeroExceptGenLock`
+            // on subsequent destroys preserves whatever's already there.
+            // A NULL `class` page-faults the lockdep panic-printer (fixed
+            // alongside this) and, more importantly, makes every two slab-
+            // backed `_gen_lock` acquires falsely register as a same-class
+            // overlap (NULL == NULL), turning every nested slab access into
+            // a lockdep panic. Naming each slab's GenLock-class by T's
+            // typename keeps distinct slabs distinct in the detector.
+            slot_ptr._gen_lock.class = "SecureSlab(" ++ @typeName(T) ++ ")._gen_lock";
 
             const ptr_cell = bumpOne(&self.ptrs_bump, *T) orelse return error.SlabFull;
             ptr_cell.* = slot_ptr;
@@ -642,7 +802,6 @@ const testing = std.testing;
 const TestT = extern struct {
     _gen_lock: GenLock = .{},
     value: u64 = 0,
-    pad: u64 = 0,
 };
 
 test "validateT accepts well-formed extern struct" {
@@ -664,7 +823,7 @@ test "randStep stays in [-N, N]" {
 test "genlock lock/unlock sequencing" {
     var gl: GenLock = .{};
     gl.setGenRelease(5); // pretend we just allocated gen=5
-    gl.lock();
+    gl.lock(@src());
     try testing.expect(gl.word.load(.monotonic) & 1 == 1);
     gl.unlock();
     try testing.expect(gl.word.load(.monotonic) & 1 == 0);
@@ -677,14 +836,14 @@ test "genlock lockWithGen rejects stale" {
     // Stale gen must still be odd — an even expected_gen would trip
     // the parity assert, not return StaleHandle (that's a caller bug,
     // not an ordinary stale-handle miss).
-    try testing.expectError(error.StaleHandle, gl.lockWithGen(3));
+    try testing.expectError(error.StaleHandle, gl.lockWithGen(3, @src()));
 }
 
 test "SlabRef lock / unlock round-trip on live slot" {
     var t: TestT = .{};
     t._gen_lock.setGenRelease(3); // pretend live at gen=3
     const ref = SlabRef(TestT).init(&t, 3);
-    const got = try ref.lock();
+    const got = try ref.lock(@src());
     try testing.expectEqual(&t, got);
     try testing.expect(t._gen_lock.word.load(.monotonic) & 1 == 1);
     ref.unlock();
@@ -695,5 +854,5 @@ test "SlabRef.lock rejects a stale ref" {
     var t: TestT = .{};
     t._gen_lock.setGenRelease(5); // slot has advanced to 5
     const stale = SlabRef(TestT).init(&t, 3); // caller captured gen=3
-    try testing.expectError(error.StaleHandle, stale.lock());
+    try testing.expectError(error.StaleHandle, stale.lock(@src()));
 }

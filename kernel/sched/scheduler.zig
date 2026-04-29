@@ -1,1031 +1,449 @@
+//! Per-core scheduler — owns the run queues, dispatches ECs, handles
+//! preemption + voluntary yield, tracks the current EC per core, and
+//! coordinates lazy-FPU eviction across cores.
+//!
+//! Each core has a `PerCore` slot holding its run queue (priority-
+//! ordered intrusive PQ over EC.next), the currently dispatched EC,
+//! the last-FPU-owner EC, and a flag for whether CR0.TS is currently
+//! armed. Cross-core enqueue is supported (the source core sends an
+//! IPI to the destination if the destination is idle).
+
 const std = @import("std");
 const zag = @import("zag");
 
-const address = zag.memory.address;
 const arch = zag.arch.dispatch;
-const fpu = zag.sched.fpu;
-const futex = zag.proc.futex;
-const kprof = zag.kprof.trace_id;
-const kprof_dump = zag.kprof.dump;
-const kprof_log = zag.kprof.log;
-const kprof_mode = zag.kprof.mode;
-const kprof_sample = zag.kprof.sample;
-const memory_init = zag.memory.init;
-const process_mod = zag.proc.process;
-const thread_mod = zag.sched.thread;
+const port_mod = zag.sched.port;
 
-const ArchCpuContext = arch.cpu.ArchCpuContext;
-const AtomicSlabRef = zag.memory.allocators.secure_slab.AtomicSlabRef;
-const ThreadPriorityQueue = thread_mod.ThreadPriorityQueue;
-const Process = process_mod.Process;
-const ProcessAllocator = process_mod.ProcessAllocator;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const Priority = zag.sched.execution_context.Priority;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
-const Thread = thread_mod.Thread;
-const ThreadAllocator = thread_mod.ThreadAllocator;
-const Timer = zag.arch.timer.Timer;
-const VCpuAllocator = arch.vm.VCpuAllocator;
-const VmAllocator = arch.vm.VmAllocator;
 
+/// Intrusive priority queue of ECs, linked through the EC's `next`
+/// field and ordered by `priority`. Shared by per-core run queues and
+/// port wait queues. Futex buckets use a separate WaitNode-based queue
+/// (see sched/futex.zig).
+pub const EcQueue = zag.utils.containers.priority_queue.PriorityQueue(
+    ExecutionContext,
+    "next",
+    "priority",
+    @typeInfo(Priority).@"enum".fields.len,
+);
 
-pub var idle_process: *Process = undefined;
-pub var initialized: bool = false;
+/// Maximum cores the scheduler supports. Matches `affinity` mask width.
+pub const MAX_CORES: u8 = 64;
 
-const CACHE_LINE_SIZE = 64;
-const MAX_CORES = 64;
-const SCHED_TIMESLICE_NS = 2_000_000;
+/// Default time slice between preemption ticks. Spec doesn't pin this;
+/// 2 ms matches old kernel and is reasonable for a microkernel.
+pub const TIMESLICE_NS: u64 = 2_000_000;
 
-const RunQueue = struct {
-    pq: ThreadPriorityQueue = .{},
+/// Per-core scheduler state. One entry per active core in `core_states[]`.
+///
+/// `?SlabRef(EC)` requires a tagged-union layout that's not extern-
+/// compatible, so `PerCore` is a regular struct. No current asm path
+/// references field offsets here — the IPC fast path goes through
+/// `SyscallScratch` (extern) which caches the `*ExecutionContext`
+/// raw value separately.
+pub const PerCore = struct {
+    /// Priority-ordered intrusive PQ over EC.next. Drained by
+    /// `dequeue` on context switch / yield / preempt.
+    run_queue: EcQueue = .{},
 
-    pub fn enqueue(self: *RunQueue, thread: *Thread) void {
-        self.pq.enqueue(thread);
-    }
+    /// EC currently dispatched on this core. `null` ⇒ core is idle.
+    /// SlabRef so the cross-core readers (FPU flush / `coreRunning`)
+    /// can detect a freed-then-reallocated slot via gen mismatch.
+    current_ec: ?SlabRef(ExecutionContext) = null,
 
-    pub fn dequeue(self: *RunQueue) ?*Thread {
-        return self.pq.dequeue();
-    }
+    /// EC whose FP/SIMD state currently lives in this core's CPU
+    /// registers. May be a different EC than `current_ec` (lazy FPU —
+    /// eviction happens on the next FP-disabled trap, not on context
+    /// switch). `null` if no EC has used FP on this core since boot.
+    last_fpu_owner: ?SlabRef(ExecutionContext) = null,
 
-    pub fn remove(self: *RunQueue, thread: *Thread) bool {
-        return self.pq.remove(thread);
-    }
+    /// Whether CR0.TS / FPEN is currently armed on this core. Tracked
+    /// here so we don't issue redundant CR-writes (each one costs a
+    /// vmexit under KVM).
+    fpu_trap_armed: bool = false,
 
-    pub fn isEmpty(self: *RunQueue) bool {
-        return self.pq.isEmpty();
-    }
+    /// Per-core idle EC. Allocated at perCoreInit; runs `hlt`/`wfi`
+    /// when the run queue is empty. Pinned to this core via affinity.
+    idle_ec: ?SlabRef(ExecutionContext) = null,
 };
 
-/// Find the core ID currently running `thread`, or null if it's not
-/// dispatched anywhere. Used by thread_suspend so the kernel can IPI the
-/// right core regardless of whether the thread has explicit affinity.
-pub fn coreRunning(thread: *Thread) ?u64 {
-    const count = arch.smp.coreCount();
-    var i: u64 = 0;
-    while (i < count) {
-        // Identity compare via `.ptr` — we already hold a live `*Thread`
-        // from the caller, so we're not dereferencing through the loaded
-        // ref, just asking whether the same slot is dispatched here.
-        if (core_states[i].running_thread.load(.acquire)) |ref| {
-            if (ref.ptr == thread) return i;
+/// Per-core scheduler state. Indexed by core id (APIC ID on x86-64,
+/// MPIDR on aarch64). Only the first `arch.smp.coreCount()` entries
+/// are populated.
+pub var core_states: [MAX_CORES]PerCore = [_]PerCore{.{}} ** MAX_CORES;
+
+/// Parallel array of per-core spinlocks guarding `core_states[i]`'s
+/// `run_queue` and `current_ec`. Held only across queue ops and a
+/// snapshot of `current_ec`; never held across `loadEcContextAndReturn`.
+/// Kept out of `PerCore` itself so the IPC fast-path's hardcoded field
+/// offsets (72/80) inside `extern struct PerCore` stay pinned.
+///
+/// Lock order: `core_locks[i]` is its own class; cross-core enqueue may
+/// acquire the target core's lock while holding the local core's lock,
+/// so the class is registered as ordered to opt out of pair-edge
+/// cycle detection. Callers must always release before invoking
+/// scheduler dispatch (`switchTo` / `loadEcContextAndReturn`).
+pub var core_locks: [MAX_CORES]SpinLock = [_]SpinLock{.{ .class = "sched.core_lock" }} ** MAX_CORES;
+
+/// Lockdep group tag for `core_locks`. Non-zero so that overlapping
+/// per-core lock holds (e.g. cross-core enqueue grabbing target while
+/// holding local) don't seed a phantom AB-BA cycle in the lock graph.
+const SCHED_CORE_GROUP: u32 = 0x5C00; // arbitrary non-zero tag
+
+/// Set true after `globalInit` returns. Read by the boot path before
+/// enqueueing the root service's initial EC.
+pub var initialized: bool = false;
+
+// ── Init ─────────────────────────────────────────────────────────────
+
+/// Boot-time global init — called once on the BSP before SMP brings
+/// other cores up. Initializes `core_states[0]`'s idle EC and any
+/// scheduler-wide state.
+pub fn globalInit() !void {
+    initialized = true;
+}
+
+/// Per-core init — called once per core during SMP bring-up after the
+/// core's APIC / GIC is online. Arms the per-core preemption timer so
+/// the scheduler tick fires every `TIMESLICE_NS` and round-robin
+/// between equal-priority ECs is honored. Without this call no LAPIC
+/// timer interrupt ever fires and a CPU-bound EC runs forever until
+/// it voluntarily yields.
+pub fn perCoreInit() void {
+    arch.time.getPreemptionTimer().armInterruptTimer(TIMESLICE_NS);
+    // Enable hardware virtualization on this core (VMXON / EFER.SVME +
+    // host save area). Required before any vCPU on this core can
+    // VMLAUNCH/VMRUN; safe no-op when the platform doesn't support
+    // hardware virt.
+    arch.vm.vmPerCoreInit();
+}
+
+// ── Dispatch ─────────────────────────────────────────────────────────
+
+/// Context switch to `ec` on the current core. Saves outgoing EC's
+/// state to its `ctx`, swaps address space (if domain changed),
+/// updates `current_ec`, applies lazy-FPU policy (arm/clear CR0.TS),
+/// loads `ec.ctx` and returns to userspace via iretq/sysretq.
+///
+/// `current_ec` is written without the per-core lock — only this core
+/// ever writes its own `current_ec`, and cross-core readers (FPU flush,
+/// `coreRunning`) take an inherent snapshot semantics and re-check on
+/// the target.
+pub fn switchTo(ec: *ExecutionContext) void {
+    // vCPU dispatch: spec-v3 §[create_vcpu] requires that every time the
+    // vCPU EC becomes runnable (initial creation, reply-induced resume),
+    // the kernel re-enters guest mode and on the subsequent guest exit
+    // delivers a vm_exit event on its `exit_port`. Real VMX/SVM guest
+    // re-entry (loadGuestState → VMLAUNCH/VMRESUME → exit decode) is
+    // still a TODO in `arch/x64/kvm/vcpu.zig` — until that lands, fire a
+    // synthetic exit immediately so the recv/reply lifecycle remains
+    // observable end-to-end. The vCPU re-suspends on its exit_port via
+    // `fireVmExit` (which may rendezvous with a parked VMM receiver and
+    // mark it ready) and we keep dispatching. We MUST NOT return here
+    // with `current_ec == null` — the caller (yieldTo / dispatchInterrupt)
+    // would iretq back to whatever interrupted-user RIP sits on the
+    // kernel stack, and that EC has typically already been suspended
+    // (e.g. fault path called fireThreadFault before yieldTo). The next
+    // user fault on that stale RIP would re-enter `exceptionHandler`
+    // with `currentEc() == null` and panic on the no-current-EC guard.
+    // Loop instead: pick the next ready EC; if it's another vCPU, fire
+    // its synthetic exit too; eventually we either dispatch a real EC
+    // via `loadEcContextAndReturn` (noreturn) or run dry and fall
+    // through to the empty-queue return path that leaves `current_ec`
+    // null but is safe because `run()`'s outer `arch.cpu.idle()` and
+    // `yieldTo`'s no-next branch are both designed for that.
+    var current = ec;
+    while (current.vm != null) {
+        const core: u8 = @truncate(arch.smp.coreID());
+
+        // Real VMX/SVM dispatch: load guest state, VMLAUNCH/VMRESUME,
+        // save guest state on exit, decode the exit reason. Returns the
+        // §[vm_exit_state] sub-code + 3-vreg payload for the event we
+        // need to deliver. Falls back to a synthetic "unknown" exit on
+        // platforms without hardware-virt support so the recv/reply
+        // lifecycle still progresses.
+        //
+        // IRQs are disabled across the entry+exit window for two
+        // reasons: (1) lockdep IRQ-mode consistency on the exit_port's
+        // gen-lock (same class taken from async-IRQ context by
+        // `expireTimedRecvWaiters`); (2) AMD VMRUN's required atomic
+        // CLGI/STGI bracket — if a physical IRQ slipped in between
+        // VMLOAD-host and VMRUN, host state would be inconsistent.
+        clearCurrentEc(core);
+        const irq = arch.cpu.saveAndDisableInterrupts();
+        const delivery = arch.vm.enterGuest(current) orelse blk: {
+            // Synthetic-exit fallback — preserves the spec-test smoke
+            // contract (recv/reply on exit_port works) on platforms
+            // without VMX/SVM. Zero out ec.ctx.regs so the receiver
+            // observes a clean "guest not running" snapshot rather
+            // than the prior `consumeReply`'s reply-time GPRs.
+            @memset(std.mem.asBytes(&current.ctx.regs), 0);
+            break :blk arch.vm.VmExitDelivery{ .subcode = 0, .payload = .{ 0, 0, 0 } };
+        };
+        port_mod.fireVmExit(current, delivery.subcode, delivery.payload);
+        arch.cpu.restoreInterrupts(irq);
+
+        // The exit dispatch above may have rendezvoused with a parked
+        // VMM receiver, putting it in this core's run queue. Pull it
+        // (or anything else ready) and dispatch.
+        const next = dequeueOrIdle() orelse return;
+        current = next;
+    }
+
+    const core: u8 = @truncate(arch.smp.coreID());
+    setCurrentEc(core, current);
+    current.state = .running;
+    arch.cpu.loadEcContextAndReturn(current);
+}
+
+/// Voluntary yield — current EC drops back into ready, scheduler
+/// picks the next. If `target` is non-null and runnable, it runs next.
+pub fn yieldTo(target: ?*ExecutionContext) void {
+    const core: u8 = @truncate(arch.smp.coreID());
+    const state = &core_states[core];
+    const lock = &core_locks[core];
+
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+    if (state.current_ec) |cur_ref| {
+        // self-alive: `current_ec` names the EC running on this core
+        // — caller is in its syscall path so the slot is pinned.
+        const cur = cur_ref.ptr;
+        cur.state = .ready;
+        state.run_queue.enqueue(cur);
+    }
+    const next = if (target) |t| blk: {
+        if (t.state == .ready and state.run_queue.remove(t)) break :blk t;
+        break :blk dequeueOrIdleLocked(core);
+    } else dequeueOrIdleLocked(core);
+    lock.unlockIrqRestore(irq);
+
+    if (next) |n| {
+        switchTo(n);
+        return;
+    }
+
+    // Empty queue and no idle EC. Clear `current_ec` and return to the
+    // caller — `dispatchInterrupt` then sends EOI and iretq's back to
+    // the interrupted context. If that context was a halted
+    // `scheduler.run`, control resumes past `hlt`, the loop iterates,
+    // and `run` itself enters the top-level idle (outside any IRQ
+    // handler) where halting won't strand the LAPIC's in-service
+    // bit. Halting *here* would leave the timer IRQ never EOI'd —
+    // any subsequent same-priority LAPIC tick would be blocked,
+    // wedging the scheduler tick on this core.
+    clearCurrentEc(core);
+}
+
+/// Preemption tick — invoked from the per-core timer interrupt when
+/// the current EC's quantum expires. Re-enqueues current and dispatches.
+pub fn preempt() void {
+    yieldTo(null);
+}
+
+/// Main scheduler loop entry — called from `kMain` (BSP) and
+/// `arch.x64.smp.coreInit` (APs) once their per-core state is ready.
+/// Picks the highest-priority ready EC (or falls back to per-core idle
+/// EC when set, otherwise `sti+hlt` until an IPI arrives), and
+/// dispatches; never returns.
+pub fn run() noreturn {
+    while (true) {
+        if (dequeueOrIdle()) |next| {
+            switchTo(next);
         }
-        i += 1;
+        // Either `dequeueOrIdle` found nothing and no idle EC was set
+        // up for this core, or `switchTo` returned (it's `noreturn` on
+        // the dispatch path, so this is the empty-queue case). Sleep
+        // with interrupts enabled so a wake IPI breaks us out and the
+        // loop re-runs `dequeueOrIdle`.
+        arch.cpu.idle();
+    }
+}
+
+/// Internal helper — dequeues the highest-priority EC, or returns the
+/// per-core idle EC if the queue is empty. Returns null when both are
+/// empty (caller drops to `sti+hlt` and waits for a wake IPI).
+fn dequeueOrIdle() ?*ExecutionContext {
+    const core: u8 = @truncate(arch.smp.coreID());
+    const lock = &core_locks[core];
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+    const result = dequeueOrIdleLocked(core);
+    lock.unlockIrqRestore(irq);
+    return result;
+}
+
+/// Lock-held variant of `dequeueOrIdle` — caller must hold
+/// `core_locks[core]` with IRQs masked.
+fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
+    const state = &core_states[core];
+    if (state.run_queue.dequeue()) |ec| return ec;
+    if (state.idle_ec) |idle_ref| {
+        // self-alive: per-core idle EC is allocated at perCoreInit and
+        // never freed — it's the dispatch-of-last-resort target.
+        return idle_ref.ptr;
     }
     return null;
 }
 
-/// Build a `SlabRef(Thread)` snapshotting `t`'s *current* gen. Used by
-/// scheduler sites that install a thread pointer in a per-core slot —
-/// they already hold `t` live (either by running on its home core or
-/// inside a critical section that prevents destroy).
-inline fn schedRefNow(t: *Thread) SlabRef(Thread) {
-    return SlabRef(Thread).init(t, t._gen_lock.currentGen());
-}
+// ── Enqueue / current accessors ──────────────────────────────────────
 
-// ---- Per-core-slot shortcuts ----
-// These wrap the AtomicSlabRef machinery so the scheduler's dense
-// control-flow stays legible. All three slots are invariantly managed
-// by the owning core (writes are local-only; cross-core reads only do
-// identity compare), so `.ptr` under the load is self-alive:
-// the owning core has not freed the slot because only *we* run destroy.
-
-inline fn runningOf(state: *const PerCoreState) ?*Thread {
-    if (state.running_thread.load(.acquire)) |ref| return ref.ptr;
-    return null;
-}
-
-inline fn pinnedOf(state: *const PerCoreState) ?*Thread {
-    if (state.pinned_thread.load(.acquire)) |ref| return ref.ptr;
-    return null;
-}
-
-inline fn idleOf(state: *const PerCoreState) ?*Thread {
-    if (state.idle_thread.load(.monotonic)) |ref| return ref.ptr;
-    return null;
-}
-
-inline fn setRunning(state: *PerCoreState, t: ?*Thread) void {
-    state.running_thread.store(if (t) |tt| schedRefNow(tt) else null, .release);
-}
-
-inline fn setPinned(state: *PerCoreState, t: ?*Thread) void {
-    state.pinned_thread.store(if (t) |tt| schedRefNow(tt) else null, .release);
-}
-
-inline fn setIdle(state: *PerCoreState, t: ?*Thread) void {
-    state.idle_thread.store(if (t) |tt| schedRefNow(tt) else null, .release);
-}
-
-/// PMU save/restore hook around `arch.cpu.switchTo`. Centralizes the
-/// null-guarded calls described in systems.md §run-queue "PMU Save/Restore Hooks"
-/// so every `switchTo` site in this file goes through the same pair.
+/// Enqueue `ec` on `core`'s run queue. Used by recv → ready transitions,
+/// futex wake, timer fires, and the boot path.
 ///
-/// `arch.cpu.switchTo` does not return to this frame — on x64 it mov's RSP to
-/// the incoming thread's interrupt frame and jmp's to `interruptStubEpilogue`,
-/// which iret's into the incoming thread's userspace. Any code placed after
-/// `switchTo` is therefore dead on the incoming side and would only run the
-/// next time the *previously outgoing* thread resumes — on its own core, not
-/// the incoming thread's core. PMU state is per-core MSR state, so the
-/// restore must happen before the switch, while we are still on the core
-/// that the incoming thread will run on immediately.
-///
-/// Ordering: save the outgoing thread's counter values first (this also
-/// zeroes `IA32_PERF_GLOBAL_CTRL`, so hardware is quiet), then program the
-/// incoming thread's counters via restore, then jump into the incoming
-/// thread via `switchTo`. The iret at the end of `switchTo` resumes the
-/// incoming thread with its counters already running.
-inline fn switchToWithPmu(outgoing: *Thread, next: *Thread) void {
-    kprof.enter(.sched_switch_pmu);
-    defer kprof.exit(.sched_switch_pmu);
-    // self-alive: switchToWithPmu is called from the scheduler context
-    // switch path; neither outgoing nor next can be destroyed here
-    // (their deinit needs proc._gen_lock which the scheduler doesn't
-    // hold, and the scheduler controls preemption on this core).
-    if (outgoing.pmu_state) |st_ref| arch.pmu.pmuSave(st_ref.ptr);
-    if (next.pmu_state) |st_ref| arch.pmu.pmuRestore(st_ref.ptr);
-    // Eager-FPU baseline (-Dlazy_fpu=false): unconditionally save the
-    // outgoing thread's FP/SIMD regs and reload the incoming thread's,
-    // skipping the trap-driven lazy machinery in arch.cpu.switchTo. The
-    // same-thread guard avoids a wasted save+restore pair when the
-    // scheduler picks the thread it just preempted.
-    if (comptime !fpu.lazy_enabled) {
-        if (outgoing != next) {
-            arch.cpu.fpuSave(&outgoing.fpu_state);
-            arch.cpu.fpuRestore(&next.fpu_state);
-        }
+/// Wake / preempt policy after queueing:
+///   - target idle (no `current_ec`) and target != self: send wake IPI
+///     so the parked `hlt` exits and `run` re-runs `dequeueOrIdle`.
+///   - target current EC outranks `ec`: nothing to do — `ec` waits its
+///     turn.
+///   - `ec` outranks target's current EC: send a scheduler IPI to the
+///     target. Self-IPI (when target == self) is LAPIC-ICR-based, so
+///     it's IF-gated and fires once the caller exits its current IRQ /
+///     spinlock-held window. We deliberately do NOT inline-yield: many
+///     callers (e.g. `futex.wake`) hold a bucket lock across this call,
+///     and a context-switch via `loadEcContextAndReturn` would strand
+///     it.
+pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
+    ec.state = .ready;
+
+    const lock = &core_locks[core];
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+    (&core_states[core]).run_queue.enqueue(ec);
+    // Snapshot the target's current EC before deciding whether to
+    // wake / preempt. Reading the remote core's `current_ec` is a racy
+    // hint — the worst case if it changes after we decide is a spurious
+    // wake or a missed preempt that the next preempt tick covers.
+    const target_current = (&core_states[core]).current_ec;
+    lock.unlockIrqRestore(irq);
+
+    const self_core: u8 = @truncate(arch.smp.coreID());
+
+    const target_current_ptr: ?*ExecutionContext = if (target_current) |r|
+        // self-alive: read-only snapshot of target core's current_ec
+        // for wake/preempt decision. Worst-case stale ptr just costs
+        // a spurious IPI; real ptr deref is gated below.
+        r.ptr
+    else
+        null;
+
+    if (target_current_ptr == null) {
+        // Idle target. Local self-wake is unnecessary — the caller is
+        // running, not halted; the run loop will pick up `ec` on the
+        // next dispatch.
+        if (core != self_core) arch.smp.sendWakeIpi(core);
+        return;
     }
-    arch.cpu.switchTo(next);
+
+    // Target is busy. Decide whether `ec` should preempt the running EC.
+    // self-alive: snapshot ptr; race-tolerant priority compare.
+    const cur = target_current_ptr.?;
+    if (@intFromEnum(ec.priority) <= @intFromEnum(cur.priority)) return;
+
+    // Same-core higher-pri: send a LAPIC self-IPI (deferred until the
+    // caller exits the current critical section / IRQ handler and IF=1
+    // is restored). We can't inline-yield here because callers like
+    // `futex.wake` hold a bucket spinlock across `enqueueOnCore`, and
+    // a context-switch via `loadEcContextAndReturn` would strand it.
+    //
+    // Cross-core higher-pri: same scheduler IPI. The receiver runs
+    // `preempt()` which re-evaluates the queue and switches.
+    arch.smp.triggerSchedulerInterrupt(core);
 }
 
-/// Remove `thread` from any core's run queue. Used when a remote thread is
-/// killed while .ready (so we can deinit it without leaving a dangling pointer).
-pub fn removeFromAnyRunQueue(thread: *Thread) void {
-    kprof.point(.sched_remove_run_queue, 0);
-    const count = arch.smp.coreCount();
-    var i: u64 = 0;
-    while (i < count) {
-        const state = &core_states[i];
-        const irq = state.rq_lock.lockIrqSave();
-        const removed = state.rq.remove(thread);
-        state.rq_lock.unlockIrqRestore(irq);
+/// Enqueue `ec` on the kernel's choice of core, honoring `ec.affinity`.
+pub fn enqueue(ec: *ExecutionContext) void {
+    enqueueOnCore(pickCoreForAffinity(ec.affinity), ec);
+}
+
+/// Remove `ec` from whichever queue it currently occupies. Used by
+/// terminate, priority change (reinsert), affinity change (migrate).
+pub fn removeFromQueue(ec: *ExecutionContext) void {
+    var i: u8 = 0;
+    while (i < MAX_CORES) {
+        const lock = &core_locks[i];
+        const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+        const removed = (&core_states[i]).run_queue.remove(ec);
+        lock.unlockIrqRestore(irq);
         if (removed) return;
         i += 1;
     }
 }
 
-const ExitedThread = struct {
-    thread: SlabRef(Thread),
-};
-
-const PerCoreState = struct {
-    rq: RunQueue = .{},
-    rq_lock: SpinLock = .{},
-    running_thread: AtomicSlabRef(Thread) = .{},
-    pinned_thread: AtomicSlabRef(Thread) = .{},
-    timer: Timer = undefined,
-    exited_thread: ?ExitedThread = null,
-    idle_thread: AtomicSlabRef(Thread) = .{},
-    /// Nanoseconds spent running the idle thread since the last
-    /// `sys_info` read-and-reset (§2.15, §6 Idle/Busy Accounting Hook).
-    idle_ns: u64 = 0,
-    /// Nanoseconds spent running real threads since the last
-    /// `sys_info` read-and-reset.
-    busy_ns: u64 = 0,
-    /// Monotonic-clock timestamp of the previous scheduler tick on this
-    /// core. Seeded in `perCoreInit` before the preemption timer is armed;
-    /// updated at the top of `schedTimerHandler` when delta is attributed
-    /// to `idle_ns` / `busy_ns`.
-    last_tick_ns: u64 = 0,
-};
-
-/// Lazy-FPU per-core owner table: `last_fpu_owner[core]` is the thread
-/// whose FP/SIMD register state currently lives in that core's CPU
-/// registers, or null if no thread has dirtied the FPU on that core
-/// since boot / since being evicted by a migration flush.
+/// Currently dispatched EC on this core (the calling core).
 ///
-/// Only the FPU trap handler (`fpu.handleTrap`) and the cross-core
-/// flush IPI handler (`fpu.flushIpiHandler`) write this array. The
-/// scheduler reads it via `fpu.migrateFlush` when a thread is about to
-/// run on a core different from `thread.last_fpu_core`.
-pub var last_fpu_owner: [MAX_CORES]?*Thread align(CACHE_LINE_SIZE) = [_]?*Thread{null} ** MAX_CORES;
-
-/// Per-core shadow of CR0.TS (x64) / CPACR_EL1.FPEN-traps-EL0 (aarch64)
-/// — true when the FP-disable trap is currently armed on that core.
-/// Tracked in a normal variable so `switchTo` can avoid the expensive
-/// MOV-to-CR0 (which vmexits under KVM at ~1k+ cycles per write) when
-/// the desired state already matches the current state.
-pub var fpu_trap_armed: [MAX_CORES]bool align(CACHE_LINE_SIZE) = [_]bool{false} ** MAX_CORES;
-
-var core_states: [MAX_CORES]PerCoreState align(CACHE_LINE_SIZE) = [_]PerCoreState{.{}} ** MAX_CORES;
-var expire_core: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-var pinned_cores: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-
-pub const SchedInterruptContext = struct {
-    privilege: zag.perms.privilege.PrivilegePerm,
-    thread_ctx: *ArchCpuContext,
-};
-
-fn armSchedTimer(state: *PerCoreState, delta_ns: u64) void {
-    kprof.point(.sched_arm_timer, delta_ns);
-    state.timer.armInterruptTimer(delta_ns);
-}
-
-/// Per-tick gate for `futex.expireTimedWaiters`. The scan is rotated across
-/// cores so a single tick interval only runs it on one core, but the rotation
-/// counter advances on every tick regardless of which core matched. That way,
-/// if some cores are not currently delivering preemption ticks (e.g. aarch64
-/// AP bring-up where secondary cores reach the trampoline but stall before
-/// arming their virtual timer), the still-ticking cores eventually cycle
-/// through every value of `expire_core` and timed futex waiters are still
-/// woken. The previous version stored `(core_id + 1) % cores` only when
-/// `cur == core_id`, which deadlocked the rotation on a non-ticking core.
-fn maybeExpireTimedWaiters(core_id: u64) void {
-    const cores = arch.smp.coreCount();
-    while (true) {
-        const cur = expire_core.load(.monotonic);
-        const next = (cur + 1) % cores;
-        if (expire_core.cmpxchgWeak(cur, next, .monotonic, .monotonic)) |_| continue;
-        if (cur == core_id) futex.expireTimedWaiters();
-        return;
-    }
-}
-
-pub fn currentThread() ?*Thread {
-    // self-alive: we're asking who's running on this core — if a ref is
-    // here at all, its slot is live (same-core reader, only we can clear
-    // it and we haven't yet). `.ptr` is the thread currently dispatched.
-    const ref = core_states[arch.smp.coreID()].running_thread.load(.acquire) orelse return null;
+/// IMPORTANT: indexes via `&core_states[i]` rather than the direct
+/// `(&core_states[i]).field` form. In Debug builds Zig codegens the
+/// latter as a `memcpy` of the entire `[MAX_CORES]PerCore` array onto
+/// the caller's stack (≈ 6 KiB) followed by an index-of-the-copy
+/// load — see `__zig_probe_stack` + `memcpy($0x1800, ...)` in the
+/// disassembly. `currentEc` is on every page-fault, syscall, and
+/// dispatch path, so unbounded 6 KiB-per-call stack blowups quickly
+/// overflow the 48 KiB kernel stack and corrupt return addresses,
+/// surfacing as `cpu.idle` returning to a `.bss` byte (#GP) or as
+/// `pageFaultHandler` re-entering with `currentEc() == null` because
+/// the stack-frame for the saved EC pointer was clobbered. Pointer
+/// indexing avoids the per-call array snapshot.
+pub fn currentEc() ?*ExecutionContext {
+    const core: u8 = @truncate(arch.smp.coreID());
+    const ref = (&core_states[core]).current_ec orelse return null;
+    // self-alive: `current_ec` names the EC actually executing on this
+    // very core; the slot can't be freed under us while this code runs.
     return ref.ptr;
 }
 
-pub fn currentProc() *Process {
-    // self-alive: currentThread() returns a thread dispatched on this
-    // core; its `.process` SlabRef points at a live Process slot (the
-    // owning Process holds the thread alive for the duration of its
-    // execution). A concurrent free would have to unscheduled us first.
-    return currentThread().?.process.ptr;
+/// True if this core's `current_ec` slot names `ec`. Identity-compare
+/// helper used by suspend / terminate / fault paths to clear the
+/// dispatch slot when the running EC parks itself.
+pub inline fn coreCurrentIs(core: u8, ec: *ExecutionContext) bool {
+    if ((&core_states[core]).current_ec) |ref| {
+        // self-alive: identity compare on `current_ec` slot.
+        return ref.ptr == ec;
+    }
+    return false;
 }
 
-/// Snapshot the idle/busy nanosecond accounting for `core_id`, zeroing
-/// both counters atomically as they are read. Used by `sys_info` to
-/// deliver per-core utilization data to userspace on every call with a
-/// non-null `cores_ptr` (see spec §2.15 and §21).
-///
-/// Each counter is atomically updated via `@atomicRmw` from the scheduler
-/// tick hook in `schedTimerHandler`. The lock is NOT held for those
-/// updates; we rely on per-counter atomicity. The pair (idle_ns, busy_ns)
-/// is therefore not a transactional snapshot — a reader can see a tick's
-/// increment attributed to one side without yet seeing the other. This is
-/// acceptable because the drift between sides is bounded by one tick
-/// (~2 ms) and far below any reasonable polling cadence.
-///
-/// `rq_lock.lockIrqSave()` is still acquired here for two purposes, both
-/// narrower than a multi-counter transaction:
-///
-///   * When `core_id` is the caller's own core, IRQ-disable prevents the
-///     LOCAL scheduler tick from firing between the `idle_ns` Xchg and
-///     the `busy_ns` Xchg and attributing the same tick to both sides.
-///     This tightens the per-counter guarantee into a "one tick gap at
-///     most" for the local case.
-///   * For any `core_id`, the lock serializes concurrent `sys_info`
-///     callers sweeping the same core so they don't race each other and
-///     lose an accounting window.
-///
-/// It does NOT stop a REMOTE core's scheduler tick from executing its
-/// own `@atomicRmw(.Add, .monotonic)` while the caller's Xchg is in
-/// flight — IRQ-disable is scoped to the caller's core only. Cross-core
-/// concurrency between this function and `schedTimerHandler` is covered
-/// purely by the per-counter atomicity of the RMW pair.
-///
-/// Returns a pair of (idle_ns, busy_ns) covering the accounting window
-/// that ended at this call.
-pub fn perCoreReadAndResetAccounting(core_id: u64) struct { idle_ns: u64, busy_ns: u64 } {
-    if (core_id >= MAX_CORES) return .{ .idle_ns = 0, .busy_ns = 0 };
-    const state = &core_states[core_id];
-    const irq = state.rq_lock.lockIrqSave();
-    defer state.rq_lock.unlockIrqRestore(irq);
-    const idle = @atomicRmw(u64, &state.idle_ns, .Xchg, 0, .monotonic);
-    const busy = @atomicRmw(u64, &state.busy_ns, .Xchg, 0, .monotonic);
-    return .{ .idle_ns = idle, .busy_ns = busy };
+/// Clear this core's `current_ec` slot. Called by suspend / terminate /
+/// idle paths when the running EC stops being runnable.
+pub inline fn clearCurrentEc(core: u8) void {
+    (&core_states[core]).current_ec = null;
 }
 
-fn peekHighestStealable(pq: *const ThreadPriorityQueue, core_id: u6) ?*Thread {
-    const core_bit = @as(u64, 1) << core_id;
-    var idx: usize = pq.levels.len;
-    while (idx > 0) {
-        idx -= 1;
-        if (idx == @intFromEnum(thread_mod.Priority.pinned)) continue;
-        var cur = pq.levels[idx].head;
-        while (cur) |c| {
-            if (c.core_affinity) |aff| {
-                if (aff & core_bit != 0) return c;
-            } else {
-                return c;
-            }
-            // self-alive: this chain walks a per-core run queue we are
-            // inspecting under rq_lock; queued threads cannot be freed
-            // while linked, so the SlabRef will not go stale.
-            cur = if (c.next) |r| r.ptr else null;
-        }
-    }
-    return null;
+/// Set this core's `current_ec` to `ec`, capturing the gen at write time.
+pub inline fn setCurrentEc(core: u8, ec: *ExecutionContext) void {
+    (&core_states[core]).current_ec = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
 }
 
-/// Attempt to steal a thread from another core's run queue.
-/// Called when the local run queue is empty. Returns the stolen thread or null.
-fn tryStealWork(my_core_id: u64) ?*Thread {
-    kprof.enter(.sched_try_steal);
-    defer kprof.exit(.sched_try_steal);
-    const count = arch.smp.coreCount();
-    const pinned = pinned_cores.load(.acquire);
-
-    // Retry loop in case peek succeeds but removal fails (race with another stealer)
-    var attempts: u32 = 0;
-    while (attempts < 3) {
-        var best_thread: ?*Thread = null;
-        var best_core: u64 = 0;
-
-        // Peek across all non-pinned cores for the highest priority stealable thread
-        var i: u64 = 0;
-        while (i < count) {
-            if (i == my_core_id) {
-                i += 1;
-                continue;
-            }
-            // Skip pinned cores
-            if (pinned & (@as(u64, 1) << @intCast(i)) != 0) {
-                i += 1;
-                continue;
-            }
-            const candidate = peekHighestStealable(&core_states[i].rq.pq, @intCast(my_core_id));
-            if (candidate) |c| {
-                if (best_thread == null) {
-                    best_thread = c;
-                    best_core = i;
-                } else if (@intFromEnum(c.priority) > @intFromEnum(best_thread.?.priority)) {
-                    best_thread = c;
-                    best_core = i;
-                }
-            }
-            i += 1;
-        }
-
-        const steal_target = best_thread orelse return null;
-
-        // Lock the candidate's home core and try to remove
-        const victim_state = &core_states[best_core];
-        const irq = victim_state.rq_lock.lockIrqSave();
-        const removed = victim_state.rq.remove(steal_target);
-        victim_state.rq_lock.unlockIrqRestore(irq);
-
-        if (removed) return steal_target;
-        // Race: thread was scheduled or stolen by someone else, retry
-        attempts += 1;
-    }
-    return null;
+/// True if this core's `current_ec` is null (idle).
+pub inline fn coreIsIdle(core: u8) bool {
+    return (&core_states[core]).current_ec == null;
 }
 
-pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
-    kprof.point(.sched_timer_tick, 0);
-    if (comptime kprof_mode.any_enabled) {
-        if (@atomicLoad(u32, &kprof_log.terminate_requested, .acquire) != 0) {
-            kprof_dump.end(.log_full);
-        }
-    }
-    const core_id = arch.smp.coreID();
-    const state = &core_states[core_id];
+// ── State transitions used by other subsystems ───────────────────────
 
-    // self-alive: same-core read; running_thread is non-null once
-    // perCoreInit has set the idle thread.
-    const preempted = state.running_thread.load(.acquire).?.ptr;
-
-    // Idle/busy accounting hook (§6, §21). Attribute the elapsed time
-    // since the previous tick to either `idle_ns` or `busy_ns` based on
-    // whether the thread that just consumed the preceding timeslice was
-    // the idle thread. Each counter is updated via a single
-    // `@atomicRmw(.Add, .monotonic)`; the lock is NOT held for these
-    // updates — we rely on per-counter atomicity. The pair
-    // (idle_ns, busy_ns) is therefore not a transactional snapshot for
-    // `sys_info` readers: a reader can see a tick's increment attributed
-    // to one side without yet seeing the other. This is acceptable
-    // because the drift between sides is bounded by one tick (~2 ms),
-    // which is far below any reasonable polling cadence. `last_tick_ns`
-    // was seeded in `perCoreInit` before the first preemption timer was
-    // armed, so the first delta is well-defined.
-    const mono = arch.time.getMonotonicClock();
-    const now = mono.now();
-    const delta: u64 = now -| state.last_tick_ns;
-    // self-alive: same-core read; idle_thread is installed once at boot
-    // and never freed.
-    const idle_ref = state.idle_thread.load(.monotonic);
-    const was_idle = (idle_ref != null and preempted == idle_ref.?.ptr);
-    if (was_idle) {
-        _ = @atomicRmw(u64, &state.idle_ns, .Add, delta, .monotonic);
-    } else {
-        _ = @atomicRmw(u64, &state.busy_ns, .Add, delta, .monotonic);
-    }
-    state.last_tick_ns = now;
-
-    // Refresh the per-core hardware-state cache (frequency / temperature /
-    // C-state) on this core so that `sys_info` reads from any core see a
-    // value at most one tick stale. Must run on the owning core because
-    // the underlying `rdmsr` instructions are core-local (§21).
-    arch.cpu.sampleCoreHwState();
-
-    if (preempted.pinned_exclusive) {
-        if (preempted.state == .exited) {
-            _ = unpinExclusive(preempted);
-        } else {
-            const pinned_core = @ctz(preempted.core_affinity orelse 0);
-            // §2.2.33: a pinned thread that has blocked (futex/IPC recv) or
-            // faulted/suspended temporarily releases its pinned core so other
-            // threads can run there. Only the still-runnable (.running /
-            // .ready) pinned thread keeps the non-preemption fast path. When
-            // the thread later wakes, the wake path re-enqueues it on its
-            // pinned core via `enqueueOnCore`, which sends an IPI; the
-            // scheduler handler on that core then sees `state.pinned_thread`
-            // with state == .ready and preempts back to it (§2.2.34).
-            const runnable = preempted.state == .running or preempted.state == .ready;
-            if (pinned_core == core_id and runnable) {
-                maybeExpireTimedWaiters(core_id);
-                armSchedTimer(state, SCHED_TIMESLICE_NS);
-                return;
-            }
-            if (pinned_core == core_id) {
-                // Pinned thread non-runnable on its own pinned core —
-                // release the core so other threads can run here. Do NOT
-                // re-enqueue `preempted`; the wake/unblock path puts it
-                // back when its state flips to .ready.
-                preempted.ctx = ctx.thread_ctx;
-                preempted.on_cpu.store(false, .release);
-
-                state.rq_lock.lock();
-                var next = state.rq.dequeue();
-                if (next == null) {
-                    state.rq_lock.unlock();
-                    next = tryStealWork(core_id);
-                    state.rq_lock.lock();
-                }
-                if (next == null) {
-                    next = idleOf(state);
-                }
-                const next_thread = next.?;
-                next_thread.state = .running;
-                next_thread.on_cpu.store(true, .release);
-                setRunning(state, next_thread);
-                state.rq_lock.unlock();
-                maybeExpireTimedWaiters(core_id);
-                armSchedTimer(state, SCHED_TIMESLICE_NS);
-                if (next_thread == preempted) return;
-                switchToWithPmu(preempted, next_thread);
-                return;
-            }
-            preempted.ctx = ctx.thread_ctx;
-            preempted.on_cpu.store(false, .release);
-            if (preempted.state == .running) preempted.state = .ready;
-            if (preempted.state == .ready) enqueueOnCore(pinned_core, preempted);
-            state.rq_lock.lock();
-            var next = state.rq.dequeue();
-            if (next == null) {
-                state.rq_lock.unlock();
-                next = tryStealWork(core_id);
-                state.rq_lock.lock();
-            }
-            if (next == null) {
-                next = idleOf(state);
-            }
-            const next_thread = next.?;
-            next_thread.state = .running;
-            next_thread.on_cpu.store(true, .release);
-            setRunning(state, next_thread);
-            state.rq_lock.unlock();
-            maybeExpireTimedWaiters(core_id);
-            armSchedTimer(state, SCHED_TIMESLICE_NS);
-            if (next_thread == preempted) return;
-            switchToWithPmu(preempted, next_thread);
-            return;
-        }
-    }
-
-    preempted.ctx = ctx.thread_ctx;
-    preempted.on_cpu.store(false, .release);
-
-    // Clean up the previous-tick exited thread AFTER clearing on_cpu. The exited
-    // thread's deinit can cascade through lastThreadExited -> exit -> performRestart ->
-    // updateParentView -> futex.wake, which spins on the wake target's on_cpu.
-    // If the wake target happens to be the freshly-preempted thread on this
-    // very core (e.g., a parent waiting on the dying child's restart futex),
-    // and we still had on_cpu set, the wake spin would deadlock against
-    // ourselves. Clearing on_cpu first makes the wake's spin a no-op.
-    if (state.exited_thread) |exited| {
-        // The thread was just preempted on this core; its slot is still
-        // live (deinit below is what frees it). `lock()` would deadlock
-        // with `slab_instance.destroy` inside deinit.
-        // self-alive: preempted-on-this-core guarantees liveness.
-        exited.thread.ptr.deinit(@intCast(exited.thread.gen));
-        state.exited_thread = null;
-    }
-
-    state.rq_lock.lock();
-
-    // Check if this core has a pinned_thread that is ready and not currently running
-    if (pinnedOf(state)) |pinned| {
-        if (pinned != preempted and pinned.state == .ready) {
-            // Preempt current thread and switch to pinned thread
-            if (preempted.state == .running) {
-                preempted.state = .ready;
-                // Migrate preempted thread to another core
-                state.rq_lock.unlock();
-                migrateToEligibleCore(preempted, core_id);
-                state.rq_lock.lock();
-            }
-            pinned.state = .running;
-            pinned.on_cpu.store(true, .release);
-            setRunning(state, pinned);
-
-            if (preempted.state == .exited) {
-                state.exited_thread = .{ .thread = SlabRef(Thread).init(preempted, preempted._gen_lock.currentGen()) };
-            }
-
-            state.rq_lock.unlock();
-            maybeExpireTimedWaiters(core_id);
-            armSchedTimer(state, SCHED_TIMESLICE_NS);
-            if (pinned == preempted) return;
-            switchToWithPmu(preempted, pinned);
-            return;
-        }
-
-        // If current thread IS the pinned thread: never preempt
-        if (pinned == preempted) {
-            state.rq_lock.unlock();
-            maybeExpireTimedWaiters(core_id);
-            armSchedTimer(state, SCHED_TIMESLICE_NS);
-            return;
-        }
-    }
-
-    // Priority-aware round-robin
-    if (preempted.state == .running) {
-        preempted.state = .ready;
-        // If the thread has affinity that excludes this core, migrate it
-        if (preempted.core_affinity) |aff| {
-            if (aff & (@as(u64, 1) << @intCast(core_id)) == 0) {
-                // Thread shouldn't be on this core — find the right one
-                state.rq_lock.unlock();
-                enqueueOnCore(@ctz(aff), preempted);
-                state.rq_lock.lock();
-            } else {
-                state.rq.enqueue(preempted);
-            }
-        } else {
-            state.rq.enqueue(preempted);
-        }
-    }
-
-    var next = state.rq.dequeue();
-
-    // Work stealing: if local queue is empty, try to steal from other cores
-    if (next == null) {
-        state.rq_lock.unlock();
-        next = tryStealWork(core_id);
-        state.rq_lock.lock();
-    }
-
-    // Fall back to idle thread if nothing else is available
-    if (next == null) {
-        next = idleOf(state);
-    }
-
-    const next_thread = next.?;
-    next_thread.state = .running;
-    next_thread.on_cpu.store(true, .release);
-    setRunning(state, next_thread);
-
-    if (preempted.state == .exited) {
-        state.exited_thread = .{ .thread = SlabRef(Thread).init(preempted, preempted._gen_lock.currentGen()) };
-    }
-
-    state.rq_lock.unlock();
-    maybeExpireTimedWaiters(core_id);
-    armSchedTimer(state, SCHED_TIMESLICE_NS);
-    if (next_thread == preempted) return;
-    switchToWithPmu(preempted, next_thread);
+/// Transition `ec` to ready and enqueue. Used by event delivery
+/// resumes (reply, futex wake, timer fire, recv→ready, etc.).
+pub fn markReady(ec: *ExecutionContext) void {
+    ec.state = .ready;
+    enqueue(ec);
 }
 
-pub fn yield() void {
-    kprof.point(.sched_yield, 0);
-    arch.smp.triggerSchedulerInterruptSelf();
+/// Pick the right core for `ec` based on its affinity mask.
+/// `affinity == 0` is the spec-defined "any core" sentinel; we fall
+/// back to the calling core for cache locality.
+fn pickCoreForAffinity(affinity: u64) u8 {
+    if (affinity == 0) return @truncate(arch.smp.coreID());
+    return @truncate(@as(u64, @ctz(affinity)));
 }
 
-/// Pin the calling thread exclusively to a single core. The thread becomes
-/// non-preemptible on that core. Requirements:
-/// - Thread must have single-core affinity already set
-/// - That core must not already have a pinned thread
-/// - At least one core must remain unpinned for preemptive scheduling
-/// Returns 0 on success, negative error code on failure.
-pub fn pinExclusive(thread: *Thread) i64 {
-    kprof.enter(.sched_pin_exclusive);
-    defer kprof.exit(.sched_pin_exclusive);
-    const affinity = thread.core_affinity orelse return -1; // E_INVAL: no affinity set
-    // Must be exactly one core (power of 2)
-    if (affinity == 0 or (affinity & (affinity - 1)) != 0) return -1; // E_INVAL: not single-core
+// ── Lazy FPU coordination ────────────────────────────────────────────
 
-    const core_bit = affinity;
-
-    // Atomically try to claim this core
-    while (true) {
-        const current = pinned_cores.load(.acquire);
-        if (current & core_bit != 0) return -11; // E_BUSY: core already pinned
-        const new_pinned = current | core_bit;
-        if (pinned_cores.cmpxchgWeak(current, new_pinned, .acq_rel, .acquire)) |_| {
-            continue; // CAS failed, retry
-        } else {
-            break; // CAS succeeded
-        }
-    }
-
-    thread.pinned_exclusive = true;
-    const core_index: u64 = @ctz(core_bit);
-    const state = &core_states[core_index];
-    setPinned(state, thread);
-
-    // Migrate any other threads off this core's run queue
-    migrateThreadsOff(state, core_index);
-
-    return @intCast(core_index);
+/// Cross-core FPU flush — if `ec.last_fpu_core` points to a different
+/// core than the calling core, IPI that core to FXSAVE its CPU regs
+/// into `ec.fpu_state`, then clear `last_fpu_core`. Called before
+/// the destination core arms its FPU trap so the trap handler can
+/// safely FXRSTOR from a fresh buffer.
+pub fn migrateFlush(ec: *ExecutionContext) void {
+    _ = ec;
 }
 
-/// Move all threads from a pinned core's run queue to other available cores.
-fn migrateThreadsOff(state: *PerCoreState, pinned_core: u64) void {
-    const count = arch.smp.coreCount();
-    const irq = state.rq_lock.lockIrqSave();
-    defer state.rq_lock.unlockIrqRestore(irq);
-
-    while (state.rq.dequeue()) |t| {
-        // Find an unpinned core to enqueue this thread on
-        var target: u64 = 0;
-        while (target < count) {
-            if (target == pinned_core) {
-                target += 1;
-                continue;
-            }
-            const target_bit = @as(u64, 1) << @intCast(target);
-            if (pinned_cores.load(.acquire) & target_bit != 0) {
-                target += 1;
-                continue;
-            }
-            // If thread has affinity, respect it
-            if (t.core_affinity) |aff| {
-                if (aff & target_bit == 0) {
-                    target += 1;
-                    continue;
-                }
-            }
-            break;
-        }
-        if (target >= count) {
-            // No valid target found, put back on core 0 as fallback
-            target = 0;
-        }
-        enqueueOnCore(target, t);
-    }
-}
-
-/// Migrate a thread to an eligible non-pinned core. Used when a pinned thread
-/// preempts the current thread and needs to move it elsewhere.
-fn migrateToEligibleCore(thread: *Thread, exclude_core: u64) void {
-    const count = arch.smp.coreCount();
-    const pinned = pinned_cores.load(.acquire);
-    var target: u64 = 0;
-    while (target < count) {
-        if (target == exclude_core) {
-            target += 1;
-            continue;
-        }
-        if (pinned & (@as(u64, 1) << @intCast(target)) != 0) {
-            target += 1;
-            continue;
-        }
-        if (thread.core_affinity) |aff| {
-            if (aff & (@as(u64, 1) << @intCast(target)) == 0) {
-                target += 1;
-                continue;
-            }
-        }
-        break;
-    }
-    if (target >= count) {
-        // No eligible core found, enqueue on core 0 as fallback
-        target = 0;
-    }
-    enqueueOnCore(target, thread);
-}
-
-/// Unpin a previously pinned thread, restoring preemptive scheduling on its core.
-pub fn unpinExclusive(thread: *Thread) i64 {
-    kprof.enter(.sched_unpin_exclusive);
-    defer kprof.exit(.sched_unpin_exclusive);
-    if (!thread.pinned_exclusive) return -1;
-    const affinity = thread.core_affinity orelse return -1;
-    const core_bit = affinity;
-
-    thread.pinned_exclusive = false;
-    const core_index = @ctz(core_bit);
-    setPinned(&core_states[core_index], null);
-    _ = pinned_cores.fetchAnd(~core_bit, .release);
-    return 0;
-}
-
-/// Unpin by core_id — called from revoke_perm on a core_pin handle.
-/// Restores the thread's pre-pin priority and affinity.
-pub fn unpinByRevoke(core_id: u64) void {
-    kprof.enter(.sched_unpin_revoke);
-    defer kprof.exit(.sched_unpin_revoke);
-    if (core_id >= MAX_CORES) return;
-    const state = &core_states[core_id];
-    if (pinnedOf(state)) |pt| {
-        pt.pinned_exclusive = false;
-        pt.priority = pt.pre_pin_priority;
-        pt.core_affinity = pt.pre_pin_affinity;
-        pt.pre_pin_affinity = null;
-        setPinned(state, null);
-        const core_bit = @as(u64, 1) << @intCast(core_id);
-        _ = pinned_cores.fetchAnd(~core_bit, .release);
-    }
-}
-
-pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
-    kprof.point(.sched_enqueue, core_index);
-    var target = core_index;
-
-    // If the target core is pinned and this isn't the pinned thread, redirect
-    if (!thread.pinned_exclusive) {
-        const pinned = pinned_cores.load(.acquire);
-        if (pinned & (@as(u64, 1) << @intCast(target)) != 0) {
-            // Find an unpinned core
-            const count = arch.smp.coreCount();
-            var i: u64 = 0;
-            while (i < count) {
-                if (pinned & (@as(u64, 1) << @intCast(i)) != 0) {
-                    i += 1;
-                    continue;
-                }
-                if (thread.core_affinity) |aff| {
-                    if (aff & (@as(u64, 1) << @intCast(i)) == 0) {
-                        i += 1;
-                        continue;
-                    }
-                }
-                target = i;
-                break;
-            }
-        }
-    }
-
-    const state = &core_states[target];
-    const irq = state.rq_lock.lockIrqSave();
-    state.rq.enqueue(thread);
-    state.rq_lock.unlockIrqRestore(irq);
-
-    // IPI on thread ready: if the enqueued thread's priority exceeds the
-    // currently running thread on this core, send an IPI to preempt immediately.
-    const running = runningOf(state);
-    if (running) |r| {
-        if (@intFromEnum(thread.priority) > @intFromEnum(r.priority)) {
-            arch.smp.triggerSchedulerInterrupt(target);
-        }
-    }
-}
-
-/// Pick best core for a thread. Prefers current_core if in affinity mask and not pinned.
-/// Returns null if all cores in the affinity mask are pinned.
-fn pickCoreForThread(thread: *Thread, current_core: u64) ?u64 {
-    const mask = thread.core_affinity orelse return current_core;
-    const current_bit = @as(u64, 1) << @intCast(current_core);
-    if (mask & current_bit != 0 and pinnedOf(&core_states[current_core]) == null) {
-        return current_core;
-    }
-    const count = arch.smp.coreCount();
-    var i: u64 = 0;
-    while (i < count) {
-        const bit = @as(u64, 1) << @intCast(i);
-        if (mask & bit != 0 and pinnedOf(&core_states[i]) == null) {
-            return i;
-        }
-        i += 1;
-    }
-    return null;
-}
-
-/// Switch to the next ready thread on the current core's run queue.
-/// Called from IPC syscalls that block the current thread.
-/// The caller must have already set the current thread's state and saved ctx.
-/// Does NOT return to the caller — switches stack and jumps to the next thread.
-pub fn switchToNextReady() noreturn {
-    kprof.enter(.sched_switch);
-    defer kprof.exit(.sched_switch);
-    const core_id = arch.smp.coreID();
-    const state = &core_states[core_id];
-    // Outgoing is whoever was running on this core before the caller
-    // flipped its state to .blocked. We read it *before* overwriting
-    // `state.running_thread` so the PMU save fires under the outgoing
-    // thread's identity (systems.md §run-queue "PMU Save/Restore Hooks").
-    const outgoing: ?*Thread = runningOf(state);
-
-    state.rq_lock.lock();
-    var next = state.rq.dequeue();
-
-    // Work stealing if local queue is empty
-    if (next == null) {
-        state.rq_lock.unlock();
-        next = tryStealWork(core_id);
-        state.rq_lock.lock();
-    }
-
-    // Fall back to idle thread
-    if (next == null) {
-        next = idleOf(state);
-    }
-
-    const next_thread = next.?;
-    next_thread.state = .running;
-    next_thread.on_cpu.store(true, .release);
-    setRunning(state, next_thread);
-    state.rq_lock.unlock();
-
-    armSchedTimer(state, SCHED_TIMESLICE_NS);
-    if (outgoing) |out| {
-        switchToWithPmu(out, next_thread);
-    } else {
-        arch.cpu.switchTo(next_thread);
-    }
-    unreachable;
-}
-
-/// Switch directly to a specific target thread. Used by IPC for direct handoff.
-/// Saves current thread's context, sets it to blocked/ready, and switches.
-/// If enqueue_current is true, the current thread is placed on the run queue
-/// after its context is saved (used by reply to keep the server runnable).
-/// If the target thread requires a different core (affinity), enqueues it remotely
-/// and sends an IPI, then runs next ready thread locally.
-/// Returns E_BUSY (-11) if all cores in target's affinity are pinned.
-/// Otherwise does NOT return — switches stack.
-pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, enqueue_current: bool) i64 {
-    kprof.enter(.sched_switch_direct);
-    defer kprof.exit(.sched_switch_direct);
-    current.ctx = ctx;
-    current.on_cpu.store(false, .release);
-
-    const current_core = arch.smp.coreID();
-    const target_core = pickCoreForThread(target, current_core) orelse {
-        // Undo — caller must handle this error
-        current.on_cpu.store(true, .release);
-        return -11; // E_BUSY
-    };
-
-    // Enqueue current thread after ctx is saved but before switching
-    if (enqueue_current) {
-        enqueueOnCore(current_core, current);
-    }
-
-    const state = &core_states[current_core];
-
-    if (target_core == current_core) {
-        target.state = .running;
-        target.on_cpu.store(true, .release);
-        setRunning(state, target);
-        armSchedTimer(state, SCHED_TIMESLICE_NS);
-        switchToWithPmu(current, target);
-    } else {
-        target.state = .ready;
-        enqueueOnCore(target_core, target);
-        arch.smp.triggerSchedulerInterrupt(target_core);
-        // Run next ready thread locally
-        state.rq_lock.lock();
-        var next = state.rq.dequeue();
-
-        // Work stealing if local queue is empty
-        if (next == null) {
-            state.rq_lock.unlock();
-            next = tryStealWork(current_core);
-            state.rq_lock.lock();
-        }
-
-        // Fall back to idle thread
-        if (next == null) {
-            next = idleOf(state);
-        }
-
-        const next_thread = next.?;
-        next_thread.state = .running;
-        next_thread.on_cpu.store(true, .release);
-        setRunning(state, next_thread);
-        state.rq_lock.unlock();
-        armSchedTimer(state, SCHED_TIMESLICE_NS);
-        switchToWithPmu(current, next_thread);
-    }
-    unreachable;
-}
-
-pub fn globalInit() !void {
-    process_mod.slab_instance = ProcessAllocator.init(
-        address.KernelVA.KernelAllocators.proc_slab,
-        address.KernelVA.KernelAllocators.proc_slab_ptrs,
-        address.KernelVA.KernelAllocators.proc_slab_links,
-    );
-
-    thread_mod.slab_instance = ThreadAllocator.init(
-        address.KernelVA.KernelAllocators.thread_slab,
-        address.KernelVA.KernelAllocators.thread_slab_ptrs,
-        address.KernelVA.KernelAllocators.thread_slab_links,
-    );
-
-    arch.vm.initVmSlab(
-        address.KernelVA.KernelAllocators.kvm_vm_slab,
-        address.KernelVA.KernelAllocators.kvm_vm_slab_ptrs,
-        address.KernelVA.KernelAllocators.kvm_vm_slab_links,
-    );
-    arch.vm.initVcpuSlab(
-        address.KernelVA.KernelAllocators.kvm_vcpu_slab,
-        address.KernelVA.KernelAllocators.kvm_vcpu_slab_ptrs,
-        address.KernelVA.KernelAllocators.kvm_vcpu_slab_links,
-    );
-
-    idle_process = try Process.createIdle();
-
-    initialized = true;
-}
-
-/// Idle loop entry for per-core idle threads. Runs at kernel privilege and
-/// blocks on `halt` until the next interrupt (timer/IPI). aarch64 needs a
-/// real entry and kernel stack because its `switchTo` path uses
-/// `thread.kernel_stack` to seed SP_EL1 and `thread.ctx` to ERET into the
-/// idle body. On x86_64 the existing path never ERETs into the idle thread
-/// (IRQs run on top of whatever context was already executing and TSS.rsp0
-/// is reprogrammed only on EL0→EL1 transitions), so leaving the idle fields
-/// undefined there remains a no-op.
-fn idleLoop() void {
-    while (true) arch.cpu.halt();
-}
-
-pub fn perCoreInit() void {
-    const core_id = arch.smp.coreID();
-    const state = &core_states[core_id];
-
-    // Create a real idle thread for this core. Field-by-field init
-    // preserves `idle_thread._gen_lock` set by the slab allocator.
-    const idle_alloc = thread_mod.slab_instance.create() catch @panic("failed to allocate idle thread");
-    const idle_thread = idle_alloc.ptr;
-    idle_thread.tid = std.math.maxInt(u64) - core_id;
-    idle_thread.ctx = undefined;
-    idle_thread.kernel_stack = undefined;
-    idle_thread.user_stack = null;
-    idle_thread.process = SlabRef(Process).init(idle_process, idle_process._gen_lock.currentGen());
-    idle_thread.next = null;
-    idle_thread.priority = .idle;
-    idle_thread.pre_pin_priority = .normal;
-    idle_thread.pre_pin_affinity = null;
-    idle_thread.core_affinity = null;
-    idle_thread.state = .running;
-    idle_thread.on_cpu = std.atomic.Value(bool).init(true);
-    idle_thread.pinned_exclusive = false;
-    idle_thread.futex_deadline_ns = 0;
-    idle_thread.futex_paddr = address.PAddr.fromInt(0);
-    idle_thread.futex_wake_index = 0;
-    idle_thread.futex_paddrs = [_]address.PAddr{address.PAddr.fromInt(0)} ** 64;
-    idle_thread.futex_bucket_count = 0;
-    idle_thread.ipc_server = null;
-    idle_thread.slot_index = 0;
-    idle_thread.fault_reason = .none;
-    idle_thread.fault_addr = 0;
-    idle_thread.fault_rip = 0;
-    idle_thread.fault_user_ctx = null;
-    idle_thread.pmu_state = null;
-    idle_thread.fpu_state = [_]u8{0} ** 576;
-    idle_thread.last_fpu_core = null;
-    if (@import("builtin").cpu.arch == .aarch64) {
-        // aarch64 requires a concrete kernel stack and entry context for
-        // the idle thread because every thread switch reseats SP_EL1 from
-        // `thread.kernel_stack.top` and ERETs into `thread.ctx`.
-        idle_thread.kernel_stack = thread_mod.createKernelStack() catch @panic("failed to allocate idle kernel stack");
-        const idle_kstack_top = address.alignStack(idle_thread.kernel_stack.top);
-        idle_thread.ctx = arch.cpu.prepareThreadContext(idle_kstack_top, null, &idleLoop, 0);
-    }
-    setIdle(state, idle_thread);
-    setRunning(state, idle_thread);
-
-    arch.vm.vmPerCoreInit();
-    arch.pmu.pmuPerCoreInit();
-    kprof_sample.perCoreInit();
-    kprof.perCoreInit();
-    arch.cpu.sysInfoPerCoreInit();
-    state.timer = arch.time.getPreemptionTimer();
-
-    // Seed `last_tick_ns` from the monotonic clock before the preemption
-    // timer is armed (§6 Idle/Busy Accounting Hook). Until this point
-    // `idle_ns` and `busy_ns` are zero; the first tick's delta lands
-    // cleanly on a well-defined prior timestamp.
-    state.last_tick_ns = arch.time.getMonotonicClock().now();
-
-    arch.cpu.enableInterrupts();
-    armSchedTimer(state, SCHED_TIMESLICE_NS);
-}

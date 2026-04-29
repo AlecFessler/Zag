@@ -21,13 +21,11 @@
 
 const zag = @import("zag");
 
-const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const pmu_facade = zag.arch.x64.pmu;
 const pmu_sched = zag.syscall.pmu;
-const sched = zag.sched.scheduler;
 
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuEvent = pmu_sched.PmuEvent;
@@ -93,7 +91,6 @@ fn eventEncoding(e: PmuEvent) EventEncoding {
             .unit_mask = 0x00,
             .arch_idx = null,
         },
-        else => .{ .event_select = 0x00, .unit_mask = 0x00, .arch_idx = null },
     };
 }
 
@@ -166,29 +163,11 @@ pub fn init() void {
     );
 }
 
-pub fn perCoreInit() void {
-    if (cached_info.num_counters == 0) return;
-    if (apic.x2_apic) {
-        const lvt_val: u64 = PMI_VECTOR;
-        cpu.wrmsr(
-            @intFromEnum(apic.X2ApicMsr.local_vector_table_performance_monitor_register),
-            lvt_val,
-        );
-    } else {
-        apic.writeReg(.lvt_perf_monitoring_counters_reg, PMI_VECTOR);
-    }
-}
-
 pub fn getInfo() PmuInfo {
     return cached_info;
 }
 
 pub fn start(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    programCounters(state, configs);
-}
-
-pub fn reset(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    clearAllOverflowStatus(state.num_counters);
     programCounters(state, configs);
 }
 
@@ -332,14 +311,6 @@ fn clearAllOverflowStatus(num_counters: u8) void {
     cpu.wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, mask);
 }
 
-/// kprof sample-mode per-core init. Intel backend isn't wired for
-/// sample-mode NMI yet — the kprof.sample.md plan reserves this for
-/// a follow-up once the AMD path proves the shape. No-op for now so
-/// `-Dkernel_profile=sample` still compiles under Intel.
-pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
-    _ = period_cycles;
-}
-
 /// Mirror of the AMD hook. Returns false because Intel sample-mode
 /// wiring isn't done yet; the NMI handler will fall through to its
 /// existing (panic) policy, which is the right thing under Intel
@@ -348,11 +319,6 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
     _ = period_cycles;
     return false;
 }
-
-/// Intel trace-counter stub. Parallel to `kprofSamplePerCoreInit`'s
-/// stub — wire up IA32_PERFEVTSELx programming here when an Intel
-/// test rig exists.
-pub fn kprofTraceCountersPerCoreInit() void {}
 
 /// Intel trace-counter read stub. Zeros the output so trace records
 /// built on Intel at least produce well-defined numbers instead of
@@ -364,6 +330,7 @@ pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
 }
 
 fn pmiHandler(ctx: *cpu.Context) void {
+    _ = ctx;
     // The PMI vector is registered as `.external`, so `dispatchInterrupt`
     // already issues `apic.endOfInterrupt()` after this handler returns.
     // Do NOT EOI here.
@@ -372,43 +339,10 @@ fn pmiHandler(ctx: *cpu.Context) void {
 
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, 0);
 
-    const thread = sched.currentThread() orelse return;
-    // self-alive: PMI fires on the core running `thread`; its pmu_state
-    // slot can't be freed under us because sysPmuStop would need to IPI
-    // this core to clear the MSRs before destroying the slot.
-    const state_ref = thread.pmu_state orelse return;
-    const state_ptr = state_ref.ptr;
-
-    // Stale-PMI filter: require at least one overflow bit in the current
-    // thread's counter range. Otherwise this is a masked PMI from a prior
-    // thread being delivered after the context switch.
-    if (state_ptr.num_counters == 0) return;
-    const nbits: u6 = @intCast(state_ptr.num_counters);
-    const owned_mask: u64 = (@as(u64, 1) << nbits) - 1;
-    if ((status & owned_mask) == 0) return;
-
-    var i: u8 = 0;
-    while (i < state_ptr.num_counters) {
-        state_ptr.values[i] = cpu.rdmsr(IA32_PMC_BASE + @as(u32, i));
-        i += 1;
-    }
-
-    const rip_at_pmi = ctx.rip;
-    // self-alive: PMI fires on the core where `thread` is running;
-    // its owning Process is alive across this handler.
-    const proc = thread.process.ptr;
-    const delivered = proc.faultBlock(
-        thread,
-        .pmu_overflow,
-        rip_at_pmi,
-        rip_at_pmi,
-        ctx,
-    );
-
-    if (!delivered) {
-        proc.kill(.pmu_overflow);
-    }
-
-    cpu.enableInterrupts();
-    sched.yield();
+    // TODO(spec-v3): pmu_state has been removed from ExecutionContext;
+    // PMI ownership / state lookup needs to be re-wired against the new
+    // PMU storage location (per-core or per-port?). Until then we panic
+    // — userspace cannot start counters, so this should be unreachable
+    // in practice.
+    @panic("not implemented: PMI handler — pmu_state migrated off ExecutionContext");
 }

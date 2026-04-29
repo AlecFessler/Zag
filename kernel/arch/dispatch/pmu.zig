@@ -22,33 +22,10 @@ pub const PmuState = switch (builtin.cpu.arch) {
 /// Duplicated from `zag.syscall.pmu.MAX_COUNTERS` so the arch dispatch
 /// layer does not force its callers to pull in `zag.syscall.pmu` just to
 /// size a stack buffer.
-pub const pmu_max_counters: usize = 8;
-
 pub fn pmuInit() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.pmu.pmuInit(),
         .aarch64 => aarch64.pmu.pmuInit(),
-        else => unreachable,
-    }
-}
-
-pub fn pmuPerCoreInit() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.pmu.pmuPerCoreInit(),
-        .aarch64 => aarch64.pmu.pmuPerCoreInit(),
-        else => unreachable,
-    }
-}
-
-/// Program one PMC on the local core for cycle-overflow sampling and
-/// set the LAPIC LVT PerfMon entry to NMI delivery. Called under
-/// `-Dkernel_profile=sample` once per core after `pmuPerCoreInit`.
-pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.pmu.kprofSamplePerCoreInit(period_cycles),
-        // aarch64 backend for kprof sampling isn't wired yet; safe
-        // no-op so the generic kprof code compiles on ARM.
-        .aarch64 => {},
         else => unreachable,
     }
 }
@@ -60,20 +37,6 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
     switch (builtin.cpu.arch) {
         .x86_64 => return x64.pmu.kprofSampleCheckAndRearm(period_cycles),
         .aarch64 => return false,
-        else => unreachable,
-    }
-}
-
-/// Program PMCs 0/1/2 on the local core for free-running
-/// cycles / cache-miss / branch-mispredict counting. Called under
-/// `-Dkernel_profile=trace` from `sched.perCoreInit` after
-/// `pmuPerCoreInit`. Counters run unattended forever; the trace
-/// helpers in `kprof.trace_id` snapshot them into each emitted
-/// record so the post-processor can compute per-scope deltas.
-pub fn kprofTraceCountersPerCoreInit() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.pmu.kprofTraceCountersPerCoreInit(),
-        .aarch64 => {},
         else => unreachable,
     }
 }
@@ -161,14 +124,6 @@ pub fn pmuRead(state: *PmuState, sample: *PmuSample) void {
     }
 }
 
-pub fn pmuReset(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => try x64.pmu.pmuReset(state, configs),
-        .aarch64 => try aarch64.pmu.pmuReset(state, configs),
-        else => unreachable,
-    }
-}
-
 pub fn pmuStop(state: *PmuState) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.pmu.pmuStop(state),
@@ -199,3 +154,4 @@ pub fn pmuClearState(state: *PmuState) void {
         else => unreachable,
     }
 }
+

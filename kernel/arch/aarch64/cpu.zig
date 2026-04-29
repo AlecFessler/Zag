@@ -24,8 +24,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zag = @import("zag");
 
-const gic = zag.arch.aarch64.gic;
 
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const VAddr = zag.memory.address.VAddr;
 
 /// True when the target CPU advertises the ARMv8.1 PAN (Privileged
@@ -52,6 +52,18 @@ pub fn enableInterrupts() void {
     // DAIFClr: clear PSTATE.I (bit 1) to unmask IRQs.
     // ARM ARM C5.2.3: MSR DAIFClr, #imm
     asm volatile ("msr daifclr, #0x2");
+}
+
+/// Read PSTATE.DAIF without modifying it. Returns true if PSTATE.I (bit 7
+/// of DAIF) is clear — i.e., IRQs are currently unmasked. Used by lockdep
+/// to detect IRQ-vs-process context at lock acquire sites.
+/// ARM ARM D5.2.1 (PSTATE), DAIF mask layout.
+pub fn interruptsEnabled() bool {
+    var daif: u64 = undefined;
+    asm volatile ("mrs %[daif], daif"
+        : [daif] "=r" (daif),
+    );
+    return (daif & (1 << 7)) == 0;
 }
 
 pub fn saveAndDisableInterrupts() u64 {
@@ -262,26 +274,6 @@ pub fn fpuClearTrap() void {
     asm volatile ("isb" ::: .{ .memory = true });
 }
 
-/// Set CPACR_EL1.FPEN bits [21:20] = 0b01 — trap EL0 FP/SIMD only.
-/// EL1 (kernel) FP access still doesn't trap, but the kernel doesn't
-/// emit any FP instructions so this is irrelevant. Called from
-/// switchTo when the new thread isn't the current FPU owner.
-/// ARM ARM D13.2.30.
-pub fn fpuArmTrap() void {
-    var cpacr: u64 = undefined;
-    asm volatile ("mrs %[v], cpacr_el1"
-        : [v] "=r" (cpacr),
-    );
-    // Clear bits [21:20] then set bit 20 (= 0b01).
-    cpacr &= ~(@as(u64, 0b11) << 20);
-    cpacr |= (@as(u64, 0b01) << 20);
-    asm volatile ("msr cpacr_el1, %[v]"
-        :
-        : [v] "r" (cpacr),
-    );
-    asm volatile ("isb" ::: .{ .memory = true });
-}
-
 /// Per-core mailbox for the lazy-FPU cross-core flush IPI (SGI 2).
 /// Mirrors the x64 layout in `arch/x64/interrupts.zig`'s mailbox — one
 /// slot per *target* core. Requester writes the thread, sends the SGI,
@@ -291,31 +283,12 @@ pub const FpuFlushMailbox = struct {
     requested_thread: ?*anyopaque align(64) = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
-    pub fn requestThread(self: *FpuFlushMailbox, thread: anytype) void {
-        @atomicStore(?*anyopaque, &self.requested_thread, @ptrCast(thread), .release);
-        self.done.store(false, .release);
-    }
-
-    pub fn waitDone(self: *FpuFlushMailbox) void {
-        while (!self.done.load(.acquire)) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
     pub fn ackDone(self: *FpuFlushMailbox) void {
         self.done.store(true, .release);
     }
 };
 
 pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
-
-/// Flush a thread's FP regs from a remote core via SGI 2.
-/// See `kernel/arch/aarch64/exceptions.zig` for the receiver.
-pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
-    fpu_flush_mailbox[target_core].requestThread(thread);
-    gic.sendIpiToCore(target_core, 2);
-    fpu_flush_mailbox[target_core].waitDone();
-}
 
 /// DC ZVA block size in bytes. Captured at boot from DCZID_EL0.BS. When
 /// `DCZID_EL0.DZP` is set the instruction is disabled at EL1 (or the
@@ -387,4 +360,164 @@ pub fn zeroPage4K(ptr: *anyopaque) void {
     }
     const bytes: [*]u8 = @ptrCast(ptr);
     @memset(bytes[0..4096], 0);
+}
+
+// ── Spec v3 EC dispatch primitives ────────────────────────────────────
+
+/// SPSR_EL1.M[3:0] selector — EL1h (kernel, dedicated SP).
+/// ARM ARM DDI 0487 §C5.2.18 SPSR_EL1, M[3:0] = 0b0101 = EL1h.
+const SPSR_M_EL1H: u64 = 0b0101;
+/// SPSR_EL1.M[3:0] selector — EL0t (user-mode AArch64).
+/// ARM ARM DDI 0487 §C5.2.18 SPSR_EL1, M[3:0] = 0b0000 = EL0t.
+const SPSR_M_EL0T: u64 = 0b0000;
+
+/// Naked tail of `loadEcContextAndReturn` — receives the saved
+/// ArchCpuContext base pointer in x0, sets sp to it, restores x0..x30,
+/// SP_EL0, ELR_EL1, SPSR_EL1, and ERETs. Splitting the prologue (Zig
+/// helper) from the restore path (this naked stub) ensures the compiler
+/// cannot insert a frame setup that clobbers x0 between the swap and
+/// the asm sequence. ARM ARM DDI 0487 §D1.10.1.
+export fn restoreContextAndEret() callconv(.naked) noreturn {
+    asm volatile (
+        \\mov sp, x0
+
+        // Restore ELR_EL1 / SPSR_EL1 from the context.
+        \\ldp x10, x11, [sp, #256]
+        \\msr elr_el1, x10
+        \\msr spsr_el1, x11
+
+        // Restore SP_EL0 (user banked SP).
+        \\ldr x10, [sp, #248]
+        \\msr sp_el0, x10
+
+        // Restore x30 from offset 240.
+        \\ldr x30, [sp, #240]
+
+        // Restore x0..x29 via ldp pairs.
+        \\ldp x28, x29, [sp, #224]
+        \\ldp x26, x27, [sp, #208]
+        \\ldp x24, x25, [sp, #192]
+        \\ldp x22, x23, [sp, #176]
+        \\ldp x20, x21, [sp, #160]
+        \\ldp x18, x19, [sp, #144]
+        \\ldp x16, x17, [sp, #128]
+        \\ldp x14, x15, [sp, #112]
+        \\ldp x12, x13, [sp, #96]
+        \\ldp x10, x11, [sp, #80]
+        \\ldp x8, x9, [sp, #64]
+        \\ldp x6, x7, [sp, #48]
+        \\ldp x4, x5, [sp, #32]
+        \\ldp x2, x3, [sp, #16]
+        \\ldp x0, x1, [sp, #0]
+
+        // Deallocate the ArchCpuContext frame (272 bytes) PLUS the
+        // 16-byte vector-stub save area sat above it on entry. This
+        // matches the trampoline's "+288" deallocation so that
+        // SP_EL1 lands at `kstack.top`, where the next exception's
+        // vector-stub `stp x0,x30,[sp,#-16]!` will write — keeping
+        // dispatch and exception entry framings aligned.
+        \\add sp, sp, #288
+        \\eret
+    );
+}
+
+/// Restore `ec.ctx` into the live register file and ERET to either EL0
+/// (user) or EL1 (kernel-mode init EC) depending on the saved SPSR_EL1.
+/// Mirrors the restore-and-ERET tail of `arch/aarch64/exceptions.zig
+/// exceptionTrampoline`. Spec §[execution_context] dispatch; ARM ARM
+/// DDI 0487 §D1.10.1 (ERET) restores PC from ELR_EL1 and PSTATE from
+/// SPSR_EL1, switching exception level per SPSR.M.
+pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
+    // Swap TTBR0_EL1 to the EC's domain root so the post-ERET user-half
+    // translation walks the right tree. Kernel half lives in TTBR1 and
+    // is shared, so no kernel-side TLBI is needed.
+    const dom = ec.domain.ptr;
+    const new_root = dom.addr_space_root;
+    if (new_root.addr != zag.arch.aarch64.paging.getAddrSpaceRoot().addr) {
+        zag.arch.aarch64.paging.swapAddrSpace(new_root, dom.addr_space_id);
+    }
+
+    const ctx_addr: u64 = @intFromPtr(ec.ctx);
+    asm volatile (
+        \\mov x0, %[ctx]
+        \\b restoreContextAndEret
+        :
+        : [ctx] "r" (ctx_addr),
+        : .{ .x0 = true });
+    unreachable;
+}
+
+/// Build a first-dispatch ERET frame on the kernel stack so a
+/// subsequent `loadEcContextAndReturn` lands at `entry` with x0=arg
+/// and SP_EL0=ustack_top in EL0 (user) or, when `ustack_top` is null,
+/// stays in EL1 with sp=kstack_top for kernel-mode init ECs.
+///
+/// The frame layout matches `arch/aarch64/interrupts.zig
+/// ArchCpuContext` (272 bytes — Registers 0..240, sp_el0@248,
+/// elr_el1@256, spsr_el1@264). AAPCS64 (ARM IHI 0055) places the
+/// first integer arg in x0; x30 is left zero — `_start` has no return
+/// address. SPSR.M selects the post-ERET exception level (ARM ARM
+/// DDI 0487 §D1.10.1).
+pub fn prepareEcContext(
+    kstack_top: zag.memory.address.VAddr,
+    ustack_top: ?zag.memory.address.VAddr,
+    entry: zag.memory.address.VAddr,
+    arg: u64,
+) *zag.arch.aarch64.interrupts.ArchCpuContext {
+    @setRuntimeSafety(false);
+    const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
+
+    // Place the frame at `kstack_top - 288`, matching the layout the
+    // exception trampoline produces on subsequent kernel entries
+    // (`exceptionTrampoline` consumes 16 bytes at `[sp, #-16]!` for
+    // the vector stub's `stp x0,x30` save plus 272 bytes for its own
+    // ArchCpuContext frame, totaling 288). Aligning the first-dispatch
+    // frame to the same window means ec.ctx still points at the saved
+    // frame after the next user→kernel transition.
+    const frame_size: u64 = @sizeOf(ArchCpuContext);
+    const stub_save: u64 = 16;
+    const ctx_addr: u64 = std.mem.alignBackward(u64, kstack_top.addr - frame_size - stub_save, 16);
+    const ctx: *ArchCpuContext = @ptrFromInt(ctx_addr);
+
+    @memset(std.mem.asBytes(ctx), 0);
+
+    ctx.regs.x0 = arg;
+    ctx.elr_el1 = entry.addr;
+
+    if (ustack_top) |us| {
+        ctx.sp_el0 = us.addr;
+        ctx.spsr_el1 = SPSR_M_EL0T;
+    } else {
+        // Kernel-mode init EC: stay at EL1h with the kernel stack as SP.
+        // SP_EL0 is unused at EL1h but mirror the kernel SP for safety.
+        ctx.sp_el0 = kstack_top.addr;
+        ctx.spsr_el1 = SPSR_M_EL1H;
+    }
+
+    return ctx;
+}
+
+/// Re-patch a previously-built first-dispatch frame for user-mode entry.
+/// Used when an EC was allocated without a user stack (so
+/// `prepareEcContext` left the frame in EL1h kernel-mode shape) and the
+/// caller is wiring in the user stack and entry afterward.
+pub fn patchUserModeIretFrame(
+    ctx: *zag.arch.aarch64.interrupts.ArchCpuContext,
+    entry: zag.memory.address.VAddr,
+    user_stack_top: zag.memory.address.VAddr,
+    arg: u64,
+) void {
+    ctx.elr_el1 = entry.addr;
+    ctx.sp_el0 = user_stack_top.addr;
+    ctx.spsr_el1 = SPSR_M_EL0T;
+    ctx.regs.x0 = arg;
+}
+
+/// Halt the local core with DAIF.{I,F} clear until the next IRQ (WFI).
+/// Spec §[execution_context] idle EC. ARM ARM DDI 0487 §C5.2.4 WFI.
+pub fn idle() void {
+    asm volatile (
+        \\msr daifclr, #2
+        \\wfi
+        ::: .{ .memory = true });
 }

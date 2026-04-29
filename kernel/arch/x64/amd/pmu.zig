@@ -33,7 +33,6 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const pmu_facade = zag.arch.x64.pmu;
 const pmu_sched = zag.syscall.pmu;
-const sched = zag.sched.scheduler;
 
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuEvent = pmu_sched.PmuEvent;
@@ -169,30 +168,11 @@ pub fn init() void {
     );
 }
 
-pub fn perCoreInit() void {
-    if (cached_info.num_counters == 0) return;
-    // LAPIC LVT PerfMon entry is architecturally identical on AMD and Intel;
-    // reuse the same register. Fixed delivery, unmasked.
-    if (apic.x2_apic) {
-        const lvt_val: u64 = PMI_VECTOR;
-        cpu.wrmsr(
-            @intFromEnum(apic.X2ApicMsr.local_vector_table_performance_monitor_register),
-            lvt_val,
-        );
-    } else {
-        apic.writeReg(.lvt_perf_monitoring_counters_reg, PMI_VECTOR);
-    }
-}
-
 pub fn getInfo() PmuInfo {
     return cached_info;
 }
 
 pub fn start(state: *PmuState, configs: []const PmuCounterConfig) !void {
-    programCounters(state, configs);
-}
-
-pub fn reset(state: *PmuState, configs: []const PmuCounterConfig) !void {
     programCounters(state, configs);
 }
 
@@ -338,39 +318,6 @@ const KPROF_SAMPLE_PMC: u8 = 0;
 /// AMD APM Vol 2, Appendix A: event 0x76 = "CPU Clocks not Halted".
 /// AMD APM Vol 2 §16.4 + Intel SDM Vol 3A §12.5.1: LVT delivery-mode
 /// field is bits [10:8] — value 0b100 selects NMI delivery.
-pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
-    const span: u64 = @as(u64, 1) << AMD_COUNTER_BITS;
-    const clamped = if (period_cycles == 0 or period_cycles >= span) span - 1 else period_cycles;
-    const preload = span - clamped;
-
-    // Disable PMC 0 before reprogramming so no stale PMI slips through.
-    cpu.wrmsr(perfevtselMsr(KPROF_SAMPLE_PMC), 0);
-    cpu.wrmsr(perfctrMsr(KPROF_SAMPLE_PMC), preload);
-
-    // Event 0x76 (CPU clocks not halted), count in both rings, enable
-    // the overflow interrupt bit.
-    const PERFEVTSEL_OS: u64 = 1 << 17;
-    const word: u64 =
-        @as(u64, 0x76) |
-        PERFEVTSEL_USR |
-        PERFEVTSEL_OS |
-        PERFEVTSEL_INT |
-        PERFEVTSEL_EN;
-    cpu.wrmsr(perfevtselMsr(KPROF_SAMPLE_PMC), word);
-
-    // LVT PerfMon: vector + delivery_mode=NMI (bits [10:8] = 0b100 = 0x400).
-    const NMI_DELIVERY: u32 = 0b100 << 8;
-    const lvt: u32 = @as(u32, PMI_VECTOR) | NMI_DELIVERY;
-    if (apic.x2_apic) {
-        cpu.wrmsr(
-            @intFromEnum(apic.X2ApicMsr.local_vector_table_performance_monitor_register),
-            @as(u64, lvt),
-        );
-    } else {
-        apic.writeReg(.lvt_perf_monitoring_counters_reg, lvt);
-    }
-}
-
 /// Program PMCs 0/1/2 for free-running cycles / L1 DC refill /
 /// branch-mispredict counting. No overflow interrupt — the trace
 /// helpers just RDMSR these at each tracepoint. Runs exclusively
@@ -384,29 +331,6 @@ pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
 ///         (all refill sources). An umask of 0 counts nothing, which
 ///         is why the first attempt showed cmiss=0 everywhere.
 ///   PMC2: event 0xC3 umask 0x00 = Retired Branch Mispredicts
-pub fn kprofTraceCountersPerCoreInit() void {
-    const cfg = [_]struct { pmc: u8, event: u8, umask: u8 }{
-        .{ .pmc = 0, .event = 0x76, .umask = 0x00 },
-        .{ .pmc = 1, .event = 0x43, .umask = 0xFF },
-        .{ .pmc = 2, .event = 0xC3, .umask = 0x00 },
-    };
-    const PERFEVTSEL_OS: u64 = 1 << 17;
-    var i: usize = 0;
-    while (i < cfg.len) {
-        const c = cfg[i];
-        cpu.wrmsr(perfevtselMsr(c.pmc), 0);
-        cpu.wrmsr(perfctrMsr(c.pmc), 0);
-        const word: u64 =
-            @as(u64, c.event) |
-            (@as(u64, c.umask) << 8) |
-            PERFEVTSEL_USR |
-            PERFEVTSEL_OS |
-            PERFEVTSEL_EN;
-        cpu.wrmsr(perfevtselMsr(c.pmc), word);
-        i += 1;
-    }
-}
-
 /// Snapshot the three trace counters. Masked to AMD's 48-bit
 /// counter width so the raw MSR value doesn't carry high-bit noise.
 pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
@@ -453,48 +377,12 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
 }
 
 fn pmiHandler(ctx: *cpu.Context) void {
+    _ = ctx;
     // Registered as `.external`; `dispatchInterrupt` EOIs after we return.
-    const thread = sched.currentThread() orelse return;
-    // self-alive: PMI fires on the core running `thread`; pmu_state
-    // can't be freed out from under us during the handler.
-    const state_ref = thread.pmu_state orelse return;
-    const state_ptr = state_ref.ptr;
-    if (state_ptr.num_counters == 0) return;
-
-    // Stale-PMI filter: any counter whose current value has wrapped back
-    // near its preload (i.e. is far below (2^48 - threshold_small)) is
-    // treated as the overflowing one. Simpler policy: if at least one
-    // counter's high bit cleared — meaning it overflowed past the 48-bit
-    // boundary — attribute the PMI to this thread. Otherwise drop as stale.
-    var overflowed = false;
-    var i: u8 = 0;
-    while (i < state_ptr.num_counters) {
-        const raw = cpu.rdmsr(perfctrMsr(i)) & COUNTER_MASK;
-        if (raw < state_ptr.values[i]) overflowed = true;
-        state_ptr.values[i] = raw;
-        // Disable this counter so it can't re-fire before we hand off to
-        // the fault handler.
-        cpu.wrmsr(perfevtselMsr(i), 0);
-        i += 1;
-    }
-    if (!overflowed) return;
-
-    const rip_at_pmi = ctx.rip;
-    // self-alive: PMI fires on the core where `thread` is running;
-    // its owning Process is alive across this handler.
-    const proc = thread.process.ptr;
-    const delivered = proc.faultBlock(
-        thread,
-        .pmu_overflow,
-        rip_at_pmi,
-        rip_at_pmi,
-        ctx,
-    );
-
-    if (!delivered) {
-        proc.kill(.pmu_overflow);
-    }
-
-    cpu.enableInterrupts();
-    sched.yield();
+    // TODO(spec-v3): pmu_state has been removed from ExecutionContext;
+    // PMI ownership / state lookup needs to be re-wired against the new
+    // PMU storage location (per-core or per-port?). Until then we panic
+    // — userspace cannot start counters, so this should be unreachable
+    // in practice.
+    @panic("not implemented: PMI handler — pmu_state migrated off ExecutionContext");
 }

@@ -57,7 +57,11 @@ pub fn init(port: Ports, baud: u32) void {
     g_port = port;
 }
 
-var print_lock = sync.SpinLock{};
+var print_lock = sync.SpinLock{ .class = "serial.print_lock" };
+
+pub fn printRaw(s: []const u8) void {
+    for (s) |b| writeByte(b, g_port);
+}
 
 pub fn print(
     comptime format: []const u8,
@@ -72,8 +76,8 @@ pub fn print(
         args,
     ) catch @panic("Print would be truncated!");
 
-    print_lock.lock();
-    defer print_lock.unlock();
+    const irq = print_lock.lockIrqSave(@src());
+    defer print_lock.unlockIrqRestore(irq);
 
     for (s) |b| {
         writeByte(b, g_port);

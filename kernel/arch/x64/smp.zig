@@ -13,10 +13,11 @@ const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const sched = zag.sched.scheduler;
+const serial = zag.arch.x64.serial;
 const stack_mod = zag.memory.stack;
 const timers = zag.arch.x64.timers;
 
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
@@ -33,13 +34,7 @@ const TRAMPOLINE_PHYS: u64 = 0x8000;
 const TRAMPOLINE_VECTOR: u8 = @intCast(TRAMPOLINE_PHYS >> 12);
 const params_offset = trampoline_code.len - @sizeOf(TrampolineParams);
 
-const KERNEL_PERMS = MemoryPerms{
-    .write_perm = .write,
-    .execute_perm = .no_execute,
-    .cache_perm = .write_back,
-    .global_perm = .global,
-    .privilege_perm = .kernel,
-};
+const KERNEL_PERMS = MemoryPerms{ .read = true, .write = true };
 
 var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 
@@ -48,6 +43,12 @@ var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 /// Intel SDM Vol 3A, §11.4.4 "MP Initialization Example", Table 11-1 — INIT-SIPI-SIPI
 /// sequence with 10 ms delay between INIT and first SIPI.
 pub fn smpInit() !void {
+    // Write the BSP's IA32_TSC_AUX so its later `coreID()` calls can
+    // use the RDPID fast path. APs do the same in `coreInit` after
+    // they discover their core_id via the slow path. After every core
+    // has run, `enableRdpidFastPath()` below flips the global switch.
+    apic.writeTscAuxCoreId(apic.coreIDSlow());
+
     for (0..apic.coreCount()) |i| {
         gdt.initForCore(i);
     }
@@ -59,13 +60,8 @@ pub fn smpInit() !void {
         memory_init.kernel_addr_space_root,
         trampoline_phys,
         trampoline_virt,
-        .{
-            .write_perm = .write,
-            .execute_perm = .execute,
-            .cache_perm = .write_back,
-            .global_perm = .not_global,
-            .privilege_perm = .kernel,
-        },
+        .{ .read = true, .write = true, .exec = true },
+        .kernel_data,
     );
 
     const dest: [*]u8 = @ptrFromInt(trampoline_virt.addr);
@@ -96,7 +92,7 @@ pub fn smpInit() !void {
                 break;
             };
             const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-            arch_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
+            arch_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS, .kernel_data) catch {
                 pmm_mgr.destroy(kpage);
                 map_ok = false;
                 break;
@@ -133,6 +129,11 @@ pub fn smpInit() !void {
             std.atomic.spinLoopHint();
         }
     }
+
+    // All online APs have run `writeTscAuxCoreId` on themselves before
+    // bumping `cores_online` (see coreInit below); the BSP did the same
+    // at the top of this function. Safe to flip the global RDPID flag.
+    apic.enableRdpidFastPath();
 }
 
 /// AP initialization entry point — corresponds to the "Typical AP Initialization Sequence"
@@ -148,7 +149,8 @@ fn coreInit() callconv(.c) noreturn {
         apic.enableSpuriousVector(@intFromEnum(interrupts.IntVecs.spurious));
     }
 
-    const core_id = apic.coreID();
+    const core_id = apic.coreIDSlow();
+    apic.writeTscAuxCoreId(core_id);
     gdt.loadGdt(core_id);
     cpu.ltr(gdt.TSS_OFFSET);
 
@@ -160,5 +162,15 @@ fn coreInit() callconv(.c) noreturn {
     cpu.enableSpeculationBarriers();
     _ = cores_online.fetchAdd(1, .release);
     sched.perCoreInit();
-    cpu.halt();
+
+    // Visual confirmation that this AP reached the scheduler. Printed
+    // from inside the AP — serial driver is multi-core safe via its
+    // print_lock (see arch/x64/serial.zig).
+    serial.print("[ap {}] entering sched.run\n", .{core_id});
+
+    // Drop into the scheduler loop. APs start with empty run queues
+    // and no per-core idle EC, so `sched.run` will fall through to
+    // `sti+hlt` and wait for a cross-core wake / preempt IPI from
+    // `enqueueOnCore`. `sched.run` is `noreturn`.
+    sched.run();
 }

@@ -1,1 +1,1 @@
-pub const registry = @import("registry.zig");
+pub const device_region = @import("device_region.zig");

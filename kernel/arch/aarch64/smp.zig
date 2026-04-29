@@ -43,7 +43,6 @@ const zag = @import("zag");
 // Module aliases — alphabetical
 const aarch64_paging = zag.arch.aarch64.paging;
 const cpu = zag.arch.aarch64.cpu;
-const exceptions = zag.arch.aarch64.exceptions;
 const gic = zag.arch.aarch64.gic;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
@@ -53,7 +52,7 @@ const sched = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
 
 // Type aliases — alphabetical
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageEntry = aarch64_paging.PageEntry;
 const VAddr = zag.memory.address.VAddr;
@@ -69,19 +68,10 @@ var mpidr_table: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
 /// Whether each MPIDR entry has been set by ACPI parsing.
 var mpidr_valid: [MAX_CORES]bool = [_]bool{false} ** MAX_CORES;
 
-/// Per-core stack top addresses (kernel VA), indexed by logical core ID.
-var core_stack_tops: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
-
 /// Number of secondary cores successfully brought online.
 var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 
-const KERNEL_PERMS = MemoryPerms{
-    .write_perm = .write,
-    .execute_perm = .no_execute,
-    .cache_perm = .write_back,
-    .global_perm = .global,
-    .privilege_perm = .kernel,
-};
+const KERNEL_PERMS = MemoryPerms{ .read = true, .write = true };
 
 /// Boot parameters passed to secondary cores via PSCI context_id (x0).
 /// The secondary reads this struct at its physical address with MMU off,
@@ -364,7 +354,7 @@ fn smpInitFull() !void {
                 break;
             };
             const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-            aarch64_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
+            aarch64_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS, .kernel_data) catch {
                 pmm_mgr.destroy(kpage);
                 map_ok = false;
                 break;
@@ -411,13 +401,29 @@ fn smpInitFull() !void {
         }
 
         // Spin-wait for the secondary to signal it is online.
-        // Use a bounded wait to avoid hanging if a core fails to start.
+        //
+        // PSCI CPU_ON is asynchronous (DEN0022D §5.1.4): a SUCCESS
+        // return only confirms that the firmware accepted the
+        // request, not that the target core has begun executing the
+        // entry point. The actual wakeup latency depends on whether
+        // the core was previously powered down or just halted in
+        // WFI; on a real Cortex-A76 + KVM (Pi 5) we have measured
+        // several milliseconds before the AP increments
+        // `cores_online`.
+        //
+        // The previous 500 k-iteration cap completed in microseconds
+        // on KVM — well under the AP's startup latency — and was the
+        // actual cause of "secondaries deaf to interrupts" on Pi 5:
+        // the BSP gave up before the AP could ack, then started
+        // `cpuOn(core_idx + 1)` while the previous AP was still
+        // setting up its GIC CPU interface, so the AP missed the
+        // first scheduler tick and the workaround broadcast (SGI 7)
+        // could not run on a vGICv2 view that was never enabled.
+        // 50 M iterations is ~tens of milliseconds on Cortex-A76 and
+        // hundreds of milliseconds on TCG, well above any realistic
+        // PSCI CPU_ON latency.
         var spin_count: u64 = 0;
-        // Bounded wait so the BSP can make forward progress even when a
-        // secondary stalls inside per-core GIC init. TCG spin iters are
-        // slow, so keep this small enough that N cores still fit under
-        // the kernel test timeout.
-        const max_spins: u64 = 500_000;
+        const max_spins: u64 = 50_000_000;
         while (cores_online.load(.acquire) == expected) {
             if (spin_count >= max_spins) {
                 stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
@@ -575,9 +581,16 @@ fn secondaryEntry() callconv(.naked) noreturn {
 /// Called from secondaryEntry with core_idx in x0, running at kernel VA.
 fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
     // Initialize the GIC redistributor and CPU interface for this core.
+    // This MUST complete before we increment `cores_online`: the BSP
+    // moves on to the next CPU_ON (and ultimately to perCoreInit /
+    // armSchedTimer) as soon as the counter advances, and any IRQ it
+    // routes here before our GIC CPU interface is enabled would be
+    // silently dropped. ARM IHI 0048B §4.4.1 (GICC_CTLR) — the CPU
+    // interface only forwards interrupts after `Enable` is set.
     gic.initSecondaryCoreGic(@intCast(core_idx));
 
-    // Signal to the BSP that this core is online.
+    // Signal to the BSP that this core is online. The release store
+    // is paired with the BSP's acquire load in `smpInitFull`.
     _ = cores_online.fetchAdd(1, .release);
 
     // Initialize per-core scheduler state (idle thread, running thread).

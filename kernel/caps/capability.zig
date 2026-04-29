@@ -1,0 +1,619 @@
+//! Generic capability envelope. See docs/kernel/specv3.md §[capabilities].
+//!
+//! A capability is an unforgeable reference to a kernel object, paired
+//! with type-dependent caps and metadata. The system holds two parallel
+//! tables per capability domain, indexed by the same 12-bit handle id:
+//!
+//!   - User table — array of `Capability` (24 bytes each). Mapped
+//!     read-only into the holding domain so userspace can inspect cap
+//!     bits, type, and the kernel-mutable field0/field1 snapshots
+//!     directly without a syscall.
+//!
+//!   - Kernel table — array of `KernelHandle`. Carries the actual
+//!     `*Object` (type-erased) and slab gen for UAF validation. Not
+//!     mapped to userspace.
+//!
+//! Slot N in the user table mirrors slot N in the kernel table. A read
+//! of `Capability.word0` bits 12-15 names which kernel object type the
+//! parallel `KernelHandle.obj` points at.
+//!
+//! The kernel writes field0/field1 directly on the user table pages
+//! (via the kernel-side R/W view of the same physical pages) when an
+//! object's kernel-mutable snapshot changes (e.g. EC priority).
+
+const zag = @import("zag");
+
+const capability_domain = zag.capdom.capability_domain;
+const derivation = zag.caps.derivation;
+const device_region = zag.devices.device_region;
+const errors = zag.syscall.errors;
+const execution_context = zag.sched.execution_context;
+const page_frame = zag.memory.page_frame;
+const port = zag.sched.port;
+const secure_slab = zag.memory.allocators.secure_slab;
+const timer = zag.sched.timer;
+const var_range = zag.capdom.var_range;
+const virtual_machine = zag.capdom.virtual_machine;
+
+const CapabilityDomain = capability_domain.CapabilityDomain;
+const DeviceRegion = device_region.DeviceRegion;
+const ExecutionContext = execution_context.ExecutionContext;
+const PageFrame = page_frame.PageFrame;
+const Port = port.Port;
+const Timer = timer.Timer;
+const VAR = var_range.VAR;
+const VirtualMachine = virtual_machine.VirtualMachine;
+
+/// Maximum handles per capability domain. Spec: 12-bit handle id.
+pub const MAX_HANDLES_PER_DOMAIN: u16 = 4096;
+
+/// Sentinel marking the tail of the free-slot list.
+pub const FREE_LIST_TAIL: u16 = 0xFFFF;
+
+/// Type tag carried in `Capability.word0` bits 12-15. Names which kind
+/// of kernel object the corresponding `KernelHandle.obj` points at.
+/// 4-bit field allows up to 16 distinct types.
+pub const CapabilityType = enum(u4) {
+    /// Slot 0 in every domain. References the domain itself (its
+    /// self-handle, with the full ceiling-bearing cap word).
+    capability_domain_self = 0,
+    /// IDC handle to another (or this) capability domain.
+    capability_domain = 1,
+    execution_context = 2,
+    page_frame = 3,
+    virtual_address_range = 4,
+    device_region = 5,
+    port = 6,
+    reply = 7,
+    virtual_machine = 8,
+    timer = 9,
+    _,
+};
+
+/// User-visible capability entry. 24 bytes, three little-endian u64s.
+/// One of these per slot in the domain's user-mapped table.
+pub const Capability = extern struct {
+    /// Word 0 — universal envelope:
+    /// ```
+    /// 63            48 47                          16 15   12 11         0
+    /// ┌────────────────┬──────────────────────────────┬───────┬────────────┐
+    /// │   cap (16)     │       _reserved (32)         │type(4)│   id(12)   │
+    /// └────────────────┴──────────────────────────────┴───────┴────────────┘
+    /// ```
+    /// - bits 0-11  : `id`   — slot index, equals this entry's position
+    /// - bits 12-15 : `type` — `CapabilityType`
+    /// - bits 16-47 : reserved, must be zero
+    /// - bits 48-63 : `cap`  — type-dependent cap bitfield (see each
+    ///                         object's spec section for layout)
+    word0: u64,
+
+    /// Word 1 — type-dependent metadata. Layout per object type. Some
+    /// fields are kernel-mutable snapshots refreshed on syscalls
+    /// touching the handle.
+    field0: u64,
+
+    /// Word 2 — type-dependent metadata. Same.
+    field1: u64,
+};
+
+comptime {
+    if (@sizeOf(Capability) != 24) @compileError("Capability must be 24 bytes");
+}
+
+/// Bit-packing helpers for `Capability.word0`.
+pub const Word0 = struct {
+    pub inline fn id(word0: u64) u12 {
+        return @truncate(word0 & 0xFFF);
+    }
+    pub inline fn typeTag(word0: u64) CapabilityType {
+        return @enumFromInt(@as(u4, @truncate((word0 >> 12) & 0xF)));
+    }
+    pub inline fn caps(word0: u64) u16 {
+        return @truncate(word0 >> 48);
+    }
+    pub inline fn pack(handle_id: u12, t: CapabilityType, c: u16) u64 {
+        return @as(u64, handle_id) |
+            (@as(u64, @intFromEnum(t)) << 12) |
+            (@as(u64, c) << 48);
+    }
+};
+
+/// Mask of the syscall-handle argument bits the caller is allowed to
+/// set. Spec: a handle argument is bits 0-11; upper bits are reserved
+/// and must be zero. `restrict`/`delete`/`revoke`/`sync` all return
+/// E_INVAL if bits 12-63 are non-zero.
+pub const HANDLE_ARG_MASK: u64 = 0xFFF;
+
+/// Mask of the caps-argument bits the caller is allowed to set in
+/// `restrict`. Spec packs new caps into bits 0-15; bits 16-63 are
+/// reserved.
+pub const RESTRICT_CAPS_MASK: u64 = 0xFFFF;
+
+/// Type-erased SlabRef. Same on-wire layout as `SlabRef(T)` for any T —
+/// `{ ptr, gen, _pad }`, 16 bytes — but with `?*anyopaque` for the ptr
+/// so the free-slot state can be encoded as `ptr = null` without a
+/// separate discriminator. Bit-cast to/from `SlabRef(T)` once the user
+/// table's type tag names the concrete T.
+pub const ErasedSlabRef = extern struct {
+    ptr: ?*anyopaque = null,
+    gen: u32 = 0,
+    _pad: u32 = 0,
+
+    /// Reconstitute a typed `SlabRef(T)` and acquire its gen-lock.
+    /// Returns `StaleHandle` if the slot has been freed since this
+    /// reference was minted, or null on a structurally-empty link
+    /// IRQ-saving typed lock. Reconstructs the typed `SlabRef(T)` from
+    /// the erased fat pointer, then takes its gen-lock with IRQs masked.
+    /// Caller pairs with `unlockTypedIrqRestore` and threads the
+    /// returned IRQ state back.
+    pub fn lockTypedIrqSave(self: ErasedSlabRef, comptime T: type) secure_slab.AccessError!struct { ptr: *T, irq_state: u64 } {
+        const raw = self.ptr orelse return error.StaleHandle;
+        const ref = secure_slab.SlabRef(T){
+            .ptr = @ptrCast(@alignCast(raw)),
+            .gen = self.gen,
+            ._pad = self._pad,
+        };
+        const lr = try ref.lockIrqSave(@src());
+        return .{ .ptr = lr.ptr, .irq_state = lr.irq_state };
+    }
+
+    /// Release the lock acquired via `lockTypedIrqSave`. Restores the
+    /// captured IRQ state.
+    pub fn unlockTypedIrqRestore(self: ErasedSlabRef, comptime T: type, irq_state: u64) void {
+        const raw = self.ptr orelse return;
+        const ref = secure_slab.SlabRef(T){
+            .ptr = @ptrCast(@alignCast(raw)),
+            .gen = self.gen,
+            ._pad = self._pad,
+        };
+        ref.unlockIrqRestore(irq_state);
+    }
+};
+
+comptime {
+    const SlabRef = secure_slab.SlabRef;
+    const Concrete = SlabRef(u8);
+    if (@sizeOf(ErasedSlabRef) != @sizeOf(Concrete)) {
+        @compileError("ErasedSlabRef size must match SlabRef");
+    }
+    if (@offsetOf(ErasedSlabRef, "ptr") != @offsetOf(Concrete, "ptr")) {
+        @compileError("ErasedSlabRef.ptr offset must match SlabRef.ptr");
+    }
+    if (@offsetOf(ErasedSlabRef, "gen") != @offsetOf(Concrete, "gen")) {
+        @compileError("ErasedSlabRef.gen offset must match SlabRef.gen");
+    }
+    if (@offsetOf(ErasedSlabRef, "_pad") != @offsetOf(Concrete, "_pad")) {
+        @compileError("ErasedSlabRef._pad offset must match SlabRef._pad");
+    }
+    if (@alignOf(ErasedSlabRef) != @alignOf(Concrete)) {
+        @compileError("ErasedSlabRef alignment must match SlabRef");
+    }
+}
+
+/// Cross-domain link to a `KernelHandle` in another (or this) capability
+/// domain. Used for revoke-ancestry tree links — parent, first_child,
+/// next_sibling — embedded in `KernelHandle`.
+///
+/// Carries the holder domain as an `ErasedSlabRef` so each traversal step
+/// goes through `SlabRef.lock` for gen validation: if the target domain
+/// has been freed since the link was installed, the lock raises
+/// `StaleHandle` and the descendant is treated as already gone.
+///
+/// `slot` is the 12-bit handle id within `domain`'s `kernel_table`. The
+/// remaining bits in the trailing word are reserved.
+///
+/// Two-state encoding mirrors `ErasedSlabRef` itself:
+///   - Linked  : `domain.ptr != null`. `slot` is the linked slot id.
+///   - Unlinked: `domain.ptr == null`. `slot` is meaningful only on the
+///               `parent` link of a free slot, where it carries the
+///               next-free-slot index (see `KernelHandle` doc).
+pub const HandleLink = extern struct {
+    domain: ErasedSlabRef = .{},
+    slot: u16 = 0,
+    _reserved: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
+};
+
+comptime {
+    if (@sizeOf(HandleLink) != 24) @compileError("HandleLink must be 24 bytes");
+    if (@offsetOf(HandleLink, "domain") != 0) @compileError("HandleLink.domain must be at offset 0");
+}
+
+/// Kernel-side mirror entry. One per slot in the domain's handle table,
+/// indexed identically to the user-visible `Capability` table. Lives in
+/// kernel-only memory.
+///
+/// Two states distinguished by `ref.ptr`:
+///   - **Used** (`ref.ptr != null`): the embedded `SlabRef` references
+///     the kernel object. Combine with the user table's type tag to
+///     reconstruct a typed `SlabRef(T)` via `typedRef`. The three link
+///     fields (`parent`, `first_child`, `next_sibling`) describe this
+///     handle's position in the cross-domain copy-derivation tree used
+///     by `revoke` (Spec §[capabilities].revoke). A null `parent.domain`
+///     in the used state means the handle was minted as a tree root
+///     (e.g. via `create_*`) and has no copy ancestor.
+///   - **Free** (`ref.ptr == null`): the parent link doubles as the
+///     free-slot list link — `parent.slot` low 16 bits hold the next
+///     free slot index (`FREE_LIST_TAIL` = end of list). The
+///     `first_child` and `next_sibling` fields are zeroed. The two
+///     states are unambiguous because a free slot has no copy ancestor
+///     and no descendants.
+pub const KernelHandle = extern struct {
+    ref: ErasedSlabRef = .{},
+    parent: HandleLink = .{},
+    first_child: HandleLink = .{},
+    next_sibling: HandleLink = .{},
+};
+
+comptime {
+    if (@sizeOf(KernelHandle) != 88) @compileError("KernelHandle must be 88 bytes");
+    if (@offsetOf(KernelHandle, "ref") != 0) @compileError("KernelHandle.ref must be at offset 0");
+    if (@offsetOf(KernelHandle, "parent") != 16) @compileError("KernelHandle.parent must be at offset 16");
+}
+
+/// Reconstruct a typed `SlabRef(T)` from a kernel entry. Returns `null`
+/// if the slot is free. Caller is responsible for matching `T` to the
+/// type tag in the parallel user `Capability.word0`.
+///
+/// Explicit field reconstruction rather than `@bitCast` — Zig disallows
+/// bit-casting between `?*anyopaque` and a non-null `*T`, even when
+/// the comptime layout assertion above proves the bit representation
+/// is identical. The compiler treats them as different types at the
+/// optional level. Field-by-field copy sidesteps that.
+pub fn typedRef(comptime T: type, entry: KernelHandle) ?SlabRefOf(T) {
+    const raw = entry.ref.ptr orelse return null;
+    return SlabRefOf(T){
+        .ptr = @ptrCast(@alignCast(raw)),
+        .gen = entry.ref.gen,
+        ._pad = entry.ref._pad,
+    };
+}
+
+// Forward reference — the real `SlabRef(T)` lives in
+// `memory.allocators.secure_slab`. Aliased here to avoid a circular
+// import while we're still stubbing.
+fn SlabRefOf(comptime T: type) type {
+    return secure_slab.SlabRef(T);
+}
+
+// ── Free-list helpers ─────────────────────────────────────────────────
+
+/// Compose the free-list cell stored in a free entry's `parent` link.
+/// In the free state `parent.domain` is null and `parent.slot` carries
+/// the next free slot index (`FREE_LIST_TAIL` for end of list).
+pub inline fn encodeFreeNext(next: u16) HandleLink {
+    return .{ .domain = .{}, .slot = next };
+}
+
+/// Read the next free slot index from a free entry's `parent` link.
+pub inline fn decodeFreeNext(link: HandleLink) u16 {
+    return link.slot;
+}
+
+// ── External API (cross-cutting capability operations) ───────────────
+
+/// `restrict` syscall handler. Spec §[capabilities].restrict.
+pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
+    if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
+    if (caps_arg & ~RESTRICT_CAPS_MASK != 0) return errors.E_INVAL;
+
+    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+    const cd_ref = ec.domain;
+    const cd_lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = cd_lr.ptr;
+    defer cd_ref.unlockIrqRestore(cd_lr.irq_state);
+
+    const slot: u12 = @truncate(handle);
+    const entry = resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
+    const user_entry = &cd.user_table[slot];
+
+    const type_tag = Word0.typeTag(user_entry.word0);
+    const current_caps = Word0.caps(user_entry.word0);
+    const requested_caps: u16 = @truncate(caps_arg);
+
+    if (!capsAreSubset(current_caps, requested_caps, type_tag)) return errors.E_PERM;
+    if (!restartPolicyMonotone(current_caps, requested_caps, type_tag)) return errors.E_PERM;
+
+    user_entry.word0 = Word0.pack(slot, type_tag, requested_caps);
+
+    refreshSnapshot(cd, slot, entry);
+    return 0;
+}
+
+/// `delete` syscall handler. Spec §[capabilities].delete.
+///
+/// Detaches the handle from the copy-derivation tree (reparenting any
+/// children to the deleted handle's parent so a subsequent revoke on
+/// an ancestor still reaches them — Spec §[capabilities].revoke
+/// test 04), then runs the per-type release and clears the slot.
+///
+/// Lock order: `tree_mutex` → caller's domain gen-lock. Matches the
+/// order taken by `derivation.revoke`/`derivation.derive`.
+pub fn delete(caller: *anyopaque, handle: u64) i64 {
+    if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
+
+    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+    const caller_dom_ref: ErasedSlabRef = @bitCast(ec.domain);
+
+    const slot: u12 = @truncate(handle);
+    return derivation.deleteAndDetach(caller_dom_ref, slot);
+}
+
+/// `revoke` syscall handler. Spec §[capabilities].revoke.
+///
+/// Walks the copy-derivation subtree under `handle` and releases every
+/// transitive descendant; `handle` itself is left in place. See
+/// `caps.derivation.revoke`.
+pub fn revoke(caller: *anyopaque, handle: u64) i64 {
+    if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
+
+    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+    const caller_dom_ref: ErasedSlabRef = @bitCast(ec.domain);
+    return derivation.revoke(caller_dom_ref, handle);
+}
+
+/// `sync` syscall handler. Spec §[capabilities].sync.
+pub fn sync(caller: *anyopaque, handle: u64) i64 {
+    if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
+
+    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+    const cd_ref = ec.domain;
+    const cd_lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = cd_lr.ptr;
+    defer cd_ref.unlockIrqRestore(cd_lr.irq_state);
+
+    const slot: u12 = @truncate(handle);
+    const entry = resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
+
+    refreshSnapshot(cd, slot, entry);
+    return 0;
+}
+
+// ── Internal helpers (used by every per-object syscall handler) ──────
+
+/// Resolve a 12-bit handle id from the caller's table to the parallel
+/// (Capability, KernelHandle) entries, validating reserved bits, that
+/// the slot is in-use, and that the type tag matches `expected`.
+///
+/// `expected == null` skips the type-tag check (used by
+/// `restrict`/`delete`/`revoke`/`sync` which all accept any type).
+pub fn resolveHandleOnDomain(
+    cd: *CapabilityDomain,
+    slot: u12,
+    expected: ?CapabilityType,
+) ?*KernelHandle {
+    if (@as(u16, slot) >= MAX_HANDLES_PER_DOMAIN) return null;
+
+    const entry = &cd.kernel_table[slot];
+    // Free slots are flagged by `ref.ptr == null` (see KernelHandle
+    // doc comment for the two-state encoding). The free-list link
+    // lives in `parent`; an in-use entry has `ref.ptr` set to the
+    // underlying kernel object.
+    if (entry.ref.ptr == null) return null;
+
+    if (expected) |t| {
+        const user_word0 = cd.user_table[slot].word0;
+        if (Word0.typeTag(user_word0) != t) return null;
+    }
+    return entry;
+}
+
+/// Per-type delete dispatch — switch on `entry`'s type tag (read from
+/// the parallel user `Capability`) and apply the type-specific delete
+/// behavior. Refcount-lifetime types (Port, PageFrame, DeviceRegion,
+/// Timer) call their `decHandleRef` to release their per-handle
+/// increment; capability-domain-lifetime types (EC, VAR, VM) and
+/// system-lifetime IDC handles do not — those die only with the
+/// owning domain. Spec §[capabilities].delete table.
+pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
+    const user_entry = &holder.user_table[slot];
+    const type_tag = Word0.typeTag(user_entry.word0);
+    const caps_word = Word0.caps(user_entry.word0);
+
+    switch (type_tag) {
+        .capability_domain_self => {
+            // delete on the self-handle tears the domain down.
+            // Implementation lives in capdom.capability_domain.
+            capability_domain.releaseSelf(holder);
+        },
+        .capability_domain => {
+            // System-lifetime: dropping an IDC handle does not destroy
+            // the referenced domain. No per-handle refcount.
+        },
+        .execution_context => {
+            // Capability-domain lifetime: ECs die with their domain,
+            // not with the last handle drop.
+        },
+        .page_frame => {
+            // releaseHandle takes its own _gen_lock internally; pass
+            // the bare *T pulled out of the SlabRef rather than holding
+            // the lock at this layer.
+            const ref = typedRef(PageFrame, entry.*) orelse return;
+            page_frame.releaseHandle(ref.ptr);
+        },
+        .virtual_address_range => {
+            // Spec §[capabilities].delete (virtual_address_range row):
+            // "Delete unmaps everything installed, frees the address
+            // range, releases the handle." VAR holds exactly one handle
+            // by construction (non-transferable), so the per-handle
+            // delete is the same teardown that fires when the owning
+            // capability domain dies — `destroyVar` unmaps every
+            // installed page, removes the VAR from `domain.vars[]` so
+            // the address range is reusable, and frees the slab slot.
+            const ref = typedRef(VAR, entry.*) orelse return;
+            var_range.destroyVar(ref.ptr);
+        },
+        .device_region => {
+            const ref = typedRef(DeviceRegion, entry.*) orelse return;
+            device_region.releaseHandle(ref.ptr);
+        },
+        .port => {
+            const ref = typedRef(Port, entry.*) orelse return;
+            port.releaseHandle(ref.ptr, caps_word);
+        },
+        .reply => {
+            // The reply slot holds a back-pointer to a suspended
+            // sender EC; the entry's ref.ptr is that EC. Resume them
+            // with E_ABANDONED if still parked. The reply is not a
+            // separate slab object — clearing the slot below severs
+            // the back-pointer. Spec §[capabilities] line 176: "If
+            // the suspended sender is still waiting, resume them
+            // with E_ABANDONED. Release handle."
+            const ref = typedRef(ExecutionContext, entry.*) orelse return;
+            const sender_lr = ref.lockIrqSave(@src()) catch return;
+            const sender = sender_lr.ptr;
+            defer ref.unlockIrqRestore(sender_lr.irq_state);
+            port.resumeWithAbandoned(sender);
+        },
+        .virtual_machine => {
+            const ref = typedRef(VirtualMachine, entry.*) orelse return;
+            virtual_machine.releaseHandle(ref.ptr);
+        },
+        .timer => {
+            const ref = typedRef(Timer, entry.*) orelse return;
+            timer.decHandleRef(ref.ptr);
+        },
+        _ => {},
+    }
+}
+
+/// Zero out both halves of `slot` in `holder`'s tables and push it
+/// back onto the free list. Pure handle-table bookkeeping — caller has
+/// already applied any object-side release semantics via `releaseHandle`
+/// and unlinked the handle from any copy-derivation tree it participated
+/// in (see `caps.derivation`).
+pub fn clearAndFreeSlot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
+    holder.user_table[slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
+    entry.ref = .{};
+    entry.parent = encodeFreeNext(holder.free_head);
+    entry.first_child = .{};
+    entry.next_sibling = .{};
+    holder.free_head = @as(u16, slot);
+    holder.free_count += 1;
+}
+
+/// Bit-subset cap check for `restrict` (and `copy` cap-mint paths).
+/// `restart_policy` is handled separately via `restartPolicyMonotone`
+/// because it's a numeric-monotone field, not bitwise subset.
+fn capsAreSubset(current: u16, requested: u16, type_tag: CapabilityType) bool {
+    const mask = restartPolicyMask(type_tag);
+    const masked_current = current & ~mask;
+    const masked_requested = requested & ~mask;
+    // Bitwise subset: every bit set in requested must be set in current.
+    return (masked_requested & ~masked_current) == 0;
+}
+
+/// Numeric-monotone reduction check for `restart_policy` cap field.
+/// Per spec, "reducing" means new ≤ current along the privilege
+/// ordering, not bitwise subset. Spec §[restart_semantics].
+fn restartPolicyMonotone(current: u16, requested: u16, type_tag: CapabilityType) bool {
+    const mask = restartPolicyMask(type_tag);
+    if (mask == 0) return true;
+    const shift: u4 = @intCast(@ctz(mask));
+    const cur_val = (current & mask) >> shift;
+    const req_val = (requested & mask) >> shift;
+    return req_val <= cur_val;
+}
+
+/// Bit mask of the `restart_policy` field within a handle's caps word
+/// for the given type, or 0 if the type carries no restart_policy.
+/// Tracks the per-type cap layouts in §[execution_context], §[var],
+/// §[port], §[page_frame], §[device_region], §[timer], §[capability_domain].
+fn restartPolicyMask(type_tag: CapabilityType) u16 {
+    return switch (type_tag) {
+        .execution_context => 0b11 << 8, // EcCaps bits 8-9
+        .virtual_address_range => 0b11 << 9, // VarCaps bits 9-10
+        .port => 0b1 << 5, // PortCaps bit 5
+        .page_frame => 0b1 << 7, // PageFrameCaps bit 7
+        .device_region => 0b1 << 4, // DeviceRegionCaps bit 4
+        .timer => 0b1 << 4, // TimerCaps bit 4
+        .virtual_machine => 0b1 << 1, // VmCaps bit 1
+        .capability_domain => 0b1 << 5, // IdcCaps bit 5
+        else => 0,
+    };
+}
+
+/// Refresh `entry`'s parallel user `Capability.field0`/`field1` from
+/// authoritative kernel state (per-type snapshot). No-op for types
+/// whose snapshot doesn't drift. Spec §[capabilities].sync.
+///
+/// The user table is mapped read-only into the holding domain but
+/// kernel writes go through the kernel-side R/W view of the same
+/// physical pages — see `CapabilityDomain.user_table` doc comment.
+pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
+    const user_entry = &holder.user_table[slot];
+    const type_tag = Word0.typeTag(user_entry.word0);
+    switch (type_tag) {
+        .execution_context => {
+            const ref = typedRef(ExecutionContext, entry.*) orelse return;
+            const ec = ref.lock(@src()) catch return;
+            defer ref.unlock();
+            // field0 bits 0-1 = priority (Spec §[execution_context])
+            user_entry.field0 = @intFromEnum(ec.priority);
+            // field1 bits 0-63 = affinity mask
+            user_entry.field1 = ec.affinity;
+        },
+        .virtual_address_range => {
+            const ref = typedRef(VAR, entry.*) orelse return;
+            const v = ref.lock(@src()) catch return;
+            defer ref.unlock();
+            // VAR field0 = base vaddr (immutable; refresh is harmless).
+            user_entry.field0 = v.base_vaddr.addr;
+            // VAR field1: page_count[0..31], sz[32..33], cch[34..35],
+            // cur_rwx[36..38], map[39..40], device[41..52]. cur_rwx,
+            // map, and device are the kernel-mutable subset. The device
+            // sub-field is the device's handle id in the holding
+            // domain; resolution is done via a reverse lookup that
+            // depends on the per-VAR DeviceRegion → CapabilityDomain
+            // back-reference (not yet plumbed through). Until then the
+            // device sub-field stays 0.
+            const new_field1 = (@as(u64, v.page_count)) |
+                (@as(u64, @intFromEnum(v.sz)) << 32) |
+                (@as(u64, @intFromEnum(v.cch)) << 34) |
+                (@as(u64, v.cur_rwx) << 36) |
+                (@as(u64, @intFromEnum(v.map)) << 39);
+            user_entry.field1 = new_field1;
+        },
+        .device_region => {
+            const ref = typedRef(DeviceRegion, entry.*) orelse return;
+            const dr = ref.lock(@src()) catch return;
+            defer ref.unlock();
+            // Spec §[device_region] handle ABI: field0 packs immutable
+            // dev_type (bits 0-3) and, for port_io, base_port (bits 4-19)
+            // and port_count (bits 20-35). field1 = irq_count, owned by
+            // the IRQ handler — it propagates increments directly to each
+            // copy's `field1` paddr via `propagateIrqAndWake`. Refresh
+            // must NOT clobber it (would race with concurrent IRQs and
+            // erase coalesced counts not yet ack'd by userspace).
+            var field0: u64 = @intFromEnum(dr.device_type);
+            if (dr.device_type == .port_io) {
+                const pio = dr.access.port_io;
+                field0 |= (@as(u64, pio.base_port) << 4) |
+                    (@as(u64, pio.port_count) << 20);
+            }
+            user_entry.field0 = field0;
+        },
+        .timer => {
+            const ref = typedRef(Timer, entry.*) orelse return;
+            const t = ref.lock(@src()) catch return;
+            defer ref.unlock();
+            // field0 = counter; field1 bit0 = armed, bit1 = periodic.
+            user_entry.field0 = t.counter;
+            user_entry.field1 = (@as(u64, @intFromBool(t.armed))) |
+                (@as(u64, @intFromBool(t.periodic)) << 1);
+        },
+        // Types whose snapshots don't drift. For these, no-op.
+        .capability_domain_self,
+        .capability_domain,
+        .page_frame,
+        .port,
+        .reply,
+        .virtual_machine,
+        => {},
+        _ => {},
+    }
+}
+
+// Per-object release entry points live in each object's own file.
+// They wrap the type-specific refcount/teardown machinery; this file
+// invokes them through the per-module `releaseHandle` symbol so the
+// switch in `releaseHandle` below stays purely dispatch.

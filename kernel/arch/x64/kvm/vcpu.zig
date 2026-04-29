@@ -1,536 +1,94 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const apic = zag.arch.x64.apic;
-const arch_paging = zag.arch.x64.paging;
-const cpu = zag.arch.x64.cpu;
-const kvm = zag.arch.x64.kvm;
-const interrupts = zag.arch.x64.interrupts;
-const vm_hw = zag.arch.x64.vm;
-const exit_handler = kvm.exit_handler;
-const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-const sched = zag.sched.scheduler;
-const stack_mod = zag.memory.stack;
-const thread_mod = zag.sched.thread;
-const vm_mod = kvm.vm;
+const vm_hw = zag.arch.x64.vm;
 
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
-const PAddr = zag.memory.address.PAddr;
-const Process = zag.proc.process.Process;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const SpinLock = zag.utils.sync.SpinLock;
-const Thread = zag.sched.thread.Thread;
-const VAddr = zag.memory.address.VAddr;
-const Vm = vm_mod.Vm;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const GuestState = vm_hw.GuestState;
+const FxsaveArea = vm_hw.FxsaveArea;
+const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
+const VmExitInfo = vm_hw.VmExitInfo;
 
-/// State of a vCPU. The field is accessed from multiple threads:
-/// the vCPU's own thread, `kickRunningVcpus` (walks all vCPUs), the
-/// exit handler, and `vm_reply`. All reads/writes must use atomic
-/// load/store -- see `loadState`/`storeState` helpers on `VCpu`.
-pub const VCpuState = enum(u8) {
-    idle,
-    running,
-    exited,
-    waiting_reply,
+/// Per-vCPU arch state. Lives in a single 4 KiB page allocated by
+/// `allocVcpuArchState`; pinned on the EC's `vcpu_arch_state` slot.
+/// The page is zeroed at alloc, with FCW/MXCSR seeded into `guest_fxsave`
+/// per `vm_hw.fxsaveInit`.
+///
+/// Layout is page-sized + page-aligned so the PMM `create`/`destroy`
+/// contract applies. FXSAVE requires 16-byte alignment for the fxsave
+/// area; the field's `align(16)` annotation plus the page-aligned base
+/// guarantee that.
+pub const VcpuArchState = struct {
+    guest_state: GuestState align(paging.PAGE4K) = .{},
+    guest_fxsave: FxsaveArea align(16) = vm_hw.fxsaveInit(),
+    /// Most-recent decoded VM-exit. Populated after every `vmResume`
+    /// return so the surrounding run loop / VMM can re-decode without
+    /// re-reading VMCS/VMCB fields.
+    last_exit: VmExitInfo = .{ .unknown = 0 },
+    /// 3-vreg payload (§[vm_exit_state] vregs 71..73) for the most-
+    /// recent vm_exit; staged here by the run loop so `port.deliverEvent`
+    /// can write it into the receiver's vregs without re-decoding the
+    /// exit reason. Sub-code rides on `ec.event_subcode`.
+    last_exit_payload: [3]u64 = .{ 0, 0, 0 },
+    /// Monotonic-clock timestamp (ns) at the most recent pre-VMRUN
+    /// `Lapic.tick`. Drives the emulated APIC timer's countdown across
+    /// VM exits; reset when this field is 0 (first entry).
+    last_tick_ns: u64 = 0,
+    /// True once the VMM has supplied an initial guest state via the
+    /// reply path. The first vm_exit delivered after `create_vcpu` is
+    /// synthetic (zeroed `GuestState`); the run loop must not actually
+    /// execute VMLAUNCH until the VMM replies with valid initial CR0/
+    /// CR3/CR4/EFER/segments etc., or the processor will fault on
+    /// VM-entry consistency checks (Intel SDM Vol 3C §27.2; AMD APM
+    /// Vol 2 §15.5.1). Flipped true by the reply path's GuestState
+    /// writeback once that lands; until then the run loop falls back
+    /// to firing synthetic exits, preserving the spec-test contract.
+    started: bool = false,
 };
 
-pub const VCpuAllocator = SecureSlab(VCpu, 256);
-
-pub var slab_instance: VCpuAllocator = undefined;
-
-pub const VCpu = struct {
-    _gen_lock: GenLock = .{},
-    thread: SlabRef(Thread),
-    vm: SlabRef(Vm),
-    guest_state: vm_hw.GuestState = .{},
-    /// Atomic state. Use `loadState`/`storeState` -- direct `.state = ...`
-    /// writes are still allowed inside regions already holding `vm.lock`,
-    /// but every other site must go through the atomic helpers.
-    state: VCpuState = .idle,
-    last_exit_info: vm_hw.VmExitInfo = .{ .unknown = 0 },
-    /// Guest FPU/SSE state (FXSAVE format, 512 bytes, 16-byte aligned).
-    /// Initialized with default MXCSR=0x1F80, FCW=0x037F.
-    guest_fxsave: vm_hw.FxsaveArea align(16) = vm_hw.fxsaveInit(),
-
-    pub inline fn loadState(self: *const VCpu) VCpuState {
-        return @atomicLoad(VCpuState, &self.state, .acquire);
-    }
-
-    pub inline fn storeState(self: *VCpu, s: VCpuState) void {
-        @atomicStore(VCpuState, &self.state, s, .release);
-    }
-
-    /// Advance guest RIP by `bytes`. Wrapping add matches the arithmetic the
-    /// callers used inline and keeps an out-of-band guest RIP (e.g. a guest
-    /// jumping to near the top of the 64-bit address space) from panicking
-    /// a safety-checked kernel build on the post-instruction advance.
-    pub inline fn advanceRip(self: *VCpu, bytes: u8) void {
-        self.guest_state.rip +%= bytes;
-    }
-
-    /// Write the CPUID response registers into guest state and advance RIP
-    /// past the CPUID instruction. All inline CPUID exit paths route through
-    /// here so guest-state writes stay local to VCpu.
-    pub inline fn respondCpuid(
-        self: *VCpu,
-        rax_value: u64,
-        rbx_value: u64,
-        rcx_value: u64,
-        rdx_value: u64,
-        advance: u8,
-    ) void {
-        self.guest_state.rax = rax_value;
-        self.guest_state.rbx = rbx_value;
-        self.guest_state.rcx = rcx_value;
-        self.guest_state.rdx = rdx_value;
-        self.advanceRip(advance);
-    }
-};
-
-/// Create a vCPU: allocate the struct, create a kernel thread, link them.
-pub fn create(vm_obj: *Vm) !*VCpu {
-    const vcpu_alloc = try slab_instance.create();
-    const vcpu_obj = vcpu_alloc.ptr;
-    errdefer slab_instance.destroy(vcpu_obj, vcpu_alloc.gen) catch unreachable;
-
-    // Caller (vmCreate) holds the owning Process live for the entire
-    // duration of this syscall — the Process is the syscall caller.
-    // self-alive: owning Process is the syscall caller.
-    const proc = vm_obj.owner.ptr;
-
-    // Allocate a thread from the existing ThreadAllocator
-    const thread_alloc = try thread_mod.slab_instance.create();
-    const thread = thread_alloc.ptr;
-    errdefer thread_mod.slab_instance.destroy(thread, thread_alloc.gen) catch unreachable;
-
-    // Field-by-field init preserves `thread._gen_lock` set by the slab
-    // allocator. A `.* = .{...}` would zero it.
-    thread.tid = @atomicRmw(u64, &thread_mod.tid_counter, .Add, 1, .monotonic);
-    thread.ctx = undefined;
-    thread.kernel_stack = undefined;
-    thread.user_stack = null;
-    thread.process = SlabRef(Process).init(proc, proc._gen_lock.currentGen());
-    thread.next = null;
-    thread.priority = .normal;
-    thread.pre_pin_priority = .normal;
-    thread.pre_pin_affinity = null;
-    thread.core_affinity = null;
-    thread.state = .blocked; // starts blocked until vm_vcpu_run
-    thread.on_cpu = std.atomic.Value(bool).init(false);
-    thread.pinned_exclusive = false;
-    thread.futex_deadline_ns = 0;
-    thread.futex_paddr = PAddr.fromInt(0);
-    thread.futex_wake_index = 0;
-    thread.futex_paddrs = [_]PAddr{PAddr.fromInt(0)} ** 64;
-    thread.futex_bucket_count = 0;
-    thread.ipc_server = null;
-    thread.slot_index = 0;
-    thread.fault_reason = .none;
-    thread.fault_addr = 0;
-    thread.fault_rip = 0;
-    thread.fault_user_ctx = null;
-    thread.pmu_state = null;
-    thread.fpu_state = [_]u8{0} ** 576;
-    thread.last_fpu_core = null;
-
-    // Allocate kernel stack
-    thread.kernel_stack = try stack_mod.createKernel();
-    errdefer stack_mod.destroyKernel(thread.kernel_stack, memory_init.kernel_addr_space_root);
-
-    try mapKernelStack(thread.kernel_stack);
-
-    // Set up the thread context with the vCPU entry point
-    const kstack_top = zag.memory.address.alignStack(thread.kernel_stack.top);
-    thread.ctx = interrupts.prepareThreadContext(kstack_top, null, &vcpuEntryPoint, @intFromPtr(vcpu_obj));
-
-    // Add thread to process thread list
-    proc._gen_lock.lock();
-    if (proc.num_threads >= Process.MAX_THREADS) {
-        proc._gen_lock.unlock();
-        return error.MaxThreads;
-    }
-    thread.slot_index = @intCast(proc.num_threads);
-    proc.threads[proc.num_threads] = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
-    proc.num_threads += 1;
-    proc._gen_lock.unlock();
-
-    // Field-by-field to preserve `vcpu_obj._gen_lock`.
-    vcpu_obj.thread = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
-    vcpu_obj.vm = SlabRef(Vm).init(vm_obj, vm_obj._gen_lock.currentGen());
-    vcpu_obj.guest_state = .{};
-    vcpu_obj.state = .idle;
-    vcpu_obj.last_exit_info = .{ .unknown = 0 };
-    vcpu_obj.guest_fxsave = vm_hw.fxsaveInit();
-
-    return vcpu_obj;
+comptime {
+    // VcpuArchState rides on a 4 KiB PMM page. The first field is
+    // page-aligned via `align(paging.PAGE4K)`; the struct must fit
+    // entirely within one page.
+    std.debug.assert(@sizeOf(VcpuArchState) <= paging.PAGE4K);
+    std.debug.assert(@alignOf(VcpuArchState) == paging.PAGE4K);
 }
 
-/// Destroy a vCPU: kill its thread and free the struct.
-/// `carried_gen` is the caller's SlabRef(VCpu) generation, passed
-/// through to the slab destroy so a stale ref panics rather than
-/// freeing a recycled slot.
-pub fn destroy(vcpu_obj: *VCpu, carried_gen: u63) void {
-    // vcpu_obj and its paired Thread are being torn down together here;
-    // the caller (Vm.destroy / vmCreate error unwind) has already
-    // ensured no concurrent observer holds the vCPU.
-    // self-alive: caller guarantees no concurrent observer holds vcpu_obj.
-    const thread = vcpu_obj.thread.ptr;
+/// Allocate per-vCPU arch state and pin it on `vcpu_ec.vcpu_arch_state`.
+/// Spec §[create_vcpu]: caller is `capdom.virtual_machine.allocVcpu`,
+/// which already knows the EC is a fresh vCPU bound to `vm`.
+///
+/// On platforms without VMX/SVM support, returns `error.NoDevice` so
+/// `create_virtual_machine` / `create_vcpu` can surface E_NODEV instead
+/// of allocating per-vCPU state for a VM that will never run.
+pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void {
+    if (!vm_hw.vmSupported()) return error.NoDevice;
+    _ = vm;
 
-    // Mark thread as exited so scheduler won't run it
-    thread.state = .exited;
-
-    // If on a CPU, IPI to force off
-    if (sched.coreRunning(thread)) |core_id| {
-        apic.sendSchedulerIpi(core_id);
-    }
-
-    // Remove from run queues
-    sched.removeFromAnyRunQueue(thread);
-
-    slab_instance.destroy(vcpu_obj, carried_gen) catch unreachable;
+    // Allocate one 4 KiB PMM page and place VcpuArchState at offset 0.
+    // PMM.create requires `@sizeOf(T) == PAGE4K`; VcpuArchState is
+    // smaller than a page, so allocate the raw page wrapper instead.
+    const page = pmm.global_pmm.?.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
+    const cell: *VcpuArchState = @ptrCast(@alignCast(page));
+    cell.* = .{};
+    vcpu_ec.vcpu_arch_state = @ptrCast(cell);
 }
 
-/// Syscall: transition vCPU from idle to running.
-pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-    const E_BUSY: i64 = -11;
-
-    const vm_ref = proc.vm orelse return E_INVAL;
-    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (entry.object != .thread) return E_BADCAP;
-
-    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
-    defer entry.object.thread.unlock();
-
-    const vm_obj = vm_ref.lock() catch return E_BADCAP;
-    defer vm_ref.unlock();
-
-    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse return E_BADCAP;
-
-    if (vcpu_obj.loadState() != .idle) return E_BUSY;
-
-    vcpu_obj.storeState(.running);
-    const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
-    defer vcpu_obj.thread.unlock();
-    thread.state = .ready;
-    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
-    sched.enqueueOnCore(target_core, thread);
-
-    return 0; // E_OK
+/// Free per-vCPU arch state pinned on `vcpu_ec.vcpu_arch_state`. Caller
+/// has already torn down any references to the vCPU; safe to free the
+/// page back to the PMM.
+pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
+    const erased = vcpu_ec.vcpu_arch_state orelse return;
+    const page: *paging.PageMem(.page4k) = @ptrCast(@alignCast(erased));
+    pmm.global_pmm.?.destroy(page);
+    vcpu_ec.vcpu_arch_state = null;
 }
 
-/// Syscall: set guest state (only when idle).
-pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-    const E_BADADDR: i64 = -7;
-    const E_BUSY: i64 = -11;
-
-    const vm_ref = proc.vm orelse return E_INVAL;
-    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (entry.object != .thread) return E_BADCAP;
-
-    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
-    defer entry.object.thread.unlock();
-
-    const vm_obj = vm_ref.lock() catch return E_BADCAP;
-    defer vm_ref.unlock();
-
-    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse return E_BADCAP;
-
-    if (vcpu_obj.loadState() != .idle) return E_BUSY;
-
-    if (state_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
-
-    // Read guest state from userspace via physmap, handling cross-page boundaries.
-    var buf: [@sizeOf(vm_hw.GuestState)]u8 = undefined;
-    if (!readUserStruct(proc, state_ptr, &buf)) return E_BADADDR;
-    vcpu_obj.guest_state = std.mem.bytesAsValue(vm_hw.GuestState, &buf).*;
-    return 0; // E_OK
-}
-
-/// Syscall: get guest state. If running, IPI+suspend+snapshot+resume.
-pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-    const E_BADADDR: i64 = -7;
-
-    const vm_ref = proc.vm orelse return E_INVAL;
-    // Verify vm_ref's gen once at function entry; owning proc's vm can
-    // only be torn down by proc itself (same syscall target), so after
-    // this check the slot stays live for the duration of the call.
-    _ = vm_ref.lock() catch return E_INVAL;
-    vm_ref.unlock();
-    // self-alive: caller IS vm's owner proc.
-    const vm_obj = vm_ref.ptr;
-
-    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (entry.object != .thread) return E_BADCAP;
-
-    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
-    defer entry.object.thread.unlock();
-
-    // Resolve vcpu + snapshot state under vm_obj._gen_lock. The lock is
-    // released before the IPI/spin loop so we don't stall other cores
-    // touching vm_obj while we wait for the vcpu thread to leave CPU.
-    vm_obj._gen_lock.lock();
-    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse {
-        vm_obj._gen_lock.unlock();
-        return E_BADCAP;
-    };
-    const state_snapshot = vcpu_obj.loadState();
-    vm_obj._gen_lock.unlock();
-
-    if (state_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
-
-    // If running, IPI to suspend and snapshot
-    if (state_snapshot == .running) {
-        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
-        defer vcpu_obj.thread.unlock();
-        if (sched.coreRunning(thread)) |core_id| {
-            apic.sendSchedulerIpi(core_id);
-            // Spin until the thread is off CPU
-            while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-        }
-    }
-
-    // Copy guest_state out under the lock again (point-in-time snapshot).
-    vm_obj._gen_lock.lock();
-    const src_bytes = std.mem.asBytes(&vcpu_obj.guest_state);
-    const write_ok = writeUserStruct(proc, state_ptr, src_bytes);
-    vm_obj._gen_lock.unlock();
-    if (!write_ok) return E_BADADDR;
-
-    // Resume if it was running
-    if (state_snapshot == .running) {
-        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
-        defer vcpu_obj.thread.unlock();
-        thread.state = .ready;
-        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
-        sched.enqueueOnCore(target_core, thread);
-    }
-
-    return 0; // E_OK
-}
-
-/// Syscall: inject an interrupt into a vCPU.
-pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-    const E_BADADDR: i64 = -7;
-
-    const vm_ref = proc.vm orelse return E_INVAL;
-    _ = vm_ref.lock() catch return E_INVAL;
-    vm_ref.unlock();
-    // self-alive: caller IS vm's owner proc.
-    const vm_obj = vm_ref.ptr;
-
-    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (entry.object != .thread) return E_BADCAP;
-
-    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
-    defer entry.object.thread.unlock();
-
-    // Resolve vcpu + snapshot state under vm_obj._gen_lock. Lock released
-    // before the IPI/spin so we don't stall cross-core work on the VM.
-    vm_obj._gen_lock.lock();
-    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse {
-        vm_obj._gen_lock.unlock();
-        return E_BADCAP;
-    };
-    const state_snapshot = vcpu_obj.loadState();
-    vm_obj._gen_lock.unlock();
-
-    if (interrupt_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(interrupt_ptr)) return E_BADADDR;
-
-    // Read interrupt from userspace via physmap, handling cross-page boundaries.
-    var int_buf: [@sizeOf(vm_hw.GuestInterrupt)]u8 = undefined;
-    if (!readUserStruct(proc, interrupt_ptr, &int_buf)) return E_BADADDR;
-    const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, &int_buf).*;
-
-    // Reject reserved architectural exception vectors 0-31 (Intel SDM Vol 3A,
-    // §6.3.1 "External Interrupts" and Table 6-1). External interrupts must
-    // use vectors >= 32; injecting 0-15 (faults) or 16-31 (reserved) via the
-    // VM-entry event-injection path (bypassing the LAPIC) would let an
-    // attacker VMM corrupt guest exception handling by writing an illegal
-    // vector directly to VMCS VM_ENTRY_INTR_INFO.
-    if (interrupt.vector < 32) return E_INVAL;
-
-    if (state_snapshot == .running) {
-        // Suspend phase. Scope the thread's gen-lock tightly so we do
-        // not hold it across `vm_obj._gen_lock` below — the established
-        // lock order is (vm, then thread).
-        {
-            const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
-            defer vcpu_obj.thread.unlock();
-            // IPI to suspend
-            if (sched.coreRunning(thread)) |core_id| {
-                apic.sendSchedulerIpi(core_id);
-                while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-            }
-        }
-        vm_obj._gen_lock.lock();
-        // If the vCPU entry loop (or a prior injection) already queued a
-        // vector in pending_eventinj, don't clobber it. Route this vector
-        // through the LAPIC IRR so the entry loop can pick it up next time.
-        if (vcpu_obj.guest_state.pending_eventinj != 0) {
-            vm_obj.injectExternal(interrupt.vector);
-        } else {
-            vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
-        }
-        vm_obj._gen_lock.unlock();
-        // Resume phase.
-        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
-        defer vcpu_obj.thread.unlock();
-        thread.state = .ready;
-        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
-        sched.enqueueOnCore(target_core, thread);
-    } else {
-        // Not running — write pending interrupt into arch state
-        vm_obj._gen_lock.lock();
-        defer vm_obj._gen_lock.unlock();
-        if (vcpu_obj.guest_state.pending_eventinj != 0) {
-            vm_obj.injectExternal(interrupt.vector);
-        } else {
-            vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
-        }
-    }
-
-    return 0; // E_OK
-}
-
-/// Find the VCpu that owns a given thread within a VM.
-/// Callers must hold `vm_obj._gen_lock`, which serializes with Vm
-/// destroy and keeps every live `vm_obj.vcpus[i]` slot alive for the
-/// duration of the lookup. self-alive: the vCPU slots indexed
-/// [0, num_vcpus) were allocated during vmCreate and are only freed
-/// via Vm.destroy, which takes the same lock.
-pub fn vcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*VCpu {
-    for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |v| {
-        if (v.ptr.thread.ptr == thread) return v.ptr;
-    }
-    return null;
-}
-
-/// The kernel-managed vCPU thread entry point.
-/// When scheduled, enters guest mode via vm_hw.vmResume() in a loop.
-fn vcpuEntryPoint() void {
-    // Look up our VCpu by finding the current thread in the VM's vcpu array.
-    const thread = sched.currentThread().?;
-    // self-alive: this is the vCPU's own thread entry — the process
-    // that owns it (and its `vm`) is alive for the whole lifetime of
-    // this function; teardown goes through vm.destroy() + deinit.
-    const vm_obj = thread.process.ptr.vm.?.ptr;
-    const vcpu_obj = vcpuFromThread(vm_obj, thread).?;
-
-    var last_tsc: u64 = cpu.rdtscLFenced();
-
-    while (true) {
-        if (vcpu_obj.loadState() != .running) {
-            // Block until the VMM resumes us via vm_reply.
-            thread.state = .blocked;
-            cpu.enableInterrupts();
-            sched.yield();
-            last_tsc = cpu.rdtscLFenced();
-            continue;
-        }
-
-        // Tick interrupt-controller timers with elapsed nanoseconds before
-        // each VMRUN. TSC ticks at ~1 GHz on most hardware; treat 1 tick = 1 ns.
-        const now_tsc = cpu.rdtscLFenced();
-        const elapsed_ns = now_tsc -% last_tsc;
-        last_tsc = now_tsc;
-        vm_obj.tickInterruptControllers(elapsed_ns);
-
-        // Inject any pending deliverable interrupt vector from the kernel
-        // interrupt controllers (gated on guest IF, no prior EVENTINJ).
-        vm_obj.deliverPendingInterrupts(&vcpu_obj.guest_state);
-
-        // Enter guest mode
-        const vm_structures = vm_obj.arch_structures;
-        const exit_info = vm_hw.vmResume(&vcpu_obj.guest_state, vm_structures, &vcpu_obj.guest_fxsave);
-
-        // Handle the exit
-        vcpu_obj.last_exit_info = exit_info;
-        exit_handler.handleExit(vcpu_obj, exit_info);
-    }
-}
-
-/// Verify [user_va, user_va+len) is entirely inside the user partition.
-/// Catches length overflow and the "last byte of user page, rest spills
-/// into kernel partition" case that the per-page walk would otherwise
-/// advance into blindly.
-fn checkUserRange(user_va: u64, len: usize) bool {
-    const end = std.math.add(u64, user_va, len) catch return false;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(user_va)) return false;
-    if (end != user_va and !zag.memory.address.AddrSpacePartition.user.contains(end - 1)) return false;
-    return true;
-}
-
-/// Read a struct from userspace into a kernel buffer, handling cross-page boundaries.
-/// Pre-faults pages and resolves each page's physical address independently.
-fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
-    if (!checkUserRange(user_va, buf.len)) return false;
-    var remaining: usize = buf.len;
-    var dst_off: usize = 0;
-    var src_va: u64 = user_va;
-    while (remaining > 0) {
-        const page_off = src_va & 0xFFF;
-        const chunk = @min(remaining, paging.PAGE4K - page_off);
-        proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const page_paddr = arch_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
-        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
-        const src: [*]const u8 = @ptrFromInt(physmap_addr);
-        @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
-        dst_off += chunk;
-        src_va += chunk;
-        remaining -= chunk;
-    }
-    return true;
-}
-
-/// Write a kernel buffer to userspace, handling cross-page boundaries.
-/// Pre-faults pages and resolves each page's physical address independently.
-fn writeUserStruct(proc: *Process, user_va: u64, data: []const u8) bool {
-    if (!checkUserRange(user_va, data.len)) return false;
-    var remaining: usize = data.len;
-    var src_off: usize = 0;
-    var dst_va: u64 = user_va;
-    while (remaining > 0) {
-        const page_off = dst_va & 0xFFF;
-        const chunk = @min(remaining, paging.PAGE4K - page_off);
-        proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return false;
-        const page_paddr = arch_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
-        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
-        const dst: [*]u8 = @ptrFromInt(physmap_addr);
-        @memcpy(dst[0..chunk], data[src_off..][0..chunk]);
-        src_off += chunk;
-        dst_va += chunk;
-        remaining -= chunk;
-    }
-    return true;
-}
-
-fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
-    const pmm_mgr = &pmm.global_pmm.?;
-    var page_addr = stack.base.addr;
-    while (page_addr < stack.top.addr) {
-        const kpage = try pmm_mgr.create(paging.PageMem(.page4k));
-        const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-        try arch_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), .{
-            .write_perm = .write,
-            .execute_perm = .no_execute,
-            .cache_perm = .write_back,
-            .global_perm = .global,
-            .privilege_perm = .kernel,
-        });
-        page_addr += paging.PAGE4K;
-    }
+/// Resolve the per-vCPU arch state pinned on `vcpu_ec`, or `null` if the
+/// EC is not a vCPU (or `allocVcpuArchState` has not yet run).
+pub fn archStateOf(vcpu_ec: *ExecutionContext) ?*VcpuArchState {
+    const erased = vcpu_ec.vcpu_arch_state orelse return null;
+    return @ptrCast(@alignCast(erased));
 }

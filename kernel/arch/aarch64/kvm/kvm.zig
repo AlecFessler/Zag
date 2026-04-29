@@ -30,13 +30,6 @@
 //! Any code that does not depend on a GIC or stage-2 detail should be
 //! kept as similar to its x64 counterpart as possible so the two
 //! implementations stay easy to diff.
-pub const exit_box = @import("exit_box.zig");
-pub const exit_handler = @import("exit_handler.zig");
-pub const guest_memory = @import("guest_memory.zig");
-pub const psci = @import("psci.zig");
-pub const regs = @import("regs.zig");
 pub const vcpu = @import("vcpu.zig");
 pub const vgic = @import("vgic.zig");
 pub const vm = @import("vm.zig");
-pub const vmid = @import("vmid.zig");
-pub const vtimer = @import("vtimer.zig");

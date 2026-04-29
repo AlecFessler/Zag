@@ -15,7 +15,7 @@ const uefi = std.os.uefi;
 
 const BootInfo = boot_protocol.BootInfo;
 const ElfSection = elf.ElfSection;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageAllocator = page_allocator.PageAllocator;
 const ParsedElf = zag.utils.elf.ParsedElf;
@@ -212,19 +212,14 @@ pub fn main() uefi.Status {
     const new_addr_space_root_virt = VAddr.fromPAddr(kernel_table_root_phys, identity_mapping);
 
     const new_addr_space_root_virt_physmapped = VAddr.fromPAddr(kernel_table_root_phys, null);
-    const addr_space_root_perms: MemoryPerms = .{
-        .write_perm = .write,
-        .execute_perm = .no_execute,
-        .cache_perm = .write_back,
-        .global_perm = .global,
-        .privilege_perm = .kernel,
-    };
+    const addr_space_root_perms: MemoryPerms = .{ .read = true, .write = true };
     arch.paging.mapPageBoot(
         new_addr_space_root_virt,
         kernel_table_root_phys,
         new_addr_space_root_virt_physmapped,
         .page4k,
         addr_space_root_perms,
+        .kernel_data,
         page_alloc_iface,
     ) catch return .aborted;
 
@@ -267,27 +262,9 @@ pub fn main() uefi.Status {
     for (0..num_sections) |i| {
         const section_idx: ElfSection = @enumFromInt(i);
         const perms: MemoryPerms = switch (section_idx) {
-            .text => .{
-                .write_perm = .no_write,
-                .execute_perm = .execute,
-                .cache_perm = .write_back,
-                .global_perm = .global,
-                .privilege_perm = .kernel,
-            },
-            .rodata => .{
-                .write_perm = .no_write,
-                .execute_perm = .no_execute,
-                .cache_perm = .write_back,
-                .global_perm = .global,
-                .privilege_perm = .kernel,
-            },
-            .data, .bss => .{
-                .write_perm = .write,
-                .execute_perm = .no_execute,
-                .cache_perm = .write_back,
-                .global_perm = .global,
-                .privilege_perm = .kernel,
-            },
+            .text => .{ .read = true, .exec = true },
+            .rodata => .{ .read = true },
+            .data, .bss => .{ .read = true, .write = true },
             else => unreachable,
         };
 
@@ -338,6 +315,7 @@ pub fn main() uefi.Status {
                 page_virt,
                 .page4k,
                 perms,
+                .kernel_data,
                 page_alloc_iface,
             ) catch return .aborted;
 
@@ -388,13 +366,7 @@ pub fn main() uefi.Status {
     var current_page_phys = PAddr.fromInt(@intFromPtr(stack_pages.ptr));
     for (0..num_pages) |_| {
         const current_page_virt = VAddr.fromPAddr(current_page_phys, null);
-        const perms: MemoryPerms = .{
-            .write_perm = .write,
-            .execute_perm = .no_execute,
-            .cache_perm = .write_back,
-            .global_perm = .global,
-            .privilege_perm = .kernel,
-        };
+        const perms: MemoryPerms = .{ .read = true, .write = true };
 
         arch.paging.mapPageBoot(
             new_addr_space_root_virt,
@@ -402,6 +374,7 @@ pub fn main() uefi.Status {
             current_page_virt,
             .page4k,
             perms,
+            .kernel_data,
             page_alloc_iface,
         ) catch return .aborted;
 

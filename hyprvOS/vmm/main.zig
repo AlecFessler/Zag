@@ -1,6 +1,24 @@
-/// hyprvOS — Minimal VMM for booting Linux on Zag.
-/// Creates a VM with 1 vCPU, loads bzImage + initramfs from NVMe,
-/// and handles VM exits to boot a Linux guest.
+//! hyprvOS — VMM for booting Linux on Zag.
+//!
+//! Spec-v3 port. The lifecycle:
+//!   1. Discover COM1 device_region (log.init).
+//!   2. Allocate a page_frame for the VmPolicy struct; map it locally
+//!      via createVar + mapPf so we can write the policy bytes.
+//!   3. createVirtualMachine(caps, policy_pf).
+//!   4. mem.setupGuestMemory: createPageFrame for guest RAM; map_guest
+//!      into the VM at gpa 0; createVar + mapPf locally so the VMM can
+//!      read/write guest memory by host VA.
+//!   5. Optional: vm_set_policy to seed CPUID + CR tables (skipped for
+//!      now; all CPUID/CR exits route to userspace).
+//!   6. createPort.
+//!   7. createVcpu(caps, vm, affinity = 0, exit_port = port).
+//!   8. recvVmExit returns the initial-state synthetic exit (zeroed
+//!      guest state, subcode = 0). Populate VmExitState with the Linux
+//!      boot-protocol initial state and replyVmExit.
+//!   9. Loop on recvVmExit; dispatch to per-subcode handlers; reply
+//!      with mods.
+//!  10. On fatal exit (triple_fault / shutdown), powerShutdown.
+
 const lib = @import("lib");
 
 const acpi = @import("acpi.zig");
@@ -14,112 +32,55 @@ const mem = @import("mem.zig");
 const msr = @import("msr.zig");
 const serial = @import("serial.zig");
 
-const perm_view = lib.perm_view;
+const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 
-// Guest physical memory layout constants
+const HandleId = caps.HandleId;
+const PortCap = caps.PortCap;
+const SyscallNum = syscall.SyscallNum;
+
+/// Re-export VmExitState as `GuestState` so the per-exit handler
+/// modules (cpuid.zig, io.zig, msr.zig, …) — which read/write
+/// `state.rax` / `state.rip` / `state.cr0` etc. — keep compiling
+/// without per-call changes. The new vreg-backed VmExitState carries
+/// the same canonical-name GPR/CR/segment fields as the old kernel-IPC
+/// extern struct.
+pub const GuestState = syscall.VmExitState;
+pub const SegmentReg = syscall.SegmentReg;
+
+/// VmExit subcode constants — kept around for callsites that match by
+/// number rather than the enum (a handful of legacy switch-style sites
+/// in handlers).
+pub const EXIT_CPUID: u8 = @intFromEnum(syscall.VmExitSubcode.cpuid);
+pub const EXIT_IO: u8 = @intFromEnum(syscall.VmExitSubcode.io);
+pub const EXIT_MMIO: u8 = @intFromEnum(syscall.VmExitSubcode.mmio);
+pub const EXIT_CR: u8 = @intFromEnum(syscall.VmExitSubcode.cr);
+pub const EXIT_MSR_R: u8 = @intFromEnum(syscall.VmExitSubcode.msr_r);
+pub const EXIT_MSR_W: u8 = @intFromEnum(syscall.VmExitSubcode.msr_w);
+pub const EXIT_EPT: u8 = @intFromEnum(syscall.VmExitSubcode.ept);
+pub const EXIT_EXCEPT: u8 = @intFromEnum(syscall.VmExitSubcode.except);
+pub const EXIT_INTWIN: u8 = @intFromEnum(syscall.VmExitSubcode.intwin);
+pub const EXIT_HLT: u8 = @intFromEnum(syscall.VmExitSubcode.hlt);
+pub const EXIT_SHUTDOWN: u8 = @intFromEnum(syscall.VmExitSubcode.shutdown);
+pub const EXIT_TRIPLE: u8 = @intFromEnum(syscall.VmExitSubcode.triple);
+pub const EXIT_UNKNOWN: u8 = @intFromEnum(syscall.VmExitSubcode.unknown);
+
+// Guest physical memory layout
 const GUEST_RAM_LINUX: u64 = 128 * 1024 * 1024;
-const GUEST_RAM_TEST: u64 = 4 * 1024 * 1024;
-const TEMP_ADDR: u64 = 0x2000000; // 32 MB — temp area for bzImage loading
+const TEMP_ADDR: u64 = 0x2000000;
 
-/// GuestState — must match kernel's extern struct exactly (440 bytes).
-pub const SegmentReg = extern struct {
-    base: u64 = 0,
-    limit: u32 = 0,
-    selector: u16 = 0,
-    access_rights: u16 = 0,
-};
-
-pub const GuestState = extern struct {
-    rax: u64 = 0,
-    rbx: u64 = 0,
-    rcx: u64 = 0,
-    rdx: u64 = 0,
-    rsi: u64 = 0,
-    rdi: u64 = 0,
-    rbp: u64 = 0,
-    rsp: u64 = 0,
-    r8: u64 = 0,
-    r9: u64 = 0,
-    r10: u64 = 0,
-    r11: u64 = 0,
-    r12: u64 = 0,
-    r13: u64 = 0,
-    r14: u64 = 0,
-    r15: u64 = 0,
-    rip: u64 = 0,
-    rflags: u64 = 0x2,
-    cr0: u64 = 0,
-    cr2: u64 = 0,
-    cr3: u64 = 0,
-    cr4: u64 = 0,
-    cs: SegmentReg = .{},
-    ds: SegmentReg = .{},
-    es: SegmentReg = .{},
-    fs: SegmentReg = .{},
-    gs: SegmentReg = .{},
-    ss: SegmentReg = .{},
-    tr: SegmentReg = .{},
-    ldtr: SegmentReg = .{},
-    gdtr_base: u64 = 0,
-    gdtr_limit: u32 = 0,
-    idtr_base: u64 = 0,
-    idtr_limit: u32 = 0,
-    efer: u64 = 0,
-    star: u64 = 0,
-    lstar: u64 = 0,
-    cstar: u64 = 0,
-    sfmask: u64 = 0,
-    kernel_gs_base: u64 = 0,
-    sysenter_cs: u64 = 0,
-    sysenter_esp: u64 = 0,
-    sysenter_eip: u64 = 0,
-    pat: u64 = 0x0007040600070406,
-    dr6: u64 = 0xFFFF0FF0,
-    dr7: u64 = 0x400,
-    pending_eventinj: u64 = 0,
-};
-
-// VmExitInfo tag values
-const EXIT_CPUID: u8 = 0;
-const EXIT_IO: u8 = 1;
-const EXIT_CR: u8 = 3;
-const EXIT_MSR_R: u8 = 4;
-const EXIT_MSR_W: u8 = 5;
-const EXIT_EPT: u8 = 6;
-const EXIT_EXCEPT: u8 = 7;
-const EXIT_INTWIN: u8 = 8;
-const EXIT_HLT: u8 = 9;
-const EXIT_SHUTDOWN: u8 = 10;
-const EXIT_TRIPLE: u8 = 11;
-const EXIT_UNKNOWN: u8 = 12;
-
-// VmExitMessage byte offsets
-const OFF_PAYLOAD: usize = 8;
-const OFF_TAG: usize = 32;
-const OFF_GS: usize = 40;
-
-const GS_SIZE = @sizeOf(GuestState);
-const REPLY_RESUME: u64 = 0;
-const REPLY_KILL: u64 = 4;
-
-// Tiny test guest: CPUID → serial "Hi\n" → HLT
-const tiny_guest = [_]u8{
-    0x0F, 0xA2, // CPUID
-    0xBA, 0xF8, 0x03, // MOV DX, 0x3F8
-    0xB0, 0x48, 0xEE, // MOV AL, 'H'; OUT DX, AL
-    0xB0, 0x69, 0xEE, // MOV AL, 'i'; OUT DX, AL
-    0xB0, 0x0A, 0xEE, // MOV AL, '\n'; OUT DX, AL
-    0xF4, // HLT
-};
-
-// Global buffers (must not be on stack — Debug mode stack probes overflow 32KB)
-var exit_buf: [4096]u8 align(8) = .{0} ** 4096;
-var reply_buf: [512]u8 align(8) = .{0} ** 512;
-var policy_buf: [4096]u8 align(4096) = .{0} ** 4096;
+// Globals (must not be on stack — Debug-mode probes overflow 32KB).
+var policy_buf_unused: [1]u8 = .{0}; // placeholder — actual VmPolicy lives
+// in the policy page_frame, mapped via mem.policy.zig
 var bp_buf: [4096]u8 align(8) = .{0} ** 4096;
-var guest_state: GuestState = .{};
-pub var vm_handle: u64 = 0;
+
+pub var vm_handle: HandleId = 0;
+pub var vcpu_handle: HandleId = 0;
+pub var exit_port: HandleId = 0;
+pub var first_exit_pending: bool = true;
+pub var guest_state: GuestState = .{};
+
 var exit_count: u64 = 0;
 var cpuid_count: u64 = 0;
 var io_count: u64 = 0;
@@ -127,50 +88,108 @@ var msr_r_count: u64 = 0;
 var msr_w_count: u64 = 0;
 var cr_count: u64 = 0;
 var hlt_count: u64 = 0;
-var other_count: u64 = 0;
 var ept_count: u64 = 0;
 var intr_count: u64 = 0;
+var other_count: u64 = 0;
+var last_inject_ns: u64 = 0;
 
-pub fn main(pv: u64) void {
-    log.print("\n=== hyprvOS ===\n");
+pub fn main(cap_table_base: u64) void {
+    log.init(cap_table_base);
+    log.print("\n=== hyprvOS (spec-v3) ===\n");
 
-    // Create VM with empty policy
-    const cr = syscall.vm_create(1, @intFromPtr(&policy_buf));
-    if (cr == syscall.E_NODEV) {
-        log.print("No virt support\n");
-        syscall.shutdown();
+    // Step 1 — Allocate VmPolicy page_frame. The kernel reads it on VM
+    // creation to validate (sizeof, num_*) and retains a ref. We zero
+    // the whole frame; CPUID/CR policies stay empty so all such exits
+    // route to userspace handlers.
+    const policy_pf = mem.allocPolicyPageFrame() orelse {
+        log.print("policy_pf alloc failed\n");
+        _ = syscall.powerShutdown();
+        while (true) asm volatile ("hlt");
+    };
+
+    // Step 2 — createVirtualMachine.
+    //   caps.policy = bit 0 of cap word (we'd want this for vm_set_policy
+    //   later). Ceiling check is against the calling domain's vm_ceiling.
+    const vm_caps_word: u64 = (1 << 0); // policy
+    const vm_r = syscall.createVirtualMachine(vm_caps_word, policy_pf);
+    if (vm_r.v1 < 16) {
+        log.print("createVirtualMachine failed: ");
+        log.dec(vm_r.v1);
+        log.print("\n");
+        _ = syscall.powerShutdown();
+        while (true) asm volatile ("hlt");
     }
-    if (cr < 0) {
-        log.print("vm_create failed\n");
-        syscall.shutdown();
+    vm_handle = @truncate(vm_r.v1 & 0xFFF);
+    log.print("VM handle=");
+    log.dec(vm_handle);
+    log.print("\n");
+
+    // Step 3 — Allocate guest RAM, map into VM, and map locally for
+    // VMM-side reads/writes.
+    if (!mem.setupGuestMemory(GUEST_RAM_LINUX)) {
+        log.print("guest RAM setup failed\n");
+        _ = syscall.powerShutdown();
+        while (true) asm volatile ("hlt");
     }
-    vm_handle = @bitCast(cr);
 
-    const vcpu = findVcpuHandle(pv);
-    if (vcpu == 0) {
-        log.print("No vCPU\n");
-        syscall.shutdown();
-    }
+    // Step 4 — Discover host serial (already done by log.init for
+    // output) and bridge for guest RX.
+    serial.init(cap_table_base);
 
-    // Init host serial for RX bridging
-    serial.init(pv);
-
-    // Try NVMe for Linux boot, fall back to embedded assets
-    if (disk.init(pv)) {
+    // Step 5 — Boot Linux. Try NVMe asset, fall back to embedded
+    // bzImage/initramfs from the assets module.
+    if (disk.init(cap_table_base)) {
         bootLinux();
     } else {
         bootLinuxEmbedded();
     }
 
-    _ = syscall.vm_vcpu_set_state(vcpu, @intFromPtr(&guest_state));
-    _ = syscall.vm_vcpu_run(vcpu);
-    log.print("vCPU running\n");
-    exitLoop(vcpu);
+    // Step 6 — createPort for vCPU exit delivery. `bind` is required so
+    // create_vcpu can attach this as the vCPU's exit_port (spec §
+    // [virtual_machine] create_vcpu test on port_caps.bind).
+    const port_caps_word: u64 = @as(u64, (PortCap{
+        .recv = true,
+        .bind = true,
+    }).toU16());
+    const port_r = syscall.createPort(port_caps_word);
+    if (port_r.v1 < 16) {
+        log.print("createPort failed: ");
+        log.dec(port_r.v1);
+        log.print("\n");
+        _ = syscall.powerShutdown();
+        while (true) asm volatile ("hlt");
+    }
+    exit_port = @truncate(port_r.v1 & 0xFFF);
+    log.print("exit_port=");
+    log.dec(exit_port);
+    log.print("\n");
 
-    // Print exit stats
+    // Step 7 — createVcpu bound to the VM and exit_port. The kernel
+    // immediately enqueues an initial-state synthetic vm_exit on
+    // exit_port.
+    //   caps: rwx + read + write (gating event-state vreg read/write
+    //   on recv/reply). Priority defaults to 0.
+    const vcpu_caps_word: u64 = 0; // no special caps for vcpu EC handle
+    const vcpu_r = syscall.createVcpu(vcpu_caps_word, vm_handle, 0, exit_port);
+    if (vcpu_r.v1 < 16) {
+        log.print("createVcpu failed: ");
+        log.dec(vcpu_r.v1);
+        log.print("\n");
+        _ = syscall.powerShutdown();
+        while (true) asm volatile ("hlt");
+    }
+    vcpu_handle = @truncate(vcpu_r.v1 & 0xFFF);
+    log.print("vcpu=");
+    log.dec(vcpu_handle);
+    log.print("\n");
+
+    // Step 8/9 — Run the exit loop.
+    exitLoop();
+
+    // Stats
     log.print("\n=== ");
     log.dec(exit_count);
-    log.print(" exits (CPUID/IO/MSR_R/MSR_W/CR/HLT/other: ");
+    log.print(" exits (CPUID/IO/MSR_R/MSR_W/CR/HLT/EPT/other: ");
     log.dec(cpuid_count);
     log.print("/");
     log.dec(io_count);
@@ -183,40 +202,42 @@ pub fn main(pv: u64) void {
     log.print("/");
     log.dec(hlt_count);
     log.print("/");
-    log.dec(other_count);
-    log.print(") ept=");
     log.dec(ept_count);
-    log.print(" ===\n");
-    _ = syscall.revoke_perm(vm_handle);
-    syscall.shutdown();
+    log.print("/");
+    log.dec(other_count);
+    log.print(") ===\n");
+
+    _ = syscall.powerShutdown();
+    while (true) asm volatile ("hlt");
 }
 
-/// Linux boot setup — separate noinline function to keep stack frames independent.
+/// Linux boot setup — NVMe path. Stack-isolated so the VMM driver
+/// stack frames don't pin into our caller.
 noinline fn bootLinux() void {
     const hdr = disk.readHeader() orelse {
         log.print("Bad disk header\n");
-        syscall.shutdown();
+        _ = syscall.powerShutdown();
+        while (true) asm volatile ("hlt");
     };
 
-    mem.setupGuestMemory(GUEST_RAM_LINUX);
     mem.mapMmioStubs();
 
-    // Load full bzImage to temp area, then split setup header + PM kernel
     log.print("Loading bzImage");
     if (!disk.loadToGuest(hdr.bzimage_offset, hdr.bzimage_size, TEMP_ADDR)) {
         log.print(" FAILED\n");
-        syscall.shutdown();
+        _ = syscall.powerShutdown();
+        while (true) asm volatile ("hlt");
     }
     log.print(" done\n");
 
     log.print("Loading initramfs");
     if (!disk.loadToGuest(hdr.initramfs_offset, hdr.initramfs_size, boot.INITRAMFS_ADDR)) {
         log.print(" FAILED\n");
-        syscall.shutdown();
+        _ = syscall.powerShutdown();
+        while (true) asm volatile ("hlt");
     }
     log.print(" done\n");
 
-    // Verify initramfs magic (gzip: 1f 8b)
     const m0 = mem.readGuestByte(boot.INITRAMFS_ADDR);
     const m1 = mem.readGuestByte(boot.INITRAMFS_ADDR + 1);
     log.print("initramfs magic: ");
@@ -227,7 +248,6 @@ noinline fn bootLinux() void {
     log.dec(hdr.initramfs_size);
     log.print("\n");
 
-    // Parse setup header
     const ss = mem.readGuestByte(TEMP_ADDR + 0x1F1);
     const setup_sects: u32 = if (ss == 0) 4 else @as(u32, ss);
     const setup_size: u64 = (@as(u64, setup_sects) + 1) * 512;
@@ -235,46 +255,23 @@ noinline fn bootLinux() void {
     log.dec(setup_sects);
     log.print("\n");
 
-    // Copy PM kernel to 0x100000
     mem.copyGuest(boot.KERNEL_ADDR, TEMP_ADDR + setup_size, hdr.bzimage_size - setup_size);
 
-    // Log setup header protocol version and key fields
-    const proto_ver = @as(u16, mem.readGuestByte(TEMP_ADDR + 0x207)) << 8 | mem.readGuestByte(TEMP_ADDR + 0x206);
-    log.print("boot proto=0x");
-    log.hex16(proto_ver);
-    // init_size at offset 0x260
-    const init_size = @as(u32, mem.readGuestByte(TEMP_ADDR + 0x263)) << 24 |
-        @as(u32, mem.readGuestByte(TEMP_ADDR + 0x262)) << 16 |
-        @as(u32, mem.readGuestByte(TEMP_ADDR + 0x261)) << 8 |
-        mem.readGuestByte(TEMP_ADDR + 0x260);
-    log.print(" init_size=0x");
-    log.hex32(init_size);
-    // pref_address at offset 0x258
-    log.print("\n");
-
-    // Build boot_params at 0x10000
     buildBootParams(hdr.initramfs_size);
-
-    // Command line
-    boot.setupCmdline("console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
-
-    // ACPI tables (kernel handles LAPIC/IOAPIC emulation)
+    boot.setupCmdline("console=ttyS0,115200 earlyprintk=serial,ttyS0,115200,keep earlycon=uart,io,0x3f8,115200n8 nokaslr nolapic noapic acpi=off nohpet nosmp ignore_loglevel tsc=reliable lpj=5000000");
     acpi.setupTables();
-
     setupLinuxState();
     log.print("Linux configured\n");
 }
 
-/// Embedded assets fallback — loads bzImage/initramfs from ELF when NVMe unavailable.
+/// Embedded-asset fallback when NVMe is unavailable.
 noinline fn bootLinuxEmbedded() void {
     log.print("Using embedded assets\n");
-    mem.setupGuestMemory(GUEST_RAM_LINUX);
     mem.mapMmioStubs();
 
     const bzimage = assets.bzimage;
     const initramfs_data = assets.initramfs;
 
-    // Parse setup header from embedded bzImage
     const ss = bzimage[0x1F1];
     const setup_sects: u32 = if (ss == 0) 4 else @as(u32, ss);
     const setup_size: u64 = (@as(u64, setup_sects) + 1) * 512;
@@ -282,70 +279,33 @@ noinline fn bootLinuxEmbedded() void {
     log.dec(setup_sects);
     log.print("\n");
 
-    // Copy protected-mode kernel to 0x100000
     const pm_kernel = bzimage[setup_size..];
     mem.writeGuest(boot.KERNEL_ADDR, pm_kernel);
-
-    // Copy setup header to temp area for buildBootParams to read
     mem.writeGuest(TEMP_ADDR, bzimage[0..setup_size]);
-
-    // Copy initramfs
     mem.writeGuest(boot.INITRAMFS_ADDR, initramfs_data);
     log.print("initramfs size=");
     log.dec(initramfs_data.len);
     log.print("\n");
 
-    // Build boot_params
     buildBootParams(initramfs_data.len);
-
-    // Command line
-    boot.setupCmdline("console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
-
+    boot.setupCmdline("console=ttyS0,115200 earlyprintk=serial,ttyS0,115200,keep earlycon=uart,io,0x3f8,115200n8 nokaslr nolapic noapic acpi=off nohpet nosmp ignore_loglevel tsc=reliable lpj=5000000");
     acpi.setupTables();
     setupLinuxState();
     log.print("Linux configured (embedded)\n");
 }
 
-noinline fn bootTinyGuest() void {
-    log.print("Tiny test guest\n");
-    mem.setupGuestMemory(GUEST_RAM_TEST);
-    mem.writeGuest(0, &tiny_guest);
-
-    guest_state = .{};
-    guest_state.rip = 0;
-    guest_state.rflags = 0x2;
-    guest_state.rsp = 0x0FF0;
-    guest_state.cs = .{ .base = 0, .limit = 0xFFFF, .selector = 0, .access_rights = 0x009B };
-    const ds = SegmentReg{ .base = 0, .limit = 0xFFFF, .selector = 0, .access_rights = 0x0093 };
-    guest_state.ds = ds;
-    guest_state.es = ds;
-    guest_state.fs = ds;
-    guest_state.gs = ds;
-    guest_state.ss = ds;
-    guest_state.tr = .{ .base = 0, .limit = 0xFFFF, .selector = 0, .access_rights = 0x008B };
-    guest_state.ldtr = .{ .base = 0, .limit = 0xFFFF, .selector = 0, .access_rights = 0x0082 };
-    guest_state.pat = 0x0007040600070406;
-    guest_state.dr6 = 0xFFFF0FF0;
-    guest_state.dr7 = 0x400;
-}
-
 noinline fn buildBootParams(initramfs_size: u64) void {
     @memset(&bp_buf, 0);
-
-    // Copy setup header from bzImage in guest memory
-    // Extended to 0x290 to cover kernel_info_offset and potential newer fields
     const hdr_src = mem.readGuestSlice(TEMP_ADDR + 0x1F1, 0x290 - 0x1F1);
     @memcpy(bp_buf[0x1F1..0x290], hdr_src);
 
     bp_buf[0x210] = 0xFF; // type_of_loader
-    // loadflags: LOADED_HIGH | KEEP_SEGMENTS | CAN_USE_HEAP
-    bp_buf[0x211] = bp_buf[0x211] | 0x01 | 0x40 | 0x80;
+    bp_buf[0x211] = bp_buf[0x211] | 0x01 | 0x40 | 0x80; // LOADED_HIGH | KEEP_SEGMENTS | CAN_USE_HEAP
 
     writeU32(&bp_buf, 0x228, @intCast(boot.CMDLINE_ADDR));
     writeU16(&bp_buf, 0x224, 0xDE00);
     writeU16(&bp_buf, 0x1FA, 0xFFFF); // vid_mode
 
-    // initramfs
     writeU32(&bp_buf, 0x218, @intCast(boot.INITRAMFS_ADDR));
     writeU32(&bp_buf, 0x21C, @intCast(initramfs_size));
 
@@ -353,21 +313,17 @@ noinline fn buildBootParams(initramfs_size: u64) void {
     const e: usize = 0x2D0;
     writeU64(&bp_buf, e, 0);
     writeU64(&bp_buf, e + 8, 0x9FC00);
-    writeU32(&bp_buf, e + 16, 1); // usable
-
+    writeU32(&bp_buf, e + 16, 1);
     writeU64(&bp_buf, e + 20, 0x9FC00);
     writeU64(&bp_buf, e + 28, 0x400);
-    writeU32(&bp_buf, e + 36, 2); // reserved (EBDA)
-
+    writeU32(&bp_buf, e + 36, 2);
     writeU64(&bp_buf, e + 40, 0xE0000);
     writeU64(&bp_buf, e + 48, 0x20000);
-    writeU32(&bp_buf, e + 56, 2); // reserved (BIOS/ACPI)
-
+    writeU32(&bp_buf, e + 56, 2);
     writeU64(&bp_buf, e + 60, 0x100000);
     writeU64(&bp_buf, e + 68, GUEST_RAM_LINUX - 0x100000);
-    writeU32(&bp_buf, e + 76, 1); // usable
-
-    bp_buf[0x1E8] = 4; // e820_entries
+    writeU32(&bp_buf, e + 76, 1);
+    bp_buf[0x1E8] = 4;
 
     mem.writeGuest(boot.BOOT_PARAMS_ADDR, &bp_buf);
     log.print("boot_params OK\n");
@@ -375,8 +331,8 @@ noinline fn buildBootParams(initramfs_size: u64) void {
 
 noinline fn setupLinuxState() void {
     guest_state = .{};
-    // Linux boot protocol: 32-bit protected mode, paging off
-    // https://hv.smallkirby.com/en/vmm/linux_boot
+    // 32-bit protected mode, paging off — Linux boot protocol entry
+    // (https://hv.smallkirby.com/en/vmm/linux_boot).
     guest_state.rip = boot.KERNEL_ADDR; // 0x100000
     guest_state.rsi = boot.BOOT_PARAMS_ADDR; // 0x10000
     guest_state.rflags = 0x2;
@@ -384,11 +340,7 @@ noinline fn setupLinuxState() void {
     guest_state.cr4 = 0;
     guest_state.efer = 0;
 
-    // All selectors = 0, flat 32-bit segments (base=0, limit=4GB)
-    // AMD VMCB attrib: bits[7:0]=P:DPL:S:Type, bits[11:8]=G:D/B:L:AVL, bits[15:12]=0
-    // 32-bit code: P=1,DPL=0,S=1,Type=B(code+read+access) → 0x9B; G=1,D=1,L=0,AVL=0 → 0xC
     guest_state.cs = .{ .base = 0, .limit = 0xFFFFFFFF, .selector = 0, .access_rights = 0x0C9B };
-    // 32-bit data: P=1,DPL=0,S=1,Type=3(data+write+access) → 0x93; G=1,D=1,L=0,AVL=0 → 0xC
     const ds = SegmentReg{ .base = 0, .limit = 0xFFFFFFFF, .selector = 0, .access_rights = 0x0C93 };
     guest_state.ds = ds;
     guest_state.es = ds;
@@ -403,164 +355,255 @@ noinline fn setupLinuxState() void {
     guest_state.dr7 = 0x400;
 }
 
-/// VM exit handling loop — separate noinline to isolate stack frame.
-noinline fn exitLoop(_: u64) void {
-    const start = syscall.clock_gettime();
-    const timeout_ns: u64 = 600_000_000_000; // 10 minutes
-
+/// VM exit handling loop. Runs until a fatal subcode (shutdown / triple)
+/// or a recv error.
+noinline fn exitLoop() void {
+    log.print("entering exit loop\n");
+    // Timeout-based polling cadence: when the guest is idle (HLT or busy
+    // doing pure compute that doesn't trap), recv returns E_TIMEOUT after
+    // the given window so the VMM can tick the emulated PIT and poll
+    // host serial RX. Linux's `check_timer` waits ~100ms for PIT IRQ0
+    // fires; 1 ms is well below that threshold and gives plenty of
+    // periodic-timer fires within Linux's measurement window.
+    const RECV_POLL_NS: u64 = 1_000_000; // 1 ms
     while (true) {
-        const tok = syscall.vm_recv(vm_handle, @intFromPtr(&exit_buf), 0);
-        if (tok == syscall.E_AGAIN) {
-            if (syscall.clock_gettime() -% start > timeout_ns) {
-                log.print("TIMEOUT\n");
-                break;
-            }
-            serial.pollHostRx();
+        const r = syscall.recvVmExit(exit_port, RECV_POLL_NS);
+        if (r.err == @intFromEnum(errors.Error.E_TIMEOUT) or r.event_type == 0) {
+            // No exit pending; tick PIT + serial RX and re-poll.
+            io.pitCheckIrq();
             if (serial.irq_pending) {
                 serial.irq_pending = false;
-                _ = syscall.vm_intc_assert_irq(vm_handle, 4);
-                _ = syscall.vm_intc_deassert_irq(vm_handle, 4);
+                _ = syscall.vmInjectIrq(vm_handle, 4, 1);
+                _ = syscall.vmInjectIrq(vm_handle, 4, 0);
             }
-            // Tick PIT — fires IRQ0 (GSI2) when counter reaches 0
-            io.pitCheckIrq();
-            syscall.thread_yield();
             continue;
         }
-        if (tok < 0) break;
-
-        exit_count += 1;
-        const tag = exit_buf[OFF_TAG];
-        const gs: *GuestState = @ptrCast(@alignCast(&exit_buf[OFF_GS]));
-
-        if (gs.rflags & (1 << 9) != 0) if_one_count += 1 else if_zero_count += 1;
-
-        const kill = handleTag(tag, gs);
-
-        if (kill) {
-            @as(*align(1) u64, @ptrCast(&reply_buf)).* = REPLY_KILL;
-            _ = syscall.vm_reply_action(vm_handle, @bitCast(tok), @intFromPtr(&reply_buf));
+        if (r.err != 0) {
+            log.print("recvVmExit err=");
+            log.dec(r.err);
+            log.print("\n");
             break;
         }
 
-        // Route serial IRQ through kernel IOAPIC
-        if (serial.irq_pending) {
-            serial.irq_pending = false;
-            _ = syscall.vm_intc_assert_irq(vm_handle, 4);
-            _ = syscall.vm_intc_deassert_irq(vm_handle, 4);
+        exit_count += 1;
+        if (exit_count <= 5 or exit_count % 25 == 0) {
+            log.print("exit#");
+            log.dec(exit_count);
+            log.print(" et=");
+            log.dec(r.event_type);
+            log.print(" subcode=");
+            log.dec(r.state.exit_subcode);
+            log.print(" rip=0x");
+            log.hex64(r.state.rip);
+            log.print("\n");
         }
 
-        // Tick PIT — fires IRQ0 (GSI2) when counter reaches 0
+        if (first_exit_pending) {
+            // Initial-state synthetic exit — kernel hands us zeroed
+            // guest state; we install the Linux boot-protocol state
+            // and reply.
+            first_exit_pending = false;
+            log.print("reply#1 rip=0x");
+            log.hex64(guest_state.rip);
+            log.print(" cs.base=0x");
+            log.hex64(guest_state.cs.base);
+            log.print(" cr0=0x");
+            log.hex64(guest_state.cr0);
+            log.print("\n");
+            const reply_err = syscall.replyVmExit(r.reply_handle_id, guest_state);
+            if (reply_err != 0) {
+                log.print("initial replyVmExit err=");
+                log.dec(reply_err);
+                log.print("\n");
+                break;
+            }
+            continue;
+        }
+
+        var state = r.state;
+        // recvVmExit reads vreg 64 from `vm_exit_buf` which retains
+        // whatever the VMM wrote on the prior reply (the kernel does
+        // not clear vreg 64 on recv-side projection). Clear it
+        // explicitly so we only inject when the late-boot block
+        // below explicitly sets it again — otherwise our previous
+        // timer-IRQ injection sticks across exits and hardware
+        // re-fires the same vector on every entry, livelocking
+        // Linux in its IRQ0 ISR.
+        state.vcpu_event_intr_nmi = 0;
+        const subcode: u8 = @truncate(state.exit_subcode);
+        const kill = handleSubcode(subcode, &state);
+
+        if (kill) {
+            // Drop the reply handle implicitly by replying with the
+            // current state (the kernel will re-enter; subsequent exits
+            // will walk back here). For a clean exit we just break out.
+            // SPEC AMBIGUITY: spec doesn't define "kill" — a reply still
+            // resumes the guest. For triple-fault / shutdown we just
+            // drop out of the loop and shut the VMM down.
+            break;
+        }
+
+        // Route serial RX → IRQ 4 if the host serial polled some bytes.
+        if (serial.irq_pending) {
+            serial.irq_pending = false;
+            _ = syscall.vmInjectIrq(vm_handle, 4, 1);
+            _ = syscall.vmInjectIrq(vm_handle, 4, 0);
+        }
+
+        // PIT tick — fires IRQ0 when counter reaches 0.
         io.pitCheckIrq();
 
-        // Resume guest
-        @as(*align(1) u64, @ptrCast(&reply_buf)).* = REPLY_RESUME;
-        @memcpy(reply_buf[8..][0..GS_SIZE], @as([*]const u8, @ptrCast(gs))[0..GS_SIZE]);
-        if (syscall.vm_reply_action(vm_handle, @bitCast(tok), @intFromPtr(&reply_buf)) != syscall.E_OK) break;
+        // Direct PIC IRQ0 injection at 4ms / 250Hz, mirroring the OLD
+        // VMM's `maybeInjectTimer`. With `nolapic noapic` Linux uses
+        // the 8259 PIC for all IRQ routing — `vmInjectIrq(pin=2)`
+        // through the in-kernel IOAPIC above is a no-op for
+        // guest-visible delivery, so without this hook jiffies never
+        // advance and `/init` hangs on its first mount syscall.
+        // Stuff a SVM-EVENTINJ-format word into vreg 64
+        // (vcpu_event_intr_nmi); kernel's applyReplyStateToVcpu
+        // forwards it to `gs.pending_eventinj`. Gates: IF=1, no prior
+        // pending event. Linux's PIC remap (vector_base 0x08 → 0x20)
+        // happens within ~1ms of boot, so the 4ms throttle is enough
+        // to ensure the first inject lands on the remapped vector.
+        // Direct PIC IRQ0 injection. Don't even try until exit_count
+        // is big enough that we've definitely traversed Linux's
+        // setup_arch + init_8259A (PIC remap, IDT install) — early
+        // injection at vector 0x08 lands on the CPU's #DF entry and
+        // either panics the guest or eats the interrupt silently
+        // depending on Linux's IDT shape at that instant. Empirically
+        // Linux reaches "Run /init" around exit#80k under our cmdline,
+        // so an exit_count threshold gives us a stable late-boot
+        // injection point without a fragile event-shape probe.
+        if (exit_count > 81_000 and
+            io.pic1_vector_base != 0x08 and
+            (state.rflags & (1 << 9)) != 0 and
+            state.vcpu_event_intr_nmi == 0)
+        {
+            const now_ns = syscall.timeMonotonic().v1;
+            if (now_ns -% last_inject_ns >= 4_000_000) {
+                last_inject_ns = now_ns;
+                state.vcpu_event_intr_nmi = @as(u64, io.pic1_vector_base) | (1 << 31);
+            }
+        }
+
+        const reply_err = syscall.replyVmExit(r.reply_handle_id, state);
+        if (reply_err != 0) {
+            log.print("replyVmExit err=");
+            log.dec(reply_err);
+            log.print("\n");
+            break;
+        }
     }
 }
 
-/// Handle a single VM exit. Returns true to kill guest.
-noinline fn handleTag(tag: u8, gs: *GuestState) bool {
-    if (tag == EXIT_CPUID) {
+/// Dispatch a single exit. Returns true iff this is a fatal subcode
+/// (triple_fault / shutdown) and the loop should terminate.
+noinline fn handleSubcode(subcode: u8, state: *GuestState) bool {
+    if (subcode == EXIT_CPUID) {
         cpuid_count += 1;
-        cpuid.handle(gs);
+        cpuid.handle(state);
         return false;
     }
-    if (tag == EXIT_IO) {
+    if (subcode == EXIT_IO) {
         io_count += 1;
-        // IoExit layout (Zig struct, fields sorted by alignment):
-        // next_rip(u64) @ 0, value(u32) @ 8, port(u16) @ 12, size(u8) @ 14, is_write(bool) @ 15
-        const next_rip = rdU64(&exit_buf, OFF_PAYLOAD);
-        const value = rdU32(&exit_buf, OFF_PAYLOAD + 8);
-        const port = rdU16(&exit_buf, OFF_PAYLOAD + 12);
-        const size = exit_buf[OFF_PAYLOAD + 14];
-        const is_write = exit_buf[OFF_PAYLOAD + 15] != 0;
+        // §[vm_exit_state] x86-64 IO payload:
+        //   exit_payload[0] = next_rip
+        //   exit_payload[1] = {value u32 [0..31], port u16 [32..47],
+        //                      size u8 [48..55], is_write u8 [56..63]}
+        const next_rip = state.exit_payload[0];
+        const ioword = state.exit_payload[1];
+        const value: u32 = @truncate(ioword);
+        const port: u16 = @truncate(ioword >> 32);
+        const size: u8 = @truncate(ioword >> 48);
+        const is_write: bool = ((ioword >> 56) & 1) != 0;
         if (is_write) {
-            io.handleOut(port, size, value, gs);
+            io.handleOut(port, size, value, state);
         } else {
-            const v = io.handleIn(port, size, gs);
-            if (size == 1) gs.rax = (gs.rax & ~@as(u64, 0xFF)) | @as(u64, v & 0xFF) else if (size == 2) gs.rax = (gs.rax & ~@as(u64, 0xFFFF)) | @as(u64, v & 0xFFFF) else gs.rax = v;
+            const v = io.handleIn(port, size, state);
+            if (size == 1) state.rax = (state.rax & ~@as(u64, 0xFF)) | @as(u64, v & 0xFF) else if (size == 2) state.rax = (state.rax & ~@as(u64, 0xFFFF)) | @as(u64, v & 0xFFFF) else state.rax = v;
         }
-        // Advance RIP using next_rip from SVM EXITINFO2
-        // AMD APM Vol 2, Section 15.10.2: EXITINFO2 = next sequential RIP for IOIO exits
-        gs.rip = next_rip;
+        state.rip = next_rip;
         return false;
     }
-    if (tag == EXIT_MSR_R) {
+    if (subcode == EXIT_MSR_R) {
         msr_r_count += 1;
-        msr.handleRead(rdU32(&exit_buf, OFF_PAYLOAD + 8), gs);
+        const idx: u32 = @truncate(state.exit_payload[1]);
+        msr.handleRead(idx, state);
         return false;
     }
-    if (tag == EXIT_MSR_W) {
+    if (subcode == EXIT_MSR_W) {
         msr_w_count += 1;
-        msr.handleWrite(rdU32(&exit_buf, OFF_PAYLOAD + 8), gs);
+        const idx: u32 = @truncate(state.exit_payload[1]);
+        msr.handleWrite(idx, state);
         return false;
     }
-    if (tag == EXIT_CR) {
+    if (subcode == EXIT_CR) {
         cr_count += 1;
-        const cr_val = rdU64(&exit_buf, OFF_PAYLOAD);
-        const info = exit_buf[OFF_PAYLOAD + 8];
+        // §[vm_exit_state] x86-64 CR payload:
+        //   exit_payload[0] = value
+        //   exit_payload[1] = packed {cr_num u4, is_write u1, gpr u4}
+        const cr_val = state.exit_payload[0];
+        const info = state.exit_payload[1];
         const cr_num: u4 = @truncate(info);
-        const is_write = (info >> 4) & 1 != 0;
+        const is_write = ((info >> 4) & 1) != 0;
         const gpr: u4 = @truncate(info >> 5);
         if (is_write) {
             switch (cr_num) {
-                0 => gs.cr0 = cr_val | 0x10,
-                3 => gs.cr3 = cr_val,
-                4 => gs.cr4 = cr_val,
+                0 => state.cr0 = cr_val | 0x10,
+                3 => state.cr3 = cr_val,
+                4 => state.cr4 = cr_val,
                 else => {},
             }
         } else {
             const v = switch (cr_num) {
-                0 => gs.cr0,
-                2 => gs.cr2,
-                3 => gs.cr3,
-                4 => gs.cr4,
-                else => 0,
+                0 => state.cr0,
+                2 => state.cr2,
+                3 => state.cr3,
+                4 => state.cr4,
+                else => @as(u64, 0),
             };
-            writeGpr(gs, gpr, v);
+            writeGpr(state, gpr, v);
         }
-        gs.rip += 3;
+        state.rip += 3;
         return false;
     }
-    if (tag == EXIT_INTWIN) {
-        // Kernel handles interrupt window injection
+    if (subcode == EXIT_INTWIN) {
         return false;
     }
-    if (tag == EXIT_HLT) {
+    if (subcode == EXIT_HLT) {
         hlt_count += 1;
-        gs.rip += 1;
+        state.rip += 1;
         return false;
     }
-    if (tag == EXIT_TRIPLE or tag == EXIT_SHUTDOWN) {
+    if (subcode == EXIT_TRIPLE or subcode == EXIT_SHUTDOWN) {
         log.print("FATAL at RIP=0x");
-        log.hex64(gs.rip);
+        log.hex64(state.rip);
         log.print(" CR0=0x");
-        log.hex64(gs.cr0);
+        log.hex64(state.cr0);
         log.print(" CR3=0x");
-        log.hex64(gs.cr3);
+        log.hex64(state.cr3);
         log.print(" CR4=0x");
-        log.hex64(gs.cr4);
+        log.hex64(state.cr4);
         log.print(" EFER=0x");
-        log.hex64(gs.efer);
+        log.hex64(state.efer);
         log.print("\n");
         return true;
     }
-    if (tag == EXIT_EPT) {
-        const ept_addr = rdU64(&exit_buf, OFF_PAYLOAD);
+    if (subcode == EXIT_EPT) {
         ept_count += 1;
-        return handleEpt(ept_addr, gs);
+        const guest_phys = state.exit_payload[0];
+        return handleEpt(guest_phys, state);
     }
-    if (tag == EXIT_EXCEPT) {
+    if (subcode == EXIT_EXCEPT) {
         log.print("#");
-        log.dec(exit_buf[OFF_PAYLOAD]);
+        log.dec(state.exit_payload[0]);
         log.print(" RIP=0x");
-        log.hex64(gs.rip);
+        log.hex64(state.rip);
         log.print("\n");
         return true;
     }
-    if (tag == EXIT_UNKNOWN) {
-        const code = rdU64(&exit_buf, OFF_PAYLOAD);
+    if (subcode == EXIT_UNKNOWN) {
+        const code = state.exit_payload[0];
         if (code == 0x060 or code == 0x061) {
             intr_count += 1;
             return false;
@@ -570,17 +613,15 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
         log.print("\n");
         return true;
     }
-    log.print("tag=");
-    log.dec(tag);
+    other_count += 1;
+    log.print("subcode=");
+    log.dec(subcode);
     log.print("\n");
     return true;
 }
 
-/// Handle EPT violation. LAPIC/IOAPIC are handled in-kernel now.
-/// Only unhandled EPT violations reach userspace.
-noinline fn handleEpt(guest_phys: u64, gs: *GuestState) bool {
-    _ = gs;
-    ept_count += 1;
+noinline fn handleEpt(guest_phys: u64, state: *GuestState) bool {
+    _ = state;
     if (ept_count <= 10) {
         log.print("EPT@0x");
         log.hex64(guest_phys);
@@ -588,19 +629,6 @@ noinline fn handleEpt(guest_phys: u64, gs: *GuestState) bool {
     }
     if (ept_count > 1000) return true;
     return false;
-}
-
-var if_one_count: u64 = 0;
-var if_zero_count: u64 = 0;
-
-fn findVcpuHandle(pv: u64) u64 {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-    const self: u64 = @bitCast(syscall.thread_self());
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and view[i].handle != self)
-            return view[i].handle;
-    }
-    return 0;
 }
 
 fn writeGpr(s: *GuestState, gpr: u4, val: u64) void {
@@ -632,13 +660,4 @@ fn writeU32(buf: []u8, off: usize, val: u32) void {
 }
 fn writeU64(buf: []u8, off: usize, val: u64) void {
     @as(*align(1) u64, @ptrCast(buf.ptr + off)).* = val;
-}
-fn rdU16(buf: []const u8, off: usize) u16 {
-    return @as(*align(1) const u16, @ptrCast(buf.ptr + off)).*;
-}
-fn rdU32(buf: []const u8, off: usize) u32 {
-    return @as(*align(1) const u32, @ptrCast(buf.ptr + off)).*;
-}
-fn rdU64(buf: []const u8, off: usize) u64 {
-    return @as(*align(1) const u64, @ptrCast(buf.ptr + off)).*;
 }

@@ -23,7 +23,6 @@ const std = @import("std");
 const zag = @import("zag");
 
 const aarch64_paging = zag.arch.aarch64.paging;
-const device_registry = zag.devices.registry;
 const gic = zag.arch.aarch64.gic;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
@@ -32,11 +31,8 @@ const rtc = zag.arch.aarch64.rtc;
 const serial = zag.arch.aarch64.serial;
 const smp = zag.arch.aarch64.smp;
 
-const DeviceClass = zag.memory.device_region.DeviceClass;
-const Framebuffer = zag.boot.protocol.Framebuffer;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
-const PixelFormat = zag.boot.protocol.PixelFormat;
 const VAddr = zag.memory.address.VAddr;
 
 /// Map an MMIO region as Device memory into the kernel's physmap range
@@ -48,13 +44,7 @@ const VAddr = zag.memory.address.VAddr;
 /// until we add one here. We map Device memory (not_cacheable) because
 /// the regions are peripheral MMIO.
 fn mapDeviceRange(phys_start: u64, length: u64) !u64 {
-    const perms: MemoryPerms = .{
-        .write_perm = .write,
-        .execute_perm = .no_execute,
-        .cache_perm = .not_cacheable,
-        .global_perm = .global,
-        .privilege_perm = .kernel,
-    };
+    const perms: MemoryPerms = .{ .read = true, .write = true };
     const page = paging.PAGE4K;
     const start_aligned = std.mem.alignBackward(u64, phys_start, page);
     const end_aligned = std.mem.alignForward(u64, phys_start + length, page);
@@ -65,6 +55,7 @@ fn mapDeviceRange(phys_start: u64, length: u64) !u64 {
             PAddr.fromInt(pa),
             VAddr.fromPAddr(PAddr.fromInt(pa), null),
             perms,
+            .kernel_mmio,
         );
         pa += page;
     }
@@ -473,117 +464,6 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
     const pl031_phys: u64 = 0x09010000;
     const rtc_vaddr = mapDeviceRange(pl031_phys, 0x1000) catch 0;
     if (rtc_vaddr != 0) rtc.setBase(rtc_vaddr);
-
-    // QEMU `virt` has no PCI device enumeration in our aarch64 ACPI
-    // parser yet (no MCFG / ECAM walk). The kernel test suite looks up
-    // an MMIO device via `requireMmioDevice`, which on aarch64 expects
-    // any stable always-present MMIO BAR to exist. Register the PL031
-    // RTC page (already mapped above) as a placeholder MMIO device so
-    // tests like §2.3.50 / §2.3.52 / §2.3.53 / §2.3.54 can resolve a
-    // real device handle and perform MMIO reads without faulting.
-    // The PCI vendor/device IDs intentionally mirror the x86 q35 AHCI
-    // controller (0x8086:0x2922) so the shared libz helper matches
-    // without arch gating. PCI class 0x01/0x06 (AHCI) is likewise a
-    // cosmetic shim — PL031 is not a storage controller but the test
-    // rig only inspects device_type/MMIO accessibility, not class.
-    _ = device_registry.registerMmioDevice(
-        PAddr.fromInt(pl031_phys),
-        0x1000,
-        DeviceClass.storage,
-        0x8086, // vendor (cosmetic; matches libz lookup for AHCI)
-        0x2922, // device (cosmetic; matches libz lookup for AHCI)
-        0x01, // pci_class (cosmetic; mirrors ICH9 AHCI class)
-        0x06, // pci_subclass (cosmetic; mirrors ICH9 AHCI subclass)
-        0, // bus
-        31, // dev (cosmetic; mirrors ICH9 AHCI function 0:31.2)
-        2, // func
-    ) catch {};
-
-    // Register a placeholder port_io device so shared libz helpers that
-    // call `requirePioDevice` (AHCI PIO BAR on x86 q35) resolve a real
-    // device handle on aarch64. QEMU `virt` has no PIO bus; the base_port
-    // is never dereferenced by the kernel's `memVirtualBarMap` path which
-    // only synthesizes a virtual BAR for guest access trapping. The base
-    // is set to 0x1000 (first 4 KiB above the legacy "low ports" reserved
-    // region on x86 for visual distinction in dumps) and port_count 32
-    // mirrors the AHCI PIO BAR size asserted by §2.4.2. Vendor/device/BDF
-    // intentionally match the MMIO placeholder above so the AHCI MMIO
-    // and PIO BARs appear on the same PCI function, as on x86 q35.
-    _ = device_registry.registerPortIoDevice(
-        0x1000, // base_port (cosmetic; aarch64 has no PIO bus)
-        32, // port_count (matches AHCI PIO BAR size)
-        DeviceClass.storage,
-        0x8086, // vendor
-        0x2922, // device
-        0x01, // pci_class
-        0x06, // pci_subclass
-        0, // bus
-        31, // dev
-        2, // func
-    ) catch {};
-
-    // Register a second placeholder MMIO device masquerading as the QEMU
-    // stdvga (Bochs) display (0x1234:0x1111). §2.4.4 / §2.4.11 expect a
-    // BOCHS MMIO device to be present in the root service's perm view.
-    // We reuse the PL031 RTC page as the backing PA since the test rig
-    // only inspects device_type/MMIO accessibility, not register contents.
-    //
-    // Size MUST differ from the AHCI MMIO placeholder above (0x1000) so
-    // that the encoded UserViewEntry.field0 (which packs `size << 32`)
-    // is distinct between the two MMIO entries. Tests like §2.1.44 /
-    // §2.1.45 scan the root service's perm view for "the AHCI MMIO
-    // entry" by matching on field0; if AHCI and BOCHS share size 0x1000
-    // they collide on field0 and the scan returns an ambiguous match,
-    // causing the cap-transfer / device-return assertions to fail
-    // because BOCHS is still present after the AHCI slot is cleared.
-    // 16 MiB matches the real q35 stdvga BAR0 framebuffer size that the
-    // x86 PCI enumeration probes, so the placeholder mirrors hardware.
-    _ = device_registry.registerMmioDevice(
-        PAddr.fromInt(pl031_phys),
-        16 * 1024 * 1024,
-        DeviceClass.storage,
-        0x1234, // vendor (Bochs)
-        0x1111, // device (Bochs)
-        0x03, // pci_class (display; cosmetic)
-        0x00, // pci_subclass (VGA; cosmetic)
-        0, // bus
-        1, // dev (distinct BDF from AHCI placeholder)
-        0, // func
-    ) catch {};
-
-    // Register a second placeholder port_io device masquerading as the
-    // ICH9 SMBus controller (0x8086:0x2930). §2.4.4 requires a PIO
-    // device with these PCI ids.
-    _ = device_registry.registerPortIoDevice(
-        0x2000, // base_port (cosmetic; aarch64 has no PIO bus)
-        64, // port_count (matches SMBus PIO BAR size)
-        DeviceClass.storage,
-        0x8086, // vendor
-        0x2930, // device (SMBus)
-        0x0c, // pci_class (serial bus)
-        0x05, // pci_subclass (SMBus)
-        0, // bus
-        31, // dev
-        3, // func
-    ) catch {};
-
-    // Register a placeholder display device so at least one entry in the
-    // root service's perm view lacks the `irq` right (§2.4.26 looks up
-    // a device region without irq and expects `irq_ack` to return E_PERM).
-    // Display-class devices are granted only {map, grant, dma} in
-    // userspace_init.grantDevices, so this satisfies the test. The PA is
-    // reused from PL031 — nothing dereferences it. Using
-    // registerDisplayDevice is required because the detail union variant
-    // must match device_class (.display → detail.display), otherwise the
-    // perm_view sync path reads the wrong union field and panics.
-    device_registry.registerDisplayDevice(.{
-        .base = PAddr.fromInt(pl031_phys),
-        .size = 0x1000,
-        .width = 640,
-        .height = 480,
-        .stride = 640 * 4,
-        .pixel_format = PixelFormat.bgr8,
-    });
 
     // GIC init must happen after MADT parsing so that the distributor,
     // CPU-interface, and redistributor bases are known. init.zig runs

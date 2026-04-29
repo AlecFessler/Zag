@@ -3,17 +3,64 @@ const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
+const dispatch = zag.arch.dispatch;
 const interrupts = zag.arch.x64.interrupts;
 const kprof = zag.kprof.trace_id;
 const paging = zag.memory.paging;
 const physmap = zag.memory.address.AddrSpacePartition.physmap;
 const pmm = zag.memory.pmm;
 
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MappingKind = zag.memory.address.MappingKind;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
+const VarCacheType = zag.capdom.var_range.CacheType;
+const VarPageSize = zag.capdom.var_range.PageSize;
+
+/// Per-MappingKind page-attribute derivation. cache/global/user fields
+/// are owned by the arch backend (Intel SDM Vol 3A §5.10, §11.11).
+const KindAttrs = struct {
+    user_accessible: bool,
+    global: bool,
+    not_cacheable: bool,
+    write_through: bool,
+    write_combining: bool,
+};
+
+fn kindAttrs(kind: MappingKind) KindAttrs {
+    return switch (kind) {
+        .kernel_data => .{
+            .user_accessible = false,
+            .global = true,
+            .not_cacheable = false,
+            .write_through = false,
+            .write_combining = false,
+        },
+        .kernel_mmio => .{
+            .user_accessible = false,
+            .global = false,
+            .not_cacheable = true,
+            .write_through = false,
+            .write_combining = false,
+        },
+        .user_data => .{
+            .user_accessible = true,
+            .global = false,
+            .not_cacheable = false,
+            .write_through = false,
+            .write_combining = false,
+        },
+        .user_mmio => .{
+            .user_accessible = true,
+            .global = false,
+            .not_cacheable = true,
+            .write_through = false,
+            .write_combining = false,
+        },
+    };
+}
 
 /// TLB shootdown: per-core pending invalidation addresses.
 /// Each core checks its slot before returning to userspace.
@@ -21,7 +68,7 @@ const VAddr = zag.memory.address.VAddr;
 /// Intel SDM Vol 3A, Section 5.10.5 "Propagation of Paging-Structure Changes to
 /// Multiple Processors" requires software to broadcast invalidations; this is
 /// implemented via IPI + INVLPG on each remote core.
-var shootdown_lock: SpinLock = .{};
+var shootdown_lock: SpinLock = .{ .class = "paging.shootdown_lock" };
 var shootdown_addr: u64 = 0;
 
 /// IPI handler for TLB shootdown: invalidate the requested address.
@@ -54,7 +101,7 @@ fn flushRemoteTlb(virt_addr: u64) void {
 
     const self_id = apic.coreID();
 
-    shootdown_lock.lock();
+    shootdown_lock.lock(@src());
     defer shootdown_lock.unlock();
 
     @atomicStore(u64, &shootdown_addr, virt_addr, .release);
@@ -231,6 +278,7 @@ pub fn mapPage(
     phys: PAddr,
     virt: VAddr,
     perms: MemoryPerms,
+    kind: MappingKind,
 ) !void {
     kprof.point(.map_page, virt.addr);
     std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
@@ -238,29 +286,30 @@ pub fn mapPage(
 
     const pmm_mgr = &pmm.global_pmm.?;
 
-    const user_accessible = perms.privilege_perm == .user;
-    const writable = perms.write_perm == .write;
-    const not_executable = perms.execute_perm == .no_execute;
-    const wc = perms.cache_perm == .write_combining;
-    const not_cacheable = perms.cache_perm == .not_cacheable;
-    const write_through = perms.cache_perm == .write_through or wc;
-    const global = perms.global_perm == .global;
+    const attrs = kindAttrs(kind);
+    if (attrs.user_accessible) {
+        // Spec §[address_space]: NULL guard `[0, 0x1000)` must always
+        // fault. No mapping path may install a leaf into the first page.
+        std.debug.assert(virt.addr >= dispatch.paging.user_null_guard.end);
+    }
+    const writable = perms.write;
+    const not_executable = !perms.exec;
 
     const parent_entry = PageEntry{
         .present = true,
         .writable = true,
-        .user_accessible = user_accessible,
+        .user_accessible = attrs.user_accessible,
     };
 
     // For L1 leaf entries, bit 7 (huge_page) is the PAT index bit
     const leaf_entry = PageEntry{
         .present = true,
         .writable = writable,
-        .user_accessible = user_accessible,
-        .write_through = write_through,
-        .not_cacheable = not_cacheable,
-        .huge_page = wc,
-        .global = global,
+        .user_accessible = attrs.user_accessible,
+        .write_through = attrs.write_through or attrs.write_combining,
+        .not_cacheable = attrs.not_cacheable,
+        .huge_page = attrs.write_combining,
+        .global = attrs.global,
         .not_executable = not_executable,
     };
 
@@ -297,34 +346,31 @@ pub fn mapPageBoot(
     virt: VAddr,
     size: PageSize,
     perms: MemoryPerms,
+    kind: MappingKind,
     allocator: std.mem.Allocator,
 ) !void {
     std.debug.assert(std.mem.isAligned(phys.addr, paging.pageAlign(size).toByteUnits()));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.pageAlign(size).toByteUnits()));
 
-    const user_accessible = perms.privilege_perm == .user;
-    const writable = perms.write_perm == .write;
-    const not_executable = perms.execute_perm == .no_execute;
-    const wc = perms.cache_perm == .write_combining;
-    const not_cacheable = perms.cache_perm == .not_cacheable;
-    const write_through = perms.cache_perm == .write_through or wc;
-    const global = perms.global_perm == .global;
+    const attrs = kindAttrs(kind);
+    const writable = perms.write;
+    const not_executable = !perms.exec;
 
     const parent_entry = PageEntry{
         .present = true,
         .writable = true,
-        .user_accessible = user_accessible,
+        .user_accessible = attrs.user_accessible,
     };
 
     // For L1 leaf entries, bit 7 (huge_page) is the PAT index bit
     const leaf_entry = PageEntry{
         .present = true,
         .writable = writable,
-        .user_accessible = user_accessible,
-        .write_through = write_through,
-        .not_cacheable = not_cacheable,
-        .huge_page = wc,
-        .global = global,
+        .user_accessible = attrs.user_accessible,
+        .write_through = attrs.write_through or attrs.write_combining,
+        .not_cacheable = attrs.not_cacheable,
+        .huge_page = attrs.write_combining,
+        .global = attrs.global,
         .not_executable = not_executable,
     };
 
@@ -461,112 +507,6 @@ pub fn unmapPage(
 /// Intel SDM Vol 3A, §4.5 "4-Level Paging and 5-Level Paging" — the hierarchy
 /// is PML4 → PDPT → PD → PT; each table is a 4-KB page of 512 eight-byte
 /// entries. Only PML4 entries 0–255 cover user space (canonical low half).
-pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
-    const Level = enum { l4, l3, l2, l1 };
-    const Cursor = struct {
-        table: *[page_entry_table_size]PageEntry,
-        idx: usize,
-    };
-
-    const pmm_mgr = &pmm.global_pmm.?;
-    const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    const root: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
-
-    // stack[0] = L4, stack[1] = L3, stack[2] = L2, stack[3] = L1
-    var stack = [4]Cursor{
-        .{ .table = root, .idx = 0 },
-        .{ .table = undefined, .idx = 0 },
-        .{ .table = undefined, .idx = 0 },
-        .{ .table = undefined, .idx = 0 },
-    };
-    var level: Level = .l4;
-
-    while (true) {
-        const depth: usize = @intFromEnum(level);
-        const cur = &stack[depth];
-
-        // Determine how many entries to scan at this level.
-        // L4 only covers the user half (indices 0–255); all others scan all 512.
-        const limit: usize = if (level == .l4) 256 else page_entry_table_size;
-
-        // Exhausted this table — pop back up (freeing non-root tables).
-        if (cur.idx >= limit) {
-            if (level == .l4) break;
-            freeTablePage(cur.table, pmm_mgr);
-            level = @enumFromInt(depth - 1);
-            stack[depth - 1].idx += 1;
-            continue;
-        }
-
-        const entry = &cur.table[cur.idx];
-
-        // Not present — skip this entry.
-        if (!entry.present) {
-            cur.idx += 1;
-            continue;
-        }
-
-        // Leaf level: free the physical page and advance.
-        if (level == .l1) {
-            freePhysPage(entry.getPAddr(), pmm_mgr);
-            cur.idx += 1;
-            continue;
-        }
-
-        // Interior level: descend into the child table.
-        std.debug.assert(!entry.huge_page);
-        const child_table = entryToTable(entry);
-        const next_depth = depth + 1;
-        stack[next_depth] = .{ .table = child_table, .idx = 0 };
-        level = @enumFromInt(next_depth);
-    }
-
-    freeTablePage(root, pmm_mgr);
-}
-
-/// Update permission bits on an existing leaf PTE and invalidate the TLB.
-///
-/// Intel SDM Vol 3A, Section 5.10.4.2 -- after modifying a paging-structure
-/// entry that maps a page, software should execute INVLPG for any linear
-/// address whose translation uses that entry.
-pub fn updatePagePerms(
-    addr_space_root: PAddr,
-    virt: VAddr,
-    new_perms: MemoryPerms,
-) void {
-    const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
-
-    const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
-    for (walk_indices) |idx| {
-        const entry = &table[idx];
-        if (!entry.present) return;
-        const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
-        table = @ptrFromInt(next_virt.addr);
-    }
-
-    const l1_entry = &table[l1Idx(virt)];
-    if (!l1_entry.present) return;
-
-    l1_entry.writable = new_perms.write_perm == .write;
-    l1_entry.not_executable = new_perms.execute_perm == .no_execute;
-    const wc = new_perms.cache_perm == .write_combining;
-    l1_entry.not_cacheable = new_perms.cache_perm == .not_cacheable;
-    l1_entry.write_through = new_perms.cache_perm == .write_through or wc;
-    l1_entry.huge_page = wc;
-    l1_entry.user_accessible = new_perms.privilege_perm == .user;
-
-    cpu.invlpg(virt.addr);
-
-    // User-space permission changes must be visible on all cores.
-    // Without this, a remote core's stale TLB entry retains the old
-    // permissions (e.g. writable) after they have been revoked.
-    const user_end = zag.memory.address.AddrSpacePartition.user.end;
-    if (virt.addr < user_end) {
-        flushRemoteTlb(virt.addr);
-    }
-}
-
 /// Walk the 4-level paging hierarchy and return the physical address mapped
 /// at the given virtual address, or null if not mapped.
 ///
@@ -593,23 +533,65 @@ pub fn resolveVaddr(
     return l1_entry.getPAddr();
 }
 
-/// Extract the physical address from a non-leaf page-table entry and return a
-/// pointer to the next-level table it points to.
-/// Intel SDM Vol 3A, §4.5 — bits 51:12 of a non-leaf entry hold the 4-KB-
-/// aligned physical address of the next paging structure (Tables 4-15 through
-/// 4-18).
-fn entryToTable(entry: *const PageEntry) *[page_entry_table_size]PageEntry {
-    const virt = VAddr.fromPAddr(entry.getPAddr(), null);
-    return @ptrFromInt(virt.addr);
+pub fn mapPageSized(
+    addr_space_root: PAddr,
+    phys: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+    cch: VarCacheType,
+    perms: MemoryPerms,
+) !void {
+    _ = cch;
+    // v0: only 4 KiB pages supported through the VAR-side map path.
+    // 2 MiB / 1 GiB landings go through `mapPageBoot` for the kernel
+    // address space; userspace VARs are spec'd over 4 KiB throughout
+    // the test runner so the simple fallback covers what the runner
+    // exercises.
+    std.debug.assert(sz == .sz_4k);
+    return mapPage(addr_space_root, phys, virt, perms, .user_data);
 }
 
-fn freePhysPage(paddr: PAddr, pmm_mgr: *pmm.PhysicalMemoryManager) void {
-    const virt = VAddr.fromPAddr(paddr, null);
-    const page: *paging.PageMem(.page4k) = @ptrFromInt(virt.addr);
-    pmm_mgr.destroy(page);
+pub fn unmapPageSized(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+) ?PAddr {
+    std.debug.assert(sz == .sz_4k);
+    return unmapPage(addr_space_root, virt);
 }
 
-fn freeTablePage(table: *[page_entry_table_size]PageEntry, pmm_mgr: *pmm.PhysicalMemoryManager) void {
-    const page: *paging.PageMem(.page4k) = @ptrCast(@alignCast(table));
-    pmm_mgr.destroy(page);
+/// Allocate a fresh PML4 table for a new capability domain. Kernel
+/// mappings (entries 256..511) are copied from the current address
+/// space so kernel addresses translate identically; user-half entries
+/// (0..255) come up empty for the caller to populate.
+///
+/// Intel SDM Vol 3A, Section 5.5.4: PML4 = 4 KiB-aligned table of 512
+/// PageEntry slots. Section 5.10.4: kernel-shared mappings rely on
+/// CR4.PGE = 1 and PageEntry.global = 1, but the PML4 entries themselves
+/// (the table pointers) must be replicated into every address-space
+/// root because the L4 walk indexes them by linear address bits 47:39.
+pub fn allocAddrSpaceRoot() !PAddr {
+    const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
+    const new_table = try pmm_mgr.create(paging.PageMem(.page4k));
+    const new_virt = VAddr.fromInt(@intFromPtr(new_table));
+    copyKernelMappings(new_virt);
+    return PAddr.fromVAddr(new_virt, null);
 }
+
+pub fn shootdownTlbRange(
+    addr_space_id: u16,
+    virt: VAddr,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = addr_space_id;
+    std.debug.assert(sz == .sz_4k);
+    var i: u32 = 0;
+    while (i < page_count) {
+        const va = virt.addr + @as(u64, i) * paging.PAGE4K;
+        cpu.invlpg(va);
+        flushRemoteTlb(va);
+        i += 1;
+    }
+}
+

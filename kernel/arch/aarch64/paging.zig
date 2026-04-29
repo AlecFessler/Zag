@@ -61,10 +61,55 @@ const paging = zag.memory.paging;
 const physmap = zag.memory.address.AddrSpacePartition.physmap;
 const pmm = zag.memory.pmm;
 
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MappingKind = zag.memory.address.MappingKind;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const VAddr = zag.memory.address.VAddr;
+const VarCacheType = zag.capdom.var_range.CacheType;
+const VarPageSize = zag.capdom.var_range.PageSize;
+
+/// Per-MappingKind descriptor attributes. cache/global/user fields are
+/// owned by the arch backend (ARM ARM D5.4, D13.2.97).
+const KindAttrs = struct {
+    user: bool,
+    /// nG bit. Kernel mappings are global (TLB-pinned across context
+    /// switches under TTBR1); user mappings are non-global.
+    not_global: bool,
+    /// MAIR_EL1 index. mair_normal = WB cacheable, mair_device = UC.
+    attr_indx: u3,
+    /// SH[1:0] shareability. Normal mem = Inner Shareable, device = none.
+    sh: u2,
+};
+
+fn kindAttrs(kind: MappingKind) KindAttrs {
+    return switch (kind) {
+        .kernel_data => .{
+            .user = false,
+            .not_global = false,
+            .attr_indx = mair_normal,
+            .sh = 0b11,
+        },
+        .kernel_mmio => .{
+            .user = false,
+            .not_global = true,
+            .attr_indx = mair_device,
+            .sh = 0b00,
+        },
+        .user_data => .{
+            .user = true,
+            .not_global = true,
+            .attr_indx = mair_normal,
+            .sh = 0b11,
+        },
+        .user_mmio => .{
+            .user = true,
+            .not_global = true,
+            .attr_indx = mair_device,
+            .sh = 0b00,
+        },
+    };
+}
 
 /// AArch64 page table descriptor for VMSAv8-64 with 4KB granule.
 ///
@@ -190,45 +235,6 @@ pub fn initMairIndices() void {
     }
 }
 
-/// Return the physical address of the current user page table from TTBR0_EL1.
-///
-/// ARM ARM D13.2.136: TTBR0_EL1 holds the base address of the translation
-/// table for the lower VA range (user space). Bits [47:1] hold the table
-/// address (4KB aligned means bits [11:0] are zero in the address).
-pub fn getAddrSpaceRoot() PAddr {
-    const ttbr0 = readTtbr0();
-    const mask: u64 = 0x0000_FFFF_FFFF_F000;
-    return PAddr.fromInt(ttbr0 & mask);
-}
-
-/// Load a new user page table address into TTBR0_EL1, tagged with the
-/// process's ASID.
-///
-/// ARM ARM D13.2.136 -- TTBR0_EL1 layout when TCR_EL1.AS=1:
-///   bits [47:1]  = BADDR (page-table base)
-///   bits [63:48] = ASID
-///
-/// User PTEs are mapped with nG=1, so each TLB entry is tagged with the
-/// ASID active when it was loaded. With per-process ASIDs, stale entries
-/// from a different ASID simply miss on lookup and never alias the new
-/// process — no flush needed on context switch. ARM ARM D5.10.2.
-///
-/// ISB publishes the new TTBR0 to instruction fetch.
-pub fn swapAddrSpace(root: PAddr, id: u16) void {
-    const ttbr0 = (@as(u64, id) << 48) | (root.addr & 0x0000_FFFF_FFFF_FFFE);
-    writeTtbr0(ttbr0);
-    asm volatile ("isb" ::: .{ .memory = true });
-}
-
-/// No-op on AArch64: kernel mappings live in TTBR1_EL1 and are always visible.
-///
-/// ARM ARM D5.2 -- the split TTBR0/TTBR1 scheme means kernel virtual addresses
-/// (upper range, starting at 0xFFFF_0000_0000_0000) are translated via TTBR1_EL1
-/// which is shared across all processes. No per-process copying is needed.
-pub fn copyKernelMappings(root: VAddr) void {
-    _ = root;
-}
-
 /// Disable UEFI's identity mapping by disabling TTBR0 walks and flushing TLB.
 ///
 /// On aarch64, UEFI's identity mapping lives in TTBR0 which is separate
@@ -266,18 +272,17 @@ pub fn mapPage(
     phys: PAddr,
     virt: VAddr,
     perms: MemoryPerms,
+    kind: MappingKind,
 ) !void {
     std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
 
     const pmm_mgr = &pmm.global_pmm.?;
 
-    const ap = permsToAp(perms);
-    const xn = perms.execute_perm == .no_execute;
+    const attrs = kindAttrs(kind);
+    const ap = permsToAp(perms, attrs.user);
+    const xn = !perms.exec;
     const pxn = xn;
-    const ng = perms.global_perm == .not_global;
-    const attr_indx = if (perms.cache_perm == .not_cacheable) mair_device else mair_normal;
-    const sh: u2 = if (perms.cache_perm == .not_cacheable) 0b00 else 0b11;
 
     const parent_entry = PageEntry{
         .valid = true,
@@ -291,11 +296,11 @@ pub fn mapPage(
     const leaf_entry = PageEntry{
         .valid = true,
         .is_table = true, // Level 3 page descriptor: bits [1:0] = 0b11
-        .attr_indx = attr_indx,
+        .attr_indx = attrs.attr_indx,
         .ap = ap,
-        .sh = sh,
+        .sh = attrs.sh,
         .af = true,
-        .ng = ng,
+        .ng = attrs.not_global,
         .xn = xn,
         .pxn = pxn,
     };
@@ -342,17 +347,16 @@ pub fn mapPageBoot(
     virt: VAddr,
     size: PageSize,
     perms: MemoryPerms,
+    kind: MappingKind,
     allocator: std.mem.Allocator,
 ) !void {
     std.debug.assert(std.mem.isAligned(phys.addr, paging.pageAlign(size).toByteUnits()));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.pageAlign(size).toByteUnits()));
 
-    const ap = permsToAp(perms);
-    const xn = perms.execute_perm == .no_execute;
+    const attrs = kindAttrs(kind);
+    const ap = permsToAp(perms, attrs.user);
+    const xn = !perms.exec;
     const pxn = xn;
-    const ng = perms.global_perm == .not_global;
-    const attr_indx = if (perms.cache_perm == .not_cacheable) mair_device else mair_normal;
-    const sh: u2 = if (perms.cache_perm == .not_cacheable) 0b00 else 0b11;
 
     const parent_entry = PageEntry{
         .valid = true,
@@ -368,11 +372,11 @@ pub fn mapPageBoot(
     const leaf_entry = PageEntry{
         .valid = true,
         .is_table = true,
-        .attr_indx = attr_indx,
+        .attr_indx = attrs.attr_indx,
         .ap = ap,
-        .sh = sh,
+        .sh = attrs.sh,
         .af = true,
-        .ng = ng,
+        .ng = attrs.not_global,
         .xn = xn,
         .pxn = pxn,
     };
@@ -476,105 +480,6 @@ pub fn unmapPage(
     return phys;
 }
 
-/// Recursively walk the 4-level translation table for user space and free
-/// all leaf pages and table pages.
-///
-/// ARM ARM D5.2 -- TTBR0_EL1 covers the lower VA range (user space).
-/// The entire level 0 table belongs to user space since TTBR1_EL1 handles
-/// kernel addresses separately.
-pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
-    const Level = enum { l3, l2, l1, l0 };
-    const Cursor = struct {
-        table: *[page_entry_table_size]PageEntry,
-        idx: usize,
-    };
-
-    const pmm_mgr = &pmm.global_pmm.?;
-    const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    const root: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
-
-    // stack[0] = L3 (level 0 table), stack[1] = L2, stack[2] = L1, stack[3] = L0
-    var stack = [4]Cursor{
-        .{ .table = root, .idx = 0 },
-        .{ .table = undefined, .idx = 0 },
-        .{ .table = undefined, .idx = 0 },
-        .{ .table = undefined, .idx = 0 },
-    };
-    var level: Level = .l3;
-
-    while (true) {
-        const depth: usize = @intFromEnum(level);
-        const cur = &stack[depth];
-
-        // All levels scan all 512 entries -- TTBR0 is entirely user space.
-        if (cur.idx >= page_entry_table_size) {
-            if (level == .l3) break;
-            freeTablePage(cur.table, pmm_mgr);
-            level = @enumFromInt(depth - 1);
-            stack[depth - 1].idx += 1;
-            continue;
-        }
-
-        const entry = &cur.table[cur.idx];
-
-        if (!entry.valid) {
-            cur.idx += 1;
-            continue;
-        }
-
-        // Leaf level (level 3 page descriptors): free the physical page.
-        if (level == .l0) {
-            freePhysPage(entry.getPAddr(), pmm_mgr);
-            cur.idx += 1;
-            continue;
-        }
-
-        // Interior level: descend into the child table.
-        const child_table = entryToTable(entry);
-        const next_depth = depth + 1;
-        stack[next_depth] = .{ .table = child_table, .idx = 0 };
-        level = @enumFromInt(next_depth);
-    }
-
-    freeTablePage(root, pmm_mgr);
-}
-
-/// Update permission bits on an existing leaf PTE and invalidate the TLB.
-///
-/// ARM ARM D5.9 -- after modifying a valid PTE, TLB maintenance is required.
-/// A break-before-make sequence (invalidate, then rewrite) is the
-/// architecturally correct approach, but for permission tightening the
-/// simpler write-then-invalidate is safe.
-pub fn updatePagePerms(
-    addr_space_root: PAddr,
-    virt: VAddr,
-    new_perms: MemoryPerms,
-) void {
-    const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
-
-    const walk_indices = [_]u9{ l3Idx(virt), l2Idx(virt), l1Idx(virt) };
-    for (walk_indices) |idx| {
-        const entry = &table[idx];
-        if (!entry.valid) return;
-        const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
-        table = @ptrFromInt(next_virt.addr);
-    }
-
-    const l0_entry = &table[l0Idx(virt)];
-    if (!l0_entry.valid) return;
-
-    l0_entry.ap = permsToAp(new_perms);
-    l0_entry.xn = new_perms.execute_perm == .no_execute;
-    l0_entry.pxn = new_perms.execute_perm == .no_execute;
-    l0_entry.ng = new_perms.global_perm == .not_global;
-    l0_entry.attr_indx = if (new_perms.cache_perm == .not_cacheable) mair_device else mair_normal;
-    l0_entry.sh = if (new_perms.cache_perm == .not_cacheable) 0b00 else 0b11;
-
-    // ARM ARM D5.9: TLBI VAE1IS invalidates the VA across all cores.
-    tlbiVae1is(virt.addr);
-}
-
 /// Walk the 4-level translation table and return the page-base physical
 /// address (4 KiB aligned) of the mapping for `virt`, or null if not mapped.
 ///
@@ -640,9 +545,8 @@ pub fn resolveVaddr(
 ///   AP[2:1] = 0b01: EL1 RW, EL0 RW
 ///   AP[2:1] = 0b10: EL1 RO, EL0 no access
 ///   AP[2:1] = 0b11: EL1 RO, EL0 RO
-fn permsToAp(perms: MemoryPerms) u2 {
-    const writable = perms.write_perm == .write;
-    const user = perms.privilege_perm == .user;
+fn permsToAp(perms: MemoryPerms, user: bool) u2 {
+    const writable = perms.write;
 
     if (writable and user) return 0b01;
     if (writable) return 0b00;
@@ -650,44 +554,7 @@ fn permsToAp(perms: MemoryPerms) u2 {
     return 0b10;
 }
 
-/// Extract the physical address from a non-leaf table descriptor and return
-/// a pointer to the next-level table.
-/// ARM ARM D5.3, Table D5-15 -- bits [47:12] of a table descriptor hold the
-/// 4KB-aligned physical address of the next translation table.
-fn entryToTable(entry: *const PageEntry) *[page_entry_table_size]PageEntry {
-    const virt = VAddr.fromPAddr(entry.getPAddr(), null);
-    return @ptrFromInt(virt.addr);
-}
-
-fn freePhysPage(paddr: PAddr, pmm_mgr: *pmm.PhysicalMemoryManager) void {
-    const virt = VAddr.fromPAddr(paddr, null);
-    const page: *paging.PageMem(.page4k) = @ptrFromInt(virt.addr);
-    pmm_mgr.destroy(page);
-}
-
-fn freeTablePage(table: *[page_entry_table_size]PageEntry, pmm_mgr: *pmm.PhysicalMemoryManager) void {
-    const page: *paging.PageMem(.page4k) = @ptrCast(@alignCast(table));
-    pmm_mgr.destroy(page);
-}
-
 // ── AArch64 system register and barrier intrinsics ──────────────────────────
-
-/// Read TTBR0_EL1 (Translation Table Base Register 0).
-/// ARM ARM D13.2.136.
-fn readTtbr0() u64 {
-    return asm volatile ("mrs %[ret], ttbr0_el1"
-        : [ret] "=r" (-> u64),
-    );
-}
-
-/// Write TTBR0_EL1 (Translation Table Base Register 0).
-/// ARM ARM D13.2.136.
-fn writeTtbr0(val: u64) void {
-    asm volatile ("msr ttbr0_el1, %[val]"
-        :
-        : [val] "r" (val),
-        : .{ .memory = true });
-}
 
 /// Read TTBR1_EL1 (Translation Table Base Register 1 -- kernel space).
 /// ARM ARM D13.2.136.
@@ -841,9 +708,83 @@ fn tlbiVae1is(vaddr: u64) void {
     isb();
 }
 
-/// TLBI VMALLE1IS -- TLB Invalidate All, EL1&0, Inner Shareable.
-/// ARM ARM D5.9 -- invalidates all stage 1 EL1&0 TLB entries across all
-/// cores in the inner shareable domain.
-fn tlbiVmalle1is() void {
-    asm volatile ("tlbi vmalle1is" ::: .{ .memory = true });
+pub fn mapPageSized(
+    addr_space_root: PAddr,
+    phys: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+    cch: VarCacheType,
+    perms: MemoryPerms,
+) !void {
+    _ = cch;
+    std.debug.assert(sz == .sz_4k);
+    return mapPage(addr_space_root, phys, virt, perms, .user_data);
+}
+
+pub fn unmapPageSized(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    sz: VarPageSize,
+) ?PAddr {
+    std.debug.assert(sz == .sz_4k);
+    return unmapPage(addr_space_root, virt);
+}
+
+/// Allocate a fresh user-half L0 page-table root (TTBR0_EL1 will point at
+/// this PA on context switch). Kernel mappings live in TTBR1_EL1 and are
+/// shared across address spaces, so unlike the x86 PML4 we do NOT copy
+/// kernel half-entries into the new root — `dispatch.paging.copyKernelMappings`
+/// is a no-op on aarch64. ARM ARM DDI 0487 §D5.2 / §D13.2.136.
+pub fn allocAddrSpaceRoot() !PAddr {
+    const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
+    const new_table = try pmm_mgr.create(paging.PageMem(.page4k));
+    const new_virt = VAddr.fromInt(@intFromPtr(new_table));
+    return PAddr.fromVAddr(new_virt, null);
+}
+
+/// Read the current TTBR0_EL1 base PA (low-half / user translation root).
+/// Strips ASID bits [63:48] and reserved bits [11:0]; returns a clean PA.
+/// ARM ARM DDI 0487 §D13.2.136 TTBR0_EL1.
+pub fn getAddrSpaceRoot() PAddr {
+    const ttbr0 = asm volatile ("mrs %[ret], ttbr0_el1"
+        : [ret] "=r" (-> u64),
+    );
+    const mask: u64 = 0x0000_FFFF_FFFF_F000;
+    return PAddr.fromInt(ttbr0 & mask);
+}
+
+/// Swap TTBR0_EL1 to a new user-half page-table root and tag the
+/// translation with `id` (ASID, 16-bit). Per ARM ARM §D13.2.136 the
+/// ASID lives in TTBR0_EL1[63:48] when TCR_EL1.AS=1 (which
+/// `setKernelAddrSpace` already sets). Following the write the manual
+/// requires a context-synchronization event before EL0 access can use
+/// the new translation; an `isb` provides it. No explicit TLBI is
+/// needed when the ASID changes — the new ASID inherently scopes
+/// future lookups.
+pub fn swapAddrSpace(root: PAddr, id: u16) void {
+    const asid: u64 = @as(u64, id) << 48;
+    const value: u64 = (root.addr & 0x0000_FFFF_FFFF_F000) | asid;
+    asm volatile (
+        \\msr ttbr0_el1, %[v]
+        \\isb
+        :
+        : [v] "r" (value),
+        : .{ .memory = true });
+}
+
+pub fn shootdownTlbRange(
+    addr_space_id: u16,
+    virt: VAddr,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = addr_space_id;
+    std.debug.assert(sz == .sz_4k);
+    // ARM ARM D5.9: TLBI VAE1IS broadcasts across the inner-shareable
+    // domain; no IPI fan-out required (unlike x86's per-core invlpg).
+    var i: u32 = 0;
+    while (i < page_count) {
+        tlbiVae1is(virt.addr + @as(u64, i) * paging.PAGE4K);
+        i += 1;
+    }
 }

@@ -4,17 +4,24 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const boot = zag.boot;
+const capability_domain_mod = zag.capdom.capability_domain;
+const dev_region_mod = zag.devices.device_region;
 const device_region_mod = zag.memory.device_region;
+const execution_context_mod = zag.sched.execution_context;
 const KA = address.KernelVA.KernelAllocators;
+const page_frame_mod = zag.memory.page_frame;
 const paging = zag.memory.paging;
+const perfmon_mod = zag.sched.perfmon;
 const pmm = zag.memory.pmm;
-const pmu_mod = zag.syscall.pmu;
-const shared = zag.memory.shared;
+const port_mod = zag.sched.port;
+const timer_mod = zag.sched.timer;
+const var_range_mod = zag.capdom.var_range;
+const virtual_machine_mod = zag.capdom.virtual_machine;
 const vmm_mod = zag.memory.vmm;
 
 const BuddyAllocator = zag.memory.allocators.buddy.BuddyAllocator;
 const BumpAllocator = zag.memory.allocators.bump.BumpAllocator;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const MMap = zag.boot.protocol.MMap;
 const MMapEntry = zag.boot.protocol.MMapEntry;
 const PAddr = zag.memory.address.PAddr;
@@ -74,13 +81,7 @@ pub fn init(firmware_mmap: MMap) !void {
                 break :blk paging.PageSize.page4k;
             };
 
-            const physmap_perms: MemoryPerms = .{
-                .write_perm = .write,
-                .execute_perm = .no_execute,
-                .cache_perm = .write_back,
-                .global_perm = .global,
-                .privilege_perm = .kernel,
-            };
+            const physmap_perms: MemoryPerms = .{ .read = true, .write = true };
 
             try arch.paging.mapPageBoot(
                 addr_space_root_id_virt,
@@ -88,6 +89,7 @@ pub fn init(firmware_mmap: MMap) !void {
                 physmap_virt,
                 chosen_size,
                 physmap_perms,
+                .kernel_data,
                 bump_alloc_iface,
             );
 
@@ -190,14 +192,51 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.device_region_slab_ptrs,
         KA.device_region_slab_links,
     );
-
-    shared.slab_allocator_instance = shared.SharedMemoryAllocator.init(
-        KA.shm_slab,
-        KA.shm_slab_ptrs,
-        KA.shm_slab_links,
+    // Spec-v3 §[device_region] slab. Boot-time PCI / serial enumerators
+    // call into devices.device_region.registerMmio / registerPortIo
+    // before any userspace runs, so the slab must be live before
+    // arch.boot.parseFirmwareTables.
+    dev_region_mod.initSlab(
+        KA.dev_region_slab,
+        KA.dev_region_slab_ptrs,
+        KA.dev_region_slab_links,
     );
-
-    pmu_mod.initSlab(
+    capability_domain_mod.initSlab(
+        KA.capability_domain_slab,
+        KA.capability_domain_slab_ptrs,
+        KA.capability_domain_slab_links,
+    );
+    execution_context_mod.initSlab(
+        KA.execution_context_slab,
+        KA.execution_context_slab_ptrs,
+        KA.execution_context_slab_links,
+    );
+    var_range_mod.initSlab(
+        KA.var_range_slab,
+        KA.var_range_slab_ptrs,
+        KA.var_range_slab_links,
+    );
+    port_mod.initSlab(
+        KA.port_slab,
+        KA.port_slab_ptrs,
+        KA.port_slab_links,
+    );
+    page_frame_mod.initSlab(
+        KA.page_frame_slab,
+        KA.page_frame_slab_ptrs,
+        KA.page_frame_slab_links,
+    );
+    timer_mod.initSlab(
+        KA.timer_slab,
+        KA.timer_slab_ptrs,
+        KA.timer_slab_links,
+    );
+    virtual_machine_mod.initSlab(
+        KA.virtual_machine_slab,
+        KA.virtual_machine_slab_ptrs,
+        KA.virtual_machine_slab_links,
+    );
+    perfmon_mod.initSlab(
         KA.pmu_state_slab,
         KA.pmu_state_slab_ptrs,
         KA.pmu_state_slab_links,

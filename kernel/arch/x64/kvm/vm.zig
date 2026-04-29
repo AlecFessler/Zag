@@ -1,582 +1,318 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const apic = zag.arch.x64.apic;
-const arch_paging = zag.arch.x64.paging;
-const kvm = zag.arch.x64.kvm;
+const ioapic_mod = zag.arch.x64.kvm.ioapic;
 const mmio_decode = zag.arch.x64.mmio_decode;
-const vm_hw = zag.arch.x64.vm;
-const exit_box_mod = kvm.exit_box;
-const guest_memory = kvm.guest_memory;
-const ioapic_mod = kvm.ioapic;
-const lapic_mod = kvm.lapic;
-const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
-const sched = zag.sched.scheduler;
-const vcpu_mod = kvm.vcpu;
+const pmm = zag.memory.pmm;
+const vm_hw = zag.arch.x64.vm;
 
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
-const GuestMemory = guest_memory.GuestMemory;
-const Ioapic = ioapic_mod.Ioapic;
-const KernelObject = zag.perms.permissions.KernelObject;
-const Lapic = lapic_mod.Lapic;
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
-const PermissionEntry = zag.perms.permissions.PermissionEntry;
-const Process = zag.proc.process.Process;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const slabRefNow = zag.proc.process.slabRefNow;
-const SpinLock = zag.utils.sync.SpinLock;
-const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
+const PageFrame = zag.memory.page_frame.PageFrame;
 const VAddr = zag.memory.address.VAddr;
-const VCpu = vcpu_mod.VCpu;
-const VmExitBox = exit_box_mod.VmExitBox;
+const VarPageSize = zag.capdom.var_range.PageSize;
+const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
 
-pub const MAX_VCPUS = 64;
+/// Kernel-emulated LAPIC/IOAPIC MMIO base addresses. Linux's xAPIC code
+/// hits these page-aligned regions for ICR/EOI/IRR programming and IRQ
+/// routing — handled inline so the run loop never punts these exits to
+/// the VMM (a CPU-bound 1376-exits-per-second hot loop in pre-restoration
+/// builds).
+const LAPIC_BASE: u64 = 0xFEE0_0000;
+const IOAPIC_BASE: u64 = 0xFEC0_0000;
 
-/// Intel SDM Vol 3, Section 13.4.1: default APIC base.
-const LAPIC_BASE: u64 = 0xFEE00000;
-/// Intel 82093AA datasheet, Section 3.0: default IOAPIC base.
-const IOAPIC_BASE: u64 = 0xFEC00000;
+// ── Spec-v3 dispatch backings ────────────────────────────────────────
+//
+// Wire-up is intentionally minimal: it fans out to the existing low-
+// level VMX/SVM primitives (alloc/free of EPT/NPT root + VMCS/VMCB
+// pages). vCPU run-time bring-up (loadGuestState/enterGuest/etc.) and
+// guest stage-2 page-table population (stage2MapPage) still TODO —
+// those are exercised by later spec-v3 tests, not create_virtual_machine
+// or create_vcpu themselves.
 
-pub const VmAllocator = SecureSlab(Vm, 256);
+pub fn allocStage2Root(vm: *VirtualMachine) !PAddr {
+    // Caller (`capdom.virtual_machine.allocVm`) writes the returned
+    // PAddr into `vm.guest_pt_root` and then calls allocVmArchState,
+    // which patches the same root into the VMCS / VMCB.
+    _ = vm;
+    if (!vm_hw.vmSupported()) return error.NoDevice;
+    return vm_hw.allocStage2RootPage() orelse error.OutOfMemory;
+}
 
-pub var slab_instance: VmAllocator = undefined;
+pub fn freeStage2Root(vm: *VirtualMachine) void {
+    // Only walk if a non-zero root was actually installed — error paths
+    // in `allocVm` may call us after a partial setup.
+    if (vm.guest_pt_root.addr == 0) return;
+    vm_hw.freeStage2RootPage(vm.guest_pt_root);
+    vm.guest_pt_root = PAddr.fromInt(0);
+}
 
-var vm_id_counter: u64 = 1;
+/// Validate a `VmPolicy` struct seeded into the policy page frame.
+/// Spec §[create_virtual_machine] tests 05/06/07: the page frame must
+/// be at least `sizeof(VmPolicy)` bytes, and the table-count fields
+/// must not exceed their static array bounds. The struct lives at
+/// offset 0 of the frame and is read through the kernel physmap.
+pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
+    const page_bytes: u64 = switch (policy_pf.sz) {
+        .sz_4k => 0x1000,
+        .sz_2m => 0x20_0000,
+        .sz_1g => 0x4000_0000,
+        ._reserved => 0,
+    };
+    const frame_bytes: u64 = page_bytes * @as(u64, policy_pf.page_count);
+    if (frame_bytes < @sizeOf(vm_hw.VmPolicy)) return error.InvalidPolicy;
 
-pub const Vm = struct {
-    _gen_lock: GenLock = .{},
-    vcpus: [MAX_VCPUS]SlabRef(VCpu) = undefined,
-    num_vcpus: u32 = 0,
-    owner: SlabRef(Process),
-    exit_box: VmExitBox = .{},
-    policy: vm_hw.VmPolicy = .{},
-    vm_id: u64 = 0,
-    arch_structures: PAddr = PAddr.fromInt(0),
-    guest_mem: GuestMemory = .{},
-    /// Host virtual base and size of the main guest RAM region (from first vm_guest_map).
-    /// Used by MMIO decoder to read guest physical memory (page table walk).
-    guest_ram_host_base: u64 = 0,
-    guest_ram_size: u64 = 0,
-    /// In-kernel LAPIC emulation state.
-    lapic: Lapic = .{},
-    /// In-kernel IOAPIC emulation state.
-    ioapic: Ioapic = .{},
+    const phys_va = VAddr.fromPAddr(policy_pf.phys_base, null);
+    const policy_ptr: *const vm_hw.VmPolicy = @ptrFromInt(phys_va.addr);
+    if (policy_ptr.num_cpuid_responses > vm_hw.VmPolicy.MAX_CPUID_POLICIES)
+        return error.InvalidPolicy;
+    if (policy_ptr.num_cr_policies > vm_hw.VmPolicy.MAX_CR_POLICIES)
+        return error.InvalidPolicy;
+}
 
-    /// Destroy this VM: kill all vCPU threads, free structures.
-    /// `carried_gen` is the generation the caller's SlabRef(Vm) held;
-    /// passing it through (instead of reading `currentGen()` at destroy
-    /// time) ensures a stale caller panics cleanly rather than freeing
-    /// the wrong tenant of a recycled slot.
-    pub fn destroy(self: *Vm, carried_gen: u63) void {
-        // Kill all vCPU threads. self-alive: the vCPU slots were
-        // allocated by this VM at create time and have not been freed
-        // until this loop runs; no concurrent observer still holds a
-        // live ref to them because the process's perm-table handles are
-        // cleared by the caller (vmCreate rollback / process teardown)
-        // before Vm.destroy runs.
-        var i: u32 = 0;
-        while (i < self.num_vcpus) {
-            vcpu_mod.destroy(self.vcpus[i].ptr, @intCast(self.vcpus[i].gen));
-            i += 1;
-        }
-        self.num_vcpus = 0;
+pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
+    _ = policy_pf;
+    if (!vm_hw.vmSupported()) return error.NoDevice;
 
-        // Free guest memory mappings
-        self.guest_mem.deinit(self.arch_structures);
+    // EPT/NPT root has been allocated by allocStage2Root above and
+    // stored in `vm.guest_pt_root`. Both Intel (`vmx.allocVmcsWithEpt`)
+    // and AMD (`svm.allocVmcbWithNpt`) wire the externally-allocated
+    // stage-2 root into the per-VM control state.
+    const ctrl_phys = vm_hw.allocVmCtrlState(vm.guest_pt_root) orelse
+        return error.NoDevice;
 
-        // Free arch-specific structures
-        if (self.arch_structures.addr != 0) {
-            vm_hw.vmFreeStructures(self.arch_structures);
-        }
+    // Pin the per-VM control PAddr in a heap-resident *anyopaque so
+    // the dispatch contract returns a stable pointer. The pointer is
+    // currently a tagged-PAddr cell (single u64) and is freed by
+    // freeVmArchState. If/when the per-VM control state grows to a
+    // larger struct (kernel LAPIC/IOAPIC state, exit_box, etc.) this
+    // is the seam to swap to a slab allocation.
+    const cell = pmm.global_pmm.?.create(CtrlStateCell) catch {
+        vm_hw.vmFreeStructures(ctrl_phys);
+        return error.OutOfMemory;
+    };
+    cell.* = .{ .ctrl_phys = ctrl_phys };
+    return @ptrCast(cell);
+}
 
-        // Clear owner's vm pointer. The owning Process is the caller of
-        // the syscall that ended up here (vmCreate rollback or teardown
-        // from process exit), so the slot is guaranteed live — but take
-        // the gen-lock for correctness rather than reaching through
-        // `.ptr`.
-        if (self.owner.lock()) |proc| {
-            proc.vm = null;
-            self.owner.unlock();
-        } else |_| {}
+pub fn freeVmArchState(vm: *VirtualMachine) void {
+    const erased = vm.arch_state orelse return;
+    const cell: *CtrlStateCell = @ptrCast(@alignCast(erased));
+    vm_hw.vmFreeStructures(cell.ctrl_phys);
+    pmm.global_pmm.?.destroy(cell);
+    vm.arch_state = null;
+}
 
-        slab_instance.destroy(self, carried_gen) catch unreachable;
-    }
-
-    /// Returns a pointer to the VM's exit box. Used by `vcpu` and
-    /// `exit_handler` so neither has to know the box lives inside `Vm`.
-    pub fn exitBox(self: *Vm) *VmExitBox {
-        return &self.exit_box;
-    }
-
-    /// Inject an external-interrupt vector into the LAPIC IRR. Routes
-    /// `vm_vcpu_interrupt` and IOAPIC delivery through a single Vm-level entry.
-    pub fn injectExternal(self: *Vm, vector: u8) void {
-        self.lapic.injectExternal(vector);
-    }
-
-    /// Advance every kernel-managed interrupt-controller timer by `elapsed_ns`.
-    /// Called from the vCPU entry loop before each VMRUN.
-    pub fn tickInterruptControllers(self: *Vm, elapsed_ns: u64) void {
-        self.lapic.tick(elapsed_ns);
-    }
-
-    /// If the LAPIC has a deliverable pending vector and the guest is ready
-    /// to accept it (IF=1, no prior pending EVENTINJ), build the EVENTINJ
-    /// word, mark the vector accepted in the LAPIC, and return.
-    /// AMD APM Vol 2, Section 15.20, Figure 15-4.
-    pub fn deliverPendingInterrupts(self: *Vm, gs: *vm_hw.GuestState) void {
-        const vector = self.lapic.getPendingVector() orelse return;
-        const guest_if = gs.rflags & (1 << 9);
-        if (guest_if == 0 or gs.pending_eventinj != 0) return;
-        gs.pending_eventinj = @as(u64, vector) | (1 << 31);
-        self.lapic.acceptInterrupt(vector);
-    }
-
-    /// If `guest_phys` falls inside the in-kernel LAPIC or IOAPIC page,
-    /// decode the instruction at guest RIP, dispatch the access to the
-    /// matching controller, write any read result back into the guest GPR,
-    /// and advance RIP. Returns true if handled (the exit can be resumed
-    /// inline) or false if it should fall through to the VMM.
-    pub fn tryHandleMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
-        if (guest_phys >= LAPIC_BASE and guest_phys < LAPIC_BASE + 0x1000) {
-            return self.handleLapicMmio(vcpu_obj, guest_phys);
-        }
-        if (guest_phys >= IOAPIC_BASE and guest_phys < IOAPIC_BASE + 0x1000) {
-            return self.handleIoapicMmio(vcpu_obj, guest_phys);
-        }
-        return false;
-    }
-
-    fn handleLapicMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
-        const op = mmio_decode.decode(self, &vcpu_obj.guest_state) orelse return false;
-        const offset: u32 = @truncate(guest_phys - LAPIC_BASE);
-        if (op.is_write) {
-            self.lapic.mmioWrite(offset, op.value);
-        } else {
-            const value = self.lapic.mmioRead(offset);
-            mmio_decode.writeGpr(&vcpu_obj.guest_state, op.reg, @as(u64, value));
-        }
-        vcpu_obj.advanceRip(op.len);
-        return true;
-    }
-
-    fn handleIoapicMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
-        const op = mmio_decode.decode(self, &vcpu_obj.guest_state) orelse return false;
-        const offset: u32 = @truncate(guest_phys - IOAPIC_BASE);
-        if (op.is_write) {
-            self.ioapic.mmioWrite(offset, op.value);
-        } else {
-            const value = self.ioapic.mmioRead(offset);
-            mmio_decode.writeGpr(&vcpu_obj.guest_state, op.reg, @as(u64, value));
-        }
-        vcpu_obj.advanceRip(op.len);
-        return true;
-    }
-
-    /// Translate a guest-physical address backed by the main RAM region into
-    /// a host pointer. Returns null if the main-RAM-at-guest-phys-0 mapping
-    /// has not been established yet, or `[phys, phys+len)` is out of bounds.
-    /// Single home for guest-phys → host-VA arithmetic so the bookkeeping
-    /// fields stay private to `Vm`.
-    pub fn guestPhysToHost(self: *const Vm, phys: u64, len: usize) ?[*]u8 {
-        if (self.guest_ram_host_base == 0) return null;
-        if (self.guest_ram_size < len) return null;
-        if (phys > self.guest_ram_size - len) return null;
-        return @ptrFromInt(self.guest_ram_host_base + phys);
-    }
-
-    /// Read a slice from guest physical memory via the main RAM mapping.
-    /// Convenience wrapper around `guestPhysToHost`.
-    pub fn readGuestPhysSlice(self: *const Vm, phys: u64, len: usize) ?[]const u8 {
-        const ptr = self.guestPhysToHost(phys, len) orelse return null;
-        return ptr[0..len];
-    }
+/// Per-VM control-state envelope returned from `allocVmArchState`.
+/// Page-sized + page-aligned so it fits the PMM's `create`/`destroy`
+/// contract; the only payload today is the VMCS/VMCB physical address.
+/// Future arch-specific per-VM state (kernel LAPIC/IOAPIC,
+/// MSRPM/IOPM bookkeeping, exit_box, etc.) is the natural occupant of
+/// the rest of the page.
+pub const CtrlStateCell = extern struct {
+    ctrl_phys: PAddr align(paging.PAGE4K),
+    _pad: [paging.PAGE4K - @sizeOf(PAddr)]u8 = undefined,
 };
 
-/// Syscall implementation: create a VM for the calling process.
-pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_PERM: i64 = -2;
-    const E_NOMEM: i64 = -4;
-    const E_MAXCAP: i64 = -5;
-    const E_BADADDR: i64 = -7;
-    const E_NODEV: i64 = -13;
+comptime {
+    std.debug.assert(@sizeOf(CtrlStateCell) == paging.PAGE4K);
+    std.debug.assert(@alignOf(CtrlStateCell) == paging.PAGE4K);
+}
 
-    // Check ProcessRights.vm_create on slot 0
-    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
-    if (!self_entry.processRights().vm_create) return E_PERM;
+// Stage-2 paging: routes to the existing low-level VMX/SVM EPT/NPT
+// primitives. The dispatch contract takes a `*VirtualMachine` so the
+// arch backend can fetch the per-VM control state (VMCS/VMCB) from
+// `vm.arch_state`'s CtrlStateCell — `mapEptPage`/`unmapEptPage` then
+// VMPTRLD that PAddr to read the EPTP and walk the EPT. Spec
+// §[virtual_machine].map_guest / unmap_guest. The `sz` parameter is
+// currently honored only for 4K (the only encoding the underlying
+// EPT walker installs as a leaf today); larger page sizes will need
+// 2M/1G leaf support before they can be passed through.
 
-    // Check hardware support
-    if (!vm_hw.vmSupported()) return E_NODEV;
+fn ctrlPhysFor(vm: *VirtualMachine) ?PAddr {
+    const erased = vm.arch_state orelse return null;
+    const cell: *CtrlStateCell = @ptrCast(@alignCast(erased));
+    return cell.ctrl_phys;
+}
 
-    // Validate arguments
-    if (vcpu_count == 0 or vcpu_count > MAX_VCPUS) return E_INVAL;
-    if (proc.vm != null) return E_INVAL;
+pub fn stage2MapPage(
+    vm: *VirtualMachine,
+    guest_phys: u64,
+    host_phys: PAddr,
+    sz: VarPageSize,
+    perms: MemoryPerms,
+) !void {
+    _ = sz;
+    const ctrl_phys = ctrlPhysFor(vm) orelse return error.NoDevice;
+    const rights: u8 = @bitCast(perms);
+    try vm_hw.mapGuestPage(ctrl_phys, guest_phys, host_phys, rights);
+}
 
-    // Check we have room in perm table for all vCPU thread handles + 1 VM handle
-    if (proc.perm_count + vcpu_count + 1 > zag.proc.process.MAX_PERMS) return E_MAXCAP;
+pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) void {
+    _ = sz;
+    const ctrl_phys = ctrlPhysFor(vm) orelse return;
+    vm_hw.unmapGuestPage(ctrl_phys, guest_phys);
+}
 
-    // Read policy from userspace via physmap, handling cross-page boundaries.
-    if (policy_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(policy_ptr)) return E_BADADDR;
-    var policy_buf: [@sizeOf(vm_hw.VmPolicy)]u8 = undefined;
-    if (!readUserStruct(proc, policy_ptr, &policy_buf)) return E_BADADDR;
-    const user_policy = std.mem.bytesAsValue(vm_hw.VmPolicy, &policy_buf);
+pub fn invalidateStage2Range(
+    vm: *VirtualMachine,
+    guest_phys: u64,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    // `unmapGuestPage` already invokes INVEPT/INVNPT on the current core
+    // for each leaf removed; cross-core shootdown lives in a future TLB
+    // shootdown machinery (no live vCPUs in the spec-v3 smoke path).
+    _ = vm;
+    _ = guest_phys;
+    _ = sz;
+    _ = page_count;
+}
 
-    // Reject oversized policy counts -- a malicious VMM could otherwise
-    // cause lookupCpuidPolicy/lookupCrPolicy to OOB-read the policy struct.
-    if (user_policy.num_cpuid_responses > vm_hw.VmPolicy.MAX_CPUID_POLICIES) return E_INVAL;
-    if (user_policy.num_cr_policies > vm_hw.VmPolicy.MAX_CR_POLICIES) return E_INVAL;
+/// Spec §[vm_set_policy] x86-64 — replace `cpuid_responses` (kind=0) or
+/// `cr_policies` (kind=1) on `vm`. The VmPolicy struct lives at offset 0
+/// of `vm.policy_pf` and is read on guest exits; this routine writes the
+/// new entries into that struct atomically (kernel-owned mapping; no
+/// concurrent reader since vCPU exits run on the same kernel-mode core
+/// that owns the syscall). Each entry is 3 vregs:
+///   kind=0: [3i+0]={leaf u32, subleaf u32}; [3i+1]={eax u32, ebx u32};
+///           [3i+2]={ecx u32, edx u32}.
+///   kind=1: [3i+0]={cr_num u8, _pad u8[7]}; [3i+1]=read_value u64;
+///           [3i+2]=write_mask u64.
+pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
+    const errors = zag.syscall.errors;
 
-    // Allocate VM struct
-    const vm_alloc = slab_instance.create() catch return E_NOMEM;
-    const vm_obj = vm_alloc.ptr;
-
-    // Allocate arch-specific structures
-    const arch_structures = vm_hw.vmAllocStructures() orelse {
-        slab_instance.destroy(vm_obj, vm_alloc.gen) catch unreachable;
-        return E_NOMEM;
+    // Spec §[vm_set_policy] test 03: count > MAX_<kind> ⇒ E_INVAL. The
+    // bound is per-(kind, arch); on x86-64 kind=0 is bounded by
+    // MAX_CPUID_POLICIES, kind=1 by MAX_CR_POLICIES.
+    const max: u32 = switch (kind) {
+        0 => vm_hw.VmPolicy.MAX_CPUID_POLICIES,
+        1 => vm_hw.VmPolicy.MAX_CR_POLICIES,
+        else => return errors.E_INVAL,
     };
+    if (@as(u32, count) > max) return errors.E_INVAL;
 
-    // Field-by-field init preserves `vm_obj._gen_lock` set by the slab
-    // allocator. A `.* = .{...}` would zero it.
-    vm_obj.vcpus = undefined;
-    vm_obj.num_vcpus = 0;
-    vm_obj.owner = slabRefNow(Process, proc);
-    vm_obj.exit_box = .{};
-    vm_obj.policy = user_policy.*;
-    vm_obj.vm_id = @atomicRmw(u64, &vm_id_counter, .Add, 1, .monotonic);
-    vm_obj.arch_structures = arch_structures;
-    vm_obj.guest_mem = .{};
-    vm_obj.guest_ram_host_base = 0;
-    vm_obj.guest_ram_size = 0;
-    vm_obj.lapic = .{};
-    vm_obj.ioapic = .{};
+    // Both x86-64 kinds occupy 3 vregs/entry per §[vm_set_policy]. The
+    // dispatch layer hands us the full vreg space above [1]; reject
+    // wires whose payload cannot supply `count * 3` vregs of entry data.
+    const VREGS_PER_ENTRY: usize = 3;
+    const need: usize = @as(usize, count) * VREGS_PER_ENTRY;
+    if (entries.len < need) return errors.E_INVAL;
 
-    // Initialize in-kernel LAPIC and IOAPIC emulation. The two devices
-    // notify each other through host-callback structs (`LapicHost` /
-    // `IoapicHost`) routed via the owning Vm rather than holding typed
-    // pointers at each other — that peer coupling was a module-import
-    // cycle (see `lapicNotifyLevelEoi` / `ioapicInjectExternal` below).
-    vm_obj.ioapic.init(.{
-        .ctx = vm_obj,
-        .injectExternal = ioapicInjectExternal,
-    });
-    vm_obj.lapic.init(.{
-        .ctx = vm_obj,
-        .notifyLevelEoi = lapicNotifyLevelEoi,
-    });
+    // The seeded VmPolicy lives at offset 0 of `policy_pf`; the kernel
+    // physmap exposes it via VAddr.fromPAddr. policy_pf is held for the
+    // VM's lifetime by capdom (§[create_virtual_machine]) so the pointer
+    // stays valid for as long as the VM is reachable from the syscall.
+    // self-alive: policy_pf refcount is held by the VM for its lifetime.
+    const pf_ref = vm.policy_pf orelse return errors.E_NODEV;
+    const pf = pf_ref.ptr;
+    const phys_va = VAddr.fromPAddr(pf.phys_base, null);
+    const policy_ptr: *vm_hw.VmPolicy = @ptrFromInt(phys_va.addr);
 
-    // Create vCPUs. Track each inserted perm-table handle so we can roll
-    // back on partial failure without leaking dangling thread handles.
-    var inserted_handles: [MAX_VCPUS]u64 = undefined;
-    var inserted_count: u32 = 0;
-    var i: u32 = 0;
-    while (i < vcpu_count) {
-        const vcpu_obj = vcpu_mod.create(vm_obj) catch {
-            // Cleanup already-inserted handles (before destroying their threads)
-            var k: u32 = 0;
-            while (k < inserted_count) {
-                proc.removePerm(inserted_handles[k]) catch {};
-                k += 1;
+    switch (kind) {
+        0 => {
+            var i: usize = 0;
+            while (i < @as(usize, count)) {
+                const w0 = entries[i * VREGS_PER_ENTRY + 0];
+                const w1 = entries[i * VREGS_PER_ENTRY + 1];
+                const w2 = entries[i * VREGS_PER_ENTRY + 2];
+                policy_ptr.cpuid_responses[i] = .{
+                    .leaf = @truncate(w0),
+                    .subleaf = @truncate(w0 >> 32),
+                    .eax = @truncate(w1),
+                    .ebx = @truncate(w1 >> 32),
+                    .ecx = @truncate(w2),
+                    .edx = @truncate(w2 >> 32),
+                };
+                i += 1;
             }
-            // Destroy already-created vCPUs. self-alive: the slots were
-            // allocated above in this loop and have not been freed.
-            var j: u32 = 0;
-            while (j < i) {
-                vcpu_mod.destroy(vm_obj.vcpus[j].ptr, @intCast(vm_obj.vcpus[j].gen));
-                j += 1;
+            policy_ptr.num_cpuid_responses = @as(u32, count);
+        },
+        1 => {
+            var i: usize = 0;
+            while (i < @as(usize, count)) {
+                const w0 = entries[i * VREGS_PER_ENTRY + 0];
+                const w1 = entries[i * VREGS_PER_ENTRY + 1];
+                const w2 = entries[i * VREGS_PER_ENTRY + 2];
+                policy_ptr.cr_policies[i] = .{
+                    .cr_num = @truncate(w0),
+                    .read_value = w1,
+                    .write_mask = w2,
+                };
+                i += 1;
             }
-            vm_hw.vmFreeStructures(arch_structures);
-            slab_instance.destroy(vm_obj, vm_alloc.gen) catch unreachable;
-            return E_NOMEM;
-        };
-
-        vm_obj.vcpus[i] = SlabRef(VCpu).init(vcpu_obj, vcpu_obj._gen_lock.currentGen());
-        vm_obj.num_vcpus = i + 1;
-
-        // Insert thread handle into caller's perm table. vcpu_obj was
-        // just returned by vcpu_mod.create; no other observer can hold
-        // a ref to it yet.
-        // self-alive: vcpu_obj is a fresh alloc.
-        const handle_id = proc.insertThreadHandle(vcpu_obj.thread.ptr, ThreadHandleRights.full) catch {
-            // Cleanup already-inserted handles
-            var k: u32 = 0;
-            while (k < inserted_count) {
-                proc.removePerm(inserted_handles[k]) catch {};
-                k += 1;
-            }
-            // Destroy all vCPUs including the one whose handle failed to insert.
-            // self-alive: slots were allocated in this loop and not freed.
-            var j: u32 = 0;
-            while (j <= i) {
-                vcpu_mod.destroy(vm_obj.vcpus[j].ptr, @intCast(vm_obj.vcpus[j].gen));
-                j += 1;
-            }
-            vm_hw.vmFreeStructures(arch_structures);
-            slab_instance.destroy(vm_obj, vm_alloc.gen) catch unreachable;
-            return E_MAXCAP;
-        };
-        inserted_handles[inserted_count] = handle_id;
-        inserted_count += 1;
-        i += 1;
+            policy_ptr.num_cr_policies = @as(u32, count);
+        },
+        else => unreachable,
     }
 
-    proc.vm = slabRefNow(Vm, vm_obj);
-
-    // Insert VM handle into caller's perm table
-    const vm_handle_id = proc.insertPerm(PermissionEntry{
-        .handle = 0, // will be assigned by insertPerm
-        .object = KernelObject{ .vm = slabRefNow(Vm, vm_obj) },
-        .rights = 0xFFFF,
-    }) catch {
-        // Cleanup on failure: remove all vCPU thread handles, destroy VM
-        var k: u32 = 0;
-        while (k < inserted_count) {
-            proc.removePerm(inserted_handles[k]) catch {};
-            k += 1;
-        }
-        vm_obj.destroy(vm_alloc.gen);
-        return E_MAXCAP;
-    };
-
-    return @bitCast(vm_handle_id);
+    return 0;
 }
 
-/// Syscall implementation: map host virtual memory into guest physical address space (EPT).
-pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-    const E_NOMEM: i64 = -4;
-    const E_BADADDR: i64 = -7;
-
-    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
-
-    if (size == 0) return E_INVAL;
-    if (!std.mem.isAligned(guest_addr, 0x1000)) return E_INVAL;
-    if (!std.mem.isAligned(size, 0x1000)) return E_INVAL;
-    if (rights > 0x7) return E_INVAL; // only read/write/execute bits
-    if (!std.mem.isAligned(host_vaddr, 0x1000)) return E_INVAL;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(host_vaddr)) return E_BADADDR;
-
-    // Reject any (guest_addr, size) whose sum wraps u64. Without this
-    // check:
-    //   - In safety-checked builds, `guest_addr + size` below panics
-    //     the kernel from unprivileged userspace (single-syscall DoS
-    //     reachable by any process with vm_create rights).
-    //   - In unchecked builds, the sum wraps and folds a wrapping
-    //     range down into a small inner `guest_end`, so the
-    //     LAPIC/IOAPIC overlap check below can return false even when
-    //     the wrap-covered range includes one of those pages. The
-    //     recorded GuestMemory region would also have
-    //     guest_phys_start + size > 2^64, which deinit then sweeps by
-    //     wrapping into unrelated guest-phys pages.
-    const guest_end = std.math.add(u64, guest_addr, size) catch return E_INVAL;
-
-    // Guard LAPIC and IOAPIC pages -- these are handled in-kernel and
-    // must always NPT-fault to the kernel exit handler. Proper interval
-    // overlap check: [guest_addr, guest_end) vs [base, base+0x1000).
-    if (guest_addr < LAPIC_BASE + 0x1000 and guest_end > LAPIC_BASE) return E_INVAL;
-    if (guest_addr < IOAPIC_BASE + 0x1000 and guest_end > IOAPIC_BASE) return E_INVAL;
-
-    vm_obj._gen_lock.lock();
-    defer vm_obj._gen_lock.unlock();
-
-    // Walk host pages and map each into guest EPT. Track progress for
-    // rollback on partial failure.
-    var offset: u64 = 0;
-    while (offset < size) {
-        const vaddr = VAddr.fromInt(host_vaddr + offset);
-        // Pre-fault demand-paged host pages before resolving their physical address.
-        proc.vmm.demandPage(vaddr, false, false) catch {
-            rollbackGuestMap(vm_obj, guest_addr, offset);
-            return E_BADADDR;
-        };
-        const host_phys = arch_paging.resolveVaddr(proc.addr_space_root, vaddr) orelse {
-            rollbackGuestMap(vm_obj, guest_addr, offset);
-            return E_BADADDR;
-        };
-        vm_hw.mapGuestPage(vm_obj.arch_structures, guest_addr + offset, host_phys, @truncate(rights)) catch {
-            rollbackGuestMap(vm_obj, guest_addr, offset);
-            return E_NOMEM;
-        };
-        offset += 0x1000;
+/// Inject (assert/de-assert) a virtual IRQ line on the VM's emulated
+/// IOAPIC. The kernel-internal IOAPIC (kvm/ioapic.zig) exposes
+/// `NUM_REDIR_ENTRIES` (24) redirection entries per Intel 82093AA
+/// Section 3.0; any `irq_num` beyond that range cannot be emulated
+/// and must be rejected with E_INVAL per Spec §[vm_inject_irq] test 02.
+/// Returns 0 on success.
+/// If `guest_phys` falls inside the kernel-emulated LAPIC or IOAPIC
+/// MMIO page, decode the instruction at guest RIP, dispatch the access
+/// to the matching controller, write any read result back into the
+/// guest GPR, advance RIP past the decoded instruction, and return
+/// true so the run loop can re-enter the guest inline. Returns false
+/// if `guest_phys` is outside both ranges or the instruction can't be
+/// decoded — the exit then falls through to the VMM as a normal
+/// `ept_violation` delivery.
+pub fn tryHandleMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
+    if (guest_phys >= LAPIC_BASE and guest_phys < LAPIC_BASE + 0x1000) {
+        return handleLapicMmio(vm, vcpu_ec, guest_phys);
     }
-
-    // Record the region only after all pages are successfully mapped.
-    vm_obj.guest_mem.addRegion(guest_addr, size, @truncate(rights)) catch {
-        rollbackGuestMap(vm_obj, guest_addr, size);
-        return E_NOMEM;
-    };
-
-    // Track the main guest RAM region for MMIO instruction decode.
-    // First vm_guest_map at guest_addr=0 is typically the main RAM region.
-    if (vm_obj.guest_ram_host_base == 0 and guest_addr == 0) {
-        vm_obj.guest_ram_host_base = host_vaddr;
-        vm_obj.guest_ram_size = size;
+    if (guest_phys >= IOAPIC_BASE and guest_phys < IOAPIC_BASE + 0x1000) {
+        return handleIoapicMmio(vm, vcpu_ec, guest_phys);
     }
-
-    return 0; // E_OK
+    return false;
 }
 
-/// Unmap pages that were successfully mapped during a partial guestMap.
-fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
-    var off: u64 = 0;
-    while (off < mapped_size) {
-        vm_hw.unmapGuestPage(vm_obj.arch_structures, guest_addr + off);
-        off += 0x1000;
+fn handleLapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
+    const arch_state = zag.arch.x64.kvm.vcpu.archStateOf(vcpu_ec) orelse return false;
+    const gs = &arch_state.guest_state;
+    const op = mmio_decode.decode(vm, gs) orelse return false;
+    const offset: u32 = @truncate(guest_phys - LAPIC_BASE);
+    if (op.is_write) {
+        vm.lapic.mmioWrite(offset, op.value);
+    } else {
+        const value = vm.lapic.mmioRead(offset);
+        mmio_decode.writeGpr(gs, op.reg, @as(u64, value));
     }
-}
-
-/// Syscall implementation: allow/deny system-register passthrough for the
-/// calling process's VM. On x86 a "sysreg" is an MSR — `sysreg_id` is the
-/// 32-bit MSR address. Modifies MSRPM bits in the VMCB. Refuses
-/// security-critical MSRs.
-pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_read: bool, allow_write: bool) i64 {
-    const E_BADCAP: i64 = -3;
-    const E_PERM: i64 = -2;
-
-    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
-
-    // Refuse security-critical MSRs that must always be intercepted.
-    if (isSecurityCriticalSysreg(sysreg_id)) return E_PERM;
-
-    // Serialize the MSRPM bitwise RMW -- multiple threads in the same
-    // process could otherwise race.
-    vm_obj._gen_lock.lock();
-    defer vm_obj._gen_lock.unlock();
-
-    // Access the MSRPM via the VMCB.
-    vm_hw.sysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
-    return 0; // E_OK
-}
-
-/// Syscall implementation: assert an IRQ line on the in-kernel interrupt
-/// controller (x86: IOAPIC).
-pub fn intcAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-
-    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
-    if (irq_num >= 24) return E_INVAL;
-    vm_obj._gen_lock.lock();
-    defer vm_obj._gen_lock.unlock();
-    vm_obj.ioapic.assertIrq(@truncate(irq_num));
-    kickRunningVcpus(vm_obj);
-    return 0; // E_OK
-}
-
-/// Syscall implementation: de-assert an IRQ line on the in-kernel interrupt
-/// controller (x86: IOAPIC).
-pub fn intcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
-    const E_INVAL: i64 = -1;
-    const E_BADCAP: i64 = -3;
-
-    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
-    if (irq_num >= 24) return E_INVAL;
-    vm_obj._gen_lock.lock();
-    defer vm_obj._gen_lock.unlock();
-    vm_obj.ioapic.deassertIrq(@truncate(irq_num));
-    kickRunningVcpus(vm_obj);
-    return 0; // E_OK
-}
-
-/// Send an IPI to any core currently running a vCPU thread for this VM,
-/// forcing a VMEXIT so the vCPU re-enters VMRUN and checks pending interrupts.
-fn kickRunningVcpus(vm_obj: *Vm) void {
-    for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |vcpu_ref| {
-        const vcpu_obj = vcpu_ref.lock() catch continue;
-        defer vcpu_ref.unlock();
-        if (vcpu_obj.loadState() == .running) {
-            const thread = vcpu_obj.thread.lock() catch continue;
-            defer vcpu_obj.thread.unlock();
-            if (sched.coreRunning(thread)) |core_id| {
-                apic.sendSchedulerIpi(core_id);
-            }
-        }
-    }
-}
-
-/// Resolve a VM handle from the process's perm table. Returns the *Vm or null.
-fn resolveVmHandle(proc: *Process, vm_handle: u64) ?*Vm {
-    const entry = proc.getPermByHandle(vm_handle) orelse return null;
-    return switch (entry.object) {
-        .vm => |r| r.ptr,
-        else => null,
-    };
-}
-
-/// Read a struct from userspace into a kernel buffer, handling cross-page boundaries.
-fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
-    // Enforce full-range user-partition membership locally. The
-    // per-page walk below advances `src_va` across page boundaries
-    // without re-checking, and the point check at the caller is not
-    // enough to keep a near-top-of-user buffer from spilling into
-    // the kernel half.
-    const end = std.math.add(u64, user_va, buf.len) catch return false;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(user_va)) return false;
-    if (end != user_va and !zag.memory.address.AddrSpacePartition.user.contains(end - 1)) return false;
-
-    var remaining: usize = buf.len;
-    var dst_off: usize = 0;
-    var src_va: u64 = user_va;
-    while (remaining > 0) {
-        const page_off = src_va & 0xFFF;
-        const chunk = @min(remaining, paging.PAGE4K - page_off);
-        proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const page_paddr = arch_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
-        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
-        const src: [*]const u8 = @ptrFromInt(physmap_addr);
-        @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
-        dst_off += chunk;
-        src_va += chunk;
-        remaining -= chunk;
-    }
+    gs.rip += op.len;
     return true;
 }
 
-/// AMD APM Vol 2, §15.10; Intel SDM Vol 3C, §25.6.9.
-/// MSRs that must always be intercepted by the hypervisor.
-///
-/// FS_BASE (0xC0000100) and GS_BASE (0xC0000101) are intentionally
-/// NOT in this list. On SVM the VMCB host-state save area saves and
-/// restores both across VMRUN, and on VMX the host-state MSR fields
-/// do the same; real guests (Linux) write these on every task
-/// switch, so forcing an intercept here collapses scheduler
-/// throughput without buying any ring-0 protection. KERNEL_GS_BASE
-/// is different: it survives SWAPGS and the host depends on it for
-/// per-CPU data, which is why that one stays intercepted.
-fn isSecurityCriticalSysreg(msr: u32) bool {
-    return switch (msr) {
-        0xC0000080, // EFER
-        0xC0000081, // STAR
-        0xC0000082, // LSTAR
-        0xC0000083, // CSTAR
-        0xC0000084, // SFMASK
-        0x1B, // APIC_BASE
-        0xC0000102, // KERNEL_GS_BASE
-        0x174, // SYSENTER_CS
-        0x175, // SYSENTER_ESP
-        0x176, // SYSENTER_EIP
-        => true,
-        else => false,
-    };
+fn handleIoapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
+    const arch_state = zag.arch.x64.kvm.vcpu.archStateOf(vcpu_ec) orelse return false;
+    const gs = &arch_state.guest_state;
+    const op = mmio_decode.decode(vm, gs) orelse return false;
+    const offset: u32 = @truncate(guest_phys - IOAPIC_BASE);
+    if (op.is_write) {
+        vm.ioapic.mmioWrite(offset, op.value);
+    } else {
+        const value = vm.ioapic.mmioRead(offset);
+        mmio_decode.writeGpr(gs, op.reg, @as(u64, value));
+    }
+    gs.rip += op.len;
+    return true;
 }
 
-// ── Cross-device routing trampolines ─────────────────────────────────
-// `Lapic` and `Ioapic` used to hold typed pointers at each other, which
-// made `kvm/lapic.zig` and `kvm/ioapic.zig` import each other. These
-// trampolines sit on the Vm side (which already owns both) so the
-// device files stay free of peer imports.
-
-fn lapicNotifyLevelEoi(ctx: *anyopaque, vector: u8) void {
-    const vm_obj: *Vm = @ptrCast(@alignCast(ctx));
-    vm_obj.ioapic.handleEOI(vector);
-}
-
-fn ioapicInjectExternal(ctx: *anyopaque, vector: u8) void {
-    const vm_obj: *Vm = @ptrCast(@alignCast(ctx));
-    vm_obj.lapic.injectExternal(vector);
+pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
+    if (irq_num >= ioapic_mod.NUM_REDIR_ENTRIES)
+        return zag.syscall.errors.E_INVAL;
+    const irq_pin: u5 = @intCast(irq_num);
+    if (assert) {
+        vm.ioapic.assertIrq(irq_pin);
+    } else {
+        vm.ioapic.deassertIrq(irq_pin);
+    }
+    return 0;
 }

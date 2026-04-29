@@ -21,7 +21,7 @@
 //!
 //! Dispatch interface mapping:
 //!   isAvailable()          → true if IORT contains an SMMU node
-//!   mapDmaPages(dev, shm)  → create stage-2 mapping for device's stream ID
+//!   mapDmaPages(dev, frame) → create stage-2 mapping for device's stream ID
 //!   unmapDmaPages(...)     → remove stage-2 mapping, invalidate IOTLB
 //!   enableTranslation()    → set SMMU_CR0.SMMUEN (SMMUv3) or SMMU_sCR0 (SMMUv2)
 //!
@@ -32,8 +32,10 @@
 
 const zag = @import("zag");
 
-const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const SharedMemory = zag.memory.shared.SharedMemory;
+const MemoryPerms = zag.memory.address.MemoryPerms;
+const PAddr = zag.memory.address.PAddr;
+const SpecDeviceRegion = zag.devices.device_region.DeviceRegion;
+const VarPageSize = zag.capdom.var_range.PageSize;
 
 // SMMU driver is not yet implemented. QEMU `virt` does not expose an IORT
 // SMMU node by default, and the kernel test rig does not need real stage-2
@@ -46,25 +48,41 @@ const SharedMemory = zag.memory.shared.SharedMemory;
 // the cursor-race patches stay observable. No hardware page tables are
 // touched, so this is equivalent to the x86 "iommu=off" path that x86
 // routerOS uses under QEMU without VT-d.
-pub fn isAvailable() bool {
-    return true;
-}
-
-pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
-    device._gen_lock.lock();
-    defer device._gen_lock.unlock();
-    shm._gen_lock.lock();
-    defer shm._gen_lock.unlock();
-
-    const base_dma = device.detail.pci.dma_cursor;
-    device.detail.pci.dma_cursor = base_dma + @as(u64, shm.num_pages) * 0x1000;
-    return base_dma;
-}
-
-pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void {
+pub fn iommuMapPage(
+    device: *SpecDeviceRegion,
+    iova: u64,
+    phys: PAddr,
+    sz: VarPageSize,
+    perms: MemoryPerms,
+) !void {
     _ = device;
-    _ = dma_base;
-    _ = num_pages;
+    _ = iova;
+    _ = phys;
+    _ = sz;
+    _ = perms;
+    @panic("not implemented");
 }
 
-pub fn enableTranslation() void {}
+pub fn iommuUnmapPage(
+    device: *SpecDeviceRegion,
+    iova: u64,
+    sz: VarPageSize,
+) ?PAddr {
+    _ = device;
+    _ = iova;
+    _ = sz;
+    @panic("not implemented");
+}
+
+pub fn invalidateIotlbRange(
+    device: *SpecDeviceRegion,
+    iova: u64,
+    sz: VarPageSize,
+    page_count: u32,
+) void {
+    _ = device;
+    _ = iova;
+    _ = sz;
+    _ = page_count;
+    @panic("not implemented");
+}

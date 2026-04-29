@@ -3,7 +3,6 @@
 /// Detects CPU vendor at boot via CPUID and dispatches all VM operations
 /// to the appropriate backend. Follows the same pattern as iommu.zig
 /// (Intel VT-d vs AMD-Vi runtime dispatch).
-const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
@@ -85,23 +84,6 @@ pub const GuestState = extern struct {
     };
 };
 
-/// FXSAVE area (512 bytes, must be 16-byte aligned).
-/// Used to save/restore FPU/SSE state across VM transitions.
-pub const FxsaveArea = [512]u8;
-
-/// Return an FxsaveArea initialized with default x87/SSE state:
-/// FCW=0x037F (x87 default), MXCSR=0x1F80 (SSE default, all exceptions masked).
-pub fn fxsaveInit() FxsaveArea {
-    var area: FxsaveArea = .{0} ** 512;
-    // FCW at offset 0 (2 bytes, little-endian)
-    area[0] = 0x7F;
-    area[1] = 0x03;
-    // MXCSR at offset 24 (4 bytes, little-endian)
-    area[24] = 0x80;
-    area[25] = 0x1F;
-    return area;
-}
-
 /// Tagged union of x64 VM exit reasons.
 pub const VmExitInfo = union(enum) {
     cpuid: CpuidExit,
@@ -162,6 +144,22 @@ pub const VmExitInfo = union(enum) {
         error_code: u64,
     };
 };
+
+/// FXSAVE area (512 bytes, 16-byte aligned) for guest FP/SIMD save/restore.
+pub const FxsaveArea = [512]u8;
+
+/// Return an FxsaveArea initialized with default x87/SSE state:
+/// FCW=0x037F (x87 default), MXCSR=0x1F80 (SSE default, all exceptions masked).
+pub fn fxsaveInit() FxsaveArea {
+    var area: FxsaveArea = .{0} ** 512;
+    // FCW at offset 0 (2 bytes, little-endian)
+    area[0] = 0x7F;
+    area[1] = 0x03;
+    // MXCSR at offset 24 (4 bytes, little-endian)
+    area[24] = 0x80;
+    area[25] = 0x1F;
+    return area;
+}
 
 /// Interrupt to inject into a guest vCPU.
 pub const GuestInterrupt = extern struct {
@@ -267,42 +265,6 @@ pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr, guest_fxsave: *alig
     };
 }
 
-/// Allocate and initialize arch-specific per-VM structures (e.g. VMCS, EPT root).
-pub fn vmAllocStructures() ?PAddr {
-    return switch (active_backend) {
-        .intel_vmx => vmx.allocVmStructures(),
-        .amd_svm => svm.allocVmStructures(),
-        .none => null,
-    };
-}
-
-/// Free arch-specific per-VM structures.
-pub fn vmFreeStructures(paddr: PAddr) void {
-    switch (active_backend) {
-        .intel_vmx => vmx.freeVmStructures(paddr),
-        .amd_svm => svm.freeVmStructures(paddr),
-        .none => {},
-    }
-}
-
-/// Map a guest physical page in the arch-specific guest memory translation structures.
-pub fn mapGuestPage(vm_structures: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8) !void {
-    switch (active_backend) {
-        .intel_vmx => try vmx.mapEptPage(vm_structures, guest_phys, host_phys, rights),
-        .amd_svm => try svm.mapNptPage(vm_structures, guest_phys, host_phys, rights),
-        .none => return error.NoVmSupport,
-    }
-}
-
-/// Unmap a guest physical page from the arch-specific guest memory translation structures.
-pub fn unmapGuestPage(vm_structures: PAddr, guest_phys: u64) void {
-    switch (active_backend) {
-        .intel_vmx => vmx.unmapEptPage(vm_structures, guest_phys),
-        .amd_svm => svm.unmapNptPage(vm_structures, guest_phys),
-        .none => {},
-    }
-}
-
 /// Inject a virtual interrupt into the guest.
 pub fn injectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
     switch (active_backend) {
@@ -326,7 +288,73 @@ pub fn injectException(guest_state: *GuestState, exception: GuestException) void
 pub fn sysregPassthrough(vm_structures: PAddr, sysreg_id: u32, allow_read: bool, allow_write: bool) void {
     switch (active_backend) {
         .amd_svm => svm.msrPassthrough(vm_structures, sysreg_id, allow_read, allow_write),
-        .intel_vmx => {}, // TODO: VMX MSR bitmap support
+        // Intel VMX MSR bitmap support is configured via VMCS bits at
+        // initVmcs time; per-MSR runtime mutation is not yet wired here.
+        .intel_vmx => {},
+        .none => {},
+    }
+}
+
+/// Free arch-specific per-VM structures.
+///
+/// Spec-v3 split: this frees only the per-VM control state (VMCS on
+/// Intel, VMCB+IOPM+MSRPM on AMD). The stage-2 root is freed separately
+/// via `freeStage2RootPage`, so callers walking the spec-v3 dispatch
+/// path don't double-free the EPT/NPT root.
+pub fn vmFreeStructures(paddr: PAddr) void {
+    switch (active_backend) {
+        .intel_vmx => vmx.freeVmStructures(paddr),
+        .amd_svm => svm.freeVmcbOnly(paddr),
+        .none => {},
+    }
+}
+
+/// Allocate the stage-2 nested-paging root page (EPT PML4 / NPT PML4).
+/// Spec-v3 dispatch primitive — backs `kvm.vm.allocStage2Root`.
+pub fn allocStage2RootPage() ?PAddr {
+    return switch (active_backend) {
+        .intel_vmx => vmx.allocEptRoot(),
+        .amd_svm => svm.allocNptRoot(),
+        .none => null,
+    };
+}
+
+/// Free a stage-2 nested-paging root page allocated by
+/// `allocStage2RootPage`. TODO: walk and free intermediate tables.
+pub fn freeStage2RootPage(paddr: PAddr) void {
+    switch (active_backend) {
+        .intel_vmx => vmx.freeEptRoot(paddr),
+        .amd_svm => svm.freeNptRoot(paddr),
+        .none => {},
+    }
+}
+
+/// Allocate per-VM control state (VMCS / VMCB) wired to a pre-allocated
+/// stage-2 root. On Intel this returns the VMCS PAddr after VMCLEAR +
+/// VMPTRLD + `initVmcs(ept_root)`. On AMD this is not yet split out and
+/// returns null so the caller surfaces `error.NoDevice`.
+pub fn allocVmCtrlState(stage2_root: PAddr) ?PAddr {
+    return switch (active_backend) {
+        .intel_vmx => vmx.allocVmcsWithEpt(stage2_root),
+        .amd_svm => svm.allocVmcbWithNpt(stage2_root),
+        .none => null,
+    };
+}
+
+/// Map a guest physical page in the arch-specific guest memory translation structures.
+pub fn mapGuestPage(vm_structures: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8) !void {
+    switch (active_backend) {
+        .intel_vmx => try vmx.mapEptPage(vm_structures, guest_phys, host_phys, rights),
+        .amd_svm => try svm.mapNptPage(vm_structures, guest_phys, host_phys, rights),
+        .none => return error.NoVmSupport,
+    }
+}
+
+/// Unmap a guest physical page from the arch-specific guest memory translation structures.
+pub fn unmapGuestPage(vm_structures: PAddr, guest_phys: u64) void {
+    switch (active_backend) {
+        .intel_vmx => vmx.unmapEptPage(vm_structures, guest_phys),
+        .amd_svm => svm.unmapNptPage(vm_structures, guest_phys),
         .none => {},
     }
 }

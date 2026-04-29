@@ -7,23 +7,31 @@ const kprof = zag.kprof.trace_id;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
+const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
+const var_range = zag.capdom.var_range;
 
-const FaultReason = zag.perms.permissions.FaultReason;
-const MemoryPerms = zag.perms.memory.MemoryPerms;
+const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFaultContext = zag.arch.dispatch.cpu.PageFaultContext;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
-const VmNode = zag.memory.vmm.VmNode;
+
+/// Memory-fault sub-code carried in the event payload alongside
+/// `EventType.memory_fault` per spec §[event_type] table 1840 ("invalid
+/// read/write/execute, unmapped access, protection violation").
+const MemoryFaultSubcode = enum(u8) {
+    unmapped = 0,
+    invalid_read = 1,
+    invalid_write = 2,
+    invalid_execute = 3,
+    protection_fault = 4,
+};
 
 const KERNEL_PERMS = MemoryPerms{
-    .write_perm = .write,
-    .execute_perm = .no_execute,
-    .cache_perm = .write_back,
-    .global_perm = .global,
-    .privilege_perm = .kernel,
+    .read = true,
+    .write = true,
+    .exec = false,
 };
 
 fn demandPageKernel(faulting_virt: VAddr) void {
@@ -37,31 +45,29 @@ fn demandPageKernel(faulting_virt: VAddr) void {
         @panic("OOM in kernel demand page fault");
 
     const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
-    arch.paging.mapPage(kroot, phys, page_base, KERNEL_PERMS) catch
+    arch.paging.mapPage(kroot, phys, page_base, KERNEL_PERMS, .kernel_data) catch
         @panic("mapPage failed in kernel demand page fault");
 }
 
-fn accessReason(is_write: bool, is_exec: bool) FaultReason {
+/// Translate (is_write, is_exec) into the rwx triple consumed by
+/// `var_range.handlePageFault` (R=1, W=2, X=4 per spec §[var]).
+fn accessRwx(is_write: bool, is_exec: bool) u3 {
+    if (is_exec) return 0b100;
+    if (is_write) return 0b010;
+    return 0b001;
+}
+
+fn accessSubcode(is_write: bool, is_exec: bool) MemoryFaultSubcode {
     if (is_exec) return .invalid_execute;
     if (is_write) return .invalid_write;
     return .invalid_read;
-}
-
-fn guardPageReason(proc: anytype, node_start: u64) FaultReason {
-    const above_ref: SlabRef(VmNode) = proc.vmm.findNode(VAddr.fromInt(node_start + paging.PAGE4K)) orelse
-        return .stack_underflow;
-    const above = above_ref.lock() catch return .stack_underflow;
-    defer above_ref.unlock();
-    if (above.rights.write) {
-        return .stack_overflow;
-    }
-    return .stack_underflow;
 }
 
 pub fn handlePageFault(fault: *const PageFaultContext) void {
     kprof.enter(.handle_page_fault);
     defer kprof.exit(.handle_page_fault);
     kprof.point(.handle_page_fault, fault.faulting_address);
+
     const faulting_virt = VAddr.fromInt(fault.faulting_address);
     const is_kernel_privilege = fault.is_kernel_privilege;
     const is_user_va = faulting_virt.addr < address.AddrSpacePartition.user.end;
@@ -69,13 +75,23 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const is_exec = fault.is_exec;
 
     if (is_kernel_privilege and is_user_va) {
-        const thread = scheduler.currentThread() orelse @panic("kernel page fault on user VA with no current thread");
-        // self-alive: currentThread() on this core.
-        const proc = thread.process.ptr;
-        arch.boot.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={} rip=0x{x}\n", .{ proc.pid, fault.faulting_address, is_write, is_exec, fault.rip });
-        proc.kill(accessReason(is_write, is_exec));
+        // Kernel touched a user VA via a syscall accessor — surface as a
+        // memory_fault on the EC whose syscall triggered the access.
+        const ec = scheduler.currentEc() orelse
+            @panic("kernel page fault on user VA with no current EC");
+        port.fireMemoryFault(ec, @intFromEnum(accessSubcode(is_write, is_exec)), faulting_virt.addr);
         arch.cpu.enableInterrupts();
-        while (true) arch.cpu.halt();
+        scheduler.yieldTo(null);
+        // `fireMemoryFault`'s no-route fallback terminates `ec` and
+        // clears `current_ec`; if the run queue is empty, returning
+        // would iretq back into the now-stale faulting frame and re-
+        // enter exception handling with `currentEc() == null`. Hand
+        // control to `scheduler.run()` — it idles until an IRQ delivers
+        // more work, at which point dispatch via
+        // `loadEcContextAndReturn` resets `rsp` and abandons this
+        // kernel-stack frame.
+        if (scheduler.currentEc() == null) scheduler.run();
+        return;
     }
 
     if (is_kernel_privilege) {
@@ -98,100 +114,53 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         @panic("unexpected kernel page fault");
     }
 
-    const thread = scheduler.currentThread() orelse @panic("user page fault with no current thread");
-    // self-alive: currentThread() on this core; owning Process
-    // is alive for the full fault-handler scope.
-    const proc = thread.process.ptr;
+    const ec = scheduler.currentEc() orelse
+        @panic("user page fault with no current EC");
 
-    const node_ref: SlabRef(VmNode) = proc.vmm.findNode(faulting_virt) orelse {
-        arch.boot.print("K: USER_PF pid={d} addr=0x{x} w={} x={}\n", .{ proc.pid, faulting_virt.addr, is_write, is_exec });
-        if (proc.faultBlock(thread, .unmapped_access, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-            arch.cpu.enableInterrupts();
-            scheduler.yield();
-            return;
-        }
-        proc.kill(.unmapped_access);
+    // Per-PF debug print intentionally elided. Every demand-page
+    // operation hits this path; the in-kernel-parallel test runner
+    // spawns hundreds of tests whose initial ELF load each triggers
+    // many PFs, and the resulting print storm (a) inflates each PF
+    // handler's kernel-stack frame by the bufPrint formatter buffer
+    // and (b) serialised the runner against print_lock under load
+    // hard enough to mask real errors. If userland PF tracing is
+    // wanted, gate it on a runtime flag rather than a default-on log.
+
+    const dom_ref = ec.domain;
+    const dom_lr = dom_ref.lockIrqSave(@src()) catch {
+        // Domain torn down between exception entry and here — fire
+        // memory_fault so the no-route fallback retires the EC.
+        port.fireMemoryFault(ec, @intFromEnum(MemoryFaultSubcode.unmapped), faulting_virt.addr);
         arch.cpu.enableInterrupts();
-        while (true) arch.cpu.halt();
+        scheduler.yieldTo(null);
+        // See the kernel-on-user-VA branch above: the no-route fallback
+        // drains `current_ec`; if no other EC is ready we MUST not iretq
+        // back to the stale faulting frame.
+        if (scheduler.currentEc() == null) scheduler.run();
+        return;
     };
-    const node = node_ref.lock() catch {
-        // Node was freed out from under us (e.g. concurrent revoke).
-        // Treat like "no mapping".
-        if (proc.faultBlock(thread, .unmapped_access, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-            arch.cpu.enableInterrupts();
-            scheduler.yield();
-            return;
-        }
-        proc.kill(.unmapped_access);
+    const dom = dom_lr.ptr;
+
+    const rc = var_range.handlePageFault(dom, faulting_virt, accessRwx(is_write, is_exec));
+    dom_ref.unlockIrqRestore(dom_lr.irq_state);
+
+    // Spec v3 var_range.handlePageFault returns 0 on a resolved fault
+    // (demand alloc, MMIO/port-IO virtualization, etc.). Any non-zero
+    // return — E_BADADDR (no covering VAR), E_PERM (rights mismatch),
+    // E_NOMEM (demand alloc exhausted) — routes through the EC's
+    // memory_fault event. fireMemoryFault either suspends the EC on the
+    // bound port or applies the no-route fallback (restart or destroy
+    // the owning domain) per spec §[event_route]. Either outcome leaves
+    // this EC unrunnable, so yield the CPU after firing.
+    if (rc != 0) {
+        const subcode = if (rc == zag.syscall.errors.E_BADADDR)
+            MemoryFaultSubcode.unmapped
+        else
+            accessSubcode(is_write, is_exec);
+        port.fireMemoryFault(ec, @intFromEnum(subcode), faulting_virt.addr);
         arch.cpu.enableInterrupts();
-        while (true) arch.cpu.halt();
-    };
-    defer node_ref.unlock();
-
-    switch (node.kind) {
-        .shared_memory, .mmio => {
-            const r = accessReason(is_write, is_exec);
-            if (proc.faultBlock(thread, r, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                arch.cpu.enableInterrupts();
-                scheduler.yield();
-                return;
-            }
-            proc.kill(r);
-            arch.cpu.enableInterrupts();
-            while (true) arch.cpu.halt();
-        },
-        .virtual_bar => {
-            // Virtual BAR faults should be intercepted by the arch-specific
-            // page fault handler. Reaching here means something unexpected
-            // happened (e.g., present-page protection fault).
-            if (proc.faultBlock(thread, .protection_fault, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                arch.cpu.enableInterrupts();
-                scheduler.yield();
-                return;
-            }
-            proc.kill(.protection_fault);
-            arch.cpu.enableInterrupts();
-            while (true) arch.cpu.halt();
-        },
-        .private => {
-            const rights_ok = blk: {
-                if (is_exec) break :blk node.rights.execute;
-                if (is_write) break :blk node.rights.write;
-                break :blk node.rights.read;
-            };
-
-            if (!rights_ok) {
-                const r2 = if (!node.rights.read and !node.rights.write and !node.rights.execute and node.size == paging.PAGE4K)
-                    guardPageReason(proc, node.start.addr)
-                else
-                    accessReason(is_write, is_exec);
-                if (proc.faultBlock(thread, r2, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                    arch.cpu.enableInterrupts();
-                    scheduler.yield();
-                    return;
-                }
-                proc.kill(r2);
-                arch.cpu.enableInterrupts();
-                while (true) arch.cpu.halt();
-            }
-
-            // Note: we do NOT pre-check arch.paging.resolveVaddr here. A concurrent
-            // syscall pre-fault on another CPU (readUserBytes, vmRecv, futex,
-            // sysinfo, pmu, proc_create, vCPU run) can install the PTE
-            // between the hardware raising #PF and us reaching this point.
-            // demandPage takes vmm.lock and has an "already backed" fast
-            // path, so the benign race becomes a silent no-op and the
-            // faulting instruction simply retries.
-            proc.vmm.demandPage(faulting_virt, is_write, is_exec) catch {
-                if (proc.faultBlock(thread, .out_of_memory, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                    arch.cpu.enableInterrupts();
-                    scheduler.yield();
-                    return;
-                }
-                proc.kill(.out_of_memory);
-                arch.cpu.enableInterrupts();
-                while (true) arch.cpu.halt();
-            };
-        },
+        scheduler.yieldTo(null);
+        // Same rationale as the kernel-on-user-VA branch.
+        if (scheduler.currentEc() == null) scheduler.run();
     }
 }

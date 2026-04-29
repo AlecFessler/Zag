@@ -1,986 +1,721 @@
+// Spec v3 vreg-ABI syscall wrappers. Architecture dispatch lives in
+// the arch backends (`syscall_x64.zig`, `syscall_aarch64.zig`). This
+// file owns the public API, the syscall-word encoding, and the per-
+// syscall wrappers — all of which are arch-neutral.
+//
+// `Regs` carries the lowest 13 vregs (v1..v13). On x86-64 these are
+// the only register-backed vregs; on aarch64 vregs 14..31 are also
+// register-backed (x13..x30) but no current libz call site populates
+// them, so `Regs` is intentionally not widened. A future spec tweak
+// that exposes vregs 14..31 to userspace would lift the API; until
+// then the narrow shape keeps both backends symmetric.
+
+const std = @import("std");
 const builtin = @import("builtin");
-const perms = @import("perms.zig");
 
-pub const PAGE4K: u64 = 4096;
-
-pub const SyscallResult2 = struct {
-    val: i64,
-    val2: u64,
+const arch_impl = switch (builtin.cpu.arch) {
+    .x86_64 => @import("syscall_x64.zig"),
+    .aarch64 => @import("syscall_aarch64.zig"),
+    else => @compileError("unsupported target architecture for libz syscall"),
 };
 
-pub const SyscallNum = enum(u64) {
-    write,
-    mem_reserve,
-    mem_perms,
-    mem_shm_create,
-    mem_shm_map,
-    mem_unmap,
-    mem_mmio_map,
-    _mem_mmio_unmap_removed,
-    proc_create,
-    thread_create,
-    thread_exit,
-    thread_yield,
-    set_affinity,
-    revoke_perm,
-    disable_restart,
-    futex_wait_val,
-    futex_wake,
-    clock_gettime,
-    ioport_read,
-    ioport_write,
-    mem_dma_map,
-    mem_dma_unmap,
-    set_priority,
-    ipc_send,
-    ipc_call,
-    ipc_recv,
-    ipc_reply,
-    shutdown,
-    thread_self,
-    thread_suspend,
-    thread_resume,
-    thread_kill,
-    fault_recv,
-    fault_reply,
-    fault_read_mem,
-    fault_write_mem,
-    fault_set_thread_mode,
-    vm_create,
-    vm_destroy,
-    vm_guest_map,
-    vm_recv,
-    vm_reply,
-    vm_vcpu_set_state,
-    vm_vcpu_get_state,
-    vm_vcpu_run,
-    vm_vcpu_interrupt,
-    vm_sysreg_passthrough,
-    vm_intc_assert_irq,
-    vm_intc_deassert_irq,
-    pmu_info,
-    pmu_start,
-    pmu_read,
-    pmu_reset,
-    pmu_stop,
-    sys_info,
-    clock_getwall,
-    clock_setwall,
-    getrandom,
-    _notify_wait_removed,
-    irq_ack,
-    sys_power,
-    sys_cpu_power,
-    _thread_unpin_removed,
-    futex_wait_change,
+pub const Regs = struct {
+    v1: u64 = 0,
+    v2: u64 = 0,
+    v3: u64 = 0,
+    v4: u64 = 0,
+    v5: u64 = 0,
+    v6: u64 = 0,
+    v7: u64 = 0,
+    v8: u64 = 0,
+    v9: u64 = 0,
+    v10: u64 = 0,
+    v11: u64 = 0,
+    v12: u64 = 0,
+    v13: u64 = 0,
 };
 
-fn syscall0(num: SyscallNum) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile ("syscall"
-            : [ret] "={rax}" (-> i64),
-            : [num] "{rax}" (@intFromEnum(num)),
-            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
-        .aarch64 => asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-            : [num] "{x8}" (@intFromEnum(num)),
-            : .{ .memory = true }),
-        else => unreachable,
-    };
-}
-
-fn syscall1(num: SyscallNum, a0: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile ("syscall"
-            : [ret] "={rax}" (-> i64),
-            : [num] "{rax}" (@intFromEnum(num)),
-              [a0] "{rdi}" (a0),
-            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
-        .aarch64 => asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-            : [num] "{x8}" (@intFromEnum(num)),
-              [a0] "{x0}" (a0),
-            : .{ .memory = true }),
-        else => unreachable,
-    };
-}
-
-fn syscall2(num: SyscallNum, a0: u64, a1: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile ("syscall"
-            : [ret] "={rax}" (-> i64),
-            : [num] "{rax}" (@intFromEnum(num)),
-              [a0] "{rdi}" (a0),
-              [a1] "{rsi}" (a1),
-            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
-        .aarch64 => asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-            : [num] "{x8}" (@intFromEnum(num)),
-              [a0] "{x0}" (a0),
-              [a1] "{x1}" (a1),
-            : .{ .memory = true }),
-        else => unreachable,
-    };
-}
-
-fn syscall3(num: SyscallNum, a0: u64, a1: u64, a2: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile (
-            \\syscall
-            : [ret] "={rax}" (-> i64),
-            : [num] "{rax}" (@intFromEnum(num)),
-              [a0] "{rdi}" (a0),
-              [a1] "{rsi}" (a1),
-              [a2] "{rdx}" (a2),
-            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
-        .aarch64 => asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-            : [num] "{x8}" (@intFromEnum(num)),
-              [a0] "{x0}" (a0),
-              [a1] "{x1}" (a1),
-              [a2] "{x2}" (a2),
-            : .{ .memory = true }),
-        else => unreachable,
-    };
-}
-
-fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile (
-            \\syscall
-            : [ret] "={rax}" (-> i64),
-            : [num] "{rax}" (@intFromEnum(num)),
-              [a0] "{rdi}" (a0),
-              [a1] "{rsi}" (a1),
-              [a2] "{rdx}" (a2),
-              [a3] "{r10}" (a3),
-            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
-        .aarch64 => asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-            : [num] "{x8}" (@intFromEnum(num)),
-              [a0] "{x0}" (a0),
-              [a1] "{x1}" (a1),
-              [a2] "{x2}" (a2),
-              [a3] "{x3}" (a3),
-            : .{ .memory = true }),
-        else => unreachable,
-    };
-}
-
-fn syscall5(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile (
-            \\syscall
-            : [ret] "={rax}" (-> i64),
-            : [num] "{rax}" (@intFromEnum(num)),
-              [a0] "{rdi}" (a0),
-              [a1] "{rsi}" (a1),
-              [a2] "{rdx}" (a2),
-              [a3] "{r10}" (a3),
-              [a4] "{r8}" (a4),
-            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
-        .aarch64 => asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-            : [num] "{x8}" (@intFromEnum(num)),
-              [a0] "{x0}" (a0),
-              [a1] "{x1}" (a1),
-              [a2] "{x2}" (a2),
-              [a3] "{x3}" (a3),
-              [a4] "{x4}" (a4),
-            : .{ .memory = true }),
-        else => unreachable,
-    };
-}
-
-fn syscall3_2(num: SyscallNum, a0: u64, a1: u64, a2: u64) SyscallResult2 {
-    var val2: u64 = undefined;
-    const val = switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile ("syscall"
-            : [ret] "={rax}" (-> i64),
-              [out2] "={rdx}" (val2),
-            : [num] "{rax}" (@intFromEnum(num)),
-              [a0] "{rdi}" (a0),
-              [a1] "{rsi}" (a1),
-              [a2] "{rdx}" (a2),
-            : .{ .rcx = true, .r11 = true, .memory = true }),
-        // aarch64: kernel writes ret2 to x1 (see kernel/arch/aarch64/exceptions.zig).
-        .aarch64 => asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-              [out2] "={x1}" (val2),
-            : [num] "{x8}" (@intFromEnum(num)),
-              [a0] "{x0}" (a0),
-              [a1] "{x1}" (a1),
-              [a2] "{x2}" (a2),
-            : .{ .memory = true }),
-        else => unreachable,
-    };
-    return .{ .val = val, .val2 = val2 };
-}
-
-pub fn write(msg: []const u8) void {
-    _ = syscall2(.write, @intFromPtr(msg.ptr), msg.len);
-}
-
-pub fn write_raw(ptr: u64, len: u64) i64 {
-    return syscall2(.write, ptr, len);
-}
-
-pub fn mem_reserve(hint: u64, size: u64, rights_bits: u64) SyscallResult2 {
-    return syscall3_2(.mem_reserve, hint, size, rights_bits);
-}
-
-pub fn mem_perms(vm_handle: u64, offset: u64, size: u64, rights_bits: u64) i64 {
-    return syscall4(.mem_perms, vm_handle, offset, size, rights_bits);
-}
-
-pub fn mem_shm_create(size: u64) i64 {
-    return syscall2(.mem_shm_create, size, 0);
-}
-
-pub fn shm_create_with_rights(size: u64, rights: u64) i64 {
-    return syscall2(.mem_shm_create, size, rights);
-}
-
-pub fn mem_shm_map(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
-    return syscall3(.mem_shm_map, shm_handle, vm_handle, offset);
-}
-
-pub fn mem_unmap(vm_handle: u64, offset: u64, size: u64) i64 {
-    return syscall3(.mem_unmap, vm_handle, offset, size);
-}
-
-pub fn mem_mmio_map(device_handle: u64, vm_handle: u64, offset: u64) i64 {
-    return syscall3(.mem_mmio_map, device_handle, vm_handle, offset);
-}
-
-pub fn proc_create(elf_ptr: u64, elf_len: u64, rights_bits: u64) i64 {
-    return proc_create_with_opts(elf_ptr, elf_len, rights_bits, perms.ThreadHandleRights.full.bits(), PRIORITY_NORMAL);
-}
-
-pub fn proc_create_with_thread_rights(elf_ptr: u64, elf_len: u64, rights_bits: u64, thread_rights: u64) i64 {
-    return proc_create_with_opts(elf_ptr, elf_len, rights_bits, thread_rights, PRIORITY_NORMAL);
-}
-
-pub fn proc_create_with_opts(elf_ptr: u64, elf_len: u64, rights_bits: u64, thread_rights: u64, max_priority: u64) i64 {
-    return syscall5(.proc_create, elf_ptr, elf_len, rights_bits, thread_rights, max_priority);
-}
-
-pub fn thread_create(entry: *const fn () void, arg: u64, num_stack_pages: u64) i64 {
-    return syscall3(.thread_create, @intFromPtr(entry), arg, num_stack_pages);
-}
-
-pub fn thread_exit() noreturn {
-    _ = syscall0(.thread_exit);
-    unreachable;
-}
-
-pub fn thread_yield() void {
-    _ = syscall0(.thread_yield);
-}
-
-pub fn thread_yield_raw() i64 {
-    return syscall0(.thread_yield);
-}
-
-pub fn set_affinity(core_mask: u64) i64 {
-    return syscall1(.set_affinity, core_mask);
-}
-
-pub fn revoke_perm(handle: u64) i64 {
-    return syscall1(.revoke_perm, handle);
-}
-
-pub fn disable_restart() i64 {
-    return syscall0(.disable_restart);
-}
-
-/// Backwards-compatible single-address futex wait.
-/// Wraps futex_wait_val with count=1.
-pub fn futex_wait(addr: *const u64, expected: u64, timeout_ns: u64) i64 {
-    var addrs = [1]u64{@intFromPtr(addr)};
-    var expecteds = [1]u64{expected};
-    return syscall4(.futex_wait_val, @intFromPtr(&addrs), @intFromPtr(&expecteds), 1, timeout_ns);
-}
-
-/// Multi-address futex wait with expected values.
-pub fn futex_wait_val(addrs_ptr: u64, expected_ptr: u64, count: u64, timeout_ns: u64) i64 {
-    return syscall4(.futex_wait_val, addrs_ptr, expected_ptr, count, timeout_ns);
-}
-
-/// Multi-address futex wait that reads current values under lock.
-pub fn futex_wait_change(addrs_ptr: u64, count: u64, timeout_ns: u64) i64 {
-    return syscall3(.futex_wait_change, addrs_ptr, count, timeout_ns);
-}
-
-pub fn futex_wake(addr: *const u64, count: u64) i64 {
-    return syscall2(.futex_wake, @intFromPtr(addr), count);
-}
-
-pub fn clock_gettime() i64 {
-    return syscall0(.clock_gettime);
-}
-
-pub fn ioport_read(device_handle: u64, port_offset: u64, width: u64) i64 {
-    return syscall3(.ioport_read, device_handle, port_offset, width);
-}
-
-pub fn ioport_write(device_handle: u64, port_offset: u64, width: u64, value: u64) i64 {
-    return syscall4(.ioport_write, device_handle, port_offset, width, value);
-}
-
-pub fn mem_dma_map(device_handle: u64, shm_handle: u64) i64 {
-    return syscall2(.mem_dma_map, device_handle, shm_handle);
-}
-
-pub fn mem_dma_unmap(device_handle: u64, shm_handle: u64) i64 {
-    return syscall2(.mem_dma_unmap, device_handle, shm_handle);
-}
-
-pub const PRIORITY_IDLE: u64 = 0;
-pub const PRIORITY_NORMAL: u64 = 1;
-pub const PRIORITY_HIGH: u64 = 2;
-pub const PRIORITY_REALTIME: u64 = 3;
-pub const PRIORITY_PINNED: u64 = 4;
-
-pub fn set_priority(priority: u64) i64 {
-    return syscall1(.set_priority, priority);
-}
-
-pub fn shutdown() noreturn {
-    _ = syscall0(.shutdown);
-    unreachable;
-}
-
-// --- IPC Message Passing ---
-
-pub const IpcMessage = struct {
-    words: [5]u64 = .{0} ** 5,
-    word_count: u3 = 0,
-    from_call: bool = false,
+pub const SyscallNum = enum(u12) {
+    restrict = 0,
+    delete = 1,
+    revoke = 2,
+    sync = 3,
+    create_capability_domain = 4,
+    acquire_ecs = 5,
+    acquire_vars = 6,
+    create_execution_context = 7,
+    self = 8,
+    terminate = 9,
+    yield = 10,
+    priority = 11,
+    affinity = 12,
+    perfmon_info = 13,
+    perfmon_start = 14,
+    perfmon_read = 15,
+    perfmon_stop = 16,
+    create_var = 17,
+    map_pf = 18,
+    map_mmio = 19,
+    unmap = 20,
+    remap = 21,
+    snapshot = 22,
+    idc_read = 23,
+    idc_write = 24,
+    create_page_frame = 25,
+    ack = 26,
+    create_virtual_machine = 27,
+    create_vcpu = 28,
+    map_guest = 29,
+    unmap_guest = 30,
+    vm_set_policy = 31,
+    vm_inject_irq = 32,
+    create_port = 33,
+    @"suspend" = 34,
+    recv = 35,
+    bind_event_route = 36,
+    clear_event_route = 37,
+    reply = 38,
+    reply_transfer = 39,
+    timer_arm = 40,
+    timer_rearm = 41,
+    timer_cancel = 42,
+    futex_wait_val = 43,
+    futex_wait_change = 44,
+    futex_wake = 45,
+    time_monotonic = 46,
+    time_getwall = 47,
+    time_setwall = 48,
+    random = 49,
+    info_system = 50,
+    info_cores = 51,
+    power_shutdown = 52,
+    power_reboot = 53,
+    power_sleep = 54,
+    power_screen_off = 55,
+    power_set_freq = 56,
+    power_set_idle = 57,
 };
 
-pub fn ipc_send(target_handle: u64, words: []const u64) i64 {
-    return ipc_send_ex(target_handle, words, false);
+// SPEC AMBIGUITY: spec §[syscall_abi] does not pin which bits of the
+// syscall word carry syscall_num. Several syscalls put `pair_count` /
+// `count` in bits 12-19 and `tstart` / sub-fields in bits 20-31, which
+// places syscall_num in bits 0-11 by elimination. Treating that as the
+// stable encoding here.
+pub fn buildWord(num: SyscallNum, extra: u64) u64 {
+    return (@as(u64, @intFromEnum(num)) & 0xFFF) | (extra & ~@as(u64, 0xFFF));
 }
 
-pub fn ipc_send_cap(target_handle: u64, words: []const u64) i64 {
-    return ipc_send_ex(target_handle, words, true);
+pub fn extraCount(count: u8) u64 {
+    return (@as(u64, count) & 0xFF) << 12;
 }
 
-fn ipc_send_ex(target_handle: u64, words: []const u64, cap_transfer: bool) i64 {
-    var w: [5]u64 = .{0} ** 5;
-    const count: u3 = @intCast(@min(words.len, 5));
-    for (0..count) |i| w[i] = words[i];
-    const meta: u64 = @as(u64, count) | (if (cap_transfer) @as(u64, 0x8) else 0);
-
-    return switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile ("syscall"
-            : [ret] "={rax}" (-> i64),
-            : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_send)),
-              [tgt] "{r13}" (target_handle),
-              [m] "{r14}" (meta),
-              [w0] "{rdi}" (w[0]),
-              [w1] "{rsi}" (w[1]),
-              [w2] "{rdx}" (w[2]),
-              [w3] "{r8}" (w[3]),
-              [w4] "{r9}" (w[4]),
-            : .{ .rcx = true, .r11 = true, .memory = true }),
-        .aarch64 => asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-            : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_send)),
-              [tgt] "{x5}" (target_handle),
-              [m] "{x6}" (meta),
-              [w0] "{x0}" (w[0]),
-              [w1] "{x1}" (w[1]),
-              [w2] "{x2}" (w[2]),
-              [w3] "{x3}" (w[3]),
-              [w4] "{x4}" (w[4]),
-            : .{ .memory = true }),
-        else => unreachable,
-    };
+pub fn extraTstart(tstart: u12) u64 {
+    return (@as(u64, tstart) & 0xFFF) << 20;
 }
 
-pub fn ipc_call(target_handle: u64, words: []const u64, reply: *IpcMessage) i64 {
-    return ipc_call_ex(target_handle, words, false, reply);
+pub fn extraVmKind(kind: u1, count: u8) u64 {
+    return (@as(u64, kind) << 12) | ((@as(u64, count) & 0xFF) << 13);
 }
 
-pub fn ipc_call_cap(target_handle: u64, words: []const u64, reply: *IpcMessage) i64 {
-    return ipc_call_ex(target_handle, words, true, reply);
+/// Spec §[reply]: reply_handle_id rides in syscall-word bits 12-23 so
+/// the GPR-backed event-state vregs survive intact across the syscall
+/// and the L4-style fast path is preserved.
+pub fn extraReplyHandle(handle: u12) u64 {
+    return (@as(u64, handle) & 0xFFF) << 12;
 }
 
-fn ipc_call_ex(target_handle: u64, words: []const u64, cap_transfer: bool, reply: *IpcMessage) i64 {
-    var w: [5]u64 = .{0} ** 5;
-    const count: u3 = @intCast(@min(words.len, 5));
-    for (0..count) |i| w[i] = words[i];
-    const meta: u64 = @as(u64, count) | (if (cap_transfer) @as(u64, 0x8) else 0);
+/// Spec §[reply_transfer]: reply_handle_id rides in syscall-word bits
+/// 20-31 (with N at bits 12-19).
+pub fn extraReplyTransferHandle(handle: u12) u64 {
+    return (@as(u64, handle) & 0xFFF) << 20;
+}
 
-    var r_rdi: u64 = undefined;
-    var r_rsi: u64 = undefined;
-    var r_rdx: u64 = undefined;
-    var r_r8: u64 = undefined;
-    var r_r9: u64 = undefined;
-    var r_r14: u64 = undefined;
+pub const RecvReturn = struct {
+    word: u64,
+    regs: Regs,
+};
 
-    const ret: i64 = if (builtin.cpu.arch == .x86_64) asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-          [o0] "={rdi}" (r_rdi),
-          [o1] "={rsi}" (r_rsi),
-          [o2] "={rdx}" (r_rdx),
-          [o3] "={r8}" (r_r8),
-          [o4] "={r9}" (r_r9),
-          [om] "={r14}" (r_r14),
-        : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_call)),
-          [tgt] "{r13}" (target_handle),
-          [m] "{r14}" (meta),
-          [w0] "{rdi}" (w[0]),
-          [w1] "{rsi}" (w[1]),
-          [w2] "{rdx}" (w[2]),
-          [w3] "{r8}" (w[3]),
-          [w4] "{r9}" (w[4]),
-        : .{ .rcx = true, .r11 = true, .memory = true }) else blk: {
-        // aarch64: x0 is both syscall return and reply word 0. The kernel
-        // sets meta bit 0 (from_call) when a reply is being delivered
-        // successfully — in that case x0 holds reply word 0 and the
-        // syscall return is implicitly 0. When from_call is clear, x0
-        // holds the error code and reply words are not valid.
-        const r = asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-              [o1] "={x1}" (r_rsi),
-              [o2] "={x2}" (r_rdx),
-              [o3] "={x3}" (r_r8),
-              [o4] "={x4}" (r_r9),
-              [om] "={x6}" (r_r14),
-            : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_call)),
-              [tgt] "{x5}" (target_handle),
-              [m] "{x6}" (meta),
-              [w0] "{x0}" (w[0]),
-              [w1] "{x1}" (w[1]),
-              [w2] "{x2}" (w[2]),
-              [w3] "{x3}" (w[3]),
-              [w4] "{x4}" (w[4]),
-            : .{ .memory = true });
-        const from_call_bit = (r_r14 & 1) != 0;
-        if (from_call_bit) {
-            r_rdi = @bitCast(r);
-            break :blk @as(i64, 0);
-        } else {
-            r_rdi = 0;
-            break :blk r;
-        }
-    };
+fn issueRawNoStack(word: u64, in: Regs) Regs {
+    return arch_impl.issueRawNoStack(word, in);
+}
 
-    reply.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
-    reply.word_count = @truncate((r_r14 >> 1) & 0x7);
-    reply.from_call = (r_r14 & 1) != 0;
-    // aarch64: x0 is shared between syscall return and reply word 0. When
-    // a successful reply comes back, the kernel leaves reply word 0 in x0
-    // and signals success by keeping bit 0 of x6 set ("from call reply").
-    // On the error path the kernel clears x6 to 0, so the errno in x0 is
-    // unambiguous. Reinterpret the two cases here.
-    if (builtin.cpu.arch == .aarch64) {
-        if (reply.from_call) return 0;
-        return ret;
+pub fn issueReg(num: SyscallNum, extra: u64, in: Regs) Regs {
+    return issueRawNoStack(buildWord(num, extra), in);
+}
+
+pub fn issueRegDiscard(num: SyscallNum, extra: u64, in: Regs) void {
+    arch_impl.issueRegDiscard(buildWord(num, extra), in);
+}
+
+// Stack-arg path. SPEC AMBIGUITY: spec lists vreg 14 at [rsp + 8] when
+// the syscall executes (x86) / vreg 32 at [sp + 8] (aarch64), but does
+// not pin who is responsible for stack alignment / red-zone discipline.
+// The v0 mock runner exercises only register-only syscalls; the stack
+// path is bounded at 16 slots so the pad size is fixed and call sites
+// typecheck without a runtime memcpy. Bump the bound when a stack-arg
+// syscall is actually used.
+pub fn issueStack(num: SyscallNum, extra: u64, in: Regs, stack_vregs: []const u64) Regs {
+    if (stack_vregs.len == 0) return issueReg(num, extra, in);
+    if (stack_vregs.len > 16) @panic("issueStack: vreg count exceeds bounded stack pad");
+
+    var slots: [16]u64 = .{0} ** 16;
+    var i: usize = 0;
+    while (i < stack_vregs.len) {
+        slots[i] = stack_vregs[i];
+        i += 1;
     }
-    return ret;
+
+    return arch_impl.issueRawWithSlots(buildWord(num, extra), in, &slots, stack_vregs.len);
 }
 
-pub fn ipc_recv(blocking: bool, msg: *IpcMessage) i64 {
-    const meta: u64 = if (blocking) 0x2 else 0;
+// Per-syscall wrappers below. Each returns the kernel's vreg snapshot
+// (Regs) plus, where applicable, the syscall word (some recv paths
+// depend on the returned syscall word for reply_handle_id / event_type
+// / pair_count / tstart). For those cases we issue with a peek of the
+// word via a dedicated helper.
 
-    var r_rdi: u64 = undefined;
-    var r_rsi: u64 = undefined;
-    var r_rdx: u64 = undefined;
-    var r_r8: u64 = undefined;
-    var r_r9: u64 = undefined;
-    var r_r14: u64 = undefined;
+// ---------------------------------------------------------------
+// 0..3: cap-table-wide ops
+// ---------------------------------------------------------------
 
-    const ret: i64 = if (builtin.cpu.arch == .x86_64) asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-          [o0] "={rdi}" (r_rdi),
-          [o1] "={rsi}" (r_rsi),
-          [o2] "={rdx}" (r_rdx),
-          [o3] "={r8}" (r_r8),
-          [o4] "={r9}" (r_r9),
-          [om] "={r14}" (r_r14),
-        : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_recv)),
-          [m] "{r14}" (meta),
-        : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true }) else blk: {
-        const r = asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-              [o1] "={x1}" (r_rsi),
-              [o2] "={x2}" (r_rdx),
-              [o3] "={x3}" (r_r8),
-              [o4] "={x4}" (r_r9),
-              [om] "={x6}" (r_r14),
-            : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_recv)),
-              [m] "{x6}" (meta),
-            : .{ .memory = true });
-        // aarch64 x0 collision: if word_count >= 1 in returned meta,
-        // x0 holds reply word 0 (kernel used skip_ret_write). Otherwise
-        // x0 holds the syscall return.
-        const ret_word_count: u64 = (r_r14 >> 1) & 0x7;
-        if (ret_word_count >= 1) {
-            r_rdi = @bitCast(r);
-            break :blk @as(i64, 0);
-        } else {
-            r_rdi = 0;
-            break :blk r;
-        }
+pub fn restrict(handle: u12, new_caps: u64) Regs {
+    return issueReg(.restrict, 0, .{ .v1 = handle, .v2 = new_caps });
+}
+
+pub fn delete(handle: u12) Regs {
+    return issueReg(.delete, 0, .{ .v1 = handle });
+}
+
+pub fn revoke(handle: u12) Regs {
+    return issueReg(.revoke, 0, .{ .v1 = handle });
+}
+
+pub fn sync(handle: u12) Regs {
+    return issueReg(.sync, 0, .{ .v1 = handle });
+}
+
+// ---------------------------------------------------------------
+// 4..6: capability-domain ops
+// ---------------------------------------------------------------
+
+pub fn createCapabilityDomain(
+    caps: u64,
+    ceilings_inner: u64,
+    ceilings_outer: u64,
+    elf_pf: u12,
+    initial_ec_affinity: u64,
+    passed_handles: []const u64,
+) Regs {
+    // Spec §[create_capability_domain]: [5] is the initial EC affinity
+    // mask, passed handles start at [6+]. Up to 8 passed handles fit
+    // in register vregs 6..13; beyond that issueStack handles spill.
+    var in = Regs{
+        .v1 = caps,
+        .v2 = ceilings_inner,
+        .v3 = ceilings_outer,
+        .v4 = elf_pf,
+        .v5 = initial_ec_affinity,
     };
-
-    msg.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
-    msg.word_count = @truncate((r_r14 >> 1) & 0x7);
-    msg.from_call = (r_r14 & 1) != 0;
-    return ret;
+    if (passed_handles.len >= 1) in.v6 = passed_handles[0];
+    if (passed_handles.len >= 2) in.v7 = passed_handles[1];
+    if (passed_handles.len >= 3) in.v8 = passed_handles[2];
+    if (passed_handles.len >= 4) in.v9 = passed_handles[3];
+    if (passed_handles.len >= 5) in.v10 = passed_handles[4];
+    if (passed_handles.len >= 6) in.v11 = passed_handles[5];
+    if (passed_handles.len >= 7) in.v12 = passed_handles[6];
+    if (passed_handles.len >= 8) in.v13 = passed_handles[7];
+    if (passed_handles.len > 8) {
+        return issueStack(.create_capability_domain, 0, in, passed_handles[8..]);
+    }
+    return issueReg(.create_capability_domain, 0, in);
 }
 
-pub fn ipc_reply(words: []const u64) i64 {
-    return ipc_reply_ex(words, false, false, false);
+pub fn acquireEcs(target: u12) RecvReturn {
+    // count is set by the kernel on return in syscall word bits 12-19.
+    const word = buildWord(.acquire_ecs, 0);
+    return arch_impl.issueRawCaptureWord(word, .{ .v1 = target });
 }
 
-pub fn ipc_reply_cap(words: []const u64) i64 {
-    return ipc_reply_ex(words, false, false, true);
+pub fn acquireVars(target: u12) RecvReturn {
+    const word = buildWord(.acquire_vars, 0);
+    return arch_impl.issueRawCaptureWord(word, .{ .v1 = target });
 }
 
-pub fn ipc_reply_recv(words: []const u64, blocking: bool, msg: *IpcMessage) i64 {
-    var w: [5]u64 = .{0} ** 5;
-    const count: u3 = @intCast(@min(words.len, 5));
-    for (0..count) |i| w[i] = words[i];
-    const meta: u64 = @as(u64, count) << 2 | 0x1 | (if (blocking) @as(u64, 0x2) else 0);
+// ---------------------------------------------------------------
+// 7..16: execution-context ops
+// ---------------------------------------------------------------
 
-    var r_rdi: u64 = undefined;
-    var r_rsi: u64 = undefined;
-    var r_rdx: u64 = undefined;
-    var r_r8: u64 = undefined;
-    var r_r9: u64 = undefined;
-    var r_r14: u64 = undefined;
-
-    const ret: i64 = if (builtin.cpu.arch == .x86_64) asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-          [o0] "={rdi}" (r_rdi),
-          [o1] "={rsi}" (r_rsi),
-          [o2] "={rdx}" (r_rdx),
-          [o3] "={r8}" (r_r8),
-          [o4] "={r9}" (r_r9),
-          [om] "={r14}" (r_r14),
-        : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_reply)),
-          [m] "{r14}" (meta),
-          [w0] "{rdi}" (w[0]),
-          [w1] "{rsi}" (w[1]),
-          [w2] "{rdx}" (w[2]),
-          [w3] "{r8}" (w[3]),
-          [w4] "{r9}" (w[4]),
-        : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true }) else blk: {
-        const r = asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-              [o1] "={x1}" (r_rsi),
-              [o2] "={x2}" (r_rdx),
-              [o3] "={x3}" (r_r8),
-              [o4] "={x4}" (r_r9),
-              [om] "={x6}" (r_r14),
-            : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_reply)),
-              [m] "{x6}" (meta),
-              [w0] "{x0}" (w[0]),
-              [w1] "{x1}" (w[1]),
-              [w2] "{x2}" (w[2]),
-              [w3] "{x3}" (w[3]),
-              [w4] "{x4}" (w[4]),
-            : .{ .memory = true });
-        // aarch64 x0 collision: if atomic reply+recv delivers a message
-        // with word_count >= 1, x0 holds that message's word 0.
-        const ret_word_count: u64 = (r_r14 >> 1) & 0x7;
-        if (ret_word_count >= 1) {
-            r_rdi = @bitCast(r);
-            break :blk @as(i64, 0);
-        } else {
-            r_rdi = 0;
-            break :blk r;
-        }
-    };
-
-    msg.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
-    msg.word_count = @truncate((r_r14 >> 1) & 0x7);
-    msg.from_call = (r_r14 & 1) != 0;
-    return ret;
+pub fn createExecutionContext(
+    caps: u64,
+    entry: u64,
+    stack_pages: u64,
+    target: u64,
+    affinity_mask: u64,
+) Regs {
+    return issueReg(.create_execution_context, 0, .{
+        .v1 = caps,
+        .v2 = entry,
+        .v3 = stack_pages,
+        .v4 = target,
+        .v5 = affinity_mask,
+    });
 }
 
-// --- New Thread/Fault Syscalls ---
-
-pub fn thread_self() i64 {
-    return syscall0(.thread_self);
+pub fn self() Regs {
+    return issueReg(.self, 0, .{});
 }
 
-pub fn thread_suspend(thread_handle: u64) i64 {
-    return syscall1(.thread_suspend, thread_handle);
+pub fn terminate(target: u12) Regs {
+    return issueReg(.terminate, 0, .{ .v1 = target });
 }
 
-pub fn thread_resume(thread_handle: u64) i64 {
-    return syscall1(.thread_resume, thread_handle);
+pub fn yieldEc(target: u64) Regs {
+    return issueReg(.yield, 0, .{ .v1 = target });
 }
 
-pub fn thread_kill(thread_handle: u64) i64 {
-    return syscall1(.thread_kill, thread_handle);
+pub fn priority(target: u12, new_priority: u64) Regs {
+    return issueReg(.priority, 0, .{ .v1 = target, .v2 = new_priority });
 }
 
-pub fn fault_recv(buf_ptr: u64, blocking: u64) i64 {
-    return syscall2(.fault_recv, buf_ptr, blocking);
+pub fn affinity(target: u12, new_affinity: u64) Regs {
+    return issueReg(.affinity, 0, .{ .v1 = target, .v2 = new_affinity });
 }
 
-pub fn fault_reply_action(token: u64, action: u64, modified_regs_ptr: u64) i64 {
-    // Explicit zero-flags reply: the kernel's sysFaultReply reads exclude
-    // flags from the IPC metadata register (r14 on x86, x6 on aarch64).
-    // Using the plain `syscall3` path leaves that register uninitialized,
-    // and stray bits can re-arm FAULT_EXCLUDE_NEXT/PERMANENT across the
-    // reply. Route through `fault_reply_flags` with `flags = 0` so the
-    // metadata register is explicitly clobbered to zero.
-    return fault_reply_flags(token, action, modified_regs_ptr, 0);
+pub fn perfmonInfo() Regs {
+    return issueReg(.perfmon_info, 0, .{});
 }
 
-pub fn fault_reply_simple(token: u64, action: u64) i64 {
-    return fault_reply_flags(token, action, 0, 0);
+pub fn perfmonStart(target: u12, num_configs: u64, configs: []const u64) Regs {
+    var in = Regs{ .v1 = target, .v2 = num_configs };
+    if (configs.len >= 1) in.v3 = configs[0];
+    if (configs.len >= 2) in.v4 = configs[1];
+    if (configs.len >= 3) in.v5 = configs[2];
+    if (configs.len >= 4) in.v6 = configs[3];
+    if (configs.len >= 5) in.v7 = configs[4];
+    if (configs.len >= 6) in.v8 = configs[5];
+    if (configs.len >= 7) in.v9 = configs[6];
+    if (configs.len >= 8) in.v10 = configs[7];
+    if (configs.len >= 9) in.v11 = configs[8];
+    if (configs.len >= 10) in.v12 = configs[9];
+    if (configs.len >= 11) in.v13 = configs[10];
+    if (configs.len > 11) {
+        return issueStack(.perfmon_start, 0, in, configs[11..]);
+    }
+    return issueReg(.perfmon_start, 0, in);
 }
 
-/// Invoke `fault_reply` with explicit `flags` in r14 (e.g. FAULT_EXCLUDE_NEXT,
-/// FAULT_EXCLUDE_PERMANENT). `modified_regs_ptr` is passed via rdx.
-pub fn fault_reply_flags(token: u64, action: u64, modified_regs_ptr: u64, flags: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile ("syscall"
-            : [ret] "={rax}" (-> i64),
-            : [num] "{rax}" (@intFromEnum(SyscallNum.fault_reply)),
-              [a0] "{rdi}" (token),
-              [a1] "{rsi}" (action),
-              [a2] "{rdx}" (modified_regs_ptr),
-              [f] "{r14}" (flags),
-            : .{ .rcx = true, .r11 = true, .memory = true }),
-        .aarch64 => asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-            : [num] "{x8}" (@intFromEnum(SyscallNum.fault_reply)),
-              [a0] "{x0}" (token),
-              [a1] "{x1}" (action),
-              [a2] "{x2}" (modified_regs_ptr),
-              [f] "{x6}" (flags),
-            : .{ .memory = true }),
-        else => unreachable,
-    };
+pub fn perfmonRead(target: u12) Regs {
+    return issueReg(.perfmon_read, 0, .{ .v1 = target });
 }
 
-pub fn fault_read_mem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
-    return syscall4(.fault_read_mem, proc_handle, vaddr, buf_ptr, len);
+pub fn perfmonStop(target: u12) Regs {
+    return issueReg(.perfmon_stop, 0, .{ .v1 = target });
 }
 
-pub fn fault_write_mem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
-    return syscall4(.fault_write_mem, proc_handle, vaddr, buf_ptr, len);
+// ---------------------------------------------------------------
+// 17..24: VAR ops
+// ---------------------------------------------------------------
+
+pub fn createVar(
+    caps: u64,
+    props: u64,
+    pages: u64,
+    preferred_base: u64,
+    device_region: u64,
+) Regs {
+    return issueReg(.create_var, 0, .{
+        .v1 = caps,
+        .v2 = props,
+        .v3 = pages,
+        .v4 = preferred_base,
+        .v5 = device_region,
+    });
 }
 
-pub fn fault_set_thread_mode(thread_handle: u64, mode: u64) i64 {
-    return syscall2(.fault_set_thread_mode, thread_handle, mode);
+pub fn mapPf(var_handle: u12, pairs: []const u64) Regs {
+    const n: u8 = @intCast(pairs.len / 2);
+    var in = Regs{ .v1 = var_handle };
+    if (pairs.len >= 1) in.v2 = pairs[0];
+    if (pairs.len >= 2) in.v3 = pairs[1];
+    if (pairs.len >= 3) in.v4 = pairs[2];
+    if (pairs.len >= 4) in.v5 = pairs[3];
+    if (pairs.len >= 5) in.v6 = pairs[4];
+    if (pairs.len >= 6) in.v7 = pairs[5];
+    if (pairs.len >= 7) in.v8 = pairs[6];
+    if (pairs.len >= 8) in.v9 = pairs[7];
+    if (pairs.len >= 9) in.v10 = pairs[8];
+    if (pairs.len >= 10) in.v11 = pairs[9];
+    if (pairs.len >= 11) in.v12 = pairs[10];
+    if (pairs.len >= 12) in.v13 = pairs[11];
+    const extra = extraCount(n);
+    if (pairs.len > 12) {
+        return issueStack(.map_pf, extra, in, pairs[12..]);
+    }
+    return issueReg(.map_pf, extra, in);
 }
 
-// --- VM / vCPU Syscalls ---
-
-pub const E_OK: i64 = 0;
-pub const E_INVAL: i64 = -1;
-pub const E_PERM: i64 = -2;
-pub const E_BADHANDLE: i64 = -3;
-pub const E_NOMEM: i64 = -4;
-pub const E_MAXCAP: i64 = -5;
-pub const E_BADADDR: i64 = -7;
-pub const E_TIMEOUT: i64 = -8;
-pub const E_AGAIN: i64 = -9;
-pub const E_NOENT: i64 = -10;
-pub const E_BUSY: i64 = -11;
-pub const E_NODEV: i64 = -13;
-pub const E_NORES: i64 = -14;
-
-pub fn vm_create(vcpu_count: u64, policy_ptr: u64) i64 {
-    return syscall2(.vm_create, vcpu_count, policy_ptr);
+pub fn mapMmio(var_handle: u12, device_region: u12) Regs {
+    return issueReg(.map_mmio, 0, .{ .v1 = var_handle, .v2 = device_region });
 }
 
-/// Deprecated: always returns E_INVAL. Use revoke_vm() instead.
-pub fn vm_destroy() i64 {
-    return syscall0(.vm_destroy);
+pub fn unmap(var_handle: u12, selectors: []const u64) Regs {
+    const n: u8 = @intCast(selectors.len);
+    var in = Regs{ .v1 = var_handle };
+    if (selectors.len >= 1) in.v2 = selectors[0];
+    if (selectors.len >= 2) in.v3 = selectors[1];
+    if (selectors.len >= 3) in.v4 = selectors[2];
+    if (selectors.len >= 4) in.v5 = selectors[3];
+    if (selectors.len >= 5) in.v6 = selectors[4];
+    if (selectors.len >= 6) in.v7 = selectors[5];
+    if (selectors.len >= 7) in.v8 = selectors[6];
+    if (selectors.len >= 8) in.v9 = selectors[7];
+    if (selectors.len >= 9) in.v10 = selectors[8];
+    if (selectors.len >= 10) in.v11 = selectors[9];
+    if (selectors.len >= 11) in.v12 = selectors[10];
+    if (selectors.len >= 12) in.v13 = selectors[11];
+    const extra = extraCount(n);
+    if (selectors.len > 12) {
+        return issueStack(.unmap, extra, in, selectors[12..]);
+    }
+    return issueReg(.unmap, extra, in);
 }
 
-pub fn vm_guest_map(vm_handle_arg: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
-    return syscall5(.vm_guest_map, vm_handle_arg, host_vaddr, guest_addr, size, rights);
+pub fn remap(var_handle: u12, new_cur_rwx: u64) Regs {
+    return issueReg(.remap, 0, .{ .v1 = var_handle, .v2 = new_cur_rwx });
 }
 
-pub fn vm_recv(vm_handle_arg: u64, buf_ptr: u64, blocking: u64) i64 {
-    return syscall3(.vm_recv, vm_handle_arg, buf_ptr, blocking);
+pub fn snapshot(target_var: u12, source_var: u12) Regs {
+    return issueReg(.snapshot, 0, .{ .v1 = target_var, .v2 = source_var });
 }
 
-pub fn vm_reply_action(vm_handle_arg: u64, exit_token: u64, action_ptr: u64) i64 {
-    return syscall3(.vm_reply, vm_handle_arg, exit_token, action_ptr);
+pub fn idcRead(var_handle: u12, offset: u64, count: u8) Regs {
+    return issueReg(.idc_read, extraCount(count), .{ .v1 = var_handle, .v2 = offset });
 }
 
-pub fn vm_vcpu_set_state(thread_handle: u64, guest_state_ptr: u64) i64 {
-    return syscall2(.vm_vcpu_set_state, thread_handle, guest_state_ptr);
+pub fn idcWrite(var_handle: u12, offset: u64, qwords: []const u64) Regs {
+    const n: u8 = @intCast(qwords.len);
+    var in = Regs{ .v1 = var_handle, .v2 = offset };
+    if (qwords.len >= 1) in.v3 = qwords[0];
+    if (qwords.len >= 2) in.v4 = qwords[1];
+    if (qwords.len >= 3) in.v5 = qwords[2];
+    if (qwords.len >= 4) in.v6 = qwords[3];
+    if (qwords.len >= 5) in.v7 = qwords[4];
+    if (qwords.len >= 6) in.v8 = qwords[5];
+    if (qwords.len >= 7) in.v9 = qwords[6];
+    if (qwords.len >= 8) in.v10 = qwords[7];
+    if (qwords.len >= 9) in.v11 = qwords[8];
+    if (qwords.len >= 10) in.v12 = qwords[9];
+    if (qwords.len >= 11) in.v13 = qwords[10];
+    const extra = extraCount(n);
+    if (qwords.len > 11) {
+        return issueStack(.idc_write, extra, in, qwords[11..]);
+    }
+    return issueReg(.idc_write, extra, in);
 }
 
-pub fn vm_vcpu_get_state(thread_handle: u64, guest_state_ptr: u64) i64 {
-    return syscall2(.vm_vcpu_get_state, thread_handle, guest_state_ptr);
+// ---------------------------------------------------------------
+// 25: page frame
+// ---------------------------------------------------------------
+
+pub fn createPageFrame(caps: u64, props: u64, pages: u64) Regs {
+    return issueReg(.create_page_frame, 0, .{
+        .v1 = caps,
+        .v2 = props,
+        .v3 = pages,
+    });
 }
 
-pub fn vm_vcpu_run(thread_handle: u64) i64 {
-    return syscall1(.vm_vcpu_run, thread_handle);
+// ---------------------------------------------------------------
+// 26: device region
+// ---------------------------------------------------------------
+
+pub fn ack(device_region: u12) Regs {
+    return issueReg(.ack, 0, .{ .v1 = device_region });
 }
 
-pub fn vm_vcpu_interrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
-    return syscall2(.vm_vcpu_interrupt, thread_handle, interrupt_ptr);
+// ---------------------------------------------------------------
+// 27..32: virtual machine
+// ---------------------------------------------------------------
+
+pub fn createVirtualMachine(caps: u64, policy_pf: u12) Regs {
+    return issueReg(.create_virtual_machine, 0, .{ .v1 = caps, .v2 = policy_pf });
 }
 
-pub fn vm_sysreg_passthrough(vm_handle_arg: u64, sysreg_id: u64, allow_read: u64, allow_write: u64) i64 {
-    return syscall4(.vm_sysreg_passthrough, vm_handle_arg, sysreg_id, allow_read, allow_write);
+pub fn createVcpu(caps: u64, vm_handle: u12, affinity_mask: u64, exit_port: u12) Regs {
+    return issueReg(.create_vcpu, 0, .{
+        .v1 = caps,
+        .v2 = vm_handle,
+        .v3 = affinity_mask,
+        .v4 = exit_port,
+    });
 }
 
-pub fn vm_intc_assert_irq(vm_handle_arg: u64, irq_num: u64) i64 {
-    return syscall2(.vm_intc_assert_irq, vm_handle_arg, irq_num);
+pub fn mapGuest(vm_handle: u12, pairs: []const u64) Regs {
+    const n: u8 = @intCast(pairs.len / 2);
+    var in = Regs{ .v1 = vm_handle };
+    if (pairs.len >= 1) in.v2 = pairs[0];
+    if (pairs.len >= 2) in.v3 = pairs[1];
+    if (pairs.len >= 3) in.v4 = pairs[2];
+    if (pairs.len >= 4) in.v5 = pairs[3];
+    if (pairs.len >= 5) in.v6 = pairs[4];
+    if (pairs.len >= 6) in.v7 = pairs[5];
+    if (pairs.len >= 7) in.v8 = pairs[6];
+    if (pairs.len >= 8) in.v9 = pairs[7];
+    if (pairs.len >= 9) in.v10 = pairs[8];
+    if (pairs.len >= 10) in.v11 = pairs[9];
+    if (pairs.len >= 11) in.v12 = pairs[10];
+    if (pairs.len >= 12) in.v13 = pairs[11];
+    const extra = extraCount(n);
+    if (pairs.len > 12) {
+        return issueStack(.map_guest, extra, in, pairs[12..]);
+    }
+    return issueReg(.map_guest, extra, in);
 }
 
-pub fn vm_intc_deassert_irq(vm_handle_arg: u64, irq_num: u64) i64 {
-    return syscall2(.vm_intc_deassert_irq, vm_handle_arg, irq_num);
+pub fn unmapGuest(vm_handle: u12, page_frames: []const u64) Regs {
+    const n: u8 = @intCast(page_frames.len);
+    var in = Regs{ .v1 = vm_handle };
+    if (page_frames.len >= 1) in.v2 = page_frames[0];
+    if (page_frames.len >= 2) in.v3 = page_frames[1];
+    if (page_frames.len >= 3) in.v4 = page_frames[2];
+    if (page_frames.len >= 4) in.v5 = page_frames[3];
+    if (page_frames.len >= 5) in.v6 = page_frames[4];
+    if (page_frames.len >= 6) in.v7 = page_frames[5];
+    if (page_frames.len >= 7) in.v8 = page_frames[6];
+    if (page_frames.len >= 8) in.v9 = page_frames[7];
+    if (page_frames.len >= 9) in.v10 = page_frames[8];
+    if (page_frames.len >= 10) in.v11 = page_frames[9];
+    if (page_frames.len >= 11) in.v12 = page_frames[10];
+    if (page_frames.len >= 12) in.v13 = page_frames[11];
+    const extra = extraCount(n);
+    if (page_frames.len > 12) {
+        return issueStack(.unmap_guest, extra, in, page_frames[12..]);
+    }
+    return issueReg(.unmap_guest, extra, in);
 }
 
-pub fn revoke_vm(vm_handle_arg: u64) i64 {
-    return syscall1(.revoke_perm, vm_handle_arg);
+pub fn vmSetPolicy(vm_handle: u12, kind: u1, count: u8, entries: []const u64) Regs {
+    var in = Regs{ .v1 = vm_handle };
+    if (entries.len >= 1) in.v2 = entries[0];
+    if (entries.len >= 2) in.v3 = entries[1];
+    if (entries.len >= 3) in.v4 = entries[2];
+    if (entries.len >= 4) in.v5 = entries[3];
+    if (entries.len >= 5) in.v6 = entries[4];
+    if (entries.len >= 6) in.v7 = entries[5];
+    if (entries.len >= 7) in.v8 = entries[6];
+    if (entries.len >= 8) in.v9 = entries[7];
+    if (entries.len >= 9) in.v10 = entries[8];
+    if (entries.len >= 10) in.v11 = entries[9];
+    if (entries.len >= 11) in.v12 = entries[10];
+    if (entries.len >= 12) in.v13 = entries[11];
+    const extra = extraVmKind(kind, count);
+    if (entries.len > 12) {
+        return issueStack(.vm_set_policy, extra, in, entries[12..]);
+    }
+    return issueReg(.vm_set_policy, extra, in);
 }
 
-// --- Performance Monitoring Unit (§2.14, §4.50–§4.54) ---
-
-pub const PMU_MAX_COUNTERS: usize = 8;
-
-pub const PmuEvent = enum(u8) {
-    cycles = 0,
-    instructions = 1,
-    cache_references = 2,
-    cache_misses = 3,
-    branch_instructions = 4,
-    branch_misses = 5,
-    bus_cycles = 6,
-    stalled_cycles_frontend = 7,
-    stalled_cycles_backend = 8,
-    _,
-};
-
-/// Configures one PMU counter. `has_threshold == false` means precise counting
-/// (no overflow fault); `has_threshold == true` selects sample-based profiling
-/// at `overflow_threshold` events. Matches the kernel's canonical 24-byte
-/// extern layout (see kernel/sched/pmu.zig).
-pub const PmuCounterConfig = extern struct {
-    event: PmuEvent,
-    _pad: [7]u8 = .{0} ** 7,
-    has_threshold: bool,
-    _pad2: [7]u8 = .{0} ** 7,
-    overflow_threshold: u64,
-};
-
-pub const PmuInfo = extern struct {
-    num_counters: u8,
-    overflow_support: bool,
-    _pad: [6]u8 = .{0} ** 6,
-    supported_events: u64,
-};
-
-pub const PmuSample = extern struct {
-    counters: [PMU_MAX_COUNTERS]u64 = .{0} ** PMU_MAX_COUNTERS,
-    timestamp: u64 = 0,
-};
-
-pub const FAULT_REASON_PMU_OVERFLOW: u8 = 15;
-
-pub fn pmu_info(info_ptr: u64) i64 {
-    return syscall1(.pmu_info, info_ptr);
+pub fn vmInjectIrq(vm_handle: u12, irq_num: u64, assert_word: u64) Regs {
+    return issueReg(.vm_inject_irq, 0, .{
+        .v1 = vm_handle,
+        .v2 = irq_num,
+        .v3 = assert_word,
+    });
 }
 
-pub fn pmu_start(thread_handle: u64, configs_ptr: u64, count: u64) i64 {
-    return syscall3(.pmu_start, thread_handle, configs_ptr, count);
+// ---------------------------------------------------------------
+// 33..39: port / IDC / event-route / reply
+// ---------------------------------------------------------------
+
+pub fn createPort(caps: u64) Regs {
+    return issueReg(.create_port, 0, .{ .v1 = caps });
 }
 
-pub fn pmu_read(thread_handle: u64, sample_ptr: u64) i64 {
-    return syscall2(.pmu_read, thread_handle, sample_ptr);
+pub fn suspendEc(target: u12, port: u12, attachments: []const u64) Regs {
+    const n: u8 = @intCast(attachments.len);
+    const extra = extraCount(n);
+    if (attachments.len == 0) {
+        return issueReg(.@"suspend", extra, .{ .v1 = target, .v2 = port });
+    }
+    // SPEC AMBIGUITY: §[handle_attachments] places pair entries at
+    // vregs [128-N..127] — the *high* end of the vreg space, not vregs
+    // 3..3+N-1. Implementing the high-vreg path needs a stack-pad
+    // sized analogously to replyTransfer; the runner v0 doesn't attach
+    // handles on suspend, so this branch is left as a stub.
+    @panic("suspend with attachments: high-vreg layout not yet wired");
 }
 
-pub fn pmu_reset(thread_handle: u64, configs_ptr: u64, count: u64) i64 {
-    return syscall3(.pmu_reset, thread_handle, configs_ptr, count);
+pub fn recv(port: u12, timeout_ns: u64) RecvReturn {
+    const word = buildWord(.recv, 0);
+    return arch_impl.issueRawCaptureWord(word, .{ .v1 = port, .v2 = timeout_ns });
 }
 
-pub fn pmu_stop(thread_handle: u64) i64 {
-    return syscall1(.pmu_stop, thread_handle);
+pub fn bindEventRoute(target: u12, event_type: u64, port: u12) Regs {
+    return issueReg(.bind_event_route, 0, .{
+        .v1 = target,
+        .v2 = event_type,
+        .v3 = port,
+    });
 }
 
-// --- System Information (§2.15, §4.55) ---
+pub fn clearEventRoute(target: u12, event_type: u64) Regs {
+    return issueReg(.clear_event_route, 0, .{ .v1 = target, .v2 = event_type });
+}
 
-/// Matches §5 "Max CPU cores" and "Max `SysInfo.core_count`". Tests use this
-/// as a worst-case bound when sizing stack-resident `CoreInfo` arrays without
-/// having to first poll `sys_info` for the actual count.
-pub const MAX_CPU_CORES: usize = 64;
+pub fn reply(reply_handle: u12) Regs {
+    // Spec §[reply]: reply_handle_id rides in syscall-word bits 12-23.
+    // Pass empty regs — vregs 1..13 are receiver-side state mods that
+    // survive the syscall as-is when the receiver hasn't modified them.
+    return issueReg(.reply, extraReplyHandle(reply_handle), .{});
+}
 
-/// System-wide static and dynamic properties returned by `sys_info` in its
-/// `info_ptr` output. Matches the canonical extern layout defined in §2.15 of
-/// the spec.
-pub const SysInfo = extern struct {
-    core_count: u64,
-    mem_total: u64,
-    mem_free: u64,
-};
+pub fn replyTransfer(reply_handle: u12, attachments: []const u64) Regs {
+    // Spec §[handle_attachments]: pair entries occupy vregs `[128-N..127]`
+    // — the *high* end of the vreg space. The arch backend handles the
+    // platform-specific stack reservation and high-vreg slot layout
+    // (different on x86-64 vs aarch64 because their GPR-backed vreg
+    // bands differ in width). The reply handle id rides in syscall-word
+    // bits 20-31; N rides in bits 12-19; syscall_num in bits 0-11. See
+    // §[reply_transfer].
+    const n: u8 = @intCast(attachments.len);
+    if (n == 0 or n > 63) @panic("reply_transfer: N must be 1..63");
+    const word: u64 =
+        (@as(u64, @intFromEnum(SyscallNum.reply_transfer)) & 0xFFF) |
+        (@as(u64, n) << 12) |
+        (@as(u64, reply_handle) << 20);
+    return arch_impl.replyTransferAsm(word, attachments.ptr, @as(u64, n));
+}
 
-/// Per-core dynamic properties returned by `sys_info` in its `cores_ptr`
-/// output, one entry per core indexed by core ID. Matches §2.15. The trailing
-/// explicit padding brings the struct to 8-byte alignment so a `[N]CoreInfo`
-/// array lays out predictably across the syscall boundary.
-pub const CoreInfo = extern struct {
-    idle_ns: u64,
-    busy_ns: u64,
-    freq_hz: u64,
-    temp_mc: u32,
-    c_state: u8,
-    _pad: [3]u8 = .{0} ** 3,
-};
+// ---------------------------------------------------------------
+// 40..42: timer
+// ---------------------------------------------------------------
 
-// ABI guard against drift from the kernel side, which asserts the same
-// sizes in `kernel/sched/sysinfo.zig`. The struct layout is part of the
-// observable §2.15 contract, so any change here must be matched on both
-// sides.
+pub fn timerArm(caps: u64, deadline_ns: u64, flags: u64) Regs {
+    return issueReg(.timer_arm, 0, .{ .v1 = caps, .v2 = deadline_ns, .v3 = flags });
+}
+
+pub fn timerRearm(timer_handle: u12, deadline_ns: u64, flags: u64) Regs {
+    return issueReg(.timer_rearm, 0, .{ .v1 = timer_handle, .v2 = deadline_ns, .v3 = flags });
+}
+
+pub fn timerCancel(timer_handle: u12) Regs {
+    return issueReg(.timer_cancel, 0, .{ .v1 = timer_handle });
+}
+
+// ---------------------------------------------------------------
+// 43..45: futex
+// ---------------------------------------------------------------
+
+pub fn futexWaitVal(timeout_ns: u64, pairs: []const u64) Regs {
+    const n: u8 = @intCast(pairs.len / 2);
+    var in = Regs{ .v1 = timeout_ns };
+    if (pairs.len >= 1) in.v2 = pairs[0];
+    if (pairs.len >= 2) in.v3 = pairs[1];
+    if (pairs.len >= 3) in.v4 = pairs[2];
+    if (pairs.len >= 4) in.v5 = pairs[3];
+    if (pairs.len >= 5) in.v6 = pairs[4];
+    if (pairs.len >= 6) in.v7 = pairs[5];
+    if (pairs.len >= 7) in.v8 = pairs[6];
+    if (pairs.len >= 8) in.v9 = pairs[7];
+    if (pairs.len >= 9) in.v10 = pairs[8];
+    if (pairs.len >= 10) in.v11 = pairs[9];
+    if (pairs.len >= 11) in.v12 = pairs[10];
+    if (pairs.len >= 12) in.v13 = pairs[11];
+    const extra = extraCount(n);
+    if (pairs.len > 12) {
+        return issueStack(.futex_wait_val, extra, in, pairs[12..]);
+    }
+    return issueReg(.futex_wait_val, extra, in);
+}
+
+pub fn futexWaitChange(timeout_ns: u64, pairs: []const u64) Regs {
+    const n: u8 = @intCast(pairs.len / 2);
+    var in = Regs{ .v1 = timeout_ns };
+    if (pairs.len >= 1) in.v2 = pairs[0];
+    if (pairs.len >= 2) in.v3 = pairs[1];
+    if (pairs.len >= 3) in.v4 = pairs[2];
+    if (pairs.len >= 4) in.v5 = pairs[3];
+    if (pairs.len >= 5) in.v6 = pairs[4];
+    if (pairs.len >= 6) in.v7 = pairs[5];
+    if (pairs.len >= 7) in.v8 = pairs[6];
+    if (pairs.len >= 8) in.v9 = pairs[7];
+    if (pairs.len >= 9) in.v10 = pairs[8];
+    if (pairs.len >= 10) in.v11 = pairs[9];
+    if (pairs.len >= 11) in.v12 = pairs[10];
+    if (pairs.len >= 12) in.v13 = pairs[11];
+    const extra = extraCount(n);
+    if (pairs.len > 12) {
+        return issueStack(.futex_wait_change, extra, in, pairs[12..]);
+    }
+    return issueReg(.futex_wait_change, extra, in);
+}
+
+pub fn futexWake(addr: u64, count: u64) Regs {
+    return issueReg(.futex_wake, 0, .{ .v1 = addr, .v2 = count });
+}
+
+// ---------------------------------------------------------------
+// 46..51: time / rng / sysinfo
+// ---------------------------------------------------------------
+
+pub fn timeMonotonic() Regs {
+    return issueReg(.time_monotonic, 0, .{});
+}
+
+pub fn timeGetwall() Regs {
+    return issueReg(.time_getwall, 0, .{});
+}
+
+pub fn timeSetwall(ns_since_epoch: u64) Regs {
+    return issueReg(.time_setwall, 0, .{ .v1 = ns_since_epoch });
+}
+
+pub fn random(count: u8) Regs {
+    return issueReg(.random, extraCount(count), .{});
+}
+
+pub fn infoSystem() Regs {
+    return issueReg(.info_system, 0, .{});
+}
+
+pub fn infoCores(core_id: u64) Regs {
+    return issueReg(.info_cores, 0, .{ .v1 = core_id });
+}
+
+// ---------------------------------------------------------------
+// 52..57: power
+// ---------------------------------------------------------------
+
+pub fn powerShutdown() Regs {
+    return issueReg(.power_shutdown, 0, .{});
+}
+
+pub fn powerReboot() Regs {
+    return issueReg(.power_reboot, 0, .{});
+}
+
+pub fn powerSleep(depth: u64) Regs {
+    return issueReg(.power_sleep, 0, .{ .v1 = depth });
+}
+
+pub fn powerScreenOff() Regs {
+    return issueReg(.power_screen_off, 0, .{});
+}
+
+pub fn powerSetFreq(core_id: u64, hz: u64) Regs {
+    return issueReg(.power_set_freq, 0, .{ .v1 = core_id, .v2 = hz });
+}
+
+pub fn powerSetIdle(core_id: u64, policy: u64) Regs {
+    return issueReg(.power_set_idle, 0, .{ .v1 = core_id, .v2 = policy });
+}
+
+// Compile-time guard against accidentally reordering the SyscallNum
+// enum above. Matches the spec assignments verbatim.
 comptime {
-    if (@sizeOf(SysInfo) != 24) @compileError("SysInfo must be 24 bytes (§2.15)");
-    if (@sizeOf(CoreInfo) != 32) @compileError("CoreInfo must be 32 bytes (§2.15)");
-}
-
-/// Invokes `sys_info(info_ptr, cores_ptr)`. Pass `0` for `cores_ptr` to read
-/// `SysInfo` without touching per-core scheduler accounting (§2.15, §4.55.4).
-pub fn sys_info(info_ptr: u64, cores_ptr: u64) i64 {
-    return syscall2(.sys_info, info_ptr, cores_ptr);
-}
-
-/// Returns the lowest-indexed event variant whose bit is set in
-/// `info.supported_events`, or null if no defined variants are supported on
-/// this hardware. Test helpers call this and skip the positive path when it
-/// returns null, so the same binary passes on both counter-capable hardware
-/// and stubbed/no-PMU rigs (see §2.14 and §4.50–§4.54).
-pub fn pickSupportedEvent(info: PmuInfo) ?PmuEvent {
-    inline for (@typeInfo(PmuEvent).@"enum".fields) |f| {
-        const bit = @as(u64, 1) << f.value;
-        if ((info.supported_events & bit) != 0) return @enumFromInt(f.value);
-    }
-    return null;
-}
-
-// --- Wall Clock (§2.16, §4.56–§4.57) ---
-
-pub fn clock_getwall() i64 {
-    return syscall0(.clock_getwall);
-}
-
-pub fn clock_setwall(nanos: u64) i64 {
-    return syscall1(.clock_setwall, nanos);
-}
-
-// --- Randomness (§2.17, §4.58) ---
-
-pub fn getrandom(buf: [*]u8, len: u64) i64 {
-    return syscall2(.getrandom, @intFromPtr(buf), len);
-}
-
-pub fn getrandom_raw(buf_addr: u64, len: u64) i64 {
-    return syscall2(.getrandom, buf_addr, len);
-}
-
-// --- IRQ Notifications (§2.18, §4.59–§4.60) ---
-
-/// Removed — always returns E_INVAL.
-pub fn notify_wait(timeout_ns: u64) i64 {
-    return syscall1(._notify_wait_removed, timeout_ns);
-}
-
-pub fn irq_ack(handle: u64) i64 {
-    return syscall1(.irq_ack, handle);
-}
-
-// --- Power Control (§2.19, §4.61–§4.62) ---
-
-pub const POWER_SHUTDOWN: u64 = 0;
-pub const POWER_REBOOT: u64 = 1;
-pub const POWER_SLEEP: u64 = 2;
-pub const POWER_HIBERNATE: u64 = 3;
-pub const POWER_SCREEN_OFF: u64 = 4;
-
-pub const CPU_POWER_SET_FREQ: u64 = 0;
-pub const CPU_POWER_SET_IDLE: u64 = 1;
-
-pub fn sys_power(action: u64) i64 {
-    return syscall1(.sys_power, action);
-}
-
-pub fn sys_cpu_power(action: u64, value: u64) i64 {
-    return syscall2(.sys_cpu_power, action, value);
-}
-
-pub const FAULT_KILL: u64 = 0;
-pub const FAULT_RESUME: u64 = 1;
-pub const FAULT_RESUME_MODIFIED: u64 = 2;
-
-pub const FAULT_MODE_STOP_ALL: u64 = 0;
-pub const FAULT_MODE_EXCLUDE_NEXT: u64 = 1;
-pub const FAULT_MODE_EXCLUDE_PERMANENT: u64 = 2;
-
-/// Number of GPRs serialized in a FaultMessage's saved-regs area. Must
-/// match `kernel/arch/dispatch.zig`'s `fault_gpr_count`.
-pub const fault_gpr_count: usize = switch (builtin.cpu.arch) {
-    .x86_64 => 15,
-    .aarch64 => 31,
-    else => @compileError("unsupported arch"),
-};
-
-/// Size of the saved-regs area inside a FaultMessage: ip + flags + sp +
-/// `fault_gpr_count` GPRs. Must match kernel `fault_regs_size`.
-pub const fault_regs_size: usize = (3 + fault_gpr_count) * @sizeOf(u64);
-
-/// Total size of a FaultMessage written by the kernel into a fault_recv
-/// buffer: 32-byte header + saved-regs area. Must match kernel
-/// `fault_msg_size`.
-pub const fault_msg_size: usize = 32 + fault_regs_size;
-
-pub const FaultMessage = extern struct {
-    process_handle: u64,
-    thread_handle: u64,
-    fault_reason: u8,
-    _pad: [7]u8,
-    fault_addr: u64,
-    // SavedRegs area: kernel writes ip (rip on x86, elr_el1 on aarch64) first.
-    rip: u64,
-    _regs_rest: [fault_regs_size - @sizeOf(u64)]u8,
-};
-
-fn ipc_reply_ex(words: []const u64, atomic_recv: bool, recv_blocking: bool, cap_transfer: bool) i64 {
-    var w: [5]u64 = .{0} ** 5;
-    const count: u3 = @intCast(@min(words.len, 5));
-    for (0..count) |i| w[i] = words[i];
-    const meta: u64 = @as(u64, count) << 2 |
-        (if (atomic_recv) @as(u64, 0x1) else 0) |
-        (if (recv_blocking) @as(u64, 0x2) else 0) |
-        (if (cap_transfer) @as(u64, 0x20) else 0);
-
-    return switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile ("syscall"
-            : [ret] "={rax}" (-> i64),
-            : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_reply)),
-              [m] "{r14}" (meta),
-              [w0] "{rdi}" (w[0]),
-              [w1] "{rsi}" (w[1]),
-              [w2] "{rdx}" (w[2]),
-              [w3] "{r8}" (w[3]),
-              [w4] "{r9}" (w[4]),
-            : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true }),
-        .aarch64 => asm volatile ("svc #0"
-            : [ret] "={x0}" (-> i64),
-            : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_reply)),
-              [m] "{x6}" (meta),
-              [w0] "{x0}" (w[0]),
-              [w1] "{x1}" (w[1]),
-              [w2] "{x2}" (w[2]),
-              [w3] "{x3}" (w[3]),
-              [w4] "{x4}" (w[4]),
-            : .{ .memory = true }),
-        else => unreachable,
-    };
+    std.debug.assert(@intFromEnum(SyscallNum.power_set_idle) == 57);
+    std.debug.assert(@intFromEnum(SyscallNum.create_capability_domain) == 4);
+    std.debug.assert(@intFromEnum(SyscallNum.@"suspend") == 34);
+    std.debug.assert(@intFromEnum(SyscallNum.recv) == 35);
+    std.debug.assert(@intFromEnum(SyscallNum.reply) == 38);
 }
