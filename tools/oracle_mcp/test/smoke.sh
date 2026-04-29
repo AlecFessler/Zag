@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke test for oracle_mcp: speaks JSON-RPC over stdio, exercises every
-# `tmp_callgraph_*` tool, asserts each returns a result (not an error).
+# `callgraph_*` tool, asserts each returns a result (not an error).
 #
 # Usage:
 #   tools/oracle_mcp/test/smoke.sh                # uses default DB dir
@@ -39,22 +39,22 @@ trap 'rm -f "$REQ_FILE"' EXIT
     cat <<JSON
 {"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tmp_callgraph_arches","arguments":{}}}
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tmp_callgraph_find","arguments":{"q":"halt","limit":3}}}
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tmp_callgraph_loc","arguments":{"name":"arch.x64.cpu.halt"}}}
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tmp_callgraph_src","arguments":{"name":"arch.x64.cpu.halt"}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tmp_callgraph_callers","arguments":{"name":"arch.x64.cpu.halt"}}}
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"tmp_callgraph_reaches","arguments":{"from":"arch.x64.power.doShutdown","to":"arch.x64.cpu.halt"}}}
-{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tmp_callgraph_entries","arguments":{}}}
-{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"tmp_callgraph_modules","arguments":{}}}
-{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"tmp_callgraph_trace","arguments":{"entry":"arch.x64.power.doShutdown","depth":2}}}
-{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"tmp_callgraph_type","arguments":{"name":"memory.address.VAddr"}}}
-{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"tmp_callgraph_src_bin","arguments":{"name":"arch.x64.cpu.halt"}}}
-{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"tmp_callgraph_src_bin_at","arguments":{"at":"arch/x64/cpu.zig:430"}}}
-{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"tmp_callgraph_bin_dataflow_reg","arguments":{"name":"arch.x64.cpu.halt","reg":"rsp"}}}
-{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"tmp_callgraph_bin_addr2line","arguments":{"addr":"0xffffffff8000f815"}}}
-{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"tmp_callgraph_commits","arguments":{"limit":3}}}
-{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"tmp_callgraph_findings","arguments":{"limit":3}}}
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"callgraph_arches","arguments":{}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"callgraph_find","arguments":{"q":"halt","limit":3}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"callgraph_loc","arguments":{"name":"arch.x64.cpu.halt"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"callgraph_src","arguments":{"name":"arch.x64.cpu.halt"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"callgraph_callers","arguments":{"name":"arch.x64.cpu.halt"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"callgraph_reaches","arguments":{"from":"arch.x64.power.doShutdown","to":"arch.x64.cpu.halt"}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"callgraph_entries","arguments":{}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"callgraph_modules","arguments":{}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"callgraph_trace","arguments":{"entry":"arch.x64.power.doShutdown","depth":2}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"callgraph_type","arguments":{"name":"memory.address.VAddr"}}}
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"callgraph_src_bin","arguments":{"name":"arch.x64.cpu.halt"}}}
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"callgraph_src_bin_at","arguments":{"at":"arch/x64/cpu.zig:430"}}}
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"callgraph_bin_dataflow_reg","arguments":{"name":"arch.x64.cpu.halt","reg":"rsp"}}}
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"callgraph_bin_addr2line","arguments":{"addr":"0xffffffff8000f815"}}}
+{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"callgraph_commits","arguments":{"limit":3}}}
+{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"callgraph_findings","arguments":{"limit":3}}}
 JSON
 } > "$REQ_FILE"
 

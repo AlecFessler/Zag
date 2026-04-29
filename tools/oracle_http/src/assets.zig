@@ -1,8 +1,6 @@
-//! Static frontend assets, embedded at compile time. We point at the
-//! sibling `tools/callgraph/src/assets/` tree directly (build-time path)
-//! so the in-development web UI doesn't have to be copied to live in two
-//! places. When the user switches over to oracle_http they're seeing
-//! the exact same JS/HTML they ran under the old server.
+//! Static frontend assets, embedded at compile time. Lives in
+//! tools/oracle_http/src/assets/ directly (vendored at the cutover
+//! when the legacy tools/callgraph/ in-memory daemon was removed).
 
 pub const index_html = @embedFile("assets/index.html");
 pub const app_js = @embedFile("assets/app.js");

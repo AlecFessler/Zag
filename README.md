@@ -95,18 +95,32 @@ zig build -Darch=arm -Dprofile=test
 
 All under [`tools/`](tools/). Each builds with `zig build` from its own directory.
 
-### callgraph — interactive call graph explorer
+### oracle DB — indexed callgraph + analyzer pipeline
 
-[`tools/callgraph/`](tools/callgraph/) — parses kernel LLVM IR + Zig AST and serves a browser UI for navigating the call graph. Same daemon also runs as an MCP server over stdio for use from agentic tools.
+The kernel is indexed into a per-(arch, commit_sha) SQLite DB built by [`tools/indexer/`](tools/indexer/) and queried by two daemons. The DB carries entities, ir_calls, AST, entry points, alias chains, type refs, binary symbols + disasm + DWARF lines, and analyzer findings — one schema, every consumer.
 
 ![callgraph trace view](docs/tools/callgraph_trace_view.png)
 
 ```bash
-cd tools/callgraph && zig build
-./zig-out/bin/callgraph                 # http://127.0.0.1:8080
-./zig-out/bin/callgraph --mcp           # stdio MCP server
-./zig-out/bin/callgraph --verify        # AST/IR diff, exit
+# Build the DB after a kernel build (takes a few seconds):
+cd tools/indexer && zig build && cd ../..
+zig build -Dprofile=test -Demit_ir=true   # gives us .ll + .elf
+tools/indexer/zig-out/bin/indexer \
+    --kernel-root kernel \
+    --extra-source-root routerOS --extra-source-root hyprvOS \
+    --extra-source-root bootloader --extra-source-root tools --extra-source-root tests \
+    --out tools/oracle_http/test/dbs/x86_64-$(git rev-parse --short HEAD).db \
+    --arch x86_64 --commit-sha $(git rev-parse HEAD) \
+    --ir zig-out/kernel.x86_64.ll --elf zig-out/bin/kernel.elf
+
+# Then either daemon — both auto-discover DBs in their --db-dir:
+cd tools/oracle_http && zig build && ./zig-out/bin/oracle_http \
+    --db-dir ../oracle_http/test/dbs --port 8080   # HTTP API + browser UI
+cd tools/oracle_mcp  && zig build && ./zig-out/bin/oracle_mcp \
+    --db-dir ../oracle_http/test/dbs               # stdio MCP server
 ```
+
+The MCP server speaks the production callgraph_* tool surface (callgraph_trace, callgraph_callers, callgraph_findings, ...). The HTTP server has the matching /api/* routes plus a graph view, source/diff endpoints, and `/api/findings` for analyzer output.
 
 ### check_gen_lock — SecureSlab gen-lock analyzer
 

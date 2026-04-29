@@ -4,7 +4,7 @@
 //!   --db <path>        open a single oracle DB file
 //!   --db-dir <dir>     pick the newest *.db in <dir> (by mtime)
 //!   --git-root <dir>   repo root for git-plumbing tools
-//!                      (`tmp_callgraph_commits`); defaults to CWD
+//!                      (`callgraph_commits`); defaults to CWD
 //!
 //! At least one of --db / --db-dir is required. The daemon refuses to open
 //! a DB that doesn't have `meta('schema_complete','true')` — the indexer

@@ -1,4 +1,4 @@
-//! Tool dispatch for the oracle MCP daemon. Each `tmp_callgraph_*` handler
+//! Tool dispatch for the oracle MCP daemon. Each `callgraph_*` handler
 //! issues SQL queries against an open SQLite DB matching tools/indexer/schema.sql.
 //!
 //! The registry holds one open Db per (arch, commit_sha) DB file the daemon
@@ -25,7 +25,7 @@ pub const DbEntry = struct {
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     dbs: std.ArrayList(DbEntry),
-    /// Repo root used for git-plumbing tools (tmp_callgraph_commits).
+    /// Repo root used for git-plumbing tools (callgraph_commits).
     /// Defaults to CWD; override at construction time. Lifetime-managed
     /// by main; the registry just borrows the slice.
     git_root: []const u8,
@@ -79,67 +79,67 @@ pub const Registry = struct {
         args: std.json.Value,
         out: *std.ArrayList(u8),
     ) !bool {
-        if (std.mem.eql(u8, tool, "tmp_callgraph_arches")) {
+        if (std.mem.eql(u8, tool, "callgraph_arches")) {
             try self.toolArches(al, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_find")) {
+        if (std.mem.eql(u8, tool, "callgraph_find")) {
             try self.toolFind(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_loc")) {
+        if (std.mem.eql(u8, tool, "callgraph_loc")) {
             try self.toolLoc(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_src")) {
+        if (std.mem.eql(u8, tool, "callgraph_src")) {
             try self.toolSrc(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_callers")) {
+        if (std.mem.eql(u8, tool, "callgraph_callers")) {
             try self.toolCallers(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_reaches")) {
+        if (std.mem.eql(u8, tool, "callgraph_reaches")) {
             try self.toolReaches(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_entries")) {
+        if (std.mem.eql(u8, tool, "callgraph_entries")) {
             try self.toolEntries(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_modules")) {
+        if (std.mem.eql(u8, tool, "callgraph_modules")) {
             try self.toolModules(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_trace")) {
+        if (std.mem.eql(u8, tool, "callgraph_trace")) {
             try self.toolTrace(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_type")) {
+        if (std.mem.eql(u8, tool, "callgraph_type")) {
             try self.toolType(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_src_bin")) {
+        if (std.mem.eql(u8, tool, "callgraph_src_bin")) {
             try self.toolSrcBin(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_src_bin_at")) {
+        if (std.mem.eql(u8, tool, "callgraph_src_bin_at")) {
             try self.toolSrcBinAt(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_bin_dataflow_reg")) {
+        if (std.mem.eql(u8, tool, "callgraph_bin_dataflow_reg")) {
             try self.toolBinDataflowReg(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_bin_addr2line")) {
+        if (std.mem.eql(u8, tool, "callgraph_bin_addr2line")) {
             try self.toolBinAddr2Line(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_commits")) {
+        if (std.mem.eql(u8, tool, "callgraph_commits")) {
             try self.toolCommits(al, args, out);
             return true;
         }
-        if (std.mem.eql(u8, tool, "tmp_callgraph_findings")) {
+        if (std.mem.eql(u8, tool, "callgraph_findings")) {
             try self.toolFindings(al, args, out);
             return true;
         }
@@ -853,7 +853,7 @@ pub const Registry = struct {
         });
     }
 
-    /// `tmp_callgraph_commits` — output identical to oracle_http's
+    /// `callgraph_commits` — output identical to oracle_http's
     /// `/api/commits?format=text`. Shells out to `git log` against
     /// `self.git_root` and decorates the output with `[stale]` markers.
     fn toolCommits(self: *Registry, al: std.mem.Allocator, args: std.json.Value, out: *std.ArrayList(u8)) !void {

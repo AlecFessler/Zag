@@ -1,9 +1,11 @@
 //! MCP (Model Context Protocol) stdio transport.
 //!
-//! Speaks JSON-RPC 2.0, line-delimited, over stdin/stdout. Same wire format
-//! as tools/callgraph/src/mcp.zig — that's what Claude Code's MCP transport
-//! expects. Each tool call dispatches into the local SQLite-backed handlers
-//! (see tools.zig); we don't talk to a daemon.
+//! Speaks JSON-RPC 2.0, line-delimited, over stdin/stdout — the wire
+//! format Claude Code's MCP transport expects. Each tool call
+//! dispatches into the local SQLite-backed handlers (see tools.zig)
+//! against the per-(arch, commit_sha) DB built by tools/indexer.
+//! This is the production callgraph MCP server; the in-memory daemon
+//! at tools/callgraph/ that this replaces is gone.
 
 const std = @import("std");
 
@@ -15,29 +17,31 @@ const SERVER_INFO_JSON = "{\"name\":\"oracle-mcp\",\"version\":\"0.1.0\"}";
 const CAPABILITIES_JSON = "{\"tools\":{\"listChanged\":false},\"logging\":{}}";
 
 const INSTRUCTIONS =
-    "Secondary callgraph oracle (SQLite-backed prototype). Tool names " ++
-    "are prefixed `tmp_callgraph_` so they don't collide with the " ++
-    "production `callgraph_*` daemon running alongside this one. Use " ++
-    "this only when explicitly directed.";
+    "Callgraph oracle for the Zag kernel — SQLite-backed view over " ++
+    "the per-(arch, commit_sha) DB built by tools/indexer. Provides " ++
+    "structured queries over entities, ir_calls, entry points, AST, " ++
+    "binaries, DWARF lines, and analyzer findings (lint_finding). " ++
+    "Use these tools instead of Read/Grep/Glob when investigating " ++
+    "kernel code; typically 5-20× cheaper in tokens.";
 
 const TOOLS_JSON =
     \\[
-    \\  {"name":"tmp_callgraph_arches","description":"List (arch, commit_sha) for every loaded oracle DB.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_find","description":"FTS5 substring search over entity.qualified_name. Returns name + kind + file:line.","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"limit":{"type":"integer"}},"required":["q"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_loc","description":"Definition location for one function: path:def_line:def_col, with [inlined] when is_ast_only=1.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_src","description":"Function body sliced from file.source via def_byte_start..def_byte_end.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_callers","description":"Reverse callers from ir_call. Aggregates across generic_parent_id instantiations.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_reaches","description":"Recursive CTE on ir_call (direct/dispatch_x64/dispatch_aarch64). Returns yes/no + shortest path.","inputSchema":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"max_depth":{"type":"integer"}},"required":["from","to"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_entries","description":"Entry points grouped by kind. Optional kind filter.","inputSchema":{"type":"object","properties":{"kind":{"type":"string"}},"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_modules","description":"Cross-module call counts. min_edges threshold; direction = out|in|both.","inputSchema":{"type":"object","properties":{"level":{"type":"integer"},"min_edges":{"type":"integer"},"direction":{"type":"string"}},"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_trace","description":"Recursive CTE on ir_call rooted at one fn; per-callsite ast_edge ancestor walk reveals enclosing if/else/while/for/switch_prong/block. Renders an indented tree with control-flow markers.","inputSchema":{"type":"object","properties":{"entry":{"type":"string"},"depth":{"type":"integer"},"hide_debug":{"type":"boolean"},"hide_library":{"type":"boolean"},"hide_assertions":{"type":"boolean"}},"required":["entry"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_type","description":"Type definition: type table for the entity, plus alias chain (depth ≤4 via const_alias).","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_src_bin","description":"Disassembly for a function — bin_inst over the symbol's address range, interleaved with `; file:line` markers when entering a new dwarf_line range.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_src_bin_at","description":"Source line → emitted instructions. file basename match against dwarf_line, then bin_inst over the joined ranges.","inputSchema":{"type":"object","properties":{"at":{"type":"string"}},"required":["at"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_bin_dataflow_reg","description":"Linear scan of bin_inst over a fn's address range; regex over operands extracts register tokens. stop_at_call defaults true.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"reg":{"type":"string"},"stop_at_call":{"type":"boolean"}},"required":["name","reg"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_bin_addr2line","description":"Floor lookup — dwarf_line WHERE addr_lo <= ? ORDER BY addr_lo DESC LIMIT 1; symbol via bin_symbol.","inputSchema":{"type":"object","properties":{"addr":{"type":"string"}},"required":["addr"],"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_commits","description":"Recent commits in the Zag repo. One commit per line: `<short_sha>  <iso8601_date>  <subject>` with a trailing `  [stale]` marker on commits older than the `-Demit_ir` build option. Limit defaults to 30 (max 500). Shells out to `git log` against the daemon's repo root.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":500}},"additionalProperties":false}},
-    \\  {"name":"tmp_callgraph_findings","description":"Query the lint_finding table populated by analyzer passes (genlock, dead_code). Filters: analyzer / rule / severity / file (path GLOB). One line per finding: `<analyzer>  [<severity>]  <rule>  <file>:<line>  <message>`. Useful for asking 'what dead code does X module have?' without re-running the analyzer.","inputSchema":{"type":"object","properties":{"analyzer":{"type":"string"},"rule":{"type":"string"},"severity":{"type":"string"},"file":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":2000}},"additionalProperties":false}}
+    \\  {"name":"callgraph_arches","description":"List (arch, commit_sha) for every loaded oracle DB.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+    \\  {"name":"callgraph_find","description":"FTS5 substring search over entity.qualified_name. Returns name + kind + file:line.","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"limit":{"type":"integer"}},"required":["q"],"additionalProperties":false}},
+    \\  {"name":"callgraph_loc","description":"Definition location for one function: path:def_line:def_col, with [inlined] when is_ast_only=1.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
+    \\  {"name":"callgraph_src","description":"Function body sliced from file.source via def_byte_start..def_byte_end.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
+    \\  {"name":"callgraph_callers","description":"Reverse callers from ir_call. Aggregates across generic_parent_id instantiations.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
+    \\  {"name":"callgraph_reaches","description":"Recursive CTE on ir_call (direct/dispatch_x64/dispatch_aarch64). Returns yes/no + shortest path.","inputSchema":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"max_depth":{"type":"integer"}},"required":["from","to"],"additionalProperties":false}},
+    \\  {"name":"callgraph_entries","description":"Entry points grouped by kind. Optional kind filter.","inputSchema":{"type":"object","properties":{"kind":{"type":"string"}},"additionalProperties":false}},
+    \\  {"name":"callgraph_modules","description":"Cross-module call counts. min_edges threshold; direction = out|in|both.","inputSchema":{"type":"object","properties":{"level":{"type":"integer"},"min_edges":{"type":"integer"},"direction":{"type":"string"}},"additionalProperties":false}},
+    \\  {"name":"callgraph_trace","description":"Recursive CTE on ir_call rooted at one fn; per-callsite ast_edge ancestor walk reveals enclosing if/else/while/for/switch_prong/block. Renders an indented tree with control-flow markers.","inputSchema":{"type":"object","properties":{"entry":{"type":"string"},"depth":{"type":"integer"},"hide_debug":{"type":"boolean"},"hide_library":{"type":"boolean"},"hide_assertions":{"type":"boolean"}},"required":["entry"],"additionalProperties":false}},
+    \\  {"name":"callgraph_type","description":"Type definition: type table for the entity, plus alias chain (depth ≤4 via const_alias).","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
+    \\  {"name":"callgraph_src_bin","description":"Disassembly for a function — bin_inst over the symbol's address range, interleaved with `; file:line` markers when entering a new dwarf_line range.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
+    \\  {"name":"callgraph_src_bin_at","description":"Source line → emitted instructions. file basename match against dwarf_line, then bin_inst over the joined ranges.","inputSchema":{"type":"object","properties":{"at":{"type":"string"}},"required":["at"],"additionalProperties":false}},
+    \\  {"name":"callgraph_bin_dataflow_reg","description":"Linear scan of bin_inst over a fn's address range; regex over operands extracts register tokens. stop_at_call defaults true.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"reg":{"type":"string"},"stop_at_call":{"type":"boolean"}},"required":["name","reg"],"additionalProperties":false}},
+    \\  {"name":"callgraph_bin_addr2line","description":"Floor lookup — dwarf_line WHERE addr_lo <= ? ORDER BY addr_lo DESC LIMIT 1; symbol via bin_symbol.","inputSchema":{"type":"object","properties":{"addr":{"type":"string"}},"required":["addr"],"additionalProperties":false}},
+    \\  {"name":"callgraph_commits","description":"Recent commits in the Zag repo. One commit per line: `<short_sha>  <iso8601_date>  <subject>` with a trailing `  [stale]` marker on commits older than the `-Demit_ir` build option. Limit defaults to 30 (max 500). Shells out to `git log` against the daemon's repo root.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":500}},"additionalProperties":false}},
+    \\  {"name":"callgraph_findings","description":"Query the lint_finding table populated by analyzer passes (genlock, dead_code). Filters: analyzer / rule / severity / file (path GLOB). One line per finding: `<analyzer>  [<severity>]  <rule>  <file>:<line>  <message>`. Useful for asking 'what dead code does X module have?' without re-running the analyzer.","inputSchema":{"type":"object","properties":{"analyzer":{"type":"string"},"rule":{"type":"string"},"severity":{"type":"string"},"file":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":2000}},"additionalProperties":false}}
     \\]
 ;
 
