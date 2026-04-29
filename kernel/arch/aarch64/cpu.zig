@@ -507,7 +507,18 @@ pub fn prepareEcContext(
     ctx.elr_el1 = entry.addr;
 
     if (ustack_top) |us| {
-        ctx.sp_el0 = us.addr;
+        // Reserve a 16-byte slot at the top of the user stack for the
+        // kernel-staged syscall return word. Spec §[syscall_abi]: vreg
+        // 0 lives at `[sp_el0 + 0]` when a syscall executes, and the
+        // resume path (loadEcContextAndReturn) flushes the recv-deferred
+        // syscall word into that slot before the ERET. A freshly-prepared
+        // EC that suspends before its entry runs (e.g. a sender stashed
+        // by `suspend(W, port)` and then resumed via reply / reply_transfer)
+        // would otherwise have sp_el0 == stack_top, putting `[sp_el0 + 0]`
+        // one byte past the last mapped user-stack page — the kernel write
+        // would page-fault. Mirrors x86-64's `rsp - 8` skew rationale; 16
+        // here keeps AAPCS64's 16-byte SP alignment requirement.
+        ctx.sp_el0 = us.addr - 16;
         ctx.spsr_el1 = SPSR_M_EL0T;
     } else {
         // Kernel-mode init EC: stay at EL1h with the kernel stack as SP.

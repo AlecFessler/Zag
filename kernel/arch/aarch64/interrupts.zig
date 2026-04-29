@@ -143,12 +143,12 @@ pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
     ctx.elr_el1 = value;
 }
 
-/// Companion read for `writeUserVreg14`. Returns the value the
-/// receiver wrote at `[sp_el0 + 8]` so reply_transfer can harvest a
-/// vreg 32 modification (Spec §[reply] test 14) before resuming the
-/// sender. TTBR0 must reference the receiver's address space.
+/// Companion read for `writeUserVreg14`. Spec §[event_state] aarch64
+/// maps vreg 14 onto x13, so the receiver's modification rides in the
+/// saved x13 of its syscall frame — not on the user stack. Mirrors
+/// `writeUserVreg14`'s `ctx.regs.x13` target.
 pub fn readUserVreg14(ctx: *const ArchCpuContext) u64 {
-    return @as(*u64, @ptrFromInt(ctx.sp_el0 + 8)).*;
+    return ctx.regs.x13;
 }
 
 /// Spec §[event_state]: vreg 14 carries the suspended EC's saved PC

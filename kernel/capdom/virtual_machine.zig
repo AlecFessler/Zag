@@ -194,7 +194,10 @@ pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64
     // policies whose num_*_responses fields exceed the static array
     // bounds. The struct lives at offset 0 of the page frame; the
     // arch dispatch reads it through the kernel physmap.
-    vm_dispatch.validateVmPolicy(policy_pf_obj) catch return errors.E_INVAL;
+    vm_dispatch.validateVmPolicy(policy_pf_obj) catch |err| {
+        if (err == error.NoDevice) return errors.E_NODEV;
+        return errors.E_INVAL;
+    };
 
     const new_vm = allocVm(domain, policy_pf_obj) catch |err| switch (err) {
         // Spec §[create_virtual_machine]: E_NODEV if the platform

@@ -117,6 +117,14 @@ inline fn readPMCR() u64 {
     return v;
 }
 
+inline fn writePMCR(v: u64) void {
+    asm volatile ("msr pmcr_el0, %[v]"
+        :
+        : [v] "r" (v),
+    );
+    asm volatile ("isb");
+}
+
 inline fn readID_AA64DFR0() u64 {
     var v: u64 = undefined;
     asm volatile ("mrs %[v], id_aa64dfr0_el1"
@@ -376,7 +384,15 @@ pub fn pmuRestore(state: *PmuState) void {
         if (cfg.has_threshold) intr_mask |= @as(u64, 1) << sh;
         i += 1;
     }
-    if (enable_mask != 0) writePMCNTENSET(enable_mask);
+    if (enable_mask != 0) {
+        // D13.3.3 PMCR_EL0.E (bit 0) is the global event-counter enable;
+        // pmuSave does not clear it but the per-core reset state has E=0,
+        // so re-arming individual counters without PMCR.E would leave them
+        // frozen. Set E + LC to mirror programCounters.
+        const pmcr = readPMCR();
+        writePMCR(pmcr | 1 | (@as(u64, 1) << 6));
+        writePMCNTENSET(enable_mask);
+    }
     // D13.3.21 PMINTENSET_EL1: re-arm the PMU overflow PPI only on
     // counters the restored thread asked to sample (has_threshold). The
     // matching mask was cleared in pmuSave so this is a pure re-arm.
@@ -460,7 +476,14 @@ fn programCounters(state: *PmuState, configs: []const PmuCounterConfig) void {
         i += 1;
     }
 
-    if (enable_mask != 0) writePMCNTENSET(enable_mask);
+    if (enable_mask != 0) {
+        // D13.3.3 PMCR_EL0.E (bit 0) is the global event-counter enable;
+        // without it PMCNTENSET is inert. Set E and the long-cycle-counter
+        // bit (LC) so subsequent saves/reads observe live counts.
+        const pmcr = readPMCR();
+        writePMCR(pmcr | 1 | (@as(u64, 1) << 6));
+        writePMCNTENSET(enable_mask);
+    }
     if (intr_mask != 0) writePMINTENSET(intr_mask);
 }
 
