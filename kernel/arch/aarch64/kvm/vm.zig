@@ -17,7 +17,7 @@ const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
 
 pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
     _ = policy_pf;
-    @panic("step 6: rewrite for spec-v3");
+    return error.NoDevice;
 }
 
 pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
