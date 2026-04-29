@@ -72,15 +72,46 @@ stage_dead_code_report() {
     echo "=================================================="
     echo "[0b] Dead-code detector (gating)"
     echo "=================================================="
-    # AST-based dead-code detector. Catches alias-chain dead exports
-    # (e.g. `pub const X = mod.X;` with no consumers) that the prior
-    # grep-based tool missed. Tool exits non-zero on any finding.
+    # Dead-code detector now reads the per-(arch, commit_sha) oracle DB
+    # produced by tools/indexer. The DB must already exist; the indexer is
+    # invoked separately by the kernel build pipeline. Tool exits non-zero
+    # on any finding.
     if ! (cd "$ZAG_ROOT/tools/dead_code_zig" && zig build 2>&1); then
         FAILURES+=("dead-code detector build")
         return 1
     fi
+    if ! (cd "$ZAG_ROOT/tools/indexer" && zig build 2>&1); then
+        FAILURES+=("dead-code indexer build")
+        return 1
+    fi
+
+    local sha
+    sha="$(cd "$ZAG_ROOT" && git rev-parse --short HEAD)"
+    local db="$ZAG_ROOT/tools/oracle_http/test/dbs/x86_64-${sha}.db"
+
+    if [[ ! -f "$db" ]]; then
+        # Build the DB if absent. Requires the kernel ELF + IR; the kernel
+        # build with -Demit_ir=true emits these into zig-out/.
+        rm -f "$db"
+        (cd "$ZAG_ROOT" && tools/indexer/zig-out/bin/indexer \
+            --kernel-root kernel \
+            --extra-token-root routerOS \
+            --extra-token-root hyprvOS \
+            --extra-token-root bootloader \
+            --extra-token-root tools \
+            --extra-token-root tests \
+            --out "$db" \
+            --arch x86_64 \
+            --commit-sha "$(git rev-parse HEAD)" \
+            --ir zig-out/kernel.x86_64.ll \
+            --elf zig-out/bin/kernel.elf 2>&1) || {
+            FAILURES+=("dead-code DB build")
+            return 1
+        }
+    fi
+
     local detector="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    if ! (cd "$ZAG_ROOT" && "$detector" kernel); then
+    if ! (cd "$ZAG_ROOT" && "$detector" --db "$db" --target kernel); then
         FAILURES+=("dead-code findings")
         return 1
     fi

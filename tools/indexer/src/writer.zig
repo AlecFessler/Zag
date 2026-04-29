@@ -24,6 +24,10 @@ pub const Job = union(enum) {
     bin_symbols: []const types.BinSymbolRow,
     bin_insts: []const types.BinInstRow,
     dwarf_lines: []const types.DwarfLineRow,
+    /// const_alias rows; pre-resolved (alias_id, target_id) pairs.
+    const_aliases: []const ConstAliasRow,
+    /// entity_type_ref rows; pre-resolved.
+    type_refs: []const TypeRefRow,
     /// One-shot SQL string the writer executes verbatim. Caller must provide
     /// a null-terminated slice (use `palloc.dupeZ`). Used for UPDATE / INSERT
     /// passes (e.g. setting is_ast_only on the complement of ir_fn).
@@ -34,6 +38,17 @@ pub const Job = union(enum) {
     fts_rebuild: []const u8, // virtual table name
     /// Owner is done writing; flush and exit.
     shutdown: void,
+};
+
+pub const ConstAliasRow = struct {
+    entity_id: u32,
+    target_entity_id: u32,
+};
+
+pub const TypeRefRow = struct {
+    referrer_entity_id: u32,
+    referred_entity_id: u32,
+    role: []const u8,
 };
 
 pub const FinalEntity = struct {
@@ -47,6 +62,7 @@ pub const FinalEntity = struct {
     def_line: u32,
     def_col: u32,
     is_slab_backed: bool,
+    is_pub: bool,
 };
 
 pub const AstEntityRef = struct {
@@ -226,9 +242,29 @@ pub const Writer = struct {
                         try stmts.insert_entity.bindInt(8, e.def_line);
                         try stmts.insert_entity.bindInt(9, e.def_col);
                         try stmts.insert_entity.bindInt(10, if (e.is_slab_backed) 1 else 0);
+                        try stmts.insert_entity.bindInt(11, if (e.is_pub) 1 else 0);
                         try stmts.insert_entity.execOnce();
                     }
                     rows_in_txn += records.len;
+                },
+                .const_aliases => |rows| {
+                    for (rows) |r| {
+                        stmts.insert_const_alias.reset();
+                        try stmts.insert_const_alias.bindInt(1, r.entity_id);
+                        try stmts.insert_const_alias.bindInt(2, r.target_entity_id);
+                        try stmts.insert_const_alias.execOnce();
+                    }
+                    rows_in_txn += rows.len;
+                },
+                .type_refs => |rows| {
+                    for (rows) |r| {
+                        stmts.insert_type_ref.reset();
+                        try stmts.insert_type_ref.bindInt(1, r.referrer_entity_id);
+                        try stmts.insert_type_ref.bindInt(2, r.referred_entity_id);
+                        try stmts.insert_type_ref.bindText(3, r.role);
+                        try stmts.insert_type_ref.execOnce();
+                    }
+                    rows_in_txn += rows.len;
                 },
                 .ir_fns => |rows| {
                     for (rows) |r| {
@@ -375,6 +411,8 @@ const Statements = struct {
     insert_bin_inst: sqlite.Stmt,
     insert_dwarf_line: sqlite.Stmt,
     insert_meta: sqlite.Stmt,
+    insert_const_alias: sqlite.Stmt,
+    insert_type_ref: sqlite.Stmt,
 
     fn prepare(db: *sqlite.Db) !Statements {
         return .{
@@ -384,7 +422,7 @@ const Statements = struct {
             .insert_token = try db.prepare("INSERT INTO token (file_id, idx, kind, byte_start, byte_len, text, paren_depth, brace_depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
             .insert_ast_node = try db.prepare("INSERT INTO ast_node (id, file_id, parent_id, kind, byte_start, byte_end) VALUES (?, ?, ?, ?, ?, ?)"),
             .insert_ast_edge = try db.prepare("INSERT OR IGNORE INTO ast_edge (parent_id, child_id, role) VALUES (?, ?, ?)"),
-            .insert_entity = try db.prepare("INSERT INTO entity (id, kind, qualified_name, module_id, def_file_id, def_byte_start, def_byte_end, def_line, def_col, is_slab_backed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+            .insert_entity = try db.prepare("INSERT INTO entity (id, kind, qualified_name, module_id, def_file_id, def_byte_start, def_byte_end, def_line, def_col, is_slab_backed, is_pub) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
             .update_ast_entity = try db.prepare("UPDATE ast_node SET entity_id = ? WHERE id = ?"),
             .insert_ir_fn = try db.prepare("INSERT OR IGNORE INTO ir_fn (entity_id, ir_name, attrs) VALUES (?, ?, ?)"),
             .insert_ir_call = try db.prepare("INSERT INTO ir_call (caller_entity_id, callee_entity_id, call_kind, resolved_via, confidence, ast_node_id, site_line) VALUES (?, ?, ?, ?, ?, ?, ?)"),
@@ -392,6 +430,8 @@ const Statements = struct {
             .insert_bin_inst = try db.prepare("INSERT OR IGNORE INTO bin_inst (addr, bytes, mnemonic, operands) VALUES (?, ?, ?, ?)"),
             .insert_dwarf_line = try db.prepare("INSERT OR IGNORE INTO dwarf_line (addr_lo, addr_hi, file_id, line, col) VALUES (?, ?, ?, ?, ?)"),
             .insert_meta = try db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)"),
+            .insert_const_alias = try db.prepare("INSERT OR IGNORE INTO const_alias (entity_id, target_entity_id) VALUES (?, ?)"),
+            .insert_type_ref = try db.prepare("INSERT OR IGNORE INTO entity_type_ref (referrer_entity_id, referred_entity_id, role) VALUES (?, ?, ?)"),
         };
     }
 
@@ -410,5 +450,7 @@ const Statements = struct {
         self.insert_bin_inst.finalize();
         self.insert_dwarf_line.finalize();
         self.insert_meta.finalize();
+        self.insert_const_alias.finalize();
+        self.insert_type_ref.finalize();
     }
 };

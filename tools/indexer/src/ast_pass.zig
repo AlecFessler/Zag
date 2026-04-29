@@ -2,6 +2,8 @@ const std = @import("std");
 const types = @import("types.zig");
 
 const ProvisionalEntity = types.ProvisionalEntity;
+const ProvisionalAlias = types.ProvisionalAlias;
+const ProvisionalTypeRef = types.ProvisionalTypeRef;
 const AstNodeRow = types.AstNodeRow;
 const AstEdgeRow = types.AstEdgeRow;
 const EntityKind = types.EntityKind;
@@ -13,6 +15,8 @@ pub const PassResult = struct {
     entities: []ProvisionalEntity,
     ast_nodes: []AstNodeRow,
     ast_edges: []AstEdgeRow,
+    aliases: []ProvisionalAlias,
+    type_refs: []ProvisionalTypeRef,
 };
 
 const Walker = struct {
@@ -27,6 +31,8 @@ const Walker = struct {
     entities: std.ArrayList(ProvisionalEntity),
     nodes: std.ArrayList(AstNodeRow),
     edges: std.ArrayList(AstEdgeRow),
+    aliases: std.ArrayList(ProvisionalAlias),
+    type_refs: std.ArrayList(ProvisionalTypeRef),
 };
 
 /// Slice B: walks the AST emitting BOTH provisional entity records AND
@@ -56,17 +62,21 @@ pub fn pass(
         .entities = .empty,
         .nodes = .empty,
         .edges = .empty,
+        .aliases = .empty,
+        .type_refs = .empty,
     };
 
     const root_decls = tree.rootDecls();
     for (root_decls) |decl| {
-        try walkContainerMember(&w, decl, null, "");
+        try walkContainerMember(&w, decl, null, "", .other);
     }
 
     return .{
         .entities = try w.entities.toOwnedSlice(palloc),
         .ast_nodes = try w.nodes.toOwnedSlice(palloc),
         .ast_edges = try w.edges.toOwnedSlice(palloc),
+        .aliases = try w.aliases.toOwnedSlice(palloc),
+        .type_refs = try w.type_refs.toOwnedSlice(palloc),
     };
 }
 
@@ -87,6 +97,8 @@ const KIND_DEFER = "defer";
 const KIND_ERRDEFER = "errdefer";
 const KIND_CONTAINER_DECL = "container_decl";
 const KIND_CONTAINER_FIELD = "container_field";
+
+const ContainerKind = enum { @"struct", @"enum", @"union", other };
 
 fn emitNode(w: *Walker, kind: []const u8, idx: Node.Index, parent_id: ?u64) !u64 {
     const id = w.next_node_id.fetchAdd(1, .monotonic);
@@ -112,6 +124,7 @@ fn walkContainerMember(
     idx: Node.Index,
     parent_id: ?u64,
     container_path: []const u8,
+    container_kind: ContainerKind,
 ) anyerror!void {
     const tag = w.tree.nodeTag(idx);
     switch (tag) {
@@ -123,10 +136,11 @@ fn walkContainerMember(
         },
         .container_field, .container_field_init, .container_field_align => {
             const node_id = try emitNode(w, KIND_CONTAINER_FIELD, idx, parent_id);
-            // Recurse into init/align expressions to catch calls in defaults.
-            // Use lastToken-based descent: for slice B we skip this and accept that
-            // calls inside field defaults are not parented through the field node.
-            _ = node_id;
+            // Capture chain-shaped field-type expressions for entity_type_ref.
+            try emitContainerFieldTypeRef(w, idx, container_path);
+            // Emit a `field`-kind entity for the field/variant itself.
+            // Enum variants get `kind=variant`; struct/union fields get `kind=field`.
+            try emitField(w, idx, node_id, container_path, container_kind);
         },
         .test_decl => {
             // tests are ignored for kernel indexing
@@ -151,6 +165,7 @@ fn emitFn(
     const qualified = try buildQname(w, container_path, name);
     const span = nodeByteSpan(w.tree, idx);
     const lc = byteToLineCol(w.source, span.start);
+    const is_pub = fn_proto.visib_token != null;
 
     try w.entities.append(w.palloc, .{
         .kind = .fn_,
@@ -162,8 +177,20 @@ fn emitFn(
         .def_line = lc.line,
         .def_col = lc.col,
         .is_slab_backed = false,
+        .is_pub = is_pub,
         .def_ast_node_id = node_id,
     });
+
+    // Param + return type chain extraction for entity_type_ref.
+    var it = fn_proto.iterate(w.tree);
+    while (it.next()) |param| {
+        if (param.type_expr) |te| {
+            try emitChainTypeRef(w, te, qualified, "param_type");
+        }
+    }
+    if (fn_proto.ast.return_type.unwrap()) |rt| {
+        try emitChainTypeRef(w, rt, qualified, "return_type");
+    }
 
     // Recurse into body (only fn_decl has a body; protos don't).
     if (w.tree.nodeTag(idx) == .fn_decl) {
@@ -190,6 +217,7 @@ fn emitVarConst(
 
     const mut_text = w.tree.tokenSlice(vd.ast.mut_token);
     const kind: EntityKind = if (std.mem.eql(u8, mut_text, "const")) .const_ else .var_;
+    const is_pub = vd.visib_token != null;
 
     try w.entities.append(w.palloc, .{
         .kind = kind,
@@ -201,8 +229,20 @@ fn emitVarConst(
         .def_line = lc.line,
         .def_col = lc.col,
         .is_slab_backed = false,
+        .is_pub = is_pub,
         .def_ast_node_id = node_id,
     });
+
+    // If init is a pure identifier-or-field-access chain, capture as alias.
+    if (vd.ast.init_node.unwrap()) |init_node| {
+        if (collectChain(w, init_node)) |chain| {
+            try w.aliases.append(w.palloc, .{
+                .alias_qname = qualified,
+                .alias_module_id = w.module_id,
+                .target_chain = chain,
+            });
+        }
+    }
 
     // If init is a container_decl (struct/union/enum), recurse into its members
     // with the new container_path so nested fns get correctly qualified.
@@ -215,14 +255,137 @@ fn emitVarConst(
                 try std.fmt.allocPrint(w.palloc, "{s}.{s}", .{ container_path, name });
 
             const cd_node_id = try emitNode(w, KIND_CONTAINER_DECL, init_node, node_id);
+            const sub_kind = containerDeclKind(w, init_node);
             for (cd.ast.members) |member| {
-                try walkContainerMember(w, member, cd_node_id, new_path);
+                try walkContainerMember(w, member, cd_node_id, new_path, sub_kind);
             }
         } else {
             // Non-container init: walk it as expression to catch calls.
             try walkExpr(w, init_node, node_id);
         }
     }
+}
+
+fn containerDeclKind(w: *Walker, init_node: Node.Index) ContainerKind {
+    // The container_decl's main token is one of `struct` / `enum` / `union`
+    // / `opaque`, possibly preceded by `extern`/`packed`. Inspect the
+    // tokens between firstToken and the `{`.
+    const first = w.tree.firstToken(init_node);
+    const last = w.tree.lastToken(init_node);
+    var i = first;
+    while (i <= last) : (i += 1) {
+        switch (w.tree.tokenTag(i)) {
+            .keyword_struct => return .@"struct",
+            .keyword_enum => return .@"enum",
+            .keyword_union => return .@"union",
+            .keyword_opaque => return .other,
+            .l_brace => break,
+            else => {},
+        }
+    }
+    return .other;
+}
+
+// ── Chain extraction helpers (alias + type-ref population) ────────────────
+
+/// Try to interpret `node` as a pure identifier-or-field-access chain and
+/// return its segments head-first. Returns null if `node` is anything else
+/// (call, struct init, builtin, literal, binary op, ...).
+fn collectChain(w: *Walker, node: Node.Index) ?[]const []const u8 {
+    var segs: std.ArrayList([]const u8) = .empty;
+    if (collectChainInto(w, node, &segs)) {
+        return segs.toOwnedSlice(w.palloc) catch null;
+    }
+    segs.deinit(w.palloc);
+    return null;
+}
+
+fn collectChainInto(w: *Walker, node: Node.Index, out: *std.ArrayList([]const u8)) bool {
+    const tag = w.tree.nodeTag(node);
+    switch (tag) {
+        .identifier => {
+            const tok = w.tree.nodeMainToken(node);
+            const name = w.tree.tokenSlice(tok);
+            if (name.len == 0) return false;
+            out.append(w.palloc, name) catch return false;
+            return true;
+        },
+        .field_access => {
+            // node_data is `node_and_token`: lhs node + name token.
+            const data = w.tree.nodeData(node).node_and_token;
+            if (!collectChainInto(w, data[0], out)) return false;
+            const name = w.tree.tokenSlice(data[1]);
+            if (name.len == 0) return false;
+            out.append(w.palloc, name) catch return false;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn emitChainTypeRef(w: *Walker, type_node: Node.Index, referrer_qname: []const u8, role: []const u8) !void {
+    if (collectChain(w, type_node)) |chain| {
+        try w.type_refs.append(w.palloc, .{
+            .referrer_qname = referrer_qname,
+            .referrer_module_id = w.module_id,
+            .target_chain = chain,
+            .role = role,
+        });
+    }
+}
+
+fn emitField(w: *Walker, field_node: Node.Index, node_id: u64, container_path: []const u8, container_kind: ContainerKind) !void {
+    const cf = w.tree.fullContainerField(field_node) orelse return;
+    // Note: `tuple_like` is true for enum variants too (since `sse3 = 1`
+    // has no `:` after the name). Distinguish only the truly anonymous
+    // tuple-struct case where the main token isn't an identifier.
+    const main_tok = cf.ast.main_token;
+    if (w.tree.tokenTag(main_tok) != .identifier) return;
+    const name = w.tree.tokenSlice(main_tok);
+    if (name.len == 0) return;
+    // Skip the `_` non-exhaustive enum sentinel — it's not a real variant.
+    if (std.mem.eql(u8, name, "_")) return;
+
+    const qualified = try buildQname(w, container_path, name);
+    const span = nodeByteSpan(w.tree, field_node);
+    const lc = byteToLineCol(w.source, span.start);
+
+    // Distinguish struct/union fields (kind=field) from enum variants
+    // (kind=variant). Anonymous opaque containers default to field.
+    const ekind: EntityKind = if (container_kind == .@"enum") .variant else .field;
+
+    try w.entities.append(w.palloc, .{
+        .kind = ekind,
+        .qualified_name = qualified,
+        .module_id = w.module_id,
+        .def_file_id = w.file_id,
+        .def_byte_start = span.start,
+        .def_byte_end = span.end,
+        .def_line = lc.line,
+        .def_col = lc.col,
+        .is_slab_backed = false,
+        .is_pub = false,
+        .def_ast_node_id = node_id,
+    });
+}
+
+fn emitContainerFieldTypeRef(w: *Walker, field_node: Node.Index, container_path: []const u8) !void {
+    const cf = w.tree.fullContainerField(field_node) orelse return;
+    const type_te = cf.ast.type_expr.unwrap() orelse return;
+
+    const main_tok = cf.ast.main_token;
+    if (w.tree.tokenTag(main_tok) != .identifier) return;
+    const field_name = w.tree.tokenSlice(main_tok);
+    if (field_name.len == 0) return;
+
+    // Referrer qname is the container's qname + ".field_name". container_path
+    // is the path within the file's module.
+    const referrer = if (container_path.len == 0)
+        try buildQname(w, "", field_name)
+    else
+        try buildQname(w, container_path, field_name);
+
+    try emitChainTypeRef(w, type_te, referrer, "field_type");
 }
 
 // ── Expression traversal: descend through fn bodies, control flow, calls ──
@@ -279,8 +442,15 @@ fn walkExpr(w: *Walker, idx: Node.Index, parent_id: ?u64) anyerror!void {
             _ = try emitNode(w, KIND_BUILTIN_CALL, idx, parent_id);
         },
         .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
-            // Local vars inside fn bodies — walk for nested calls in init.
-            try emitVarConst(w, idx, parent_id, "");
+            // Local vars inside fn bodies — emit a var_decl AST node so the
+            // call-graph trace renders structure, and walk the init for
+            // nested calls. Do NOT emit an `entity` row: the dead-code
+            // analyzer should not flag fn-body locals.
+            const node_id = try emitNode(w, KIND_VAR_DECL, idx, parent_id);
+            const vd = w.tree.fullVarDecl(idx) orelse return;
+            if (vd.ast.init_node.unwrap()) |init_node| {
+                try walkExpr(w, init_node, node_id);
+            }
         },
         .@"return" => {
             const node_id = try emitNode(w, KIND_RETURN, idx, parent_id);
@@ -345,8 +515,9 @@ fn walkExpr(w: *Walker, idx: Node.Index, parent_id: ?u64) anyerror!void {
             const node_id = try emitNode(w, KIND_CONTAINER_DECL, idx, parent_id);
             var buf: [2]Node.Index = undefined;
             if (w.tree.fullContainerDecl(&buf, idx)) |cd| {
+                const sub_kind = containerDeclKind(w, idx);
                 for (cd.ast.members) |member| {
-                    try walkContainerMember(w, member, node_id, "");
+                    try walkContainerMember(w, member, node_id, "", sub_kind);
                 }
             }
         },

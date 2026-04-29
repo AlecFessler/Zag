@@ -134,7 +134,31 @@ run_dead_code_check() {
     echo "=== Dead-code Analyzer ==="
     (cd "$SCRIPT_DIR/tools/dead_code_zig" && zig build) \
         || { echo "[FAIL] dead_code_zig build failed"; return 1; }
-    (cd "$SCRIPT_DIR" && tools/dead_code_zig/zig-out/bin/dead_code_zig) \
+    (cd "$SCRIPT_DIR/tools/indexer" && zig build) \
+        || { echo "[FAIL] indexer build failed"; return 1; }
+
+    local sha
+    sha="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD)"
+    local db="$SCRIPT_DIR/tools/oracle_http/test/dbs/x86_64-${sha}.db"
+
+    if [[ ! -f "$db" ]]; then
+        rm -f "$db"
+        (cd "$SCRIPT_DIR" && tools/indexer/zig-out/bin/indexer \
+            --kernel-root kernel \
+            --extra-token-root routerOS \
+            --extra-token-root hyprvOS \
+            --extra-token-root bootloader \
+            --extra-token-root tools \
+            --extra-token-root tests \
+            --out "$db" \
+            --arch x86_64 \
+            --commit-sha "$(git rev-parse HEAD)" \
+            --ir zig-out/kernel.x86_64.ll \
+            --elf zig-out/bin/kernel.elf) \
+            || { echo "[FAIL] indexer build failed"; return 1; }
+    fi
+
+    (cd "$SCRIPT_DIR" && tools/dead_code_zig/zig-out/bin/dead_code_zig --db "$db" --target kernel) \
         || { echo "[FAIL] dead-code analyzer reported findings"; return 1; }
     echo "[PASS] dead-code analyzer clean"
 }

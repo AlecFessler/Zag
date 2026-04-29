@@ -9,6 +9,7 @@ const sync_mod = @import("sync.zig");
 const writer_mod = @import("writer.zig");
 const ir_pass = @import("ir_pass.zig");
 const bin_pass = @import("bin_pass.zig");
+const refs_pass = @import("refs_pass.zig");
 
 const SCHEMA_SQL = @embedFile("schema.sql");
 
@@ -19,6 +20,12 @@ const Args = struct {
     commit_sha: []const u8 = "unknown",
     ir_path: ?[]const u8 = null,
     elf_path: ?[]const u8 = null,
+    /// Additional directories scanned for token-only ingest. Each
+    /// contributes `file` + `token` rows (paths prefixed with the dir
+    /// name, e.g. `routerOS/foo.zig`) but no `module`, `entity`, or
+    /// `ast_node` rows. Used so dead-code's field-name heuristic can
+    /// see `.foo` mentions in non-kernel source. Repeatable.
+    extra_token_roots: std.ArrayList([]const u8) = .empty,
     n_jobs: u32 = 0, // 0 → auto-detect
 
     fn parse(allocator: std.mem.Allocator) !Args {
@@ -39,18 +46,22 @@ const Args = struct {
                 a.ir_path = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
             } else if (std.mem.eql(u8, arg, "--elf")) {
                 a.elf_path = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
+            } else if (std.mem.eql(u8, arg, "--extra-token-root")) {
+                const v = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
+                try a.extra_token_roots.append(allocator, v);
             } else if (std.mem.eql(u8, arg, "--jobs")) {
                 a.n_jobs = try std.fmt.parseInt(u32, it.next() orelse return error.MissingValue, 10);
             } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 std.debug.print(
                     \\usage: indexer [opts]
-                    \\  --kernel-root <dir>   default: kernel
-                    \\  --out <path>          default: callgraph.db
-                    \\  --arch <name>         default: x86_64
-                    \\  --commit-sha <sha>    default: unknown
-                    \\  --ir <path>           pre-opt LLVM IR file (zig-out/kernel.<arch>.ll)
-                    \\  --elf <path>          final kernel ELF for DWARF + objdump (zig-out/kernel.<arch>.elf)
-                    \\  --jobs <n>            default: ncpu
+                    \\  --kernel-root <dir>          default: kernel
+                    \\  --out <path>                 default: callgraph.db
+                    \\  --arch <name>                default: x86_64
+                    \\  --commit-sha <sha>           default: unknown
+                    \\  --ir <path>                  pre-opt LLVM IR file (zig-out/kernel.<arch>.ll)
+                    \\  --elf <path>                 final kernel ELF for DWARF + objdump (zig-out/kernel.<arch>.elf)
+                    \\  --extra-token-root <dir>     extra dir to scan for tokens only (no entity emission); repeatable
+                    \\  --jobs <n>                   default: ncpu
                     \\
                 , .{});
                 std.process.exit(0);
@@ -79,6 +90,21 @@ pub fn main() !void {
     var walk_result = try walk_mod.walk(gpa, args.kernel_root);
     defer walk_result.deinit();
     std.log.info("stage 0: {d} files, {d} modules", .{ walk_result.files.len, walk_result.modules.len });
+
+    // Token-only walks for the extra roots (e.g. routerOS/, hyprvOS/,
+    // bootloader/). Their files contribute to the `file` + `token` tables
+    // and `file_line_index`, but they don't go through ast_pass / ir_pass /
+    // bin_pass — no entity, ast_node, or module rows are emitted for them.
+    var extra_walks: std.ArrayList(walk_mod.WalkResult) = .empty;
+    defer {
+        for (extra_walks.items) |*er| er.deinit();
+        extra_walks.deinit(gpa);
+    }
+    for (args.extra_token_roots.items) |root| {
+        const er = try walk_mod.walk(gpa, root);
+        std.log.info("stage 0 extra-root {s}: {d} files for token-only ingest", .{ root, er.files.len });
+        try extra_walks.append(gpa, er);
+    }
 
     // Pipeline arena: lifetime spans the entire ingest. Wrapped for safe
     // multi-thread use by workers + writer. Deinit'd at end of main, after the
@@ -114,6 +140,45 @@ pub fn main() !void {
                 .byte_starts = walk_result.line_indices[i],
             },
         });
+    }
+
+    // Send extra-root files with adjusted IDs and prefixed paths, then
+    // ingest their tokens. They land in `file` / `file_line_index` / `token`
+    // but not in `module` / `entity` / `ast_node`.
+    var next_file_id: u32 = @intCast(walk_result.files.len);
+    for (extra_walks.items, args.extra_token_roots.items) |*er, root_dir| {
+        const adjusted = try palloc.alloc(types.FileRecord, er.files.len);
+        for (er.files, 0..) |f, i| {
+            const new_id = next_file_id;
+            next_file_id += 1;
+            const prefixed_path = try std.fmt.allocPrint(palloc, "{s}/{s}", .{ root_dir, f.path });
+            adjusted[i] = .{
+                .id = new_id,
+                .path = prefixed_path,
+                .source = f.source,
+                .sha256 = f.sha256,
+                .size = f.size,
+                .module_id = std.math.maxInt(u32), // sentinel: no module
+            };
+        }
+        try channel.send(.{ .files = adjusted });
+        for (adjusted, 0..) |f, i| {
+            try channel.send(.{
+                .file_line_index = .{
+                    .file_id = f.id,
+                    .byte_starts = er.line_indices[i],
+                },
+            });
+        }
+
+        // Tokenize each file and send the token rows.
+        for (adjusted, 0..) |f, i| {
+            const token_rows = tokens_mod.tokenize(palloc, er.files[i].source) catch |e| {
+                std.log.warn("extra-root tokenize failed on {s}: {s}", .{ f.path, @errorName(e) });
+                continue;
+            };
+            try channel.send(.{ .tokens = .{ .file_id = f.id, .rows = token_rows } });
+        }
     }
 
     // ── Stages 1+2: parallel tokenize + AST per file ───────────────────────
@@ -170,6 +235,46 @@ pub fn main() !void {
     try channel.send(.{ .entities = resolve_result.final_entities });
     if (resolve_result.ast_backfill.len > 0) {
         try channel.send(.{ .ast_entity_backfill = resolve_result.ast_backfill });
+    }
+
+    // ── Stage 2.6: resolve provisional aliases + type-refs ────────────────
+    var total_aliases: usize = 0;
+    var total_type_refs: usize = 0;
+    for (per_file) |r| {
+        total_aliases += r.aliases.len;
+        total_type_refs += r.type_refs.len;
+    }
+    const all_aliases = try palloc.alloc(types.ProvisionalAlias, total_aliases);
+    const all_type_refs = try palloc.alloc(types.ProvisionalTypeRef, total_type_refs);
+    {
+        var ai: usize = 0;
+        var ti: usize = 0;
+        for (per_file) |r| {
+            @memcpy(all_aliases[ai..][0..r.aliases.len], r.aliases);
+            ai += r.aliases.len;
+            @memcpy(all_type_refs[ti..][0..r.type_refs.len], r.type_refs);
+            ti += r.type_refs.len;
+        }
+    }
+
+    const refs_result = try refs_pass.pass(
+        palloc,
+        resolve_result.final_entities,
+        walk_result.modules,
+        all_aliases,
+        all_type_refs,
+    );
+    std.log.info("stage 2.6: {d} aliases → {d} resolved, {d} type-refs → {d} resolved", .{
+        all_aliases.len,
+        refs_result.const_aliases.len,
+        all_type_refs.len,
+        refs_result.type_refs.len,
+    });
+    if (refs_result.const_aliases.len > 0) {
+        try channel.send(.{ .const_aliases = refs_result.const_aliases });
+    }
+    if (refs_result.type_refs.len > 0) {
+        try channel.send(.{ .type_refs = refs_result.type_refs });
     }
 
     // ── Stage 3: LLVM IR + callgraph ──────────────────────────────────────
@@ -364,8 +469,14 @@ pub fn main() !void {
 
 const WorkerResult = struct {
     entities: []types.ProvisionalEntity,
+    aliases: []types.ProvisionalAlias,
+    type_refs: []types.ProvisionalTypeRef,
 
-    const empty: WorkerResult = .{ .entities = &.{} };
+    const empty: WorkerResult = .{
+        .entities = &.{},
+        .aliases = &.{},
+        .type_refs = &.{},
+    };
 };
 
 const SharedState = struct {
@@ -410,5 +521,9 @@ fn processFileInner(
     if (result.ast_edges.len > 0) {
         try channel.send(.{ .ast_edges = result.ast_edges });
     }
-    out.* = .{ .entities = result.entities };
+    out.* = .{
+        .entities = result.entities,
+        .aliases = result.aliases,
+        .type_refs = result.type_refs,
+    };
 }
