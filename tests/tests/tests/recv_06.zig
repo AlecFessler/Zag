@@ -77,6 +77,7 @@
 //      iterations.
 //   4: recv returned something other than E_FULL.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -105,7 +106,13 @@ fn helperEntry() callconv(.c) noreturn {
 
     // If the kernel ever resumes us, halt deterministically so the
     // helper does not race the test's reporting path.
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
 }
 
 pub fn main(cap_table_base: u64) void {

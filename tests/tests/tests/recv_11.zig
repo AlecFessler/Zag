@@ -70,6 +70,7 @@
 //      indicating `read` was not honored) or the kernel wrote the
 //      wrong EC's state.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -101,7 +102,24 @@ const testing = lib.testing;
 //     12 registers carry W's GPRs but we don't read them in this
 //     test — they are listed as clobbers so the compiler doesn't
 //     assume any prior value survives.
-fn recvCaptureRip(port: u12) struct { v1: u64, rip: u64 } {
+const RecvRip = struct { v1: u64, rip: u64 };
+
+// Portable no-op entry — local to this test so we don't depend on the
+// libz testing.dummyEntry (which is x86-only `hlt`). W never executes
+// past creation: suspend lands before scheduling, and the test reads
+// W's saved RIP — which the kernel set to this function's address — as
+// the witness for §[event_state].
+fn localDummyEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
+}
+
+fn recvCaptureRipX64(port: u12) RecvRip {
     const word: u64 = 35; // syscall_num for recv per §[recv]
     var v1_out: u64 = undefined;
     var rip_out: u64 = undefined;
@@ -122,6 +140,45 @@ fn recvCaptureRip(port: u12) struct { v1: u64, rip: u64 } {
              .memory = true });
 
     return .{ .v1 = v1_out, .rip = rip_out };
+}
+
+// aarch64 ABI per spec §[syscall_abi]:
+//   vreg 0     = [sp + 0]            (syscall word)
+//   vreg 1..31 = x0..x30             (vreg 1 = x0; vreg 14 = x13)
+// Per §[event_state] the kernel writes the suspended EC's saved RIP into
+// vreg 14, which on aarch64 is register-backed at x13. We reserve 16
+// bytes (16-byte aligned) for the syscall word slot only and read x13
+// directly out of the asm.
+fn recvCaptureRipArm(port: u12) RecvRip {
+    const word: u64 = 35; // syscall_num for recv per §[recv]
+    var v1_out: u64 = undefined;
+    var rip_out: u64 = undefined;
+
+    asm volatile (
+        \\ sub sp, sp, #16
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ add sp, sp, #16
+        : [v1] "={x0}" (v1_out),
+          [rip] "={x13}" (rip_out),
+        : [word] "r" (word),
+          [iv1] "{x0}" (@as(u64, port)),
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+             .x11 = true, .x12 = true, .x14 = true, .x15 = true,
+             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+
+    return .{ .v1 = v1_out, .rip = rip_out };
+}
+
+fn recvCaptureRip(port: u12) RecvRip {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => recvCaptureRipX64(port),
+        .aarch64 => recvCaptureRipArm(port),
+        else => @compileError("unsupported arch"),
+    };
 }
 
 pub fn main(cap_table_base: u64) void {
@@ -155,7 +212,7 @@ pub fn main(cap_table_base: u64) void {
     // target_caps in 16-31 (ignored when target = self), priority in
     // 32-33. priority = 0 stays inside the runner pri ceiling.
     const ec_caps_word: u64 = @as(u64, w_caps.toU16());
-    const entry: u64 = @intFromPtr(&testing.dummyEntry);
+    const entry: u64 = @intFromPtr(&localDummyEntry);
     const cec = syscall.createExecutionContext(
         ec_caps_word,
         entry,

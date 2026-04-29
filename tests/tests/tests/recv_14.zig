@@ -109,6 +109,7 @@
 //      blocked suspend — deleting the reply handle did not resolve
 //      the sender with E_ABANDONED
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -147,7 +148,13 @@ fn workerEntry() callconv(.c) noreturn {
     const sus = syscall.suspendEc(self_slot, port_slot, &.{});
     @atomicStore(u64, &worker_result, sus.v1, .release);
     @atomicStore(u64, &worker_done, 1, .release);
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
 }
 
 pub fn main(cap_table_base: u64) void {

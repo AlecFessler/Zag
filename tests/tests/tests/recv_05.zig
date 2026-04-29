@@ -99,6 +99,7 @@
 //   5: worker did not signal completion within the bounded poll window
 //   6: worker observed something other than E_CLOSED on its recv
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -123,7 +124,13 @@ fn workerEntry() callconv(.c) noreturn {
     const got = syscall.recv(slot, 0);
     @atomicStore(u64, &worker_recv_result, got.regs.v1, .release);
     @atomicStore(u64, &worker_done, 1, .release);
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
 }
 
 pub fn main(cap_table_base: u64) void {

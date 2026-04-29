@@ -96,6 +96,7 @@
 //      nonzero even though the sender attached no handles — the spec
 //      line under test is violated.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const lib = @import("lib");
 
@@ -120,7 +121,11 @@ fn senderEntry() callconv(.c) noreturn {
     // observes shared_ready == 1 sees the prior writes to
     // shared_port_handle and shared_sender_ec.
     while (@atomicLoad(u64, &shared_ready, .acquire) != 1) {
-        asm volatile ("pause");
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("pause"),
+            .aarch64 => asm volatile ("yield"),
+            else => @compileError("unsupported arch"),
+        }
     }
 
     const port: u12 = @truncate(shared_port_handle & 0xFFF);
@@ -134,7 +139,13 @@ fn senderEntry() callconv(.c) noreturn {
     // here and halts; the test domain exits when the test EC returns.
     _ = syscall.suspendEc(ec, port, &.{});
 
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
 }
 
 pub fn main(cap_table_base: u64) void {

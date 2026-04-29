@@ -105,6 +105,7 @@
 //   8: inserted slot is not a port handle
 //   9: inserted slot's caps do not match the entry's caps verbatim
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -133,7 +134,21 @@ const testing = lib.testing;
 // is NOT consumed by the syscall ABI (rax/rbx/rcx are reserved for
 // v1/v2/word) keeps the values intact across the RSP move. Same fix
 // pattern as `handle_attachments_10`.
-fn suspendWithOneAttachment(target: u12, port: u12, entry: u64) u64 {
+// Portable no-op entry — local to this test so we don't depend on the
+// libz testing.dummyEntry (which is x86-only `hlt`). W never executes
+// past creation in this test (suspend lands before scheduling), so the
+// entry pointer just needs to be a valid code address.
+fn localDummyEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
+}
+
+fn suspendWithOneAttachmentX64(target: u12, port: u12, entry: u64) u64 {
     const SUSPEND_NUM: u64 = 34;
     const PAIR_COUNT_ONE: u64 = 1 << 12;
     const word: u64 = SUSPEND_NUM | PAIR_COUNT_ONE;
@@ -151,6 +166,45 @@ fn suspendWithOneAttachment(target: u12, port: u12, entry: u64) u64 {
           [entry] "{r8}" (entry),
         : .{ .rcx = true, .r8 = true, .r11 = true, .memory = true });
     return v1_out;
+}
+
+// aarch64 ABI per spec §[syscall_abi]:
+//   vreg 0   = [sp + 0]            (syscall word)
+//   vreg 1..31 = x0..x30           (vreg 1 = x0, vreg 2 = x1, ...)
+//   vreg N   = [sp + (N-31)*8]     for 32 <= N <= 127
+// vreg 127 lives at [sp + 768]. We reserve 784 bytes (16-byte aligned)
+// to cover the syscall word at [sp+0] and vreg 127 at [sp+768].
+fn suspendWithOneAttachmentArm(target: u12, port: u12, entry: u64) u64 {
+    const SUSPEND_NUM: u64 = 34;
+    const PAIR_COUNT_ONE: u64 = 1 << 12;
+    const word: u64 = SUSPEND_NUM | PAIR_COUNT_ONE;
+    var x0_out: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #784
+        \\ str %[entry], [sp, #768]
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ add sp, sp, #784
+        : [x0_out] "={x0}" (x0_out),
+        : [word] "r" (word),
+          [iv1] "{x0}" (@as(u64, target)),
+          [iv2] "{x1}" (@as(u64, port)),
+          [entry] "r" (entry),
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
+             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
+             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
+             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
+             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+    return x0_out;
+}
+
+fn suspendWithOneAttachment(target: u12, port: u12, entry: u64) u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => suspendWithOneAttachmentX64(target, port, entry),
+        .aarch64 => suspendWithOneAttachmentArm(target, port, entry),
+        else => @compileError("unsupported arch"),
+    };
 }
 
 pub fn main(cap_table_base: u64) void {
@@ -187,7 +241,7 @@ pub fn main(cap_table_base: u64) void {
         .restart_policy = 0,
     };
     const ec_caps_word: u64 = @as(u64, w_caps.toU16());
-    const w_entry: u64 = @intFromPtr(&testing.dummyEntry);
+    const w_entry: u64 = @intFromPtr(&localDummyEntry);
     const cec = syscall.createExecutionContext(
         ec_caps_word,
         w_entry,
