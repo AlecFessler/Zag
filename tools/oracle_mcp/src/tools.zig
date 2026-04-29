@@ -575,7 +575,7 @@ pub const Registry = struct {
                 last_path = try al.dupe(u8, path.?);
                 last_line = line;
             }
-            try std.fmt.format(out.writer(al), "  {x:0>8}: {s} {s}\n", .{ @as(u64, @intCast(addr)), mnem, ops });
+            try std.fmt.format(out.writer(al), "  {x:0>8}: {s} {s}\n", .{ @as(u64, @bitCast(addr)), mnem, ops });
         }
     }
 
@@ -671,7 +671,7 @@ pub const Registry = struct {
             const mnem = stmt.columnText(1) orelse "";
             const ops = stmt.columnText(2) orelse "";
             if (stop_at_call and std.mem.startsWith(u8, mnem, "call")) {
-                try std.fmt.format(out.writer(al), "  {x:0>8}: {s} {s}    [stop: call]\n", .{ @as(u64, @intCast(addr)), mnem, ops });
+                try std.fmt.format(out.writer(al), "  {x:0>8}: {s} {s}    [stop: call]\n", .{ @as(u64, @bitCast(addr)), mnem, ops });
                 break;
             }
             // Width-alias-aware match: we look for the register name as a
@@ -685,7 +685,7 @@ pub const Registry = struct {
                 .src => "[src]",
                 else => "",
             };
-            try std.fmt.format(out.writer(al), "  {x:0>8}: {s} {s}    {s}\n", .{ @as(u64, @intCast(addr)), mnem, ops, tag });
+            try std.fmt.format(out.writer(al), "  {x:0>8}: {s} {s}    {s}\n", .{ @as(u64, @bitCast(addr)), mnem, ops, tag });
         }
     }
 
@@ -696,10 +696,14 @@ pub const Registry = struct {
             addr_str[2..]
         else
             addr_str;
-        const addr = std.fmt.parseInt(i64, trimmed, 16) catch {
+        // Kernel virtual addresses (0xffffffff8xxxxxxx) overflow i64 if parsed
+        // directly — go through u64 and bit-cast to match how the writer stored
+        // them.
+        const addr_u: u64 = std.fmt.parseInt(u64, trimmed, 16) catch {
             try out.appendSlice(al, "bad hex address\n");
             return;
         };
+        const addr: i64 = @bitCast(addr_u);
         // Floor on dwarf_line.
         var dstmt = try entry.db.prepare(
             \\SELECT f.path, d.line
