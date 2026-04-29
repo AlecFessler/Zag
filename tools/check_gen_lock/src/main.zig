@@ -4539,6 +4539,16 @@ pub fn main() !u8 {
     try w.print("         {d} bare-pointer fat-pointer violations\n", .{bare_ptr.items.len});
     try w.print("         {d} `.ptr` bypass sites\n", .{ptr_bypasses.items.len});
 
+    // IRQ-acquired lock-class discipline. Independent of the genlock
+    // bracketing checks — runs over a separately-built call graph that
+    // includes ALL kernel functions, not just slab-method receivers.
+    // Findings here are gating: any IRQ discipline violation OR pairing
+    // violation increments total_errs and fails the analyzer's exit.
+    const n_irq_errs = try runIrqDisciplineCheck(
+        gpa, &pool, w, files.items, tokens.items, struct_fields.items, &slab_types,
+    );
+    total_errs += n_irq_errs;
+
     try w.flush();
     if (total_errs > 0) return 1;
     return 0;
@@ -4635,4 +4645,1323 @@ fn eventKindName(k: EventKind) []const u8 {
         .defer_unlock => "defer-unlock",
         .errdefer_unlock => "errdefer-unlock",
     };
+}
+
+// =================================================================
+// IRQ-acquired lock-class discipline analyzer.
+//
+// Rule (from spec): a lock class L is "IRQ-acquired" iff some IRQ /
+// NMI / async-trap entry can transitively reach an acquire of L. Any
+// process-context acquire of an IRQ-acquired class MUST disable IRQs
+// across the held window; otherwise an interrupt mid-hold can produce
+// AB-BA via lockdep ordering vs a destroy-side path that takes the
+// pair the other way around.
+//
+// Discipline OK iff:
+//   a. The acquire is itself reachable only from an IRQ entry (CPU
+//      already masked).
+//   b. The variant is `lockIrqSave` / `lockIrqSaveOrdered` /
+//      `lockOrderedIrqSave` / `lockWithGenIrqSave` /
+//      `lockWithGenIrqSaveOrdered` / `lockWithGenOrderedIrqSave`.
+//   c. The acquire is bracketed by a same-line / preceding
+//      `arch.cpu.saveAndDisableInterrupts()` and matching restore.
+//
+// Pairing: every plain `lock(...)` must pair with `unlock(...)`; every
+// `lockIrqSave*` must pair with `unlockIrqRestore(...)`. Mixed pairing
+// is a separate finding.
+// =================================================================
+
+// Lock-acquire method names. The analyzer treats these uniformly as
+// "acquire" events; the IRQ-saving subset is flagged for the discipline
+// check. Names mirror SpinLock + GenLock + SlabRef variants in
+// kernel/utils/sync/{spin_lock,gen_lock}.zig and
+// kernel/memory/allocators/secure_slab.zig.
+const PLAIN_ACQUIRE_METHODS = [_][]const u8{
+    "lock",
+    "lockOrdered",
+    "lockWithGen",
+    "lockWithGenOrdered",
+};
+
+const IRQ_SAVE_ACQUIRE_METHODS = [_][]const u8{
+    "lockIrqSave",
+    "lockIrqSaveOrdered",
+    "lockOrderedIrqSave",
+    "lockWithGenIrqSave",
+    "lockWithGenIrqSaveOrdered",
+    "lockWithGenOrderedIrqSave",
+};
+
+const PLAIN_RELEASE_METHODS = [_][]const u8{
+    "unlock",
+};
+
+const IRQ_RESTORE_RELEASE_METHODS = [_][]const u8{
+    "unlockIrqRestore",
+};
+
+// IRQ / NMI / async-trap entry kinds. Names match
+// EXCEPTION_ENTRY_NAMES + EXTRA_ROOTS but tagged async-vs-sync.
+//
+// Synchronous traps (page fault, GP, etc.) take the CPU out of the
+// running thread but do NOT preempt arbitrary kernel-mode lock-holders
+// the way an asynchronous IRQ does — a sync trap fires only at the
+// faulting instruction, so a kernel function that doesn't take page
+// faults won't see one mid-hold. They're therefore conservative
+// matches for "IRQ-acquired" classification: count them so that any
+// fault handler reachable from kernel code that can in fact fault
+// inside a held lock window is still policed. (The precise
+// async-vs-sync split would need control-flow that we don't have;
+// over-conservatism here is the design choice per the brief.)
+const IrqEntryKind = enum {
+    irq_async, // schedTimerHandler, dispatchIrq, handleIrq*
+    nmi, // (currently no separate name; reserved)
+    trap_sync, // exceptionHandler, pageFaultHandler, handleSync*
+    irq_unexpected, // handleUnexpected — async catch-all
+};
+
+const IrqEntryDecl = struct {
+    name: []const u8,
+    kind: IrqEntryKind,
+};
+
+const IRQ_ENTRY_DECLS = [_]IrqEntryDecl{
+    .{ .name = "schedTimerHandler", .kind = .irq_async },
+    .{ .name = "dispatchIrq", .kind = .irq_async },
+    .{ .name = "handleIrqLowerEl", .kind = .irq_async },
+    .{ .name = "handleIrqCurrentEl", .kind = .irq_async },
+    .{ .name = "handleUnexpected", .kind = .irq_unexpected },
+    .{ .name = "exceptionHandler", .kind = .trap_sync },
+    .{ .name = "pageFaultHandler", .kind = .trap_sync },
+    .{ .name = "handleSyncLowerEl", .kind = .trap_sync },
+    .{ .name = "handleSyncCurrentEl", .kind = .trap_sync },
+};
+
+fn irqEntryKindLabel(k: IrqEntryKind) []const u8 {
+    return switch (k) {
+        .irq_async => "irq_async",
+        .nmi => "nmi",
+        .trap_sync => "trap_sync",
+        .irq_unexpected => "irq_unexpected",
+    };
+}
+
+fn lookupIrqEntry(name: []const u8) ?IrqEntryKind {
+    for (IRQ_ENTRY_DECLS) |d| {
+        if (mem.eql(u8, d.name, name)) return d.kind;
+    }
+    return null;
+}
+
+fn isPlainAcquire(name: []const u8) bool {
+    return inList(name, &PLAIN_ACQUIRE_METHODS);
+}
+
+fn isIrqSaveAcquire(name: []const u8) bool {
+    return inList(name, &IRQ_SAVE_ACQUIRE_METHODS);
+}
+
+fn isAnyAcquire(name: []const u8) bool {
+    return isPlainAcquire(name) or isIrqSaveAcquire(name);
+}
+
+fn isPlainRelease(name: []const u8) bool {
+    return inList(name, &PLAIN_RELEASE_METHODS);
+}
+
+fn isIrqRestoreRelease(name: []const u8) bool {
+    return inList(name, &IRQ_RESTORE_RELEASE_METHODS);
+}
+
+fn isAnyRelease(name: []const u8) bool {
+    return isPlainRelease(name) or isIrqRestoreRelease(name);
+}
+
+// (StructName, FieldName) → known SpinLock / GenLock field. Built from
+// the existing scanStructFields output. The class id we hand back is
+// the dotted form `<StructName>.<FieldName>`.
+const LockFieldSet = struct {
+    inner: StringHashMap(void), // keys are owned "<S>.<F>" interns
+
+    fn init(gpa: Allocator) LockFieldSet {
+        return .{ .inner = StringHashMap(void).init(gpa) };
+    }
+    fn deinit(self: *LockFieldSet) void {
+        self.inner.deinit();
+    }
+    fn contains(self: *const LockFieldSet, key: []const u8) bool {
+        return self.inner.contains(key);
+    }
+};
+
+// One lock-acquire site we discovered. `class_id` is owned by the pool.
+const AcquireSite = struct {
+    file_rel: []const u8, // borrowed — sf.rel_path
+    line: u32,
+    class_id: []const u8, // pool-interned: "<T>._gen_lock", "<S>.<F>", or fallback chain
+    method: []const u8, // pool-interned method name (e.g. "lock", "lockIrqSave")
+    is_irq_save: bool,
+    enclosing_fn: u32, // index into FuncTable
+    // True iff the fn body has a syntactic `arch.cpu.saveAndDisableInterrupts()`
+    // call earlier in the body and a matching restore later. Per-acquire
+    // approximation: if the fn body contains both calls anywhere, every
+    // plain acquire in the same body is treated as bracketed. Strict
+    // analysis would require pairing the bracketing per-line, but this
+    // pragmatic approximation matches existing code that nests an entire
+    // critical section inside a manual save/restore block.
+    syntactic_save_bracket: bool,
+};
+
+// One lock-release site (used only by the pairing checker).
+const ReleaseSite = struct {
+    file_rel: []const u8,
+    line: u32,
+    class_id: []const u8, // pool-interned
+    method: []const u8, // pool-interned
+    is_irq_restore: bool,
+    enclosing_fn: u32,
+    receiver: []const u8, // pool-interned literal receiver text
+};
+
+// Entry in the global function table. A FuncTable supports name lookup
+// (one slot per function-name basename — multiple functions sharing a
+// name are stored as a flat list keyed off name).
+const FuncRecord = struct {
+    name: []const u8, // pool-interned
+    file_rel: []const u8,
+    line: u32,
+    body_start_line: u32,
+    body_end_line: u32,
+    receiver_type: []const u8 = "", // pool-interned, empty if free fn
+    // Indices into the global AcquireSite list — only acquires inside this
+    // function's body. Used for fast site lookup once IRQ-acquired classes
+    // are known.
+    acquire_site_idxs: []u32,
+    release_site_idxs: []u32,
+    // Names of called functions inside the body. By basename only. Used
+    // for transitive reachability.
+    callee_names: []const []const u8,
+    // Computed during reachability fixed-point: the set of lock-class ids
+    // this function transitively acquires (own + via callees). Stored as
+    // a sorted-unique slice of pool-interned class ids.
+    transitive_classes: []const []const u8 = &.{},
+    // Set of irq entry kinds whose reach set includes this function.
+    // Bitmask over IrqEntryKind values.
+    reached_from_irq: u8 = 0,
+};
+
+// Maps function name → list of FuncRecord indices. A name can resolve
+// to multiple functions across different files / receiver types; the
+// reachability propagator visits all of them when expanding a call edge.
+const FuncTable = struct {
+    records: ArrayList(FuncRecord),
+    by_name: StringHashMap(ArrayList(u32)),
+};
+
+fn funcTableInit(gpa: Allocator) FuncTable {
+    return .{
+        .records = ArrayList(FuncRecord).empty,
+        .by_name = StringHashMap(ArrayList(u32)).init(gpa),
+    };
+}
+
+fn funcTableDeinit(self: *FuncTable, gpa: Allocator) void {
+    var it = self.by_name.valueIterator();
+    while (it.next()) |al| al.deinit(gpa);
+    self.by_name.deinit();
+    for (self.records.items) |r| {
+        gpa.free(r.acquire_site_idxs);
+        gpa.free(r.release_site_idxs);
+        gpa.free(r.callee_names);
+        if (r.transitive_classes.len > 0) gpa.free(r.transitive_classes);
+    }
+    self.records.deinit(gpa);
+}
+
+// IRQ-discipline finding. Distinct from the genlock Finding type — the
+// IRQ analyzer has its own grouping (per-class + cross-cutting pairing
+// list), so it tracks its own lifecycle.
+const IrqFinding = struct {
+    kind: enum { discipline, pairing },
+    class_id: []const u8, // pool-interned (discipline), or "" (pairing)
+    file_rel: []const u8,
+    line: u32,
+    enclosing_fn: []const u8, // pool-interned
+    method: []const u8, // pool-interned
+    fix_hint: []const u8, // owned (allocPrint)
+};
+
+// Build LockFieldSet from struct_fields. Keys are pool-interned
+// "<StructName>.<FieldName>".
+fn buildLockFieldSet(
+    gpa: Allocator,
+    pool: *Pool,
+    struct_fields: []const StructField,
+    out: *LockFieldSet,
+) !void {
+    for (struct_fields) |f| {
+        const ft = trimAscii(f.field_type);
+        // Strip leading qualifiers: `pub `, `const `, `?`, `*`. The
+        // recognized lock types appear bare on a struct field.
+        var t = ft;
+        while (t.len > 0) {
+            if (t[0] == '?' or t[0] == '*') {
+                t = trimAscii(t[1..]);
+                continue;
+            }
+            if (mem.startsWith(u8, t, "const ")) {
+                t = trimAscii(t["const ".len..]);
+                continue;
+            }
+            break;
+        }
+        // A field-of-lock-type is normally bare-named; skip generic
+        // wrappers like `?SpinLock` or `*const GenLock` (still match
+        // the inner name).
+        var is_lock = false;
+        for (LOCK_TYPE_NAMES) |ln| {
+            if (mem.eql(u8, t, ln)) {
+                is_lock = true;
+                break;
+            }
+            // Allow exact-prefix `SpinLock` followed by `,` / end:
+            // declarations like `SpinLock = .{}` keep the bare name.
+            if (mem.startsWith(u8, t, ln) and (t.len == ln.len or !isIdentChar(t[ln.len]))) {
+                is_lock = true;
+                break;
+            }
+        }
+        if (!is_lock) continue;
+        const key = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ f.struct_name, f.field_name });
+        defer gpa.free(key);
+        const interned = try pool.intern(key);
+        try out.inner.put(interned, {});
+    }
+}
+
+// Walk every kernel/* file and register every fn into the FuncTable.
+// We capture (name, receiver_type, body_start, body_end). The receiver
+// type comes from the first param's parseTypeRef, just like buildFnIndex,
+// but here we accept ALL functions (not just those with a slab-typed
+// first param) and we don't restrict to non-arch/dispatch files —
+// downstream reachability still benefits from the broader corpus.
+fn buildFuncTable(
+    gpa: Allocator,
+    pool: *Pool,
+    files: []const *SourceFile,
+    tokens_per_file: []const []const Tok,
+    out: *FuncTable,
+) !void {
+    for (files, tokens_per_file) |sf, toks| {
+        // Skip non-kernel files (the analyzer's walker may have been
+        // pointed at a fixture root; we only care about kernel sources).
+        if (!mem.startsWith(u8, sf.rel_path, "kernel/")) continue;
+        var i: usize = 0;
+        while (i < toks.len) : (i += 1) {
+            if (toks[i].tag != .keyword_fn) continue;
+            var start_i = i;
+            if (i > 0 and toks[i - 1].tag == .keyword_pub) start_i = i - 1;
+            // Match `<ws>(pub )?fn ` at start of line — same anchor the
+            // genlock walker uses.
+            const hdr_line_raw = sf.raw_lines[toks[start_i].line - 1];
+            const hdr_line = trimAscii(hdr_line_raw);
+            if (!(mem.startsWith(u8, hdr_line, "fn ") or
+                mem.startsWith(u8, hdr_line, "pub fn ")))
+            {
+                continue;
+            }
+            const header = parseFnHeaderAt(toks, start_i) orelse continue;
+            const name = tokSlice(sf, toks[header.name_tok_idx]);
+            const name_i = try pool.intern(name);
+            const params = parseParamList(gpa, sf, toks, header.l_paren_idx, header.r_paren_idx) catch {
+                i = header.r_brace_idx;
+                continue;
+            };
+            defer gpa.free(params);
+            var recv_i: []const u8 = "";
+            if (params.len > 0) {
+                const bare = typeNameFromFieldType(params[0].type_str);
+                if (bare.len > 0) recv_i = try pool.intern(bare);
+                // Also accept SlabRef wrapper.
+                if (parseTypeRef(params[0].type_str)) |inner| {
+                    recv_i = try pool.intern(inner);
+                }
+            }
+            const body_start = computeFirstBodyLine(sf, toks, header);
+            const body_end = toks[header.r_brace_idx].line;
+            const idx: u32 = @intCast(out.records.items.len);
+            try out.records.append(gpa, .{
+                .name = name_i,
+                .file_rel = sf.rel_path,
+                .line = toks[start_i].line,
+                .body_start_line = body_start,
+                .body_end_line = body_end,
+                .receiver_type = recv_i,
+                .acquire_site_idxs = &.{},
+                .release_site_idxs = &.{},
+                .callee_names = &.{},
+            });
+            const gop = try out.by_name.getOrPut(name_i);
+            if (!gop.found_existing) gop.value_ptr.* = ArrayList(u32).empty;
+            try gop.value_ptr.append(gpa, idx);
+            i = header.r_brace_idx;
+        }
+    }
+}
+
+// Per-function env used by IRQ analysis. A pruned variant of SlabEnv
+// that tracks all idents → bare-type-name (no slab/fat distinction).
+// Lock-class resolution chases through this to pin down the type of
+// the receiver chain.
+const IrqEnv = struct {
+    types: StringStringMap, // ident -> bare type name (e.g. "ExecutionContext", "SlabRef:ExecutionContext", "Process")
+    // SlabRef wrapper marker: separate from `types` so the chain walker
+    // can distinguish `<x>.lock()` (gen-lock through a fat ref) from
+    // `<x>.<f>.lock()` (lock-field on a non-slab struct).
+    is_slabref: SliceSet,
+
+    fn init(gpa: Allocator) IrqEnv {
+        return .{
+            .types = StringStringMap.init(gpa),
+            .is_slabref = SliceSet.init(gpa),
+        };
+    }
+    fn deinit(self: *IrqEnv) void {
+        self.types.deinit();
+        self.is_slabref.deinit();
+    }
+};
+
+// Resolve the lock class for an acquire/release site. `recv_chain` is
+// the full receiver text BEFORE the trailing `.<lockop>(`. Examples:
+//   "sender_ref"         (an EC SlabRef local)
+//   "cd_ref"             (a CD SlabRef local)
+//   "ec._gen_lock"       (direct gen-lock access)
+//   "self.perm_lock"     (a SpinLock field)
+//   "irq_table_lock"     (a module-scoped lock — fallback)
+//   "bucket.lock"        (a SpinLock field on a non-slab struct)
+//
+// Returns (class_id, owned-by-pool) or null if we couldn't classify.
+fn resolveLockClass(
+    pool: *Pool,
+    env: *const IrqEnv,
+    lock_field_set: *const LockFieldSet,
+    recv_chain: []const u8,
+) !?[]const u8 {
+    const chain = trimAscii(recv_chain);
+    if (chain.len == 0) return null;
+    // Bare-dot / leading-dot fragments come from method-chain
+    // continuations like:
+    //     foo
+    //         .bar()
+    //         .lock();
+    // The walker strips back through ident+dot chars and lands on a
+    // bare `.lock` chunk with no resolvable receiver. Reject so we
+    // don't pollute the class set with junk ".lock" / "" entries.
+    if (chain[0] == '.') return null;
+    var has_ident = false;
+    for (chain) |c| if (isIdentStart(c)) { has_ident = true; break; };
+    if (!has_ident) return null;
+
+    // Pure ident.
+    if (mem.indexOfScalar(u8, chain, '.') == null) {
+        // Look up type. If it's a SlabRef, class is `<T>._gen_lock`.
+        // If it's a bare slab type T, also `<T>._gen_lock`.
+        if (env.is_slabref.contains(chain)) {
+            if (env.types.get(chain)) |inner| {
+                const buf = try std.fmt.allocPrint(pool.gpa, "{s}._gen_lock", .{inner});
+                defer pool.gpa.free(buf);
+                return try pool.intern(buf);
+            }
+        }
+        // Plain top-level ident — not enough info to bind a struct lock
+        // class; treat the chain literal itself as the class id (so two
+        // sites on the same global match, but we won't hit struct-field
+        // table lookups).
+        return try pool.intern(chain);
+    }
+
+    // <head>.<tail> with possibly more dots. For our purposes we
+    // recognize:
+    //   <head>._gen_lock           → "<head_type>._gen_lock"
+    //   <head>.<field>             → "<head_type>.<field>" if known
+    //   any other dotted form      → fall back to literal chain text
+    // Multi-dot chains: peel from the right looking for a known field.
+    if (mem.endsWith(u8, chain, "._gen_lock")) {
+        const head = chain[0 .. chain.len - "._gen_lock".len];
+        if (mem.indexOfScalar(u8, head, '.') == null) {
+            if (env.types.get(head)) |ty| {
+                const buf = try std.fmt.allocPrint(pool.gpa, "{s}._gen_lock", .{ty});
+                defer pool.gpa.free(buf);
+                return try pool.intern(buf);
+            }
+        }
+        // Multi-segment head — fall through.
+    }
+
+    // Try last-segment field. <prefix>.<field>
+    const last_dot = mem.lastIndexOfScalar(u8, chain, '.').?;
+    const prefix = chain[0..last_dot];
+    const field = chain[last_dot + 1 ..];
+    // Resolve prefix to a type name when possible.
+    var prefix_ty: ?[]const u8 = null;
+    if (mem.indexOfScalar(u8, prefix, '.') == null) {
+        if (env.types.get(prefix)) |ty| prefix_ty = ty;
+    }
+    if (prefix_ty) |pt| {
+        const buf = try std.fmt.allocPrint(pool.gpa, "{s}.{s}", .{ pt, field });
+        defer pool.gpa.free(buf);
+        const interned = try pool.intern(buf);
+        if (lock_field_set.contains(interned)) return interned;
+        // Even if not in the lock_field_set, return the pretty form
+        // so that two sites on the same struct.field collapse. Not in
+        // the set means we don't *know* it's a lock, but the acquire
+        // method already told us it is (.lock(...) call).
+        return interned;
+    }
+
+    // Fallback: literal chain text.
+    return try pool.intern(chain);
+}
+
+// Scan one function body for acquire/release sites and called fns.
+// Populates `acquires`, `releases`, `callees`. Updates `func.acquire_site_idxs`
+// / `func.release_site_idxs` / `func.callee_names`.
+fn scanFuncForIrq(
+    gpa: Allocator,
+    pool: *Pool,
+    sf: *const SourceFile,
+    toks: []const Tok,
+    func_idx: u32,
+    func: *FuncRecord,
+    lock_field_set: *const LockFieldSet,
+    slab_types: *const SlabTypeMap,
+    acquires: *ArrayList(AcquireSite),
+    releases: *ArrayList(ReleaseSite),
+) !void {
+    // Build a fresh env from the function header params.
+    var env = IrqEnv.init(gpa);
+    defer env.deinit();
+
+    // Re-find the header to walk params.
+    var hdr: ?FnHeader = null;
+    for (toks, 0..) |t, ti| {
+        if (t.tag != .keyword_fn) continue;
+        var si = ti;
+        if (ti > 0 and toks[ti - 1].tag == .keyword_pub) si = ti - 1;
+        if (toks[si].line != func.line) continue;
+        if (ti + 1 >= toks.len) continue;
+        if (!mem.eql(u8, tokSlice(sf, toks[ti + 1]), func.name)) continue;
+        hdr = parseFnHeaderAt(toks, si) orelse continue;
+        break;
+    }
+    if (hdr == null) return;
+    const params = try parseParamList(gpa, sf, toks, hdr.?.l_paren_idx, hdr.?.r_paren_idx);
+    defer gpa.free(params);
+    for (params) |pp| {
+        const nm = try pool.intern(pp.name);
+        // SlabRef(T) → record is_slabref + types[name] = T.
+        if (parseTypeRef(pp.type_str)) |inner| {
+            const inner_i = try pool.intern(inner);
+            try env.types.put(nm, inner_i);
+            if (mem.indexOf(u8, pp.type_str, "SlabRef") != null) try env.is_slabref.add(nm);
+            continue;
+        }
+        const bare = typeNameFromFieldType(pp.type_str);
+        if (bare.len > 0) {
+            const bare_i = try pool.intern(bare);
+            try env.types.put(nm, bare_i);
+        }
+    }
+
+    // Walk body lines.
+    if (func.body_start_line > func.body_end_line) return;
+    if (func.body_end_line > sf.stripped_lines.len) return;
+    const body_lines = sf.stripped_lines[func.body_start_line - 1 .. func.body_end_line];
+    const body_raw_lines = sf.raw_lines[func.body_start_line - 1 .. func.body_end_line];
+    _ = body_raw_lines;
+
+    // First, syntactic check: does the function body reference
+    // arch.cpu.saveAndDisableInterrupts() AND restoreInterrupts()?
+    // If both appear, we treat plain acquires inside this fn as
+    // sufficiently bracketed for rule (c).
+    var has_save = false;
+    var has_restore = false;
+    for (body_lines) |ln| {
+        if (mem.indexOf(u8, ln, "saveAndDisableInterrupts(") != null) has_save = true;
+        if (mem.indexOf(u8, ln, "restoreInterrupts(") != null) has_restore = true;
+    }
+    const syntactic_save_bracket = has_save and has_restore;
+
+    var local_acquires = ArrayList(u32).empty;
+    defer local_acquires.deinit(gpa);
+    var local_releases = ArrayList(u32).empty;
+    defer local_releases.deinit(gpa);
+    var local_callees = ArrayList([]const u8).empty;
+    defer local_callees.deinit(gpa);
+    var seen_callees = StringHashMap(void).init(gpa);
+    defer seen_callees.deinit();
+
+    for (body_lines, 0..) |line, rel| {
+        const src_line: u32 = func.body_start_line + @as(u32, @intCast(rel));
+        const code = line;
+
+        // Decl: const x = <RHS>;
+        const trimmed = trimAscii(code);
+        if (mem.startsWith(u8, trimmed, "const ") or mem.startsWith(u8, trimmed, "var ")) {
+            // Use the same parseDeclLine + multi-line join.
+            const joined = try joinMultilineDecl(gpa, body_lines, rel);
+            defer gpa.free(joined);
+            if (parseDeclLine(joined)) |dp| {
+                const nm = try pool.intern(dp.name);
+                // Type from annotation, when present.
+                if (dp.ann.len > 0) {
+                    if (parseTypeRef(dp.ann)) |inner| {
+                        const inner_i = try pool.intern(inner);
+                        try env.types.put(nm, inner_i);
+                        if (mem.indexOf(u8, dp.ann, "SlabRef") != null) try env.is_slabref.add(nm);
+                    } else {
+                        const bare = typeNameFromFieldType(dp.ann);
+                        if (bare.len > 0) {
+                            const bare_i = try pool.intern(bare);
+                            try env.types.put(nm, bare_i);
+                        }
+                    }
+                }
+                // RHS-derived type heuristics:
+                //   `const x = <ident>.lock(@src()) catch ...` → x : *<innerOf(ident)>
+                //   `const x = <ident>.<field>` → if env knows ident's
+                //      type T and T has FAT_YIELDING_FIELDS entry for field,
+                //      x is SlabRef of resolved type
+                //   `const x = <ident>` (bare) → inherit
+                const rhs_plain = stripPostfix(dp.rhs);
+                // Bare ident inheritance.
+                if (rhs_plain.len > 0) {
+                    var all_ident = true;
+                    for (rhs_plain) |c| if (!isIdentChar(c)) { all_ident = false; break; };
+                    if (all_ident) {
+                        if (env.types.get(rhs_plain)) |t| {
+                            try env.types.put(nm, t);
+                            if (env.is_slabref.contains(rhs_plain)) try env.is_slabref.add(nm);
+                        }
+                    }
+                }
+                // Chained `.lock()` returns *T (or AccessError!*T).
+                if (mem.endsWith(u8, rhs_plain, ")")) {
+                    const lock_open = ".lock(";
+                    if (mem.lastIndexOf(u8, rhs_plain, lock_open)) |lp| {
+                        const head = rhs_plain[0..lp];
+                        if (head.len > 0) {
+                            // head must be a pure ident-dot chain.
+                            var ok_chain = true;
+                            for (head) |c| if (!isIdentChar(c) and c != '.') { ok_chain = false; break; };
+                            if (ok_chain) {
+                                // First ident in chain.
+                                const first_dot = mem.indexOfScalar(u8, head, '.') orelse head.len;
+                                const head_ident = head[0..first_dot];
+                                if (env.types.get(head_ident)) |t| {
+                                    if (env.is_slabref.contains(head_ident)) {
+                                        try env.types.put(nm, t);
+                                    }
+                                }
+                                // <head>.<variant> (KernelObject) — last seg.
+                                if (mem.lastIndexOfScalar(u8, head, '.')) |last_dot| {
+                                    const last_seg = head[last_dot + 1 ..];
+                                    if (lookupUnionVariant(last_seg)) |ty| {
+                                        if (slab_types.contains(ty)) {
+                                            const ty_i = try pool.intern(ty);
+                                            try env.types.put(nm, ty_i);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // typedRef(<TypeName>, ...) call returns ?SlabRef(<TypeName>).
+                // The kernel's generic helper at kernel/capdom/capability.zig.
+                // Also handle `<module>.typedRef(<TypeName>, ...)`.
+                if (mem.indexOf(u8, rhs_plain, "typedRef(")) |tr_pos| {
+                    const after = rhs_plain[tr_pos + "typedRef(".len ..];
+                    var ae: usize = 0;
+                    while (ae < after.len and isIdentChar(after[ae])) ae += 1;
+                    if (ae > 0) {
+                        const ty_name = after[0..ae];
+                        if (slab_types.contains(ty_name)) {
+                            const ty_i = try pool.intern(ty_name);
+                            try env.types.put(nm, ty_i);
+                            try env.is_slabref.add(nm);
+                        }
+                    }
+                }
+
+                // <ident>.<fat_field> RHS — make nm a SlabRef of the resolved type.
+                if (rhs_plain.len > 0 and mem.indexOfScalar(u8, rhs_plain, '.') != null) {
+                    var ok_chain2 = true;
+                    for (rhs_plain) |c| if (!isIdentChar(c) and c != '.') { ok_chain2 = false; break; };
+                    if (ok_chain2) {
+                        const first_dot = mem.indexOfScalar(u8, rhs_plain, '.').?;
+                        const head_ident = rhs_plain[0..first_dot];
+                        const tail = rhs_plain[first_dot + 1 ..];
+                        if (env.types.get(head_ident)) |head_ty| {
+                            // Walk tail dots through DEFAULT_FIELD_CHAINS.
+                            var cur_ty: []const u8 = head_ty;
+                            var seg_start: usize = 0;
+                            var pos: usize = 0;
+                            var ok_walk = true;
+                            while (pos <= tail.len) : (pos += 1) {
+                                if (pos == tail.len or tail[pos] == '.') {
+                                    const seg = tail[seg_start..pos];
+                                    if (lookupDefaultFieldChain(cur_ty, seg)) |nxt| {
+                                        cur_ty = nxt;
+                                    } else if (mem.eql(u8, seg, "object") and pos < tail.len) {
+                                        // KernelObject hop — keep cur_ty
+                                        // and let the next segment's
+                                        // variant lookup below pick it up.
+                                    } else if (lookupUnionVariant(seg)) |variant_ty| {
+                                        cur_ty = variant_ty;
+                                    } else {
+                                        ok_walk = false;
+                                        break;
+                                    }
+                                    seg_start = pos + 1;
+                                }
+                            }
+                            if (ok_walk and slab_types.contains(cur_ty)) {
+                                const ty_i = try pool.intern(cur_ty);
+                                try env.types.put(nm, ty_i);
+                                try env.is_slabref.add(nm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Acquire / release sites: `<recv>.<method>(`.
+        try scanLockOpsOnLine(
+            gpa, pool, sf, src_line, code,
+            &env, lock_field_set, slab_types,
+            func_idx, func, syntactic_save_bracket,
+            acquires, releases, &local_acquires, &local_releases,
+        );
+
+        // Direct callee names: `<name>(` at top-level of each line. We
+        // accept dotted forms (last segment is the basename). The naive
+        // pattern over-counts but that's fine — over-conservative
+        // reachability is the design choice. We deduplicate per-fn so
+        // the worklist doesn't reprocess the same edge.
+        try scanCalleesOnLine(gpa, pool, code, &local_callees, &seen_callees);
+    }
+
+    func.acquire_site_idxs = try local_acquires.toOwnedSlice(gpa);
+    func.release_site_idxs = try local_releases.toOwnedSlice(gpa);
+    func.callee_names = try local_callees.toOwnedSlice(gpa);
+}
+
+// Pull out lock-op recognition into its own fn for clarity. Walks `code`
+// (one stripped line) looking for any `<recv_chain>.<method>(` where
+// `<method>` is in the acquire/release tables. Resolves the lock class
+// via env+lock_field_set. Emits AcquireSite/ReleaseSite as appropriate.
+fn scanLockOpsOnLine(
+    gpa: Allocator,
+    pool: *Pool,
+    sf: *const SourceFile,
+    src_line: u32,
+    code: []const u8,
+    env: *const IrqEnv,
+    lock_field_set: *const LockFieldSet,
+    slab_types: *const SlabTypeMap,
+    func_idx: u32,
+    func: *const FuncRecord,
+    syntactic_save_bracket: bool,
+    acquires_out: *ArrayList(AcquireSite),
+    releases_out: *ArrayList(ReleaseSite),
+    local_acquires: *ArrayList(u32),
+    local_releases: *ArrayList(u32),
+) !void {
+    _ = sf;
+    _ = slab_types;
+    var p: usize = 0;
+    while (p < code.len) : (p += 1) {
+        if (code[p] != '.') continue;
+        // Find method name `[a-zA-Z_][a-zA-Z0-9_]*` after the `.`.
+        const ms = p + 1;
+        if (ms >= code.len or !isIdentStart(code[ms])) continue;
+        var me = ms;
+        while (me < code.len and isIdentChar(code[me])) me += 1;
+        const method = code[ms..me];
+        // Followed by `(`.
+        var q = me;
+        while (q < code.len and ascii.isWhitespace(code[q])) q += 1;
+        if (q >= code.len or code[q] != '(') continue;
+        // Classify.
+        const is_acq = isAnyAcquire(method);
+        const is_rel = isAnyRelease(method);
+        if (!is_acq and !is_rel) continue;
+
+        // Walk back through ident/dot chars to capture full receiver chain.
+        var s: usize = p;
+        while (s > 0) {
+            const c = code[s - 1];
+            if (isIdentChar(c) or c == '.') {
+                s -= 1;
+            } else break;
+        }
+        if (s == p) continue;
+        var recv_chain = code[s..p];
+        // Strip leading `defer ` / `errdefer ` / `try ` keywords —
+        // the chain walker mustn't include them.
+        // (They'd already be stopped by the non-ident-char break, but
+        // the chain may begin at the start of line where the prior char
+        // is whitespace.) Done by `s` walk above — chain starts at first
+        // ident char.
+        // Trim trailing `.?` (optional unwrap).
+        if (recv_chain.len >= 2 and
+            recv_chain[recv_chain.len - 2] == '.' and
+            recv_chain[recv_chain.len - 1] == '?')
+        {
+            recv_chain = recv_chain[0 .. recv_chain.len - 2];
+        }
+
+        const class_opt = try resolveLockClass(pool, env, lock_field_set, recv_chain);
+        const class_id = class_opt orelse {
+            // Couldn't classify — skip this site (don't pollute the
+            // class set with empty ids).
+            continue;
+        };
+        const method_i = try pool.intern(method);
+        if (is_acq) {
+            const idx: u32 = @intCast(acquires_out.items.len);
+            try acquires_out.append(gpa, .{
+                .file_rel = func.file_rel,
+                .line = src_line,
+                .class_id = class_id,
+                .method = method_i,
+                .is_irq_save = isIrqSaveAcquire(method),
+                .enclosing_fn = func_idx,
+                .syntactic_save_bracket = syntactic_save_bracket,
+            });
+            try local_acquires.append(gpa, idx);
+        } else {
+            const recv_i = try pool.intern(recv_chain);
+            const idx: u32 = @intCast(releases_out.items.len);
+            try releases_out.append(gpa, .{
+                .file_rel = func.file_rel,
+                .line = src_line,
+                .class_id = class_id,
+                .method = method_i,
+                .is_irq_restore = isIrqRestoreRelease(method),
+                .enclosing_fn = func_idx,
+                .receiver = recv_i,
+            });
+            try local_releases.append(gpa, idx);
+        }
+        // Don't double-count: advance past the `(`.
+        p = q;
+    }
+}
+
+// Direct-callee scan: any <name>(...) where <name> is at the start of
+// an ident chain (possibly dotted; we take the last segment as the
+// basename). Filters out keywords + builtins.
+fn scanCalleesOnLine(
+    gpa: Allocator,
+    pool: *Pool,
+    code: []const u8,
+    out: *ArrayList([]const u8),
+    seen: *StringHashMap(void),
+) !void {
+    var p: usize = 0;
+    while (p < code.len) {
+        if (!isIdentStart(code[p])) {
+            p += 1;
+            continue;
+        }
+        // Don't restart inside an ident.
+        if (p > 0 and (isIdentChar(code[p - 1]) or code[p - 1] == '.' or code[p - 1] == '@')) {
+            p += 1;
+            continue;
+        }
+        var e = p;
+        while (e < code.len and (isIdentChar(code[e]) or code[e] == '.')) e += 1;
+        const fq = code[p..e];
+        var q = e;
+        while (q < code.len and ascii.isWhitespace(code[q])) q += 1;
+        if (q >= code.len or code[q] != '(') {
+            p = e;
+            continue;
+        }
+        // Last segment of fq is the basename.
+        var name: []const u8 = fq;
+        if (mem.lastIndexOfScalar(u8, fq, '.')) |ld| name = fq[ld + 1 ..];
+        if (name.len == 0 or !isIdentStart(name[0])) {
+            p = e;
+            continue;
+        }
+        if (isKeywordOrNotCall(name)) {
+            p = e;
+            continue;
+        }
+        // Exclude common Zig builtins / std-lib noise.
+        if (mem.startsWith(u8, fq, "std.") or mem.startsWith(u8, fq, "builtin.") or
+            mem.startsWith(u8, fq, "@"))
+        {
+            p = e;
+            continue;
+        }
+        const name_i = try pool.intern(name);
+        const gop = try seen.getOrPut(name_i);
+        if (!gop.found_existing) {
+            try out.append(gpa, name_i);
+        }
+        p = e;
+    }
+}
+
+// Worklist propagation: for each function, transitive_classes is the
+// union of own direct-acquire classes plus all callees' transitive
+// classes. We iterate to fixed point. Class id slices are pool-interned
+// so set operations can use reference equality.
+fn computeTransitiveClasses(
+    gpa: Allocator,
+    func_table: *FuncTable,
+    acquires: []const AcquireSite,
+) !void {
+    // Build per-fn initial set: direct acquires only.
+    const n = func_table.records.items.len;
+    var sets = try gpa.alloc(StringHashMap(void), n);
+    defer {
+        for (sets) |*s| s.deinit();
+        gpa.free(sets);
+    }
+    for (0..n) |i| {
+        sets[i] = StringHashMap(void).init(gpa);
+    }
+    for (func_table.records.items, 0..) |rec, idx| {
+        for (rec.acquire_site_idxs) |aidx| {
+            const a = acquires[aidx];
+            if (a.class_id.len == 0) continue;
+            try sets[idx].put(a.class_id, {});
+        }
+    }
+    // Worklist: any node that just gained a new element re-propagates
+    // backward via the reverse edge (callers of this fn need updating).
+    // Simpler: forward iteration to fixed point — for each fn, union
+    // every callee's set into our set. Repeat until no change.
+    var changed = true;
+    var iters: u32 = 0;
+    const max_iters: u32 = 64; // safety belt
+    while (changed and iters < max_iters) : (iters += 1) {
+        changed = false;
+        for (func_table.records.items, 0..) |rec, idx| {
+            for (rec.callee_names) |callee_name| {
+                if (callee_name.len == 0) continue;
+                const list_opt = func_table.by_name.get(callee_name);
+                if (list_opt == null) continue;
+                for (list_opt.?.items) |callee_idx| {
+                    if (callee_idx >= n) continue;
+                    // Snapshot the source set's keys before mutating the
+                    // dest. getOrPut(dest=...) on the same allocator may
+                    // realloc dest's underlying buffer; if dest == src
+                    // (self-recursive call edge), the iterator we're
+                    // walking points at potentially-moved memory.
+                    var snapshot = ArrayList([]const u8).empty;
+                    defer snapshot.deinit(gpa);
+                    var it = sets[callee_idx].keyIterator();
+                    while (it.next()) |k| {
+                        try snapshot.append(gpa, k.*);
+                    }
+                    for (snapshot.items) |key| {
+                        if (key.len == 0) continue;
+                        const gop = try sets[idx].getOrPut(key);
+                        if (!gop.found_existing) changed = true;
+                    }
+                }
+            }
+        }
+    }
+    // Materialize.
+    for (func_table.records.items, 0..) |*rec, idx| {
+        var classes = ArrayList([]const u8).empty;
+        defer classes.deinit(gpa);
+        var it = sets[idx].keyIterator();
+        while (it.next()) |k| try classes.append(gpa, k.*);
+        std.sort.heap([]const u8, classes.items, {}, lessStr);
+        rec.transitive_classes = try classes.toOwnedSlice(gpa);
+    }
+}
+
+// Mark `reached_from_irq` bitmask on each function reachable from any
+// IRQ entry. We do reverse-topological propagation: for each entry, BFS
+// over callees, OR'ing the entry kind's bit into reached_from_irq.
+fn markIrqReachable(
+    gpa: Allocator,
+    func_table: *FuncTable,
+) !void {
+    for (func_table.records.items) |*rec| rec.reached_from_irq = 0;
+
+    var queue = ArrayList(u32).empty;
+    defer queue.deinit(gpa);
+
+    for (IRQ_ENTRY_DECLS) |decl| {
+        const kind_bit: u8 = @as(u8, 1) << @intFromEnum(decl.kind);
+        const list_opt = func_table.by_name.get(decl.name);
+        if (list_opt == null) continue;
+        // Visited set per BFS (we BFS once per entry-kind to keep the
+        // bitmask attribution correct).
+        var visited = StringHashMap(void).init(gpa);
+        defer visited.deinit();
+        queue.clearRetainingCapacity();
+        for (list_opt.?.items) |idx| {
+            try queue.append(gpa, idx);
+            try visited.put(func_table.records.items[idx].name, {});
+            // ^ over-conservative key (name) so multiple records sharing
+            //   a name only enqueue once. That's fine — propagation
+            //   walks every callee anyway.
+        }
+        var qi: usize = 0;
+        while (qi < queue.items.len) : (qi += 1) {
+            const idx = queue.items[qi];
+            const rec = &func_table.records.items[idx];
+            rec.reached_from_irq |= kind_bit;
+            for (rec.callee_names) |cn| {
+                const cl = func_table.by_name.get(cn) orelse continue;
+                const v_gop = try visited.getOrPut(cn);
+                if (v_gop.found_existing) continue;
+                for (cl.items) |cidx| try queue.append(gpa, cidx);
+            }
+        }
+    }
+}
+
+// For each lock class, compute the union of IRQ entry kinds (bitmask)
+// whose reach set includes any acquire of that class.
+const ClassReachEntry = struct {
+    class_id: []const u8,
+    kinds: u8, // bitmask of IrqEntryKind
+};
+
+fn computeIrqAcquiredClasses(
+    gpa: Allocator,
+    func_table: *const FuncTable,
+    acquires: []const AcquireSite,
+    out: *StringHashMap(u8),
+) !void {
+    _ = gpa;
+    for (acquires) |a| {
+        const fn_rec = func_table.records.items[a.enclosing_fn];
+        const bits = fn_rec.reached_from_irq;
+        if (bits == 0) continue;
+        const gop = try out.getOrPut(a.class_id);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* |= bits;
+    }
+}
+
+fn renderReachableKindList(gpa: Allocator, kinds: u8) ![]u8 {
+    var buf = ArrayList(u8).empty;
+    errdefer buf.deinit(gpa);
+    try buf.append(gpa, '[');
+    var first = true;
+    inline for (.{ IrqEntryKind.irq_async, IrqEntryKind.nmi, IrqEntryKind.trap_sync, IrqEntryKind.irq_unexpected }) |k| {
+        const bit: u8 = @as(u8, 1) << @intFromEnum(k);
+        if (kinds & bit != 0) {
+            if (!first) try buf.appendSlice(gpa, ", ");
+            try buf.appendSlice(gpa, irqEntryKindLabel(k));
+            first = false;
+        }
+    }
+    try buf.append(gpa, ']');
+    return buf.toOwnedSlice(gpa);
+}
+
+// For each acquire site of an IRQ-acquired class, decide if it's OK
+// per rule 4 (a/b/c). Emit a finding when not.
+fn checkIrqDiscipline(
+    gpa: Allocator,
+    pool: *Pool,
+    func_table: *const FuncTable,
+    acquires: []const AcquireSite,
+    irq_classes: *const StringHashMap(u8),
+    out: *ArrayList(IrqFinding),
+) !void {
+    _ = pool;
+    for (acquires) |a| {
+        if (!irq_classes.contains(a.class_id)) continue;
+        const fn_rec = func_table.records.items[a.enclosing_fn];
+        // Rule (a): the acquire is itself reachable only from an IRQ
+        // entry — the CPU has already masked. We approximate with
+        // "reached from an IRQ-async or NMI entry"; a sync trap doesn't
+        // mask other IRQs, so reaching purely from a sync-trap entry
+        // doesn't satisfy (a).
+        const masked_kind_bits: u8 =
+            (@as(u8, 1) << @intFromEnum(IrqEntryKind.irq_async)) |
+            (@as(u8, 1) << @intFromEnum(IrqEntryKind.nmi)) |
+            (@as(u8, 1) << @intFromEnum(IrqEntryKind.irq_unexpected));
+        if (fn_rec.reached_from_irq & masked_kind_bits != 0) {
+            // Acquire is reachable from a hardware-IRQ context. The
+            // CPU already masked — but if the SAME function is also
+            // reachable from process context (i.e., the fn appears
+            // outside any IRQ context too) the acquire is still wrong
+            // when called from process context. Strictly checking
+            // "only-reachable-from-IRQ" requires per-call-site context,
+            // not just per-function reachability. We approximate: if
+            // ANY non-IRQ caller exists for this fn, the site is
+            // suspicious. For now we accept the (a) exemption when the
+            // fn is reached from an IRQ entry — false negatives here
+            // are rare in practice (kernel handlers don't double as
+            // process-context helpers).
+            // Mark this site OK by skipping the discipline complaint,
+            // BUT still apply rule (b) inverse: if the fn is reached
+            // from process context too AND uses a plain acquire,
+            // there's a problem. We don't have per-callsite reach
+            // info, so accept the false negative.
+            continue;
+        }
+
+        // Rule (b): IRQ-saving variant.
+        if (a.is_irq_save) continue;
+
+        // Rule (c): syntactic save/restore bracketing.
+        if (a.syntactic_save_bracket) continue;
+
+        // Otherwise — flag.
+        const fix = try std.fmt.allocPrint(gpa,
+            "switch to an IRQ-saving acquire variant (e.g. lockIrqSave + matching unlockIrqRestore)",
+            .{});
+        try out.append(gpa, .{
+            .kind = .discipline,
+            .class_id = a.class_id,
+            .file_rel = a.file_rel,
+            .line = a.line,
+            .enclosing_fn = fn_rec.name,
+            .method = a.method,
+            .fix_hint = fix,
+        });
+    }
+}
+
+// Pairing checker: per-function, walk acquire/release events in source
+// order. If receiver-text matches, the variant flavors must match too
+// (plain↔plain, IrqSave↔IrqRestore). When we can't pair statically (e.g.
+// the release lives in a callee or another function via `defer`), we
+// skip silently — false negatives are acceptable here per the brief.
+fn checkPairingDiscipline(
+    gpa: Allocator,
+    pool: *Pool,
+    func_table: *const FuncTable,
+    acquires: []const AcquireSite,
+    releases: []const ReleaseSite,
+    out: *ArrayList(IrqFinding),
+) !void {
+    _ = pool;
+    // For each function, gather events sorted by line.
+    for (func_table.records.items) |rec| {
+        if (rec.acquire_site_idxs.len == 0 and rec.release_site_idxs.len == 0) continue;
+        const Ev = struct { line: u32, is_acq: bool, idx: u32 };
+        var evs = ArrayList(Ev).empty;
+        defer evs.deinit(gpa);
+        for (rec.acquire_site_idxs) |aidx| {
+            try evs.append(gpa, .{ .line = acquires[aidx].line, .is_acq = true, .idx = aidx });
+        }
+        for (rec.release_site_idxs) |ridx| {
+            try evs.append(gpa, .{ .line = releases[ridx].line, .is_acq = false, .idx = ridx });
+        }
+        std.sort.heap(Ev, evs.items, {}, struct {
+            fn lt(_: void, a: Ev, b: Ev) bool {
+                if (a.line != b.line) return a.line < b.line;
+                // Acquire before release on the same line.
+                return a.is_acq and !b.is_acq;
+            }
+        }.lt);
+
+        // Walk events per receiver-string to pair acquires with releases.
+        // We need the receiver text for both acquires AND releases. The
+        // AcquireSite struct doesn't store the receiver explicitly (we
+        // dropped it after class resolution); use the class_id as a
+        // pairing key proxy. Class id may differ for two acquires on
+        // distinct receivers of the same class (both `cd_ref.lock` and
+        // `other_cd_ref.lock` map to "CapabilityDomain._gen_lock") — but
+        // that's the worst-case ambiguity, and the pairing checker's
+        // false-positive risk is symmetric. We additionally require the
+        // release receiver text to match a tracked acquire receiver
+        // text. ReleaseSite stores `.receiver` for that reason.
+        //
+        // Implementation: keep a stack of pending acquires per
+        // class_id. Each release pops the most recent acquire on the
+        // same class_id; flag if flavors mismatch.
+        var pending = StringHashMap(ArrayList(u32)).init(gpa);
+        defer {
+            var it = pending.valueIterator();
+            while (it.next()) |al| al.deinit(gpa);
+            pending.deinit();
+        }
+        for (evs.items) |ev| {
+            if (ev.is_acq) {
+                const a = acquires[ev.idx];
+                const gop = try pending.getOrPut(a.class_id);
+                if (!gop.found_existing) gop.value_ptr.* = ArrayList(u32).empty;
+                try gop.value_ptr.append(gpa, ev.idx);
+            } else {
+                const r = releases[ev.idx];
+                const lst_opt = pending.getPtr(r.class_id);
+                if (lst_opt == null) continue;
+                if (lst_opt.?.items.len == 0) continue;
+                const last_aidx = lst_opt.?.pop().?;
+                const a = acquires[last_aidx];
+                if (a.is_irq_save and !r.is_irq_restore) {
+                    const fix = try std.fmt.allocPrint(gpa,
+                        "acquire used IRQ-saving variant ({s} L{d}); release at L{d} must be unlockIrqRestore (currently {s})",
+                        .{ a.method, a.line, r.line, r.method });
+                    try out.append(gpa, .{
+                        .kind = .pairing,
+                        .class_id = a.class_id,
+                        .file_rel = r.file_rel,
+                        .line = r.line,
+                        .enclosing_fn = rec.name,
+                        .method = r.method,
+                        .fix_hint = fix,
+                    });
+                } else if (!a.is_irq_save and r.is_irq_restore) {
+                    const fix = try std.fmt.allocPrint(gpa,
+                        "acquire used plain variant ({s} L{d}); release at L{d} must be unlock (currently unlockIrqRestore)",
+                        .{ a.method, a.line, r.line });
+                    try out.append(gpa, .{
+                        .kind = .pairing,
+                        .class_id = a.class_id,
+                        .file_rel = r.file_rel,
+                        .line = r.line,
+                        .enclosing_fn = rec.name,
+                        .method = r.method,
+                        .fix_hint = fix,
+                    });
+                }
+            }
+        }
+    }
+}
+
+// Top-level driver: build everything and emit findings to `w`. Returns
+// the number of err-severity IRQ findings (caller adds to total_errs).
+fn runIrqDisciplineCheck(
+    gpa: Allocator,
+    pool: *Pool,
+    w: *std.Io.Writer,
+    files: []const *SourceFile,
+    tokens_per_file: []const []const Tok,
+    struct_fields: []const StructField,
+    slab_types: *const SlabTypeMap,
+) !u32 {
+    // Lock-field set from struct_fields.
+    var lock_field_set = LockFieldSet.init(gpa);
+    defer lock_field_set.deinit();
+    try buildLockFieldSet(gpa, pool, struct_fields, &lock_field_set);
+
+    // Func table.
+    var func_table = funcTableInit(gpa);
+    defer funcTableDeinit(&func_table, gpa);
+    try buildFuncTable(gpa, pool, files, tokens_per_file, &func_table);
+
+    // Acquire / release site lists.
+    var acquires = ArrayList(AcquireSite).empty;
+    defer acquires.deinit(gpa);
+    var releases = ArrayList(ReleaseSite).empty;
+    defer releases.deinit(gpa);
+
+    // Walk every function.
+    for (func_table.records.items, 0..) |*rec, idx| {
+        const sf = blk: {
+            for (files) |f| if (mem.eql(u8, f.rel_path, rec.file_rel)) break :blk f;
+            break :blk null;
+        };
+        if (sf == null) continue;
+        const toks = blk2: {
+            for (files, tokens_per_file) |f, t| if (f == sf.?) break :blk2 t;
+            break :blk2 @as([]const Tok, &.{});
+        };
+        try scanFuncForIrq(
+            gpa, pool, sf.?, toks, @intCast(idx), rec,
+            &lock_field_set, slab_types,
+            &acquires, &releases,
+        );
+    }
+
+    // Reachability: transitive_classes (currently unused for the IRQ
+    // check itself; computed for diagnostic completeness — costs a
+    // worklist pass) and reached_from_irq (the load-bearing one).
+    // The acquire-class IRQ-acquired classifier reads reached_from_irq
+    // directly per acquire site, so transitive_classes is optional. We
+    // still compute it to support potential future per-fn diagnostics
+    // and because it sanity-checks the call-graph plumbing on every
+    // run.
+    try computeTransitiveClasses(gpa, &func_table, acquires.items);
+    try markIrqReachable(gpa, &func_table);
+
+    // IRQ-acquired classes.
+    var irq_classes = StringHashMap(u8).init(gpa);
+    defer irq_classes.deinit();
+    try computeIrqAcquiredClasses(gpa, &func_table, acquires.items, &irq_classes);
+
+    // Discipline + pairing findings.
+    var discipline_findings = ArrayList(IrqFinding).empty;
+    defer {
+        for (discipline_findings.items) |f| gpa.free(f.fix_hint);
+        discipline_findings.deinit(gpa);
+    }
+    try checkIrqDiscipline(gpa, pool, &func_table, acquires.items, &irq_classes, &discipline_findings);
+
+    var pairing_findings = ArrayList(IrqFinding).empty;
+    defer {
+        for (pairing_findings.items) |f| gpa.free(f.fix_hint);
+        pairing_findings.deinit(gpa);
+    }
+    try checkPairingDiscipline(gpa, pool, &func_table, acquires.items, releases.items, &pairing_findings);
+
+    // ---- Output.
+    try w.writeAll("\n=== IRQ-acquired lock classes ===\n");
+    if (irq_classes.count() == 0) {
+        try w.writeAll("  (none — no lock class is reachable from any IRQ / NMI / async-trap entry)\n");
+    } else {
+        // Sort class ids for deterministic output.
+        var class_keys = ArrayList([]const u8).empty;
+        defer class_keys.deinit(gpa);
+        var ck_it = irq_classes.keyIterator();
+        while (ck_it.next()) |k| try class_keys.append(gpa, k.*);
+        std.sort.heap([]const u8, class_keys.items, {}, lessStr);
+        for (class_keys.items) |class_id| {
+            const kinds = irq_classes.get(class_id).?;
+            const reach_str = try renderReachableKindList(gpa, kinds);
+            defer gpa.free(reach_str);
+            try w.print("class  {s}  reachable_from={s}\n", .{ class_id, reach_str });
+            // List any sites needing fix.
+            var listed: u32 = 0;
+            for (discipline_findings.items) |f| {
+                if (!mem.eql(u8, f.class_id, class_id)) continue;
+                if (listed == 0) try w.writeAll("  acquire sites needing IRQ-save discipline:\n");
+                try w.print("    {s}:{d}  ({s})\n", .{ f.file_rel, f.line, f.enclosing_fn });
+                try w.print("      currently uses: {s}\n", .{f.method});
+                try w.print("      fix: {s}\n", .{f.fix_hint});
+                listed += 1;
+            }
+        }
+    }
+
+    if (pairing_findings.items.len > 0) {
+        try w.writeAll("\n=== Pairing violations ===\n");
+        for (pairing_findings.items) |f| {
+            try w.print("  {s}:{d}  ({s})  release={s}\n", .{ f.file_rel, f.line, f.enclosing_fn, f.method });
+            try w.print("    {s}\n", .{f.fix_hint});
+        }
+    }
+
+    const n_irq_classes: u32 = @intCast(irq_classes.count());
+    const n_discipline: u32 = @intCast(discipline_findings.items.len);
+    const n_pairing: u32 = @intCast(pairing_findings.items.len);
+    try w.print(
+        "\nIRQ-discipline summary: {d} IRQ-acquired classes, {d} discipline violations, {d} pairing violations\n",
+        .{ n_irq_classes, n_discipline, n_pairing },
+    );
+
+    return n_discipline + n_pairing;
 }

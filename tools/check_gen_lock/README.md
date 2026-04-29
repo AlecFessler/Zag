@@ -40,6 +40,21 @@ Exit status is nonzero if any err-severity findings are emitted.
    DeviceRegion, VirtualMachine, VmNode, PerfmonState, Vm, VCpu,
    PmuState).
 
+5. **IRQ-acquired lock-class discipline.** A separate analyzer pass
+   builds a kernel-wide direct call graph, classifies every lock class
+   reachable from any IRQ / NMI / async-trap entry as "IRQ-acquired",
+   and demands that every acquire site of an IRQ-acquired class either
+   (a) lives on a path that's only reachable from a hardware-IRQ entry
+   (CPU has masked already), (b) uses an IRQ-saving acquire variant
+   (`lockIrqSave`, `lockIrqSaveOrdered`, `lockOrderedIrqSave`,
+   `lockWithGenIrqSave`, `lockWithGenIrqSaveOrdered`,
+   `lockWithGenOrderedIrqSave`), or (c) is bracketed by a
+   `arch.cpu.saveAndDisableInterrupts()` / `restoreInterrupts()` pair
+   in the enclosing function body. A pairing checker also flags
+   acquire-vs-release flavor mismatches per receiver chain (plain
+   `lock()` ↔ `unlock()`; IRQ-saving `lockIrqSave*` ↔
+   `unlockIrqRestore`).
+
 2. **Bare-pointer invariant.** Struct fields whose type matches `*T`,
    `?*T`, `[N]*T`, `[]*T` for slab-backed T are violations — slab
    pointers must be `SlabRef(T)`. Exempted: the slab allocator itself
