@@ -46,6 +46,7 @@ const zag = @import("zag");
 
 const cpu = zag.arch.aarch64.cpu;
 const fpu = zag.sched.fpu;
+const futex = zag.sched.futex;
 const gic = zag.arch.aarch64.gic;
 const interrupts = zag.arch.aarch64.interrupts;
 const kprof_dump = zag.kprof.dump;
@@ -55,6 +56,8 @@ const scheduler = zag.sched.scheduler;
 const serial = zag.arch.aarch64.serial;
 const sync_debug = zag.utils.sync.debug;
 const syscall_dispatch = zag.syscall.dispatch;
+const time = zag.arch.dispatch.time;
+const timer_wheel = zag.sched.timer;
 const var_range = zag.capdom.var_range;
 
 const VAddr = zag.memory.address.VAddr;
@@ -789,6 +792,10 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             if (gic.coreID() == 0) {
                 gic.maybeBroadcastSchedTick();
             }
+            time.getPreemptionTimer().armInterruptTimer(scheduler.TIMESLICE_NS);
+            port.expireTimedRecvWaiters();
+            futex.expireTimedWaiters();
+            timer_wheel.wheelExpireDue();
             scheduler.preempt();
         },
         // SGI 1 — kprof-dump IPI. Park until the dumper bumps the epoch.
@@ -820,6 +827,10 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             // EL0. The receiving core treats it as an ordinary
             // scheduler tick. See gic.zig `broadcastSchedTick` for
             // the full diagnosis and spec citations.
+            time.getPreemptionTimer().armInterruptTimer(scheduler.TIMESLICE_NS);
+            port.expireTimedRecvWaiters();
+            futex.expireTimedWaiters();
+            timer_wheel.wheelExpireDue();
             scheduler.preempt();
         },
         23 => {
@@ -891,6 +902,10 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             if (gic.coreID() == 0) {
                 gic.maybeBroadcastSchedTick();
             }
+            time.getPreemptionTimer().armInterruptTimer(scheduler.TIMESLICE_NS);
+            port.expireTimedRecvWaiters();
+            futex.expireTimedWaiters();
+            timer_wheel.wheelExpireDue();
             scheduler.preempt();
         },
         else => {

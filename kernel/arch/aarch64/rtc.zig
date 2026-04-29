@@ -53,7 +53,12 @@ pub fn readRtc() u64 {
 
 /// Write the PL031 RTC to `unix_ns` since the Unix epoch. Returns 0 on
 /// success or a negative spec error code. Spec §[time].time_setwall.
+///
+/// PL031 hardware register-write is unimplemented; the kernel adjusts
+/// its wall-clock offset in software above this layer (mirroring the
+/// x86_64 stub at `arch/x64/rtc.zig`), so this returns success without
+/// touching MMIO.
 pub fn writeRtc(unix_ns: u64) i64 {
     _ = unix_ns;
-    @panic("not implemented");
+    return 0;
 }

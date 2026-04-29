@@ -15,6 +15,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const arch_syscall = zag.arch.dispatch.syscall;
 const capability = zag.caps.capability;
 const capability_domain = zag.capdom.capability_domain;
 const errors = zag.syscall.errors;
@@ -141,8 +142,8 @@ pub fn expireTimedRecvWaiters() void {
         ec.suspend_port = null;
         ec.event_type = .none;
         // Stash E_TIMEOUT in the syscall return slot. The scheduler's
-        // resume path puts vreg 1 back into rax on iretq.
-        ec.ctx.regs.rax = @bitCast(errors.E_TIMEOUT);
+        // resume path restores the syscall-return register on iretq.
+        arch_syscall.setSyscallReturn(ec.ctx, @bitCast(@as(i64, errors.E_TIMEOUT)));
         ec.state = .ready;
         scheduler.markReady(ec);
     }
@@ -453,7 +454,7 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
         target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     }
-    if (target_ec.state == .suspended_on_port) {
+    if (target_ec.state != .running and target_ec.state != .ready) {
         target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     }
