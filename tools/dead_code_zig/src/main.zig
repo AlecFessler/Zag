@@ -668,6 +668,20 @@ fn collectFindings(
         \\              AND (t.file_id <> e.def_file_id
         \\                   OR t.byte_start < e.def_byte_start
         \\                   OR t.byte_start >= e.def_byte_end)
+        \\              -- Exclude tokens that fall inside ANY OTHER entity's
+        \\              -- def span with the same simple name. Without this,
+        \\              -- two trees that each define `pub const Foo` keep
+        \\              -- each other's def-site token alive as a "use" —
+        \\              -- a homonym false-negative the legacy tool didn't
+        \\              -- have because it tracked decls per-file.
+        \\              AND NOT EXISTS (
+        \\                SELECT 1 FROM entity e2
+        \\                  JOIN entity_simple_name esn2 ON esn2.entity_id = e2.id
+        \\                 WHERE esn2.name = esn.name
+        \\                   AND e2.def_file_id = t.file_id
+        \\                   AND t.byte_start >= e2.def_byte_start
+        \\                   AND t.byte_start < e2.def_byte_end
+        \\              )
         \\         )
         \\    UNION
         \\      SELECT esn.entity_id FROM entity_simple_name esn
