@@ -421,6 +421,15 @@ noinline fn exitLoop() void {
         }
 
         var state = r.state;
+        // recvVmExit reads vreg 64 from `vm_exit_buf` which retains
+        // whatever the VMM wrote on the prior reply (the kernel does
+        // not clear vreg 64 on recv-side projection). Clear it
+        // explicitly so we only inject when the late-boot block
+        // below explicitly sets it again — otherwise our previous
+        // timer-IRQ injection sticks across exits and hardware
+        // re-fires the same vector on every entry, livelocking
+        // Linux in its IRQ0 ISR.
+        state.vcpu_event_intr_nmi = 0;
         const subcode: u8 = @truncate(state.exit_subcode);
         const kill = handleSubcode(subcode, &state);
 
@@ -465,7 +474,7 @@ noinline fn exitLoop() void {
         // Linux reaches "Run /init" around exit#80k under our cmdline,
         // so an exit_count threshold gives us a stable late-boot
         // injection point without a fragile event-shape probe.
-        if (exit_count > 70_000 and
+        if (exit_count > 81_000 and
             io.pic1_vector_base != 0x08 and
             (state.rflags & (1 << 9)) != 0 and
             state.vcpu_event_intr_nmi == 0)
