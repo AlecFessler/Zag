@@ -121,11 +121,44 @@ run_kernel_tests() {
     PARALLEL="${PARALLEL:-8}" bash "$SCRIPT_DIR/tests/tests/run_tests.sh"
 }
 
+# Build the per-(arch, commit_sha) oracle DB if it isn't present yet.
+# Both genlock and dead-code analyzers consume it, so we share the build.
+ensure_oracle_db() {
+    (cd "$SCRIPT_DIR/tools/indexer" && zig build) \
+        || { echo "[FAIL] indexer build failed"; return 1; }
+
+    local sha
+    sha="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD)"
+    ORACLE_DB="$SCRIPT_DIR/tools/oracle_http/test/dbs/x86_64-${sha}.db"
+
+    if [[ ! -f "$ORACLE_DB" ]]; then
+        if [[ ! -f "$SCRIPT_DIR/zig-out/kernel.x86_64.ll" || ! -f "$SCRIPT_DIR/zig-out/bin/kernel.elf" ]]; then
+            echo "  building kernel with -Demit_ir=true (needed by indexer)"
+            (cd "$SCRIPT_DIR" && zig build -Dprofile=test -Demit_ir=true) \
+                || { echo "[FAIL] kernel build for IR/ELF failed"; return 1; }
+        fi
+        (cd "$SCRIPT_DIR" && tools/indexer/zig-out/bin/indexer \
+            --kernel-root kernel \
+            --extra-token-root routerOS \
+            --extra-token-root hyprvOS \
+            --extra-token-root bootloader \
+            --extra-token-root tools \
+            --extra-token-root tests \
+            --out "$ORACLE_DB" \
+            --arch x86_64 \
+            --commit-sha "$(git rev-parse HEAD)" \
+            --ir zig-out/kernel.x86_64.ll \
+            --elf zig-out/bin/kernel.elf) \
+            || { echo "[FAIL] oracle DB build failed"; return 1; }
+    fi
+}
+
 run_genlock_check() {
     echo "=== Gen-lock Static Analyzer ==="
     (cd "$SCRIPT_DIR/tools/check_gen_lock" && zig build) \
         || { echo "[FAIL] check_gen_lock build failed"; return 1; }
-    (cd "$SCRIPT_DIR" && tools/check_gen_lock/zig-out/bin/check_gen_lock --summary) \
+    ensure_oracle_db || return 1
+    (cd "$SCRIPT_DIR" && tools/check_gen_lock/zig-out/bin/check_gen_lock --db "$ORACLE_DB" --summary) \
         || { echo "[FAIL] gen-lock analyzer reported err-severity findings"; return 1; }
     echo "[PASS] gen-lock analyzer clean"
 }
@@ -134,31 +167,8 @@ run_dead_code_check() {
     echo "=== Dead-code Analyzer ==="
     (cd "$SCRIPT_DIR/tools/dead_code_zig" && zig build) \
         || { echo "[FAIL] dead_code_zig build failed"; return 1; }
-    (cd "$SCRIPT_DIR/tools/indexer" && zig build) \
-        || { echo "[FAIL] indexer build failed"; return 1; }
-
-    local sha
-    sha="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD)"
-    local db="$SCRIPT_DIR/tools/oracle_http/test/dbs/x86_64-${sha}.db"
-
-    if [[ ! -f "$db" ]]; then
-        rm -f "$db"
-        (cd "$SCRIPT_DIR" && tools/indexer/zig-out/bin/indexer \
-            --kernel-root kernel \
-            --extra-token-root routerOS \
-            --extra-token-root hyprvOS \
-            --extra-token-root bootloader \
-            --extra-token-root tools \
-            --extra-token-root tests \
-            --out "$db" \
-            --arch x86_64 \
-            --commit-sha "$(git rev-parse HEAD)" \
-            --ir zig-out/kernel.x86_64.ll \
-            --elf zig-out/bin/kernel.elf) \
-            || { echo "[FAIL] indexer build failed"; return 1; }
-    fi
-
-    (cd "$SCRIPT_DIR" && tools/dead_code_zig/zig-out/bin/dead_code_zig --db "$db" --target kernel) \
+    ensure_oracle_db || return 1
+    (cd "$SCRIPT_DIR" && tools/dead_code_zig/zig-out/bin/dead_code_zig --db "$ORACLE_DB" --target kernel) \
         || { echo "[FAIL] dead-code analyzer reported findings"; return 1; }
     echo "[PASS] dead-code analyzer clean"
 }

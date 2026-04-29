@@ -67,51 +67,53 @@ stage_arch_layering_lint() {
     return 1
 }
 
+# Build the per-(arch, commit_sha) oracle DB if it isn't present yet.
+# Both the dead-code analyzer and the gen-lock analyzer read from it.
+ensure_oracle_db() {
+    if ! (cd "$ZAG_ROOT/tools/indexer" && zig build 2>&1); then
+        FAILURES+=("oracle indexer build")
+        return 1
+    fi
+    local sha
+    sha="$(cd "$ZAG_ROOT" && git rev-parse --short HEAD)"
+    ORACLE_DB="$ZAG_ROOT/tools/oracle_http/test/dbs/x86_64-${sha}.db"
+    if [[ -f "$ORACLE_DB" ]]; then return 0; fi
+    if [[ ! -f "$ZAG_ROOT/zig-out/kernel.x86_64.ll" || ! -f "$ZAG_ROOT/zig-out/bin/kernel.elf" ]]; then
+        echo "  building kernel with -Demit_ir=true (needed by indexer)"
+        if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test -Demit_ir=true 2>&1); then
+            FAILURES+=("kernel build for IR/ELF")
+            return 1
+        fi
+    fi
+    if ! (cd "$ZAG_ROOT" && tools/indexer/zig-out/bin/indexer \
+        --kernel-root kernel \
+        --extra-token-root routerOS \
+        --extra-token-root hyprvOS \
+        --extra-token-root bootloader \
+        --extra-token-root tools \
+        --extra-token-root tests \
+        --out "$ORACLE_DB" \
+        --arch x86_64 \
+        --commit-sha "$(git rev-parse HEAD)" \
+        --ir zig-out/kernel.x86_64.ll \
+        --elf zig-out/bin/kernel.elf 2>&1); then
+        FAILURES+=("oracle DB build")
+        return 1
+    fi
+}
+
 stage_dead_code_report() {
     echo ""
     echo "=================================================="
     echo "[0b] Dead-code detector (gating)"
     echo "=================================================="
-    # Dead-code detector now reads the per-(arch, commit_sha) oracle DB
-    # produced by tools/indexer. The DB must already exist; the indexer is
-    # invoked separately by the kernel build pipeline. Tool exits non-zero
-    # on any finding.
     if ! (cd "$ZAG_ROOT/tools/dead_code_zig" && zig build 2>&1); then
         FAILURES+=("dead-code detector build")
         return 1
     fi
-    if ! (cd "$ZAG_ROOT/tools/indexer" && zig build 2>&1); then
-        FAILURES+=("dead-code indexer build")
-        return 1
-    fi
-
-    local sha
-    sha="$(cd "$ZAG_ROOT" && git rev-parse --short HEAD)"
-    local db="$ZAG_ROOT/tools/oracle_http/test/dbs/x86_64-${sha}.db"
-
-    if [[ ! -f "$db" ]]; then
-        # Build the DB if absent. Requires the kernel ELF + IR; the kernel
-        # build with -Demit_ir=true emits these into zig-out/.
-        rm -f "$db"
-        (cd "$ZAG_ROOT" && tools/indexer/zig-out/bin/indexer \
-            --kernel-root kernel \
-            --extra-token-root routerOS \
-            --extra-token-root hyprvOS \
-            --extra-token-root bootloader \
-            --extra-token-root tools \
-            --extra-token-root tests \
-            --out "$db" \
-            --arch x86_64 \
-            --commit-sha "$(git rev-parse HEAD)" \
-            --ir zig-out/kernel.x86_64.ll \
-            --elf zig-out/bin/kernel.elf 2>&1) || {
-            FAILURES+=("dead-code DB build")
-            return 1
-        }
-    fi
-
+    ensure_oracle_db || return 1
     local detector="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    if ! (cd "$ZAG_ROOT" && "$detector" --db "$db" --target kernel); then
+    if ! (cd "$ZAG_ROOT" && "$detector" --db "$ORACLE_DB" --target kernel); then
         FAILURES+=("dead-code findings")
         return 1
     fi
@@ -122,17 +124,13 @@ stage_gen_lock_analyzer() {
     echo "=================================================="
     echo "[0c] Gen-lock analyzer (fat-pointer invariants)"
     echo "=================================================="
-    # Enforces: every kernel pointer to a slab-backed object is
-    # stored / passed / returned as `SlabRef(T)`, and every access
-    # goes through a `lock()`/`unlock()` bracket on that ref
-    # (unless the site is explicitly marked `// self-alive:`).
-    # The analyzer exits non-zero on any finding.
     if ! (cd "$ZAG_ROOT/tools/check_gen_lock" && zig build 2>&1); then
         FAILURES+=("gen-lock analyzer build")
         return 1
     fi
+    ensure_oracle_db || return 1
     local analyzer="$ZAG_ROOT/tools/check_gen_lock/zig-out/bin/check_gen_lock"
-    if ! "$analyzer"; then
+    if ! (cd "$ZAG_ROOT" && "$analyzer" --db "$ORACLE_DB" --summary); then
         FAILURES+=("gen-lock analyzer findings")
         return 1
     fi
