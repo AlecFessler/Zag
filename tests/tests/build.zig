@@ -600,8 +600,15 @@ fn patternMatches(pattern: []const u8, name: []const u8) bool {
 }
 
 pub fn build(b: *std.Build) void {
+    const target_arch_str = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
+    const cpu_arch: std.Target.Cpu.Arch = blk: {
+        if (std.mem.eql(u8, target_arch_str, "x64")) break :blk .x86_64;
+        if (std.mem.eql(u8, target_arch_str, "arm")) break :blk .aarch64;
+        @panic("-Darch must be one of: x64, arm");
+    };
+
     const target = b.resolveTargetQuery(.{
-        .cpu_arch = .x86_64,
+        .cpu_arch = cpu_arch,
         .os_tag = .freestanding,
     });
 

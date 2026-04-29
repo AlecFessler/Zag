@@ -1,30 +1,23 @@
-// Spec v3 vreg-ABI syscall wrappers.
+// Spec v3 vreg-ABI syscall wrappers. Architecture dispatch lives in
+// the arch backends (`syscall_x64.zig`, `syscall_aarch64.zig`). This
+// file owns the public API, the syscall-word encoding, and the per-
+// syscall wrappers — all of which are arch-neutral.
 //
-// The v3 ABI maps 128 virtual registers to GPRs + the user stack:
-//   vreg 0   = [rsp + 0]           (syscall word)
-//   vreg 1   = rax                 ┐
-//   vreg 2   = rbx                 │
-//   vreg 3   = rdx                 │
-//   vreg 4   = rbp                 │
-//   vreg 5   = rsi                 │ register-backed vregs
-//   vreg 6   = rdi                 │ (rcx, r11 reserved by sysret)
-//   vreg 7   = r8                  │
-//   vreg 8   = r9                  │
-//   vreg 9   = r10                 │
-//   vreg 10  = r12                 │
-//   vreg 11  = r13                 │
-//   vreg 12  = r14                 │
-//   vreg 13  = r15                 ┘
-//   vreg N   = [rsp + (N-13)*8]    for 14 <= N <= 127
-//
-// `Regs` carries the 13 register-backed vregs through the syscall;
-// `issueReg` performs a syscall whose entire payload fits in registers.
-// `issueStack` accepts an additional []const u64 of stack-spilled
-// vregs starting at vreg 14 (highest-indexed first push so vreg 14
-// lands at [rsp + 8] when the syscall executes). Both helpers preserve
-// rcx and r11 as clobbered (sysret).
+// `Regs` carries the lowest 13 vregs (v1..v13). On x86-64 these are
+// the only register-backed vregs; on aarch64 vregs 14..31 are also
+// register-backed (x13..x30) but no current libz call site populates
+// them, so `Regs` is intentionally not widened. A future spec tweak
+// that exposes vregs 14..31 to userspace would lift the API; until
+// then the narrow shape keeps both backends symmetric.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+const arch_impl = switch (builtin.cpu.arch) {
+    .x86_64 => @import("syscall_x64.zig"),
+    .aarch64 => @import("syscall_aarch64.zig"),
+    else => @compileError("unsupported target architecture for libz syscall"),
+};
 
 pub const Regs = struct {
     v1: u64 = 0,
@@ -137,132 +130,32 @@ pub fn extraReplyTransferHandle(handle: u12) u64 {
     return (@as(u64, handle) & 0xFFF) << 20;
 }
 
-// Sole call site of the raw `syscall` instruction. Reserves 16 bytes of
-// stack (avoiding the System V red zone — Zig may have stored locals
-// there) so vreg 0 at [rsp + 0] sits on a stable slot the kernel can
-// load via STAC; on return, frees the slot. Stack args (vregs 14+) are
-// pushed by the caller on top of the slot.
+pub const RecvReturn = struct {
+    word: u64,
+    regs: Regs,
+};
+
 fn issueRawNoStack(word: u64, in: Regs) Regs {
-    var ov1: u64 = undefined;
-    var ov2: u64 = undefined;
-    var ov3: u64 = undefined;
-    var ov4: u64 = undefined;
-    var ov5: u64 = undefined;
-    var ov6: u64 = undefined;
-    var ov7: u64 = undefined;
-    var ov8: u64 = undefined;
-    var ov9: u64 = undefined;
-    var ov10: u64 = undefined;
-    var ov11: u64 = undefined;
-    var ov12: u64 = undefined;
-    var ov13: u64 = undefined;
-    asm volatile (
-        \\ subq $16, %%rsp
-        \\ movq %%rcx, (%%rsp)
-        \\ syscall
-        \\ addq $16, %%rsp
-        : [v1] "={rax}" (ov1),
-          [v2] "={rbx}" (ov2),
-          [v3] "={rdx}" (ov3),
-          [v4] "={rbp}" (ov4),
-          [v5] "={rsi}" (ov5),
-          [v6] "={rdi}" (ov6),
-          [v7] "={r8}" (ov7),
-          [v8] "={r9}" (ov8),
-          [v9] "={r10}" (ov9),
-          [v10] "={r12}" (ov10),
-          [v11] "={r13}" (ov11),
-          [v12] "={r14}" (ov12),
-          [v13] "={r15}" (ov13),
-        : [word] "{rcx}" (word),
-          [iv1] "{rax}" (in.v1),
-          [iv2] "{rbx}" (in.v2),
-          [iv3] "{rdx}" (in.v3),
-          [iv4] "{rbp}" (in.v4),
-          [iv5] "{rsi}" (in.v5),
-          [iv6] "{rdi}" (in.v6),
-          [iv7] "{r8}" (in.v7),
-          [iv8] "{r9}" (in.v8),
-          [iv9] "{r10}" (in.v9),
-          [iv10] "{r12}" (in.v10),
-          [iv11] "{r13}" (in.v11),
-          [iv12] "{r14}" (in.v12),
-          [iv13] "{r15}" (in.v13),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-    return .{
-        .v1 = ov1,
-        .v2 = ov2,
-        .v3 = ov3,
-        .v4 = ov4,
-        .v5 = ov5,
-        .v6 = ov6,
-        .v7 = ov7,
-        .v8 = ov8,
-        .v9 = ov9,
-        .v10 = ov10,
-        .v11 = ov11,
-        .v12 = ov12,
-        .v13 = ov13,
-    };
+    return arch_impl.issueRawNoStack(word, in);
 }
 
 pub fn issueReg(num: SyscallNum, extra: u64, in: Regs) Regs {
     return issueRawNoStack(buildWord(num, extra), in);
 }
 
-/// Fire-and-forget variant: same syscall semantics, but the result is
-/// discarded inside the asm. Used by call sites that previously did
-/// `_ = lib.syscall.<…>(…)`. ReleaseSmall LLVM was DCE'ing those —
-/// the chain `issueRawNoStack → issueReg → wrapper → caller`'s 13
-/// output operands are all dead at the discard, and the optimizer
-/// proves the entire `Regs` struct can be elided, taking the volatile
-/// asm with it. Keeping a single inline asm with no outputs and a
-/// `memory` clobber forces emission. Must mirror the kernel ABI of
-/// `issueRawNoStack` exactly: syscall_word at `[rsp]`, vreg-1..13 in
-/// rax/rbx/rdx/rbp/rsi/rdi/r8/r9/r10/r12/r13/r14/r15.
 pub fn issueRegDiscard(num: SyscallNum, extra: u64, in: Regs) void {
-    const word = buildWord(num, extra);
-    asm volatile (
-        \\ subq $16, %%rsp
-        \\ movq %%rcx, (%%rsp)
-        \\ syscall
-        \\ addq $16, %%rsp
-        :
-        : [word] "{rcx}" (word),
-          [iv1] "{rax}" (in.v1),
-          [iv2] "{rbx}" (in.v2),
-          [iv3] "{rdx}" (in.v3),
-          [iv4] "{rbp}" (in.v4),
-          [iv5] "{rsi}" (in.v5),
-          [iv6] "{rdi}" (in.v6),
-          [iv7] "{r8}" (in.v7),
-          [iv8] "{r9}" (in.v8),
-          [iv9] "{r10}" (in.v9),
-          [iv10] "{r12}" (in.v10),
-          [iv11] "{r13}" (in.v11),
-          [iv12] "{r14}" (in.v12),
-          [iv13] "{r15}" (in.v13),
-        : .{ .rax = true, .rbx = true, .rdx = true, .rbp = true,
-             .rsi = true, .rdi = true, .r8 = true, .r9 = true,
-             .r10 = true, .r12 = true, .r13 = true, .r14 = true,
-             .r15 = true, .rcx = true, .r11 = true, .memory = true });
+    arch_impl.issueRegDiscard(buildWord(num, extra), in);
 }
 
-// Stack-arg path. SPEC AMBIGUITY: spec lists vreg 14 at [rsp + 8]
-// when the syscall executes, but does not pin who is responsible for
-// stack alignment / red-zone discipline. We push the highest-numbered
-// vreg first so vreg 14 ends up at [rsp + 8] after the word is pushed
-// last. Disk-backed loading and >13-vreg paths are not exercised by
-// the v0 mock runner; the disk-backed loader is the planned next step
-// once the runner stabilizes.
+// Stack-arg path. SPEC AMBIGUITY: spec lists vreg 14 at [rsp + 8] when
+// the syscall executes (x86) / vreg 32 at [sp + 8] (aarch64), but does
+// not pin who is responsible for stack alignment / red-zone discipline.
+// The v0 mock runner exercises only register-only syscalls; the stack
+// path is bounded at 16 slots so the pad size is fixed and call sites
+// typecheck without a runtime memcpy. Bump the bound when a stack-arg
+// syscall is actually used.
 pub fn issueStack(num: SyscallNum, extra: u64, in: Regs, stack_vregs: []const u64) Regs {
     if (stack_vregs.len == 0) return issueReg(num, extra, in);
-
-    // SPEC AMBIGUITY: a fully general stack path requires variadic-stack
-    // construction. Hard-code support up to a small bound here so the
-    // current runner (which only uses register-only syscalls) compiles
-    // without a runtime memcpy. Bump the bound when a stack-arg syscall
-    // is actually used.
     if (stack_vregs.len > 16) @panic("issueStack: vreg count exceeds bounded stack pad");
 
     var slots: [16]u64 = .{0} ** 16;
@@ -272,22 +165,7 @@ pub fn issueStack(num: SyscallNum, extra: u64, in: Regs, stack_vregs: []const u6
         i += 1;
     }
 
-    return issueRawWithSlots(buildWord(num, extra), in, &slots, stack_vregs.len);
-}
-
-// Reserves N quadwords on the stack above the syscall word, populates
-// them from `slots[0..n]` (slot[0] -> vreg 14, slot[1] -> vreg 15, ...),
-// then dispatches. Implemented as a fixed-size variant matching the
-// 16-slot pad in `issueStack` so we don't need a variable rsp adjust.
-fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) Regs {
-    _ = slots;
-    _ = n;
-    // SPEC AMBIGUITY: full implementation pending — runner currently
-    // exercises only the register-only path. The shape stays in libz so
-    // call sites typecheck; first call from a real test will replace
-    // this body with the explicit asm sequence (sub rsp, 16*8; movs;
-    // push word; syscall; add rsp).
-    return issueRawNoStack(word, in);
+    return arch_impl.issueRawWithSlots(buildWord(num, extra), in, &slots, stack_vregs.len);
 }
 
 // Per-syscall wrappers below. Each returns the kernel's vreg snapshot
@@ -295,117 +173,6 @@ fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) Regs 
 // depend on the returned syscall word for reply_handle_id / event_type
 // / pair_count / tstart). For those cases we issue with a peek of the
 // word via a dedicated helper.
-
-pub const RecvReturn = struct {
-    word: u64,
-    regs: Regs,
-};
-
-// Spec §[syscall_abi]: vreg 0 (`[rsp + 0]`) is the syscall word — on
-// return the kernel may write a syscall-word-shaped payload here (the
-// recv path packs reply_handle_id / event_type / pair_count / tstart
-// into vreg 0; vreg 1 / rax then carries the success/error code per
-// §[error_codes]). This helper preserves the slot across the syscall
-// instruction and reads vreg 0 back into `RecvReturn.word` after the
-// syscall returns. Errors land in `regs.v1` per the error-code
-// contract.
-//
-// The vreg-0 readback rides in `rcx` because the inline-asm operand
-// budget is tight: vregs 1..13 already pin 13 registers via tied
-// `{reg}` constraints, plus rcx for the input word and r11 as
-// SYSRET-clobbered. The asm restores `(%%rsp)` into `%rcx` AFTER the
-// syscall (overwriting the user-RIP rcx left by SYSRET, which is now
-// stale anyway because we are back in our own RIP), then `addq` and
-// publishes rcx to the `oword` Zig output via the existing
-// `={rcx}`-class output operand.
-//
-// Stack reservation = 144 bytes (not 16). Rationale: §[event_state]
-// vreg 14 is delivered by `recv` at `[user_rsp + 8]` of the syscall-
-// time RSP — the kernel writes the suspended-EC's RIP there during
-// rendezvous. With a 16-byte reservation, [rsp+8] from inside the asm
-// equals (caller_rsp - 16) + 8 = caller_rsp - 8 — squarely inside the
-// SysV AMD64 red zone (caller_rsp - 128 .. caller_rsp - 1) where LLVM
-// is free to spill caller-side locals across the asm. The kernel's
-// vreg-14 write then clobbers a compiler-managed spill (manifested as
-// a USER PF on the next dereference of the spilled value). Reserving
-// 144 bytes pushes the kernel writes (vreg 0 at outer-144, vreg 14 at
-// outer-136) below the red zone, so they cannot collide with any
-// caller-frame spill. 144 is the smallest 16-byte multiple ≥ 128 + 16.
-fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
-    var ov1: u64 = undefined;
-    var ov2: u64 = undefined;
-    var ov3: u64 = undefined;
-    var ov4: u64 = undefined;
-    var ov5: u64 = undefined;
-    var ov6: u64 = undefined;
-    var ov7: u64 = undefined;
-    var ov8: u64 = undefined;
-    var ov9: u64 = undefined;
-    var ov10: u64 = undefined;
-    var ov11: u64 = undefined;
-    var ov12: u64 = undefined;
-    var ov13: u64 = undefined;
-    var oword: u64 = undefined;
-    // Allocate 24 bytes so the kernel's writes to [rsp+0] (syscall
-    // word, vreg 0) and [rsp+8] (vreg 14, suspended EC's RIP per
-    // §[event_state]) both land in the alloc instead of stomping
-    // caller-frame locals that may live in the red zone. The userspace
-    // only reads [rsp+0]; [rsp+8] is consumed by the kernel and
-    // discarded on return.
-    asm volatile (
-        \\ subq $144, %%rsp
-        \\ movq %%rcx, (%%rsp)
-        \\ syscall
-        \\ movq (%%rsp), %%rcx
-        \\ addq $144, %%rsp
-        : [v1] "={rax}" (ov1),
-          [v2] "={rbx}" (ov2),
-          [v3] "={rdx}" (ov3),
-          [v4] "={rbp}" (ov4),
-          [v5] "={rsi}" (ov5),
-          [v6] "={rdi}" (ov6),
-          [v7] "={r8}" (ov7),
-          [v8] "={r9}" (ov8),
-          [v9] "={r10}" (ov9),
-          [v10] "={r12}" (ov10),
-          [v11] "={r13}" (ov11),
-          [v12] "={r14}" (ov12),
-          [v13] "={r15}" (ov13),
-          [oword] "={rcx}" (oword),
-        : [word] "{rcx}" (word_in),
-          [iv1] "{rax}" (in.v1),
-          [iv2] "{rbx}" (in.v2),
-          [iv3] "{rdx}" (in.v3),
-          [iv4] "{rbp}" (in.v4),
-          [iv5] "{rsi}" (in.v5),
-          [iv6] "{rdi}" (in.v6),
-          [iv7] "{r8}" (in.v7),
-          [iv8] "{r9}" (in.v8),
-          [iv9] "{r10}" (in.v9),
-          [iv10] "{r12}" (in.v10),
-          [iv11] "{r13}" (in.v11),
-          [iv12] "{r14}" (in.v12),
-          [iv13] "{r15}" (in.v13),
-        : .{ .r11 = true, .memory = true });
-    return .{
-        .word = oword,
-        .regs = .{
-            .v1 = ov1,
-            .v2 = ov2,
-            .v3 = ov3,
-            .v4 = ov4,
-            .v5 = ov5,
-            .v6 = ov6,
-            .v7 = ov7,
-            .v8 = ov8,
-            .v9 = ov9,
-            .v10 = ov10,
-            .v11 = ov11,
-            .v12 = ov12,
-            .v13 = ov13,
-        },
-    };
-}
 
 // ---------------------------------------------------------------
 // 0..3: cap-table-wide ops
@@ -466,12 +233,12 @@ pub fn createCapabilityDomain(
 pub fn acquireEcs(target: u12) RecvReturn {
     // count is set by the kernel on return in syscall word bits 12-19.
     const word = buildWord(.acquire_ecs, 0);
-    return issueRawCaptureWord(word, .{ .v1 = target });
+    return arch_impl.issueRawCaptureWord(word, .{ .v1 = target });
 }
 
 pub fn acquireVars(target: u12) RecvReturn {
     const word = buildWord(.acquire_vars, 0);
-    return issueRawCaptureWord(word, .{ .v1 = target });
+    return arch_impl.issueRawCaptureWord(word, .{ .v1 = target });
 }
 
 // ---------------------------------------------------------------
@@ -772,16 +539,15 @@ pub fn suspendEc(target: u12, port: u12, attachments: []const u64) Regs {
     }
     // SPEC AMBIGUITY: §[handle_attachments] places pair entries at
     // vregs [128-N..127] — the *high* end of the vreg space, not vregs
-    // 3..3+N-1. Implementing the high-vreg path needs a stack-pad of
-    // at least 128-13 = 115 quadwords to address them; the runner v0
-    // doesn't attach handles on suspend, so this branch is left as a
-    // stub. issueStack's pad would need to be expanded to support it.
+    // 3..3+N-1. Implementing the high-vreg path needs a stack-pad
+    // sized analogously to replyTransfer; the runner v0 doesn't attach
+    // handles on suspend, so this branch is left as a stub.
     @panic("suspend with attachments: high-vreg layout not yet wired");
 }
 
 pub fn recv(port: u12, timeout_ns: u64) RecvReturn {
     const word = buildWord(.recv, 0);
-    return issueRawCaptureWord(word, .{ .v1 = port, .v2 = timeout_ns });
+    return arch_impl.issueRawCaptureWord(word, .{ .v1 = port, .v2 = timeout_ns });
 }
 
 pub fn bindEventRoute(target: u12, event_type: u64, port: u12) Regs {
@@ -805,102 +571,19 @@ pub fn reply(reply_handle: u12) Regs {
 
 pub fn replyTransfer(reply_handle: u12, attachments: []const u64) Regs {
     // Spec §[handle_attachments]: pair entries occupy vregs `[128-N..127]`
-    // — the *high* end of the vreg space. For N entries, vreg (128-N)
-    // sits at `[rsp + (128-N-13)*8]` and vreg 127 sits at `[rsp + (127-13)*8]
-    // = [rsp + 912]`. We reserve 928 bytes (16-byte aligned, covers
-    // [rsp + 0..920] = vreg 0 + vregs 14..127), populate the high band
-    // with the attachment u64s, drop the syscall word at [rsp+0], and
-    // execute syscall.
-    //
-    // The reply handle id rides in syscall-word bits 20-31; N rides in
-    // bits 12-19; syscall_num in bits 0-11. See §[reply_transfer].
+    // — the *high* end of the vreg space. The arch backend handles the
+    // platform-specific stack reservation and high-vreg slot layout
+    // (different on x86-64 vs aarch64 because their GPR-backed vreg
+    // bands differ in width). The reply handle id rides in syscall-word
+    // bits 20-31; N rides in bits 12-19; syscall_num in bits 0-11. See
+    // §[reply_transfer].
     const n: u8 = @intCast(attachments.len);
     if (n == 0 or n > 63) @panic("reply_transfer: N must be 1..63");
     const word: u64 =
         (@as(u64, @intFromEnum(SyscallNum.reply_transfer)) & 0xFFF) |
         (@as(u64, n) << 12) |
         (@as(u64, reply_handle) << 20);
-
-    var ov1: u64 = undefined;
-    var ov2: u64 = undefined;
-    var ov3: u64 = undefined;
-    var ov4: u64 = undefined;
-    var ov5: u64 = undefined;
-    var ov6: u64 = undefined;
-    var ov7: u64 = undefined;
-    var ov8: u64 = undefined;
-    var ov9: u64 = undefined;
-    var ov10: u64 = undefined;
-    var ov11: u64 = undefined;
-    var ov12: u64 = undefined;
-    var ov13: u64 = undefined;
-    asm volatile (
-    // Reserve 928 bytes — covers vreg 0 at [rsp+0] and vregs 14..127
-    // at [rsp + 8..920]. Aligned to 16.
-        \\ subq $928, %%rsp
-        // Zero-fill the reserved region so vregs the kernel reads but
-        // we don't explicitly set come back as 0 rather than caller-
-        // frame stack garbage.
-        \\ movq %%rsp, %%rax
-        \\ movq $116, %%rcx
-        \\1: movq $0, (%%rax)
-        \\ addq $8, %%rax
-        \\ decq %%rcx
-        \\ jnz 1b
-        // Write attachments into vregs [128-N..127] at offsets
-        // [rsp + (128-N-13)*8 .. rsp + 912]. Loop in a way that handles
-        // arbitrary N (1..63). %rsi = src ptr, %rdi = first vreg offset
-        // = (128-N-13)*8 = (115-N)*8, %rcx = N.
-        \\ movq %[atts_ptr], %%rsi
-        \\ movq %[n], %%rcx
-        \\ movq %%rcx, %%rdi
-        \\ negq %%rdi
-        \\ addq $115, %%rdi
-        \\ shlq $3, %%rdi
-        \\ addq %%rsp, %%rdi
-        \\2: movq (%%rsi), %%rax
-        \\ movq %%rax, (%%rdi)
-        \\ addq $8, %%rsi
-        \\ addq $8, %%rdi
-        \\ decq %%rcx
-        \\ jnz 2b
-        // Syscall word at [rsp+0].
-        \\ movq %[word], %%rax
-        \\ movq %%rax, (%%rsp)
-        \\ syscall
-        \\ addq $928, %%rsp
-        : [v1] "={rax}" (ov1),
-          [v2] "={rbx}" (ov2),
-          [v3] "={rdx}" (ov3),
-          [v4] "={rbp}" (ov4),
-          [v5] "={rsi}" (ov5),
-          [v6] "={rdi}" (ov6),
-          [v7] "={r8}" (ov7),
-          [v8] "={r9}" (ov8),
-          [v9] "={r10}" (ov9),
-          [v10] "={r12}" (ov10),
-          [v11] "={r13}" (ov11),
-          [v12] "={r14}" (ov12),
-          [v13] "={r15}" (ov13),
-        : [word] "r" (word),
-          [atts_ptr] "r" (attachments.ptr),
-          [n] "r" (@as(u64, n)),
-        : .{ .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true, .cc = true });
-    return .{
-        .v1 = ov1,
-        .v2 = ov2,
-        .v3 = ov3,
-        .v4 = ov4,
-        .v5 = ov5,
-        .v6 = ov6,
-        .v7 = ov7,
-        .v8 = ov8,
-        .v9 = ov9,
-        .v10 = ov10,
-        .v11 = ov11,
-        .v12 = ov12,
-        .v13 = ov13,
-    };
+    return arch_impl.replyTransferAsm(word, attachments.ptr, @as(u64, n));
 }
 
 // ---------------------------------------------------------------
