@@ -67,13 +67,6 @@ pub fn init() void {
     // and the §6.8 alignment_fault behaviour cannot be exercised.
     // ARM ARM D13.2.118.
     enableSpAlignmentChecks();
-    // Allow EL0 wfi / wfe / wfit / wfet without trapping. Per ARM ARM
-    // D13.2.118, SCTLR_EL1.nTWI (bit 16) and .nTWE (bit 18) reset to 0
-    // on most implementations, which traps EL0 wait-for-event/interrupt
-    // to EL1 as wf_trapped. Userspace idle loops use these instructions
-    // (e.g. `wfi` in stub entry points after their work completes); a
-    // trap would be delivered as protection_fault to the EC, killing it.
-    permitEl0Wfi();
     // NOTE: GIC init is deferred to acpi.parseAcpi() — the distributor
     // and redistributor base addresses come from MADT, which has not
     // been parsed yet at this point.
@@ -115,18 +108,3 @@ fn enableSpAlignmentChecks() void {
     asm volatile ("isb");
 }
 
-/// Set SCTLR_EL1.nTWI (bit 16) and .nTWE (bit 18) so EL0 wfi/wfe execute
-/// natively rather than trapping to EL1 with EC=0x01 (wf_trapped).
-/// ARM ARM D13.2.118 (SCTLR_EL1).
-fn permitEl0Wfi() void {
-    var sctlr: u64 = undefined;
-    asm volatile ("mrs %[v], sctlr_el1"
-        : [v] "=r" (sctlr),
-    );
-    sctlr |= (@as(u64, 1) << 16) | (@as(u64, 1) << 18);
-    asm volatile ("msr sctlr_el1, %[v]"
-        :
-        : [v] "r" (sctlr),
-    );
-    asm volatile ("isb");
-}
