@@ -71,10 +71,78 @@ pub const GenLock = extern struct {
 
     /// Release a lock acquired via `lock` or `lockWithGen`. Clears the
     /// lock bit without touching the generation counter.
+    ///
+    /// Pairing rule: callers MUST match `lock`/`lockWithGen` to `unlock`,
+    /// and `lockIrqSave*`/`lockWithGenIrqSave*` to `unlockIrqRestore`.
+    /// Mixing produces broken IRQ state (an `unlock` paired with an
+    /// `lockIrqSave` leaves IRQs disabled forever; `unlockIrqRestore`
+    /// paired with a plain `lock` reads an undefined IRQ state) and is
+    /// flagged by the gen-lock analyzer.
     pub fn unlock(self: *GenLock) void {
         debug.release(self);
         const prev = self.word.fetchAnd(~@as(u64, 1), .release);
         std.debug.assert(prev & 1 == 1);
+    }
+
+    /// IRQ-saving counterpart of `lock`. Disables IRQs on the current
+    /// core, then spin-acquires the lock bit. The returned `u64` carries
+    /// the prior IRQ state — callers MUST pass it back to
+    /// `unlockIrqRestore` to release.
+    ///
+    /// Required at every acquire site of an IRQ-acquired lock class
+    /// (one some IRQ/NMI handler can transitively reach an acquire of)
+    /// — see `tools/check_gen_lock` for the static enforcement.
+    /// Without IRQ masking across the held window, a timer/IPI/etc.
+    /// firing mid-hold runs the ISR on top of the held lock; if the
+    /// ISR acquires any other lock M, lockdep records L→M against the
+    /// destroy-side M→L = AB-BA cycle.
+    pub fn lockIrqSave(self: *GenLock, src: SrcLoc) u64 {
+        return self.lockIrqSaveOrdered(0, src);
+    }
+
+    /// `lockIrqSave` variant that tags the lockdep entry with a
+    /// non-zero `ordered_group`. See `lockOrdered` for the ordered-group
+    /// semantics; this just adds the IRQ-mask discipline on top.
+    pub fn lockIrqSaveOrdered(self: *GenLock, ordered_group: u32, src: SrcLoc) u64 {
+        const state = arch.cpu.saveAndDisableInterrupts();
+        self.lockOrdered(ordered_group, src);
+        return state;
+    }
+
+    /// IRQ-saving counterpart of `lockWithGen`. Disables IRQs first,
+    /// then spin-CAS-acquires + verifies gen. On `StaleHandle` the IRQ
+    /// state is restored before returning the error so callers don't
+    /// have to special-case; on success the caller MUST pass the
+    /// returned `u64` to `unlockIrqRestore`.
+    pub fn lockWithGenIrqSave(self: *GenLock, expected_gen: u63, src: SrcLoc) AccessError!u64 {
+        return self.lockWithGenIrqSaveOrdered(expected_gen, 0, src);
+    }
+
+    /// `lockWithGenIrqSave` variant that tags the lockdep entry with a
+    /// non-zero `ordered_group`.
+    pub fn lockWithGenIrqSaveOrdered(
+        self: *GenLock,
+        expected_gen: u63,
+        ordered_group: u32,
+        src: SrcLoc,
+    ) AccessError!u64 {
+        const state = arch.cpu.saveAndDisableInterrupts();
+        self.lockWithGenOrdered(expected_gen, ordered_group, src) catch |err| {
+            arch.cpu.restoreInterrupts(state);
+            return err;
+        };
+        return state;
+    }
+
+    /// Release a lock acquired via `lockIrqSave*` / `lockWithGenIrqSave*`.
+    /// Clears the lock bit and restores the IRQ state captured at
+    /// acquire time. MUST NOT be paired with a plain `lock`/`lockWithGen`
+    /// acquire — see the pairing note on `unlock`.
+    pub fn unlockIrqRestore(self: *GenLock, state: u64) void {
+        debug.release(self);
+        const prev = self.word.fetchAnd(~@as(u64, 1), .release);
+        std.debug.assert(prev & 1 == 1);
+        arch.cpu.restoreInterrupts(state);
     }
 
     /// Spin-CAS-acquire the lock bit while atomically verifying the
@@ -201,6 +269,30 @@ pub fn SlabRef(comptime T: type) type {
 
         pub fn unlock(self: Self) void {
             self.ptr._gen_lock.unlock();
+        }
+
+        /// IRQ-saving counterpart of `lock`. Required at acquire sites
+        /// of IRQ-acquired classes (any class an IRQ/NMI handler can
+        /// reach an acquire of) — see `GenLock.lockIrqSave` for the
+        /// rationale. Returns the prior IRQ state, which the caller
+        /// MUST pass to `unlockIrqRestore`. On `StaleHandle` the IRQ
+        /// state is restored internally before the error returns.
+        pub fn lockIrqSave(self: Self, src: SrcLoc) AccessError!struct { ptr: *T, irq_state: u64 } {
+            const state = try self.ptr._gen_lock.lockWithGenIrqSave(@intCast(self.gen), src);
+            return .{ .ptr = self.ptr, .irq_state = state };
+        }
+
+        /// `lockIrqSave` variant that tags the lockdep entry with a
+        /// non-zero `ordered_group`.
+        pub fn lockOrderedIrqSave(self: Self, ordered_group: u32, src: SrcLoc) AccessError!struct { ptr: *T, irq_state: u64 } {
+            const state = try self.ptr._gen_lock.lockWithGenIrqSaveOrdered(@intCast(self.gen), ordered_group, src);
+            return .{ .ptr = self.ptr, .irq_state = state };
+        }
+
+        /// Release a lock acquired via `lockIrqSave` / `lockOrderedIrqSave`.
+        /// MUST NOT be paired with a plain `lock` acquire.
+        pub fn unlockIrqRestore(self: Self, irq_state: u64) void {
+            self.ptr._gen_lock.unlockIrqRestore(irq_state);
         }
 
         pub fn eql(self: Self, other: Self) bool {

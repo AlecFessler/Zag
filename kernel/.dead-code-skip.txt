@@ -20,7 +20,7 @@ arch/x64/serial.zig:7-14    sha256:46d763d4c76231115d8106df67c15f4de6a101bf7dc5e
 boot/protocol.zig:41-58    sha256:9882b3f612fe4d90fdb2562a1b3a666ca8ce0b6b5b0b5d0c6236a2d633e1cf4a
 syscall/errors.zig:1-15    sha256:17074f900b9a78fe15d0e0bcb1bd8ae6e2e41ea15d8f945ccba7c4e372600c4e
 kprof/kprof.zig:1-7    sha256:5e3abe0fd57384783fda05ca7a1ea2a640da43cd9d050a61d8033e5ea13c8e34
-memory/allocators/secure_slab.zig:642-646    sha256:4afc99d1447c3f88a1842e93d0524e3bc0ec52a7b81d267f44435a161defc801
+memory/allocators/secure_slab.zig:642-646    sha256:d57ef6ec8955476d824dab861db8c1d9ea3206cface409c439c702f269c74442
 memory/address.zig:138-141    sha256:0ecc8fdea0ed710fd68ef4dcc965759ffb653161cfd41abc5941ed000bfc2eaf
 arch/x64/paging.zig:122-153    sha256:16e9870fdf3dbbee0e5e60fe1157bfc483247814e9ba2f637241e383f19999e5
 arch/aarch64/paging.zig:120-165    sha256:038fa9505e28c4dc5686db3dea66ddb6448867562078a8b7a750a45ef16f395e
