@@ -708,7 +708,10 @@ pub fn handleEntries(
     defer buf.deinit(allocator);
     var prev_kind: []const u8 = "";
     while (try stmt.step()) {
-        const k = stmt.columnText(0) orelse "manual";
+        // dupe `k` before stash; SQLite reuses the column buffer each step,
+        // so the next iteration's `eql(prev_kind, k)` would otherwise read
+        // either freed memory or the new row's bytes.
+        const k = try a.dupe(u8, stmt.columnText(0) orelse "manual");
         const label = stmt.columnText(1) orelse "";
         const qname = stmt.columnText(3) orelse "";
         const path = stmt.columnText(4) orelse "";
@@ -852,7 +855,10 @@ pub fn handleModules(
     try buf.writer(allocator).print("module graph (direction={s}; min_edges={d}):\n\n", .{ direction, min_edges });
     var prev_src: []const u8 = "";
     while (try stmt.step()) {
-        const src = stmt.columnText(0) orelse "";
+        // dupe `src` before stash; SQLite's column buffer is reused on the
+        // next step(), so the next iteration's eql(prev_src, src) would be
+        // reading freed/overwritten memory.
+        const src = try a.dupe(u8, stmt.columnText(0) orelse "");
         const dst = stmt.columnText(1) orelse "";
         const count: u32 = @intCast(stmt.columnInt(2));
         if (!std.mem.eql(u8, src, prev_src)) {
@@ -1081,11 +1087,9 @@ pub fn handleSrcBinAt(
 
     var ranges = std.ArrayList(struct { lo: u64, hi: u64 }){};
     defer ranges.deinit(a);
-    var path_seen: []const u8 = "";
     while (try dstmt.step()) {
         const lo: u64 = @bitCast(dstmt.columnInt(0));
         const hi: u64 = @bitCast(dstmt.columnInt(1));
-        path_seen = dstmt.columnText(2) orelse path_seen;
         try ranges.append(a, .{ .lo = lo, .hi = hi });
     }
 
