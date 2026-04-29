@@ -81,12 +81,27 @@
 //      (which would mean the receiver's modifications leaked through
 //      despite the missing `write` cap)
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+// Architecture-portable no-op EC entry. Equivalent to
+// libz testing.dummyEntry, defined locally so the body's idle
+// instruction can be selected per arch (`hlt` on x86-64,
+// `wfe` on aarch64) without touching libz.
+fn dummyEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfe"),
+            else => @compileError("unsupported arch"),
+        }
+    }
+}
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
@@ -113,7 +128,7 @@ pub fn main(cap_table_base: u64) void {
         .restart_policy = 0,
     };
     const ec_caps_word: u64 = @as(u64, w_caps.toU16());
-    const entry: u64 = @intFromPtr(&testing.dummyEntry);
+    const entry: u64 = @intFromPtr(&dummyEntry);
     const cec = syscall.createExecutionContext(
         ec_caps_word,
         entry,

@@ -77,6 +77,7 @@
 //   6: observed never picked up the MAGIC value W should have written
 //      after the reply applied the modified rbx
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -95,19 +96,30 @@ export var observed: u64 = 0;
 
 const MAGIC: u64 = 0xC0FFEE_CAFE_BEEF_50;
 
-// W's entry. Naked so no function prologue clobbers rbx before the
-// store. The store uses rip-relative addressing on the exported
-// `observed` symbol directly — no asm operands, so LLVM cannot spill
-// through the (nonexistent) stack frame. After the store W spins so it
-// neither faults nor races the test EC's reporter — the runner only
-// cares about the test EC's eventual `pass()`/`fail()` suspension on
-// the result port; W never touches the result port.
+// W's entry. Naked so no function prologue clobbers vreg 2 (rbx on
+// x86-64, x1 on aarch64) before the store. The store uses
+// PC-relative addressing on the exported `observed` symbol directly
+// — no asm operands, so LLVM cannot spill through the (nonexistent)
+// stack frame. After the store W spins so it neither faults nor races
+// the test EC's reporter — the runner only cares about the test EC's
+// eventual `pass()`/`fail()` suspension on the result port; W never
+// touches the result port.
 fn observerEntry() callconv(.naked) noreturn {
-    asm volatile (
-        \\ movq %%rbx, observed(%%rip)
-        \\ 1: pause
-        \\    jmp 1b
-        ::: .{ .memory = true });
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\ movq %%rbx, observed(%%rip)
+            \\ 1: pause
+            \\    jmp 1b
+            ::: .{ .memory = true }),
+        .aarch64 => asm volatile (
+            \\ adrp x2, observed
+            \\ add x2, x2, :lo12:observed
+            \\ str x1, [x2]
+            \\ 1: yield
+            \\    b 1b
+            ::: .{ .memory = true }),
+        else => @compileError("unsupported arch"),
+    }
 }
 
 pub fn main(cap_table_base: u64) void {

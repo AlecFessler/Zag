@@ -25,7 +25,7 @@
 //   The libz `syscall.reply` wrapper packages the handle id into the
 //   syscall word for us; it leaves no path for setting reserved bits.
 //   We bypass the wrapper and emit a hand-crafted syscall via inline
-//   asm, putting the malformed word directly in `rcx` (vreg 0). vregs
+//   asm, putting the malformed word directly in vreg 0. vregs
 //   1..13 are now event-state mod inputs in the new ABI rather than
 //   handle carriers, so they are left zeroed.
 //
@@ -38,6 +38,7 @@
 //   1: reply with reserved bit 63 of the syscall word returned something
 //      other than E_INVAL.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const errors = lib.errors;
@@ -45,10 +46,18 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Issue `reply` with a hand-crafted syscall word. Mirrors libz's
-// `issueRawNoStack` shape (16-byte stack pad, vreg 0 at [rsp+0]) but
+// `issueRawNoStack` shape (16-byte stack pad, vreg 0 at [sp+0]) but
 // lets the caller pin every bit of the word — including reserved bits
 // the typed `syscall.reply` wrapper would never set.
 fn issueRawReply(word: u64) u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => issueRawReplyX64(word),
+        .aarch64 => issueRawReplyArm(word),
+        else => @compileError("unsupported arch"),
+    };
+}
+
+fn issueRawReplyX64(word: u64) u64 {
     var ov1: u64 = undefined;
     asm volatile (
         \\ subq $16, %%rsp
@@ -58,6 +67,26 @@ fn issueRawReply(word: u64) u64 {
         : [v1] "={rax}" (ov1),
         : [word] "{rcx}" (word),
         : .{ .rcx = true, .r11 = true, .memory = true });
+    return ov1;
+}
+
+fn issueRawReplyArm(word: u64) u64 {
+    var ov1: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #16
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ mov %[v1], x0
+        \\ add sp, sp, #16
+        : [v1] "=r" (ov1),
+        : [word] "r" (word),
+        : .{ .x0 = true, .x1 = true, .x2 = true, .x3 = true, .x4 = true,
+             .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true,
+             .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true,
+             .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true,
+             .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true,
+             .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true,
+             .memory = true });
     return ov1;
 }
 

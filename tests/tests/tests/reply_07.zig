@@ -81,6 +81,7 @@
 //   6: sentinel was not visible after the bounded yield-and-load loop
 //      (W was not actually resumed)
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -97,7 +98,13 @@ var observed: u64 = 0;
 
 fn workerEntry() callconv(.c) noreturn {
     @atomicStore(u64, &observed, SENTINEL, .release);
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfe"),
+            else => @compileError("unsupported arch"),
+        }
+    }
 }
 
 pub fn main(cap_table_base: u64) void {

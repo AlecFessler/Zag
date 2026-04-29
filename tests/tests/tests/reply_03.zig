@@ -96,12 +96,27 @@
 //   4: reply returned something other than E_TERM or E_ABANDONED in
 //      vreg 1 (see SPEC AMBIGUITY in header)
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+// Architecture-portable "halt forever" used by the defensive tail of
+// the child entry. x86-64 uses `hlt`; aarch64 uses `wfe` (analog idle
+// instruction available at EL0/EL1 on virt machine; assembles cleanly
+// in user mode and traps if the kernel decides to deliver a wakeup).
+fn haltForever() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfe"),
+            else => @compileError("unsupported arch"),
+        }
+    }
+}
 
 // Communicated to the child EC across the create_execution_context
 // boundary. The child runs in the same capability domain so it
@@ -124,7 +139,7 @@ fn childEntry() callconv(.c) noreturn {
     // Unreachable on the test 03 path: the test terminates this EC
     // before any reply is delivered. Halt defensively in case the
     // kernel ever resumes execution.
-    while (true) asm volatile ("hlt");
+    haltForever();
 }
 
 pub fn main(cap_table_base: u64) void {
