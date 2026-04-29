@@ -113,10 +113,14 @@ stage_dead_code_report() {
     fi
     ensure_oracle_db || return 1
     local detector="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    if ! (cd "$ZAG_ROOT" && "$detector" --db "$ORACLE_DB" --target kernel); then
-        FAILURES+=("dead-code findings")
-        return 1
-    fi
+    local any_failed=0
+    for tgt in kernel routerOS hyprvOS bootloader; do
+        if ! (cd "$ZAG_ROOT" && "$detector" --db "$ORACLE_DB" --target "$tgt"); then
+            FAILURES+=("dead-code findings: $tgt")
+            any_failed=1
+        fi
+    done
+    [[ $any_failed -eq 0 ]] || return 1
 }
 
 stage_gen_lock_analyzer() {

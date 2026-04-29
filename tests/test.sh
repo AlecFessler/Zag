@@ -168,9 +168,17 @@ run_dead_code_check() {
     (cd "$SCRIPT_DIR/tools/dead_code_zig" && zig build) \
         || { echo "[FAIL] dead_code_zig build failed"; return 1; }
     ensure_oracle_db || return 1
-    (cd "$SCRIPT_DIR" && tools/dead_code_zig/zig-out/bin/dead_code_zig --db "$ORACLE_DB" --target kernel) \
-        || { echo "[FAIL] dead-code analyzer reported findings"; return 1; }
-    echo "[PASS] dead-code analyzer clean"
+    local detector="$SCRIPT_DIR/tools/dead_code_zig/zig-out/bin/dead_code_zig"
+    local any_failed=0
+    for tgt in kernel routerOS hyprvOS bootloader; do
+        if (cd "$SCRIPT_DIR" && "$detector" --db "$ORACLE_DB" --target "$tgt"); then
+            echo "[PASS] dead-code analyzer clean: $tgt"
+        else
+            echo "[FAIL] dead-code analyzer findings: $tgt"
+            any_failed=1
+        fi
+    done
+    [[ $any_failed -eq 0 ]] || return 1
 }
 
 run_linux_boot_test() {
