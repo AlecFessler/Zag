@@ -2087,9 +2087,15 @@ pub fn main() !u8 {
     var n_pairing: u32 = 0;
 
     var discipline_findings: ArrayList(DisciplineFinding) = .empty;
-    defer discipline_findings.deinit(gpa);
+    defer {
+        for (discipline_findings.items) |f| gpa.free(f.message);
+        discipline_findings.deinit(gpa);
+    }
     var pairing_findings: ArrayList(PairingFinding) = .empty;
-    defer pairing_findings.deinit(gpa);
+    defer {
+        for (pairing_findings.items) |f| gpa.free(f.message);
+        pairing_findings.deinit(gpa);
+    }
 
     var discipline_lines: ArrayList([]u8) = .empty;
     defer {
