@@ -91,6 +91,7 @@ var hlt_count: u64 = 0;
 var ept_count: u64 = 0;
 var intr_count: u64 = 0;
 var other_count: u64 = 0;
+var last_inject_ns: u64 = 0;
 
 pub fn main(cap_table_base: u64) void {
     log.init(cap_table_base);
@@ -442,6 +443,39 @@ noinline fn exitLoop() void {
 
         // PIT tick — fires IRQ0 when counter reaches 0.
         io.pitCheckIrq();
+
+        // Direct PIC IRQ0 injection at 4ms / 250Hz, mirroring the OLD
+        // VMM's `maybeInjectTimer`. With `nolapic noapic` Linux uses
+        // the 8259 PIC for all IRQ routing — `vmInjectIrq(pin=2)`
+        // through the in-kernel IOAPIC above is a no-op for
+        // guest-visible delivery, so without this hook jiffies never
+        // advance and `/init` hangs on its first mount syscall.
+        // Stuff a SVM-EVENTINJ-format word into vreg 64
+        // (vcpu_event_intr_nmi); kernel's applyReplyStateToVcpu
+        // forwards it to `gs.pending_eventinj`. Gates: IF=1, no prior
+        // pending event. Linux's PIC remap (vector_base 0x08 → 0x20)
+        // happens within ~1ms of boot, so the 4ms throttle is enough
+        // to ensure the first inject lands on the remapped vector.
+        // Direct PIC IRQ0 injection. Don't even try until exit_count
+        // is big enough that we've definitely traversed Linux's
+        // setup_arch + init_8259A (PIC remap, IDT install) — early
+        // injection at vector 0x08 lands on the CPU's #DF entry and
+        // either panics the guest or eats the interrupt silently
+        // depending on Linux's IDT shape at that instant. Empirically
+        // Linux reaches "Run /init" around exit#80k under our cmdline,
+        // so an exit_count threshold gives us a stable late-boot
+        // injection point without a fragile event-shape probe.
+        if (exit_count > 70_000 and
+            io.pic1_vector_base != 0x08 and
+            (state.rflags & (1 << 9)) != 0 and
+            state.vcpu_event_intr_nmi == 0)
+        {
+            const now_ns = syscall.timeMonotonic().v1;
+            if (now_ns -% last_inject_ns >= 4_000_000) {
+                last_inject_ns = now_ns;
+                state.vcpu_event_intr_nmi = @as(u64, io.pic1_vector_base) | (1 << 31);
+            }
+        }
 
         const reply_err = syscall.replyVmExit(r.reply_handle_id, state);
         if (reply_err != 0) {

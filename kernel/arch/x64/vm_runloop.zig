@@ -173,6 +173,10 @@ const VREG54_PAT_OFF: u64 = 328;
 // passthrough path is restored.
 const VREG60_DR6_OFF: u64 = 376;
 const VREG61_DR7_OFF: u64 = 384;
+// vcpu_events band: vregs 62..65 = exception/intr/sipi packed slots.
+// vreg 64 = interrupt/nmi packed: SVM-EVENTINJ-format word the VMM
+// writes to inject a pending external IRQ on next entry.
+const VREG64_INTR_NMI_OFF: u64 = 408;
 // Exit sub-code + payload: vregs 70..73.
 const VREG70_EXIT_SUBCODE_OFF: u64 = 456;
 const VREG71_EXIT_PAYLOAD_0_OFF: u64 = 464;
@@ -267,6 +271,17 @@ pub fn applyReplyStateToVcpu(receiver: *ExecutionContext, vcpu_ec: *ExecutionCon
     // DRs vregs 56..61 (DR0..DR3 not in GuestState — skipped; DR6/DR7 are).
     gs.dr6 = loadU64(rsp, VREG60_DR6_OFF);
     gs.dr7 = loadU64(rsp, VREG61_DR7_OFF);
+
+    // vreg 64 — pending intr/NMI injection. The VMM writes this when
+    // a PIC IRQ (e.g. PIT IRQ0 at vector 0x20 after Linux remaps the
+    // 8259) needs to be delivered into the guest, in configurations
+    // where the in-kernel LAPIC/IOAPIC isn't the routing path
+    // (`nolapic noapic` cmdline). The pre-VMRUN
+    // `deliverPendingInterrupts` hook honours `gs.pending_eventinj`
+    // alongside its LAPIC-IRR check, so the value flows straight
+    // through to the hardware event-injection field.
+    const intr = loadU64(rsp, VREG64_INTR_NMI_OFF);
+    if (intr != 0) gs.pending_eventinj = intr;
 
     arch_state.started = true;
 }
