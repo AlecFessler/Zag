@@ -49,5 +49,11 @@ pub fn isHandleError(v: u64) bool {
 // `create_execution_context`. The EC will halt forever; the test EC
 // reads/restricts/etc. the handle without interference.
 pub fn dummyEntry() noreturn {
-    while (true) asm volatile ("hlt");
+    while (true) {
+        switch (@import("builtin").cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported arch"),
+        }
+    }
 }
