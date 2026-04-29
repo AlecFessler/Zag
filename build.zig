@@ -84,6 +84,8 @@ pub fn build(b: *std.Build) void {
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
     const emit_ir = b.option(bool, "emit_ir", "Emit kernel LLVM IR to zig-out/kernel.ll (for tools/callgraph)") orelse false;
+    const emit_index = b.option(bool, "emit_index", "Build the per-(arch, commit_sha) oracle SQLite DB to tools/oracle_http/test/dbs/ (implies -Demit_ir=true)") orelse false;
+    const commit_sha = b.option([]const u8, "commit_sha", "Commit SHA recorded in the oracle DB when -Demit_index=true (default: 'DEV')") orelse "DEV";
     const kernel_profile = b.option([]const u8, "kernel_profile", "Kernel profiling mode: none, trace, or sample (default: none)") orelse "none";
     if (!std.mem.eql(u8, kernel_profile, "none") and
         !std.mem.eql(u8, kernel_profile, "trace") and
@@ -312,11 +314,46 @@ pub fn build(b: *std.Build) void {
     install_kernel.step.dependOn(&kernel.step);
     b.getInstallStep().dependOn(&install_kernel.step);
 
-    if (emit_ir) {
+    if (emit_ir or emit_index) {
         const ir_name = b.fmt("kernel.{s}.ll", .{@tagName(arch)});
         const install_ir = b.addInstallFile(kernel.getEmittedLlvmIr(), ir_name);
         install_ir.step.dependOn(&kernel.step);
         b.getInstallStep().dependOn(&install_ir.step);
+    }
+
+    if (emit_index) {
+        // Build the indexer (in tools/indexer) and run it against the just-
+        // installed kernel ELF + IR. The output `.db` lands in
+        // tools/oracle_http/test/dbs/ where the daemons auto-discover it.
+        const indexer_exe = b.addSystemCommand(&.{
+            "zig", "build", "-Doptimize=ReleaseSmall",
+        });
+        indexer_exe.setCwd(b.path("tools/indexer"));
+        const installed_ir = b.fmt("{s}/kernel.{s}.ll", .{ b.install_path, @tagName(arch) });
+        const installed_elf = b.fmt("{s}/{s}/{s}", .{ b.install_path, out_dir, kernel.name });
+        const db_dir = b.path("tools/oracle_http/test/dbs").getPath(b);
+        const db_filename = b.fmt("{s}-{s}.db", .{ @tagName(arch), commit_sha });
+        const db_out = b.fmt("{s}/{s}", .{ db_dir, db_filename });
+        const run_indexer = b.addSystemCommand(&.{
+            "tools/indexer/zig-out/bin/indexer",
+            "--kernel-root",
+            "kernel",
+            "--out",
+            db_out,
+            "--arch",
+            @tagName(arch),
+            "--commit-sha",
+            commit_sha,
+            "--ir",
+            installed_ir,
+            "--elf",
+            installed_elf,
+        });
+        run_indexer.step.dependOn(&indexer_exe.step);
+        run_indexer.step.dependOn(b.getInstallStep());
+        const index_step = b.step("index", "Run the oracle DB indexer after the kernel build");
+        index_step.dependOn(&run_indexer.step);
+        b.getInstallStep().dependOn(&run_indexer.step);
     }
 
     // ── Root service (copied into FAT image, loaded by bootloader) ─────
