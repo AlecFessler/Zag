@@ -443,18 +443,18 @@ pub fn decHandleRef(t: *Timer) void {
 /// `period_ns` nanoseconds and pins a per-core wheel-heap slot.
 ///
 /// Lock order respected: caller holds `cd._gen_lock`; we acquire each
-/// Timer's `_gen_lock` independently (canonical CD → Timer order). We
-/// only flip `armed = false` — we do NOT call `wheelRemove` here. The
-/// timer's slot stays in the per-core wheel until its next fire; on
-/// fire, `onFire`'s opening `if (!t.armed) return` short-circuits
-/// before `propagateAndWake` and (for periodic) before `wheelInsert`,
-/// so the slot is naturally consumed and not re-inserted. Avoiding
-/// `wheel_locks` during destroy keeps the lock-order shallow:
-/// `tree_mutex → cd._gen_lock → t._gen_lock` here, vs. the
-/// `cd._gen_lock → t._gen_lock → wheel_locks` chain a `wheelRemove`
-/// would add — and avoids the IRQ-context contention an active timer
-/// IRQ on another core could create against `wheel_locks` during a
-/// concurrent destroy.
+/// Timer's `_gen_lock` independently (canonical CD → Timer order),
+/// then nest `wheel_locks[t.wheel_core]` inside the timer lock — same
+/// chain `timerRearm` uses (`t._gen_lock → wheel_locks[c]`). Full
+/// chain: `tree_mutex → cd._gen_lock → t._gen_lock → wheel_locks[c]`.
+///
+/// We remove the timer from the wheel here rather than relying on
+/// the next fire to short-circuit on `!t.armed`. Disarmed entries
+/// linger in the per-core heap until their scheduled fire, and the
+/// cumulative pop+short-circuit cost (combined with the per-fire
+/// `propagateAndWake` walk over alive CDs from any concurrent armed
+/// periodics in the same heap) starves the test runner past iter
+/// ~416 on TCG aarch64. Pulling the entry now keeps the heap clean.
 ///
 /// We do NOT destroy the Timer slab slot or call `decHandleRef` here.
 /// Other domains holding a copy of this timer handle still see a live
@@ -484,7 +484,9 @@ pub fn disarmTimerHandlesInDomain(cd: *CapabilityDomain) void {
             slot += 1;
             continue;
         };
-        tlr.ptr.armed = false;
+        const t = tlr.ptr;
+        if (t.armed) wheelRemove(t);
+        t.armed = false;
         ref.unlockIrqRestore(tlr.irq_state);
         slot += 1;
     }
@@ -640,6 +642,29 @@ pub fn onFire(t: *Timer) void {
     var next_deadline: u64 = 0;
     if (periodic) {
         next_deadline = t.deadline_ns +| t.period_ns;
+        // Periodic catch-up clamp. Spec §[timer] guarantees
+        // at-least-once delivery per period but does not require
+        // the kernel to replay every missed period when the wheel
+        // falls behind. Without this, a periodic timer whose
+        // deadline lags many periods (TCG aarch64 with sub-ms
+        // `period_ns` — e.g. timer_arm_08's 1 ms periodic — plus
+        // the `propagateAndWake` walk over alive CDs taking longer
+        // than `period_ns`) re-enters wheelExpireDue's
+        // pop-fire-reinsert loop once per missed period. Each fire
+        // runs another full walk and the loop body grows with
+        // elapsed lag, starving the recv-timeout / scheduler-tick
+        // paths past iter ~416 in the spec-v3 test runner. Skip
+        // ahead to the next future tick instead. The counter still
+        // increments exactly once per real fire — spec only pins
+        // the order (1, 2, ...), not the absolute timing.
+        if (t.period_ns != 0) {
+            const now_ns = arch.time.currentMonotonicNs();
+            if (next_deadline <= now_ns) {
+                const lag = now_ns - next_deadline;
+                const periods_behind = lag / t.period_ns;
+                next_deadline +|= (periods_behind + 1) *| t.period_ns;
+            }
+        }
         t.deadline_ns = next_deadline;
     } else {
         t.armed = false;
