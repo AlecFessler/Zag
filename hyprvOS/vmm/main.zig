@@ -363,7 +363,10 @@ noinline fn exitLoop() void {
     // the given window so the VMM can tick the emulated PIT and poll
     // host serial RX. Linux's `check_timer` waits ~100ms for PIT IRQ0
     // fires; 1 ms is well below that threshold and gives plenty of
-    // periodic-timer fires within Linux's measurement window.
+    // periodic-timer fires within Linux's measurement window. The PIT
+    // tick path sets `io.pic1_irq0_pending`; the next reply that has
+    // an exit context flushes it into `state.vcpu_event_intr_nmi` so
+    // the kernel actually injects the IRQ on resume.
     const RECV_POLL_NS: u64 = 1_000_000; // 1 ms
     while (true) {
         const r = syscall.recvVmExit(exit_port, RECV_POLL_NS);
@@ -440,8 +443,26 @@ noinline fn exitLoop() void {
             _ = syscall.vmInjectIrq(vm_handle, 4, 0);
         }
 
-        // PIT tick — fires IRQ0 when counter reaches 0.
+        // PIT tick — flips `pic1_irq0_pending` if a programmed period
+        // has elapsed since the last fire.
         io.pitCheckIrq();
+
+        // Direct PIC injection. With Linux booted under `nolapic noapic`
+        // it ignores the in-kernel IOAPIC and reads its IRQ0 vector
+        // straight from the 8259 (Linux remaps it to 0x20 early in
+        // setup_arch). Stuff the pending vector into vreg 64
+        // (vcpu_event_intr_nmi) — the kernel reply path forwards that
+        // into `gs.pending_eventinj` and the next entry honours it
+        // before VMRUN/VMLAUNCH. Gate on guest IF=1 so we don't drop
+        // the fire while the guest is in a critical section; the
+        // `pic1_irq0_pending` flag is sticky across exits until we
+        // can deliver.
+        if (io.pic1_irq0_pending and (state.rflags & (1 << 9)) != 0 and state.vcpu_event_intr_nmi == 0) {
+            const vector: u64 = io.pic1_vector_base;
+            // SVM EVENTINJ format: vector | type=0 (external) | valid=1<<31.
+            state.vcpu_event_intr_nmi = vector | (1 << 31);
+            io.pic1_irq0_pending = false;
+        }
 
         const reply_err = syscall.replyVmExit(r.reply_handle_id, state);
         if (reply_err != 0) {

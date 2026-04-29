@@ -214,10 +214,20 @@ noinline fn handlePitRead(channel: u2) u32 {
     return 0;
 }
 
-/// Check if PIT channel 0 has fired and assert IOAPIC IRQ if so.
-/// ACPI MADT has IRQ0→GSI2 override, so we assert IOAPIC pin 2.
-/// Coalesces: won't re-fire if the previous timer vector is still in the
-/// LAPIC pipeline (IRR or ISR), preventing timer starvation of serial.
+/// True when a PIT IRQ0 fire is pending injection on the next guest entry.
+/// `main.zig`'s exit loop flushes this into `state.vcpu_event_intr_nmi`
+/// (if guest IF=1) and clears the flag. The OLD VMM did the equivalent
+/// via SVM EVENTINJ direct-write; the spec-v3 path is the same vector
+/// of bytes, just routed through the §[vm_exit_state] vreg ABI.
+pub var pic1_irq0_pending: bool = false;
+
+/// Check if PIT channel 0 has fired and queue an IRQ0 for direct
+/// injection on the next guest entry. Linux booted with `nolapic noapic`
+/// uses the 8259 PIC, and the PIC's IRQ0 vector is whatever Linux
+/// remapped it to (default 0x08, Linux remaps to 0x20). The exit loop
+/// reads `pic1_vector_base` to fill in the right vector when it
+/// flushes `pic1_irq0_pending` into the §[vm_exit_state] event field.
+/// Coalesces: only re-fires once per programmed PIT period.
 pub noinline fn pitCheckIrq() void {
     if (pit_ch0_reload == 0 and pit_ch0_mode == 0) return;
     if (pit_ch0_mode != 2 and pit_ch0_mode != 3 and pit_ch0_mode != 0) return;
@@ -230,15 +240,14 @@ pub noinline fn pitCheckIrq() void {
         if (pit_ch0_last_irq_ns == 0 and pit_ch0_start_ns > 0) {
             if (now -% pit_ch0_start_ns >= period_ns) {
                 pit_ch0_last_irq_ns = now;
-                _ = syscall.vmInjectIrq(@truncate(@import("main.zig").vm_handle & 0xFFF), 2, 1);
+                pic1_irq0_pending = true;
             }
         }
     } else {
         if (pit_ch0_start_ns == 0) return;
         if (now -% pit_ch0_last_irq_ns >= period_ns) {
             pit_ch0_last_irq_ns = now;
-            _ = syscall.vmInjectIrq(@truncate(@import("main.zig").vm_handle & 0xFFF), 2, 1);
-            _ = syscall.vmInjectIrq(@truncate(@import("main.zig").vm_handle & 0xFFF), 2, 0);
+            pic1_irq0_pending = true;
         }
     }
 }
