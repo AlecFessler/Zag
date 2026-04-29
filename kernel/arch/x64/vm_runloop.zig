@@ -83,6 +83,21 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
         }
         arch_state.last_tick_ns = now_ns;
 
+        // Kernel-side PIT IRQ pulse @ 100 Hz. PIT emulation lives in the
+        // VMM (port 0x40-0x43 OUT exits decoded there), but with the
+        // kernel-emulated IOAPIC the VMM only sees those IO exits during
+        // PIT setup — afterwards Linux is busy-waiting on jiffies and
+        // the VMM gets no exits to drive `pitCheckIrq` from. Linux's
+        // `check_timer` panics if jiffies don't advance. Pulse IOAPIC
+        // pin 2 (ISA IRQ0 via INT_SRC_OVR) inline so jiffies progress
+        // without the VMM round trip. Mask check inside `assertIrq`
+        // means asserts before Linux unmasks the entry are no-ops.
+        if (now_ns -% arch_state.last_auto_inject_ns >= 1_000_000) { // 1ms = 1000Hz
+            arch_state.last_auto_inject_ns = now_ns;
+            vm_ptr.ioapic.assertIrq(2);
+            vm_ptr.ioapic.deassertIrq(2);
+        }
+
         // Auto-inject the guest's PIC-IRQ0 vector at a fixed 4ms
         // cadence so /init makes scheduler progress even when the
         // guest is in user-mode busy-loops that don't generate vm
@@ -325,10 +340,16 @@ pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
     // test 09). Skip the wide reads and leave `wide_state_valid=false`
     // so `applyReplyStateToVcpu` keeps `arch_state.started=false` and
     // the next enterGuest stays on the synthetic-exit fallback.
+    // Bound-check only applies when rsp lies *within* the receiver's
+    // user_stack range. Receivers like hyprvOS redirect rsp at a static
+    // data-segment buffer (`vm_exit_buf`) for the syscall — that pointer
+    // is not on the user_stack at all and does not need the
+    // close-to-top guard. Skip the wide read only if rsp+416 would
+    // overrun the actual stack top, i.e. rsp is in [base, top) and the
+    // remaining headroom is < WIDE_VREG_END_OFF.
     if (receiver.user_stack) |us| {
-        if (rsp +% WIDE_VREG_END_OFF > us.top.addr) return snap;
-    } else {
-        return snap;
+        const on_stack = rsp >= us.base.addr and rsp < us.top.addr;
+        if (on_stack and rsp +% WIDE_VREG_END_OFF > us.top.addr) return snap;
     }
 
     cpu_dispatch.userAccessBegin();

@@ -91,9 +91,6 @@ var hlt_count: u64 = 0;
 var ept_count: u64 = 0;
 var intr_count: u64 = 0;
 var other_count: u64 = 0;
-var last_inject_ns: u64 = 0;
-var inject_count: u64 = 0;
-var last_if_seen: u64 = 99;
 
 pub fn main(cap_table_base: u64) void {
     log.init(cap_table_base);
@@ -260,7 +257,7 @@ noinline fn bootLinux() void {
     mem.copyGuest(boot.KERNEL_ADDR, TEMP_ADDR + setup_size, hdr.bzimage_size - setup_size);
 
     buildBootParams(hdr.initramfs_size);
-    boot.setupCmdline("console=ttyS0,115200 earlyprintk=serial,ttyS0,115200,keep earlycon=uart,io,0x3f8,115200n8 nokaslr nolapic noapic acpi=off nohpet nosmp ignore_loglevel tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200n8 earlycon=uart,io,0x3f8,115200n8 earlyprintk=serial,ttyS0,115200,keep nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000 ignore_loglevel");
     acpi.setupTables();
     setupLinuxState();
     log.print("Linux configured\n");
@@ -290,7 +287,7 @@ noinline fn bootLinuxEmbedded() void {
     log.print("\n");
 
     buildBootParams(initramfs_data.len);
-    boot.setupCmdline("console=ttyS0,115200 earlyprintk=serial,ttyS0,115200,keep earlycon=uart,io,0x3f8,115200n8 nokaslr nolapic noapic acpi=off nohpet nosmp ignore_loglevel tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200n8 earlycon=uart,io,0x3f8,115200n8 earlyprintk=serial,ttyS0,115200,keep nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000 ignore_loglevel");
     acpi.setupTables();
     setupLinuxState();
     log.print("Linux configured (embedded)\n");
@@ -423,14 +420,12 @@ noinline fn exitLoop() void {
         }
 
         var state = r.state;
-        // recvVmExit reads vreg 64 from `vm_exit_buf` which retains
-        // whatever the VMM wrote on the prior reply (the kernel does
-        // not clear vreg 64 on recv-side projection). Clear it
-        // explicitly so we only inject when the late-boot block
-        // below explicitly sets it again — otherwise our previous
-        // timer-IRQ injection sticks across exits and hardware
-        // re-fires the same vector on every entry, livelocking
-        // Linux in its IRQ0 ISR.
+        // recvVmExit projects vreg 64 from `vm_exit_buf`, which retains
+        // whatever the VMM wrote on the prior reply. Clear it so a
+        // stale value can't sneak back as a fresh injection request —
+        // the kernel-emulated LAPIC drives all timer/EOI delivery now,
+        // and the VMM only sets vreg 64 if it has a real interrupt to
+        // inject (currently nothing does).
         state.vcpu_event_intr_nmi = 0;
         const subcode: u8 = @truncate(state.exit_subcode);
         const kill = handleSubcode(subcode, &state);
@@ -452,74 +447,12 @@ noinline fn exitLoop() void {
             _ = syscall.vmInjectIrq(vm_handle, 4, 0);
         }
 
-        // PIT tick — fires IRQ0 when counter reaches 0.
+        // PIT tick — fires IRQ0 via the in-kernel IOAPIC for guests that
+        // still listen to the 8254. Linux runs with full APIC, so it
+        // mostly uses the LAPIC timer (driven by the kernel's per-
+        // iteration `vm_ptr.lapic.tick(elapsed_ns)` inside the run
+        // loop), but `check_timer` still expects PIT ticks during boot.
         io.pitCheckIrq();
-
-        // Direct PIC IRQ0 injection at 4ms / 250Hz, mirroring the OLD
-        // VMM's `maybeInjectTimer`. With `nolapic noapic` Linux uses
-        // the 8259 PIC for all IRQ routing — `vmInjectIrq(pin=2)`
-        // through the in-kernel IOAPIC above is a no-op for
-        // guest-visible delivery, so without this hook jiffies never
-        // advance and `/init` hangs on its first mount syscall.
-        // Stuff a SVM-EVENTINJ-format word into vreg 64
-        // (vcpu_event_intr_nmi); kernel's applyReplyStateToVcpu
-        // forwards it to `gs.pending_eventinj`. Gates: IF=1, no prior
-        // pending event. Linux's PIC remap (vector_base 0x08 → 0x20)
-        // happens within ~1ms of boot, so the 4ms throttle is enough
-        // to ensure the first inject lands on the remapped vector.
-        // Direct PIC IRQ0 injection. Don't even try until exit_count
-        // is big enough that we've definitely traversed Linux's
-        // setup_arch + init_8259A (PIC remap, IDT install) — early
-        // injection at vector 0x08 lands on the CPU's #DF entry and
-        // either panics the guest or eats the interrupt silently
-        // depending on Linux's IDT shape at that instant. Empirically
-        // Linux reaches "Run /init" around exit#80k under our cmdline,
-        // so an exit_count threshold gives us a stable late-boot
-        // injection point without a fragile event-shape probe.
-        // Track distinct rflags values seen past the gate.
-        if (exit_count > 81_000) {
-            const if_bit: u64 = (state.rflags >> 9) & 1;
-            if (if_bit != last_if_seen) {
-                log.print("IF=");
-                log.dec(if_bit);
-                log.print(" @exit#");
-                log.dec(exit_count);
-                log.print(" rflags=0x");
-                log.hex64(state.rflags);
-                log.print(" rip=0x");
-                log.hex64(state.rip);
-                log.print(" subcode=");
-                log.dec(state.exit_subcode);
-                log.print("\n");
-                last_if_seen = if_bit;
-            }
-        }
-        // No IF gate — SVM/VMX EVENTINJ delivers unconditionally
-        // regardless of guest IF (AMD APM Vol 2 §15.20). Linux's
-        // printk-during-env-dump path holds IF=0 across hundreds of
-        // exits, so gating on IF=1 means we never inject. The OLD
-        // VMM gated on IF but used a *separate* IPI-driven injection
-        // path that kicked the vCPU; our reply-path injection has
-        // strict EVENTINJ semantics, so the gate is unnecessary
-        // (and harmful).
-        if (exit_count > 81_000 and
-            io.pic1_vector_base != 0x08 and
-            state.vcpu_event_intr_nmi == 0)
-        {
-            const now_ns = syscall.timeMonotonic().v1;
-            if (now_ns -% last_inject_ns >= 4_000_000) {
-                last_inject_ns = now_ns;
-                state.vcpu_event_intr_nmi = @as(u64, io.pic1_vector_base) | (1 << 31);
-                inject_count += 1;
-                if (inject_count <= 5) {
-                    log.print("INJECT#");
-                    log.dec(inject_count);
-                    log.print(" vec=0x");
-                    log.hex8(io.pic1_vector_base);
-                    log.print("\n");
-                }
-            }
-        }
 
         const reply_err = syscall.replyVmExit(r.reply_handle_id, state);
         if (reply_err != 0) {

@@ -954,12 +954,23 @@ fn decodeExitReason(vmcb: [*]const u8, guest_state: *const GuestState) VmExitInf
         return .triple_fault;
     }
 
+    // VMEXIT_INTR: a host IRQ fired while the guest was running. We need
+    // to (a) crack the IRQ window so the host IDT services the latched
+    // IRQ (otherwise VMRUN re-exits immediately on the same pending
+    // IRQ, an infinite loop), AND (b) yield back through fireVmExit so
+    // the VMM gets scheduled to drive PIT/serial polling — without that
+    // round trip the VMM is starved and Linux's check_timer fails.
+    // Reporting as `.unknown` triggers the VMM round trip; the inline
+    // `sti; nop; cli` arm in vm_runloop's `.interrupt_window` case is
+    // also entered for the same exit code via the Intel side.
+    //
+    // VMEXIT_VINTR (guest became interruptible) is a different signal:
+    // pure interrupt-window, no host IRQ to drain. Stay inline so the
+    // next iteration's deliverPendingInterrupts can fire the queued
+    // LAPIC vector.
     if (exitcode == VMEXIT_INTR) {
         return .{ .unknown = VMEXIT_INTR };
     }
-
-    // VMEXIT_VINTR: guest became interruptible (IF went 0 → 1). Report as
-    // interrupt_window so the VMM can inject pending interrupts.
     if (exitcode == VMEXIT_VINTR) {
         return .{ .interrupt_window = {} };
     }
