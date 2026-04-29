@@ -133,9 +133,19 @@ ensure_oracle_db() {
     ORACLE_DB="$SCRIPT_DIR/tools/oracle_http/test/dbs/x86_64-${sha}.db"
 
     if [[ ! -f "$ORACLE_DB" ]]; then
+        # Need .ll AND an x86_64-flavored kernel.elf. A previous
+        # `-Darch=arm` build leaves an ARM ELF in zig-out/, which would
+        # make objdump fail silently in the indexer's stage-4 pass.
+        local need_rebuild=0
         if [[ ! -f "$SCRIPT_DIR/zig-out/kernel.x86_64.ll" || ! -f "$SCRIPT_DIR/zig-out/bin/kernel.elf" ]]; then
-            echo "  building kernel with -Demit_ir=true (needed by indexer)"
-            (cd "$SCRIPT_DIR" && zig build -Dprofile=test -Demit_ir=true) \
+            need_rebuild=1
+        elif ! file "$SCRIPT_DIR/zig-out/bin/kernel.elf" 2>/dev/null | grep -q "x86-64"; then
+            echo "  zig-out/bin/kernel.elf is not x86_64 — rebuilding"
+            need_rebuild=1
+        fi
+        if [[ $need_rebuild -eq 1 ]]; then
+            echo "  building kernel with -Darch=x64 -Demit_ir=true (needed by indexer)"
+            (cd "$SCRIPT_DIR" && zig build -Dprofile=test -Darch=x64 -Demit_ir=true) \
                 || { echo "[FAIL] kernel build for IR/ELF failed"; return 1; }
         fi
         (cd "$SCRIPT_DIR" && tools/indexer/zig-out/bin/indexer \

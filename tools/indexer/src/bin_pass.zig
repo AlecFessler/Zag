@@ -37,7 +37,12 @@ fn runCmd(palloc: std.mem.Allocator, argv: []const []const u8) ![]u8 {
         .max_output_bytes = 200 * 1024 * 1024,
     });
     if (result.term != .Exited or result.term.Exited != 0) {
-        std.log.warn("{s} exited non-zero", .{argv[0]});
+        // Non-zero exit usually means an arch mismatch (e.g. an ARM ELF
+        // passed to an x86 indexer run) which produces empty disasm /
+        // symbol tables silently. Log the stderr so the cause is visible
+        // and surface the failure as a hard error.
+        std.log.err("{s} exited with non-zero status; stderr:\n{s}", .{ argv[0], result.stderr });
+        return error.ObjdumpFailed;
     }
     return result.stdout;
 }

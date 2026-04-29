@@ -78,9 +78,19 @@ ensure_oracle_db() {
     sha="$(cd "$ZAG_ROOT" && git rev-parse --short HEAD)"
     ORACLE_DB="$ZAG_ROOT/tools/oracle_http/test/dbs/x86_64-${sha}.db"
     if [[ -f "$ORACLE_DB" ]]; then return 0; fi
+    # Need .ll AND an x86_64-flavored kernel.elf. If a previous aarch64
+    # build left an ARM ELF in zig-out/, the indexer's objdump pass would
+    # fail silently and produce an empty bin_inst table.
+    local need_rebuild=0
     if [[ ! -f "$ZAG_ROOT/zig-out/kernel.x86_64.ll" || ! -f "$ZAG_ROOT/zig-out/bin/kernel.elf" ]]; then
-        echo "  building kernel with -Demit_ir=true (needed by indexer)"
-        if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test -Demit_ir=true 2>&1); then
+        need_rebuild=1
+    elif ! file "$ZAG_ROOT/zig-out/bin/kernel.elf" 2>/dev/null | grep -q "x86-64"; then
+        echo "  zig-out/bin/kernel.elf is not x86_64 — rebuilding"
+        need_rebuild=1
+    fi
+    if [[ $need_rebuild -eq 1 ]]; then
+        echo "  building kernel with -Darch=x64 -Demit_ir=true (needed by indexer)"
+        if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test -Darch=x64 -Demit_ir=true 2>&1); then
             FAILURES+=("kernel build for IR/ELF")
             return 1
         fi
