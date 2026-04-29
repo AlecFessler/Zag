@@ -20,12 +20,16 @@ const Args = struct {
     commit_sha: []const u8 = "unknown",
     ir_path: ?[]const u8 = null,
     elf_path: ?[]const u8 = null,
-    /// Additional directories scanned for token-only ingest. Each
-    /// contributes `file` + `token` rows (paths prefixed with the dir
-    /// name, e.g. `routerOS/foo.zig`) but no `module`, `entity`, or
-    /// `ast_node` rows. Used so dead-code's field-name heuristic can
-    /// see `.foo` mentions in non-kernel source. Repeatable.
-    extra_token_roots: std.ArrayList([]const u8) = .empty,
+    /// Additional directories scanned for full ingestion (file + token +
+    /// ast_node + entity + const_alias + entity_type_ref rows). Their
+    /// paths are prefixed with the basename of the source root
+    /// (e.g. `routerOS/foo.zig`) and module qnames are prefixed with
+    /// `<basename>.` (e.g. `routerOS.nic`). Stages 3 (IR) and 4 (bin)
+    /// are kernel-only and skip these trees; stage 5 entry-point SQL
+    /// filters on kernel-only file paths so non-kernel entities are not
+    /// rooted as entries. Repeatable. The legacy `--extra-token-root`
+    /// flag is accepted as an alias for back-compat with older invokers.
+    extra_source_roots: std.ArrayList([]const u8) = .empty,
     n_jobs: u32 = 0, // 0 → auto-detect
 
     fn parse(allocator: std.mem.Allocator) !Args {
@@ -46,9 +50,11 @@ const Args = struct {
                 a.ir_path = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
             } else if (std.mem.eql(u8, arg, "--elf")) {
                 a.elf_path = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
-            } else if (std.mem.eql(u8, arg, "--extra-token-root")) {
+            } else if (std.mem.eql(u8, arg, "--extra-source-root") or
+                std.mem.eql(u8, arg, "--extra-token-root"))
+            {
                 const v = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
-                try a.extra_token_roots.append(allocator, v);
+                try a.extra_source_roots.append(allocator, v);
             } else if (std.mem.eql(u8, arg, "--jobs")) {
                 a.n_jobs = try std.fmt.parseInt(u32, it.next() orelse return error.MissingValue, 10);
             } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -60,7 +66,8 @@ const Args = struct {
                     \\  --commit-sha <sha>           default: unknown
                     \\  --ir <path>                  pre-opt LLVM IR file (zig-out/kernel.<arch>.ll)
                     \\  --elf <path>                 final kernel ELF for DWARF + objdump (zig-out/kernel.<arch>.elf)
-                    \\  --extra-token-root <dir>     extra dir to scan for tokens only (no entity emission); repeatable
+                    \\  --extra-source-root <dir>    extra source tree to fully ingest (entity+ast); repeatable
+                    \\  --extra-token-root <dir>     legacy alias for --extra-source-root
                     \\  --jobs <n>                   default: ncpu
                     \\
                 , .{});
@@ -86,23 +93,33 @@ pub fn main() !void {
     const t_start = std.time.milliTimestamp();
     std.log.info("indexer starting: kernel_root={s} arch={s} sha={s}", .{ args.kernel_root, args.arch, args.commit_sha });
 
-    // ── Stage 0: walk source tree ──────────────────────────────────────────
+    // ── Stage 0: walk kernel root + extra source roots ────────────────────
+    //
+    // The kernel walk emits files / modules with no path or qname prefix
+    // (paths like `arch/x64/foo.zig`, modules like `arch.x64.foo`).
+    // Each `--extra-source-root <dir>` is walked with `tree_prefix=<basename>`,
+    // which:
+    //   * prefixes file paths with `<basename>/` so `--target` filters in
+    //     the dead-code analyzer can use GLOB on the leading segment;
+    //   * prefixes module qnames with `<basename>.` so they don't collide
+    //     with kernel modules (the `module` table has UNIQUE on qname).
+    //
+    // After both walks, file IDs and module IDs are renumbered into a single
+    // global ID space so stages 1+2 can iterate one merged file array and
+    // refs_pass / sync see one merged entity table.
     var walk_result = try walk_mod.walk(gpa, args.kernel_root);
     defer walk_result.deinit();
-    std.log.info("stage 0: {d} files, {d} modules", .{ walk_result.files.len, walk_result.modules.len });
+    std.log.info("stage 0: kernel — {d} files, {d} modules", .{ walk_result.files.len, walk_result.modules.len });
 
-    // Token-only walks for the extra roots (e.g. routerOS/, hyprvOS/,
-    // bootloader/). Their files contribute to the `file` + `token` tables
-    // and `file_line_index`, but they don't go through ast_pass / ir_pass /
-    // bin_pass — no entity, ast_node, or module rows are emitted for them.
     var extra_walks: std.ArrayList(walk_mod.WalkResult) = .empty;
     defer {
         for (extra_walks.items) |*er| er.deinit();
         extra_walks.deinit(gpa);
     }
-    for (args.extra_token_roots.items) |root| {
-        const er = try walk_mod.walk(gpa, root);
-        std.log.info("stage 0 extra-root {s}: {d} files for token-only ingest", .{ root, er.files.len });
+    for (args.extra_source_roots.items) |root| {
+        const prefix = std.fs.path.basename(root);
+        const er = try walk_mod.walkPrefixed(gpa, root, prefix);
+        std.log.info("stage 0 extra {s} (prefix={s}): {d} files, {d} modules", .{ root, prefix, er.files.len, er.modules.len });
         try extra_walks.append(gpa, er);
     }
 
@@ -114,6 +131,56 @@ pub fn main() !void {
     defer pipeline_arena.deinit();
     var ts_arena: std.heap.ThreadSafeAllocator = .{ .child_allocator = pipeline_arena.allocator() };
     const palloc = ts_arena.allocator();
+
+    // Renumber file IDs and module IDs into a global space, then fix the
+    // module_id back-reference inside each FileRecord. The renumbered slices
+    // own their FileRecord/ModuleRecord values in `palloc`; the underlying
+    // strings (path, qname, source) still live in each walk's arena, which
+    // outlives the writer thread (we deinit `extra_walks` after the writer
+    // joins because the deferred deinit at the top of main runs after this
+    // function's defers).
+    var all_files: std.ArrayList(types.FileRecord) = .empty;
+    var all_modules: std.ArrayList(types.ModuleRecord) = .empty;
+    var all_line_indices: std.ArrayList([]const u32) = .empty;
+    // Track which files come from the kernel walk for stage 3 IR mapping
+    // (IR is kernel-only, so we don't need per-source-root distinctions
+    // beyond is-kernel-or-not). The first N files in `all_files` are the
+    // kernel walk's, in the same order.
+    {
+        // Kernel walk: IDs 0..K-1, modules 0..M_k-1.
+        for (walk_result.files) |f| try all_files.append(palloc, f);
+        for (walk_result.modules) |m| try all_modules.append(palloc, m);
+        for (walk_result.line_indices) |li| try all_line_indices.append(palloc, li);
+
+        // Each extra walk: shift file IDs by `file_id_offset`, module IDs
+        // by `module_id_offset`, then patch each file's module_id.
+        for (extra_walks.items) |er| {
+            const file_id_offset: u32 = @intCast(all_files.items.len);
+            const module_id_offset: u32 = @intCast(all_modules.items.len);
+            for (er.modules) |m| {
+                try all_modules.append(palloc, .{
+                    .id = m.id + module_id_offset,
+                    .qualified_name = m.qualified_name,
+                    .root_file_id = m.root_file_id + file_id_offset,
+                });
+            }
+            for (er.files) |f| {
+                try all_files.append(palloc, .{
+                    .id = f.id + file_id_offset,
+                    .path = f.path,
+                    .source = f.source,
+                    .sha256 = f.sha256,
+                    .size = f.size,
+                    .module_id = f.module_id + module_id_offset,
+                });
+            }
+            for (er.line_indices) |li| try all_line_indices.append(palloc, li);
+        }
+    }
+    const merged_files = all_files.items;
+    const merged_modules = all_modules.items;
+    const merged_line_indices = all_line_indices.items;
+    const kernel_file_count: usize = walk_result.files.len;
 
     // ── Bootstrap DB ───────────────────────────────────────────────────────
     const tmp_path = try std.fmt.allocPrintSentinel(arg_arena.allocator(), "{s}.tmp", .{args.out_path}, 0);
@@ -131,54 +198,15 @@ pub fn main() !void {
     const writer_thread = try std.Thread.spawn(.{}, writer_mod.Writer.run, .{&w});
 
     // ── Send Stage 0 outputs to writer ─────────────────────────────────────
-    try channel.send(.{ .modules = walk_result.modules });
-    try channel.send(.{ .files = walk_result.files });
-    for (walk_result.files, 0..) |f, i| {
+    try channel.send(.{ .modules = merged_modules });
+    try channel.send(.{ .files = merged_files });
+    for (merged_files, 0..) |f, i| {
         try channel.send(.{
             .file_line_index = .{
                 .file_id = f.id,
-                .byte_starts = walk_result.line_indices[i],
+                .byte_starts = merged_line_indices[i],
             },
         });
-    }
-
-    // Send extra-root files with adjusted IDs and prefixed paths, then
-    // ingest their tokens. They land in `file` / `file_line_index` / `token`
-    // but not in `module` / `entity` / `ast_node`.
-    var next_file_id: u32 = @intCast(walk_result.files.len);
-    for (extra_walks.items, args.extra_token_roots.items) |*er, root_dir| {
-        const adjusted = try palloc.alloc(types.FileRecord, er.files.len);
-        for (er.files, 0..) |f, i| {
-            const new_id = next_file_id;
-            next_file_id += 1;
-            const prefixed_path = try std.fmt.allocPrint(palloc, "{s}/{s}", .{ root_dir, f.path });
-            adjusted[i] = .{
-                .id = new_id,
-                .path = prefixed_path,
-                .source = f.source,
-                .sha256 = f.sha256,
-                .size = f.size,
-                .module_id = std.math.maxInt(u32), // sentinel: no module
-            };
-        }
-        try channel.send(.{ .files = adjusted });
-        for (adjusted, 0..) |f, i| {
-            try channel.send(.{
-                .file_line_index = .{
-                    .file_id = f.id,
-                    .byte_starts = er.line_indices[i],
-                },
-            });
-        }
-
-        // Tokenize each file and send the token rows.
-        for (adjusted, 0..) |f, i| {
-            const token_rows = tokens_mod.tokenize(palloc, er.files[i].source) catch |e| {
-                std.log.warn("extra-root tokenize failed on {s}: {s}", .{ f.path, @errorName(e) });
-                continue;
-            };
-            try channel.send(.{ .tokens = .{ .file_id = f.id, .rows = token_rows } });
-        }
     }
 
     // ── Stages 1+2: parallel tokenize + AST per file ───────────────────────
@@ -191,27 +219,28 @@ pub fn main() !void {
     try pool.init(.{ .allocator = gpa, .n_jobs = n_jobs });
     defer pool.deinit();
 
-    // Per-file results (indexed by file_id) — fixed-size, no resizing.
-    const per_file = try gpa.alloc(WorkerResult, walk_result.files.len);
+    // Per-file results (indexed by position in `merged_files`) — fixed-size,
+    // no resizing. Workers fill in `entities`, `aliases`, `type_refs`.
+    const per_file = try gpa.alloc(WorkerResult, merged_files.len);
     defer gpa.free(per_file);
     for (per_file) |*r| r.* = .empty;
 
     var shared: SharedState = .{ .next_node_id = std.atomic.Value(u64).init(1) };
 
     var wg: std.Thread.WaitGroup = .{};
-    for (walk_result.files, 0..) |*file, i| {
+    for (merged_files, 0..) |*file, i| {
         pool.spawnWg(&wg, processFile, .{
             palloc,
             &channel,
             file,
-            walk_result.modules[file.module_id].qualified_name,
+            merged_modules[file.module_id].qualified_name,
             &shared,
             &per_file[i],
         });
     }
     pool.waitAndWork(&wg);
     const total_ast_nodes = shared.next_node_id.load(.monotonic) - 1;
-    std.log.info("stages 1+2: parallel pass complete ({d} ast nodes)", .{total_ast_nodes});
+    std.log.info("stages 1+2: parallel pass complete ({d} ast nodes over {d} files, {d} kernel)", .{ total_ast_nodes, merged_files.len, kernel_file_count });
 
     // ── Stage 2.5: resolve provisional entities → final IDs ────────────────
     var total_provisional: usize = 0;
@@ -260,7 +289,7 @@ pub fn main() !void {
     const refs_result = try refs_pass.pass(
         palloc,
         resolve_result.final_entities,
-        walk_result.modules,
+        merged_modules,
         all_aliases,
         all_type_refs,
     );
@@ -333,10 +362,13 @@ pub fn main() !void {
         try qmap_local.ensureTotalCapacity(palloc, @intCast(resolve_result.final_entities.len));
         for (resolve_result.final_entities) |e| try qmap_local.put(palloc, e.qualified_name, e.id);
 
-        // Build basename → file_id map for DWARF line resolution.
+        // Build basename → file_id map for DWARF line resolution. The ELF is
+        // the kernel ELF, so only kernel files (the first `kernel_file_count`
+        // in `merged_files`) map. Including non-kernel files would hijack
+        // basename collisions like `main.zig` (kernel vs hyprvOS).
         var basemap: std.StringHashMapUnmanaged(u32) = .empty;
-        try basemap.ensureTotalCapacity(palloc, @intCast(walk_result.files.len));
-        for (walk_result.files) |f| {
+        try basemap.ensureTotalCapacity(palloc, @intCast(kernel_file_count));
+        for (merged_files[0..kernel_file_count]) |f| {
             const base = std.fs.path.basename(f.path);
             try basemap.put(palloc, base, f.id);
         }
@@ -518,7 +550,7 @@ pub fn main() !void {
     try channel.send(.{ .fts_rebuild = "token_fts" });
 
     const elapsed_ms_str = try std.fmt.allocPrint(arg_arena.allocator(), "{d}", .{std.time.milliTimestamp() - t_start});
-    const total_files_str = try std.fmt.allocPrint(arg_arena.allocator(), "{d}", .{walk_result.files.len});
+    const total_files_str = try std.fmt.allocPrint(arg_arena.allocator(), "{d}", .{merged_files.len});
     const total_entities_str = try std.fmt.allocPrint(arg_arena.allocator(), "{d}", .{resolve_result.final_entities.len});
     const total_ast_nodes_str = try std.fmt.allocPrint(arg_arena.allocator(), "{d}", .{total_ast_nodes});
     const built_at_str = try std.fmt.allocPrint(arg_arena.allocator(), "{d}", .{std.time.timestamp()});

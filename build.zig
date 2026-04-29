@@ -314,21 +314,25 @@ pub fn build(b: *std.Build) void {
     install_kernel.step.dependOn(&kernel.step);
     b.getInstallStep().dependOn(&install_kernel.step);
 
+    var maybe_install_ir: ?*std.Build.Step.InstallFile = null;
     if (emit_ir or emit_index) {
         const ir_name = b.fmt("kernel.{s}.ll", .{@tagName(arch)});
         const install_ir = b.addInstallFile(kernel.getEmittedLlvmIr(), ir_name);
         install_ir.step.dependOn(&kernel.step);
         b.getInstallStep().dependOn(&install_ir.step);
+        maybe_install_ir = install_ir;
     }
 
     if (emit_index) {
-        // Build the indexer (in tools/indexer) and run it against the just-
-        // installed kernel ELF + IR. The output `.db` lands in
-        // tools/oracle_http/test/dbs/ where the daemons auto-discover it.
-        const indexer_exe = b.addSystemCommand(&.{
-            "zig", "build", "-Doptimize=ReleaseSmall",
-        });
-        indexer_exe.setCwd(b.path("tools/indexer"));
+        // Run the indexer (must already be built — `cd tools/indexer && zig
+        // build` once before invoking this) against the just-installed
+        // kernel ELF + IR. Output `.db` lands in tools/oracle_http/test/dbs/
+        // where the oracle daemons auto-discover it.
+        //
+        // We can't bootstrap the indexer's own zig build from here without
+        // tripping option-forwarding (the parent `-Dprofile=test
+        // -Demit_index=true` flags get inherited by the sub-build, where
+        // they're invalid). Keep them as separate, explicit zig invocations.
         const installed_ir = b.fmt("{s}/kernel.{s}.ll", .{ b.install_path, @tagName(arch) });
         const installed_elf = b.fmt("{s}/{s}/{s}", .{ b.install_path, out_dir, kernel.name });
         const db_dir = b.path("tools/oracle_http/test/dbs").getPath(b);
@@ -336,24 +340,22 @@ pub fn build(b: *std.Build) void {
         const db_out = b.fmt("{s}/{s}", .{ db_dir, db_filename });
         const run_indexer = b.addSystemCommand(&.{
             "tools/indexer/zig-out/bin/indexer",
-            "--kernel-root",
-            "kernel",
-            "--out",
-            db_out,
-            "--arch",
-            @tagName(arch),
-            "--commit-sha",
-            commit_sha,
-            "--ir",
-            installed_ir,
-            "--elf",
-            installed_elf,
+            "--kernel-root",      "kernel",
+            "--extra-source-root", "routerOS",
+            "--extra-source-root", "hyprvOS",
+            "--extra-source-root", "bootloader",
+            "--extra-source-root", "tools",
+            "--extra-source-root", "tests",
+            "--out",              db_out,
+            "--arch",             @tagName(arch),
+            "--commit-sha",       commit_sha,
+            "--ir",               installed_ir,
+            "--elf",              installed_elf,
         });
-        run_indexer.step.dependOn(&indexer_exe.step);
-        run_indexer.step.dependOn(b.getInstallStep());
-        const index_step = b.step("index", "Run the oracle DB indexer after the kernel build");
+        run_indexer.step.dependOn(&install_kernel.step);
+        if (maybe_install_ir) |ir| run_indexer.step.dependOn(&ir.step);
+        const index_step = b.step("index", "Run the oracle DB indexer after the kernel build (requires `cd tools/indexer && zig build` and -Demit_index=true)");
         index_step.dependOn(&run_indexer.step);
-        b.getInstallStep().dependOn(&run_indexer.step);
     }
 
     // ── Root service (copied into FAT image, loaded by bootloader) ─────

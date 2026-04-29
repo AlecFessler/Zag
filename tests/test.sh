@@ -139,11 +139,11 @@ ensure_oracle_db() {
         fi
         (cd "$SCRIPT_DIR" && tools/indexer/zig-out/bin/indexer \
             --kernel-root kernel \
-            --extra-token-root routerOS \
-            --extra-token-root hyprvOS \
-            --extra-token-root bootloader \
-            --extra-token-root tools \
-            --extra-token-root tests \
+            --extra-source-root routerOS \
+            --extra-source-root hyprvOS \
+            --extra-source-root bootloader \
+            --extra-source-root tools \
+            --extra-source-root tests \
             --out "$ORACLE_DB" \
             --arch x86_64 \
             --commit-sha "$(git rev-parse HEAD)" \

@@ -30,6 +30,19 @@ const SKIP_DIRS = [_][]const u8{
 /// Computes file IDs, module IDs, sha256, and line indices.
 /// Returned arrays are valid until the WalkResult arena is deinit'd.
 pub fn walk(gpa: std.mem.Allocator, root_dir: []const u8) !WalkResult {
+    return walkPrefixed(gpa, root_dir, "");
+}
+
+/// Like `walk`, but every emitted file `path` and module `qualified_name`
+/// is prefixed with `tree_prefix` so multiple non-kernel trees can be
+/// merged into one DB without colliding with the kernel's namespace.
+/// Pass `""` for the kernel root (no prefix); pass e.g. `"routerOS"` for
+/// non-kernel sub-projects.
+pub fn walkPrefixed(
+    gpa: std.mem.Allocator,
+    root_dir: []const u8,
+    tree_prefix: []const u8,
+) !WalkResult {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const aalloc = arena.allocator();
@@ -64,12 +77,19 @@ pub fn walk(gpa: std.mem.Allocator, root_dir: []const u8) !WalkResult {
         var sha: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(source, &sha, .{});
 
-        // Path relative to root, with `/` separator regardless of OS.
+        // Path relative to root (then prefixed if tree_prefix is non-empty),
+        // with `/` separator regardless of OS.
         const rel_path = try aalloc.dupe(u8, entry.path);
         normalizeSlashes(rel_path);
+        const path_for_db: []const u8 = if (tree_prefix.len == 0)
+            rel_path
+        else
+            try std.fmt.allocPrint(aalloc, "{s}/{s}", .{ tree_prefix, rel_path });
 
-        // Module qualified name from path.
-        const module_qname = try deriveModuleQname(aalloc, rel_path);
+        // Module qualified name from path. For non-kernel trees we prefix
+        // with the tree name so qnames stay globally unique (the `module`
+        // table has UNIQUE on qualified_name).
+        const module_qname = try deriveModuleQname(aalloc, rel_path, tree_prefix);
         const module_id = try internModule(
             aalloc,
             &modules_by_qname,
@@ -81,7 +101,7 @@ pub fn walk(gpa: std.mem.Allocator, root_dir: []const u8) !WalkResult {
         const file_id: u32 = @intCast(files.items.len);
         try files.append(aalloc, .{
             .id = file_id,
-            .path = rel_path,
+            .path = path_for_db,
             .source = source,
             .sha256 = sha,
             .size = @intCast(stat.size),
@@ -125,12 +145,29 @@ fn normalizeSlashes(path: []u8) void {
     }
 }
 
-fn deriveModuleQname(allocator: std.mem.Allocator, rel_path: []const u8) ![]const u8 {
-    // Strip `.zig` suffix, replace `/` with `.`. Empty result for root.zig means module "".
+fn deriveModuleQname(
+    allocator: std.mem.Allocator,
+    rel_path: []const u8,
+    tree_prefix: []const u8,
+) ![]const u8 {
+    // Strip `.zig` suffix, replace `/` with `.`. For non-kernel trees, the
+    // resulting stem is prefixed with `<tree_prefix>.` so qnames don't
+    // collide with kernel modules of the same shape (e.g. routerOS/build.zig
+    // → `routerOS.build` vs kernel `build`).
     const stem = rel_path[0 .. rel_path.len - 4]; // ".zig" is 4 chars
-    var out = try allocator.alloc(u8, stem.len);
+    if (tree_prefix.len == 0) {
+        var out = try allocator.alloc(u8, stem.len);
+        for (stem, 0..) |c, i| {
+            out[i] = if (c == '/') '.' else c;
+        }
+        return out;
+    }
+    const total = tree_prefix.len + 1 + stem.len;
+    var out = try allocator.alloc(u8, total);
+    @memcpy(out[0..tree_prefix.len], tree_prefix);
+    out[tree_prefix.len] = '.';
     for (stem, 0..) |c, i| {
-        out[i] = if (c == '/') '.' else c;
+        out[tree_prefix.len + 1 + i] = if (c == '/') '.' else c;
     }
     return out;
 }
