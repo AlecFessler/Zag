@@ -123,6 +123,30 @@ stage_dead_code_report() {
     [[ $any_failed -eq 0 ]] || return 1
 }
 
+stage_oracle_smokes() {
+    echo ""
+    echo "=================================================="
+    echo "[0d] Oracle HTTP + MCP smoke (per-commit DB)"
+    echo "=================================================="
+    if ! (cd "$ZAG_ROOT/tools/oracle_http" && zig build 2>&1); then
+        FAILURES+=("oracle_http build")
+        return 1
+    fi
+    if ! (cd "$ZAG_ROOT/tools/oracle_mcp" && zig build 2>&1); then
+        FAILURES+=("oracle_mcp build")
+        return 1
+    fi
+    ensure_oracle_db || return 1
+    if ! bash "$ZAG_ROOT/tools/oracle_http/test/smoke.sh" "$ORACLE_DB"; then
+        FAILURES+=("oracle_http smoke")
+        return 1
+    fi
+    if ! bash "$ZAG_ROOT/tools/oracle_mcp/test/smoke.sh" "$ORACLE_DB"; then
+        FAILURES+=("oracle_mcp smoke")
+        return 1
+    fi
+}
+
 stage_gen_lock_analyzer() {
     echo ""
     echo "=================================================="
@@ -356,6 +380,7 @@ stage_kernel_perf() {
 stage_arch_layering_lint        || true
 stage_dead_code_report          || true
 stage_gen_lock_analyzer         || true
+stage_oracle_smokes             || true
 stage_x86_kernel_tests          || true
 stage_aarch64_kernel_tests_pi   || true
 stage_hyprvos_x86_linux_boot    || true

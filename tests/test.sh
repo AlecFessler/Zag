@@ -22,7 +22,8 @@ Targets:
   linux-arm       Boot Linux guest in hyprvOS (aarch64 TCG), verify 'hello from guest'
   genlock         Run gen-lock static analyzer (gates on err-severity findings)
   dead-code       Run dead-code static analyzer (gates on any findings)
-  pre-commit      Run genlock + dead-code + kernel + linux + router (gate before commit)
+  oracle          Run oracle_http + oracle_mcp smoke tests against the per-commit DB
+  pre-commit      Run genlock + dead-code + oracle + kernel + linux + router (gate before commit)
   perf            Run kernel performance benchmarks (sequential)
   kernel-fuzz     Run all kernel fuzzers (buddy, heap, vmm, rbt)
   router-fuzz     Run router packet processing fuzzer
@@ -179,6 +180,24 @@ run_dead_code_check() {
         fi
     done
     [[ $any_failed -eq 0 ]] || return 1
+}
+
+run_oracle_smokes() {
+    echo "=== Oracle HTTP + MCP smoke ==="
+    (cd "$SCRIPT_DIR/tools/oracle_http" && zig build) \
+        || { echo "[FAIL] oracle_http build failed"; return 1; }
+    (cd "$SCRIPT_DIR/tools/oracle_mcp" && zig build) \
+        || { echo "[FAIL] oracle_mcp build failed"; return 1; }
+    ensure_oracle_db || return 1
+    if ! bash "$SCRIPT_DIR/tools/oracle_http/test/smoke.sh" "$ORACLE_DB"; then
+        echo "[FAIL] oracle_http smoke failed"
+        return 1
+    fi
+    if ! bash "$SCRIPT_DIR/tools/oracle_mcp/test/smoke.sh" "$ORACLE_DB"; then
+        echo "[FAIL] oracle_mcp smoke failed"
+        return 1
+    fi
+    echo "[PASS] oracle daemons clean"
 }
 
 run_linux_boot_test() {
@@ -358,10 +377,14 @@ case "$TARGET" in
     dead-code)
         run_dead_code_check || exit 1
         ;;
+    oracle)
+        run_oracle_smokes || exit 1
+        ;;
     pre-commit)
         # Required gate before any agent commits — fails fast on the first failure.
         run_genlock_check || exit 1
         run_dead_code_check || exit 1
+        run_oracle_smokes || exit 1
         run_kernel_tests || exit 1
         run_linux_boot_test || exit 1
         run_router_tests || exit 1
